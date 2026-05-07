@@ -9,7 +9,7 @@ import pytest
 
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
-from jax_nufft.planning import W_OVERSAMPLE_X0, WGridderPlan, make_plan
+from jax_nufft.planning import W_OVERSAMPLE_ETA_MAX, WGridderPlan, make_plan
 
 
 def _baseline_uvw(n_rows: int = 50, max_baseline: float = 100.0, seed: int = 0) -> np.ndarray:
@@ -226,10 +226,13 @@ def test_plan_sample_consistency() -> None:
     if inner > 0:
         dw = w_extent / inner
         max_nm1 = float(np.max(np.abs(np.asarray(plan.n_minus_1))))
-        # Spec sec 4.2 step 3: inner ~ ceil(w_extent * max|nm1| / x0).
-        oversamp_check = w_extent * max_nm1 / W_OVERSAMPLE_X0
+        # Sampling: inner ~ ceil(w_extent * max|nm1| / x0) with x0 = 2*eta_max/W.
+        x0 = (2.0 * W_OVERSAMPLE_ETA_MAX) / plan.w_kernel_width
+        oversamp_check = w_extent * max_nm1 / x0
         # Allow ceil rounding plus a small margin.
         assert oversamp_check <= inner + 1
         assert oversamp_check >= inner - 1
         # And the kernel half-width matches dw * W/2.
         assert plan.w_kernel_scale == pytest.approx(dw * plan.w_kernel_width / 2.0)
+        # And eta_max stays in the well-conditioned region.
+        assert max_nm1 * plan.w_kernel_scale <= W_OVERSAMPLE_ETA_MAX + 1e-9

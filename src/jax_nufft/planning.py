@@ -31,9 +31,14 @@ from jax import Array
 from jax_nufft._utils import SPEED_OF_LIGHT, n_minus_1_grid
 from jax_nufft.kernel import compute_phi_hat_table, kernel_params
 
-# Oversampling target for the w-plane sampling: with x0 = 0.5 the kernel
-# spacing in w gives 2x Nyquist for the conjugate variable n-1.
-W_OVERSAMPLE_X0 = 0.5
+# Eta_max evaluated for phi_hat is ``x0 * W / 2`` (see the n_w_inner
+# derivation in :func:`make_plan`). With ``x0 = 1 / W`` we get
+# ``eta_max = 0.5``, which keeps the image-domain correction in the
+# well-conditioned region of the exp-of-semicircle phi_hat. The spec
+# nominally suggests ``x0 = 0.5`` (independent of W), but that pushes
+# eta_max well outside the kernel's natural support and produces large
+# aliasing errors for moderate-FoV / large-w-extent cases.
+W_OVERSAMPLE_ETA_MAX = 0.5
 
 
 @dataclass(frozen=True)
@@ -151,7 +156,7 @@ def make_plan(
     epsilon: float,
     *,
     phi_hat_n_fine: int = 4096,
-    phi_hat_oversample: int = 16,
+    phi_hat_oversample: int = 32,
 ) -> WGridderPlan:
     """Build the wgridder plan for the given (uvw, freq, image, epsilon).
 
@@ -203,8 +208,12 @@ def make_plan(
         # Should be unreachable with a real telescope; guard anyway.
         raise AssertionError("internal: negative w-extent")
 
-    # --- number of w-planes (spec sec 4.2 step 3) ---
-    n_w_inner = math.ceil(w_extent * max_abs_nm1 / W_OVERSAMPLE_X0)
+    # --- number of w-planes ---
+    # Pick x0 so that the image-domain argument eta = (n-1) * (dw*W/2) stays
+    # within W_OVERSAMPLE_ETA_MAX. eta_max(x0) = x0 * W / 2, so set
+    # x0 = 2 * eta_max / W, which gives the formula below.
+    x0 = (2.0 * W_OVERSAMPLE_ETA_MAX) / w_kernel_width
+    n_w_inner = math.ceil(w_extent * max_abs_nm1 / x0)
     n_w_inner = max(n_w_inner, 1)  # always have at least one interior step
     n_w = n_w_inner + w_kernel_width
 
@@ -230,7 +239,15 @@ def make_plan(
         n_fine=phi_hat_n_fine,
         oversample=phi_hat_oversample,
     )
-    phi_hat_n_np = phi_hat_table.evaluate(eta_n).astype(real_dtype)
+    # The image-domain correction needs a (W/2) factor to convert the discrete
+    # w-plane sum used in the gridder into the continuous w-integral that
+    # corresponds to the "literal sum" definition of the visibility (matching
+    # ducc's dirty2vis). Concretely: sum_k phi((w-w_k)/scale) g(w_k) ~= (1/dw)
+    # * integral phi((w-w')/scale) g(w') dw', and dw = 2*scale/W, so the
+    # discrete sum picks up a (scale/dw) = W/2 multiplier relative to the
+    # continuous-FT-based correction phi_hat(scale * (n-1)).
+    phi_hat_dim = phi_hat_table.evaluate(eta_n)
+    phi_hat_n_np = ((w_kernel_width / 2.0) * phi_hat_dim).astype(real_dtype)
     if not np.all(phi_hat_n_np > 0):
         raise ValueError(
             "phi_hat_n contains non-positive values; planning would produce "
