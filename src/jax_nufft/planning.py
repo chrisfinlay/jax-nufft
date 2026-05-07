@@ -183,12 +183,20 @@ def make_plan(
     w_kernel_width, beta = kernel_params(epsilon)
 
     # --- n - 1 grid (numpy, host-side) ---
+    # For pixels inside the unit disc (l^2 + m^2 <= 1) this is the usual
+    # n - 1 = sqrt(1 - l^2 - m^2) - 1 with values in [-1, 0]. For pixels
+    # outside the disc we use ducc's analytic extension
+    # n - 1 = -sqrt(l^2 + m^2 - 1) - 1 (values < -1), so that full-sky
+    # imaging matches ducc's wgridder pixel-by-pixel.
     i = np.arange(n_l) - n_l // 2
     j = np.arange(n_m) - n_m // 2
     ll = (i * pixsize_l)[:, None]
     mm = (j * pixsize_m)[None, :]
-    inside = np.maximum(1.0 - ll * ll - mm * mm, 0.0)
-    n_minus_1_np = (np.sqrt(inside) - 1.0).astype(real_dtype)
+    eps_lm = ll * ll + mm * mm
+    inside_disc = eps_lm <= 1.0
+    inside_val = np.sqrt(np.where(inside_disc, 1.0 - eps_lm, 0.0)) - 1.0
+    outside_val = -np.sqrt(np.where(inside_disc, 0.0, eps_lm - 1.0)) - 1.0
+    n_minus_1_np = np.where(inside_disc, inside_val, outside_val).astype(real_dtype)
     max_abs_nm1 = float(np.max(np.abs(n_minus_1_np)))
     if max_abs_nm1 == 0.0:
         # Pathological: a 1x1 image at zenith. Force a tiny but non-zero value
