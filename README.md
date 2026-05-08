@@ -263,25 +263,50 @@ The repository ships an opt-in benchmark suite that times `dirty2vis` and
 configs:
 
 ```sh
+# zenith only (default, fast)
 pixi run -e test pytest tests/test_benchmark_against_ducc.py \
     --runbench --benchmark-group-by=param -q
+
+# 30-degree off-zenith only
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=off30 --benchmark-group-by=param -q
+
+# both pointings (full matrix, slowest)
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=both --benchmark-group-by=param -q
 ```
 
-Indicative numbers from a Mac (M-series, single-threaded, eps=1e-6):
+Indicative numbers from a Mac M-series CPU at eps=1e-6, single-threaded
+(median time):
 
-| Telescope     | jax fwd | ducc fwd | jax adj | ducc adj |
-|---------------|---------|----------|---------|----------|
-| EDA2          |  3.5 ms |  0.7 ms  |  3.9 ms |  0.9 ms  |
-| MWA_compact   |  2.7 ms |  1.7 ms  |  3.2 ms |  1.9 ms  |
-| MWA_extended  | 27.3 ms |  9.6 ms  | 34.5 ms | 10.8 ms  |
-| MeerKAT       |  8.3 ms |  7.5 ms  | 10.4 ms |  8.3 ms  |
+**Zenith pointing**
 
-`jax-nufft` is 1.1x to ~5x slower than ducc on CPU. The gap is largest for
-small problems (where JAX dispatch overhead dominates) and shrinks as the
-NUFFT compute grows. The intended use case for `jax-nufft` is differentiable
-or vmap-able pipelines where ducc's CPU-only, opaque-to-JAX implementation
-isn't usable; if you have a pure CPU forward / adjoint workload with no
-need for autodiff, ducc remains the faster choice.
+| Telescope     | jax fwd | ducc fwd | jax adj | ducc adj | jax/ducc |
+|---------------|---------|----------|---------|----------|----------|
+| EDA2          |  3.5 ms |  0.7 ms  |  3.8 ms |  0.9 ms  |    ~5x   |
+| MWA_compact   |  2.7 ms |  1.7 ms  |  3.5 ms |  1.9 ms  |   ~1.7x  |
+| MWA_extended  | 27.8 ms |  9.6 ms  | 35.5 ms | 10.7 ms  |    ~3x   |
+| MeerKAT       |  8.7 ms |  7.5 ms  | 11.2 ms |  8.3 ms  |   ~1.3x  |
+
+**30-deg off-zenith pointing** (much more w-extent => larger n_w):
+
+| Telescope     | jax fwd | ducc fwd  | jax adj  | ducc adj  | jax/ducc |
+|---------------|---------|-----------|----------|-----------|----------|
+| EDA2          | 48.0 ms |  1.5 ms   |  53.1 ms |   1.9 ms  |   ~30x   |
+| MWA_compact   | 11.7 ms |  2.1 ms   |  13.6 ms |   2.6 ms  |   ~5.5x  |
+| MWA_extended  | 818 ms  | 34.7 ms   | 1061 ms  |  37.9 ms  |   ~25x   |
+| MeerKAT       | 44.3 ms |  9.8 ms   |  57.2 ms |  11.0 ms  |   ~5x    |
+
+The off-zenith case is markedly worse for `jax-nufft` because `n_w` grows
+roughly with `max|n - 1|`, and our `lax.scan` over w-planes pays a fixed
+per-iteration overhead that ducc's hand-tuned single 3D bin sort avoids.
+Switching `w_strategy="vmap"` recovers some of the gap on GPU; on CPU it
+mostly just shifts the cost around.
+
+The intended use case for `jax-nufft` is differentiable or `vmap`-able
+pipelines where ducc's CPU-only, opaque-to-JAX implementation isn't usable.
+If you have a pure CPU forward / adjoint workload with no need for autodiff,
+ducc remains the faster choice.
 
 ### `vmap` vs `scan`
 

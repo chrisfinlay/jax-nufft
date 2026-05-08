@@ -160,20 +160,32 @@ def long_telescope_pointing(request) -> tuple[Telescope, float]:
     return request.param
 
 
-# All four telescopes (zenith only) for benchmarking. Off-zenith roughly
-# doubles n_w; running both pointings would double the bench duration
-# without changing the qualitative ranking.
+# All four telescopes for benchmarking, both pointings. The
+# ``--bench-pointing`` flag (default ``zenith``) controls which subset is
+# actually run; the full param list lives here so pytest's collection logic
+# can attach proper IDs even when only a subset is selected.
 @pytest.fixture(
     params=[
         (EDA2, 0.0),
+        (EDA2, 30.0),
         (MWA_COMPACT, 0.0),
+        (MWA_COMPACT, 30.0),
         (MWA_EXTENDED, 0.0),
+        (MWA_EXTENDED, 30.0),
         (MEERKAT, 0.0),
+        (MEERKAT, 30.0),
     ],
     ids=lambda v: _telescope_pointing_id(v),
 )
 def bench_telescope_pointing(request) -> tuple[Telescope, float]:
     return request.param
+
+
+_BENCH_POINTING_FILTERS: dict[str, set[float]] = {
+    "zenith": {0.0},
+    "off30": {30.0},
+    "both": {0.0, 30.0},
+}
 
 
 def pytest_collection_modifyitems(config, items):
@@ -182,11 +194,22 @@ def pytest_collection_modifyitems(config, items):
     skip_bench = pytest.mark.skip(reason="needs --runbench")
     runslow = config.getoption("--runslow", default=False)
     runbench = config.getoption("--runbench", default=False)
+    bench_pointing = config.getoption("--bench-pointing", default="zenith")
+    allowed_angles = _BENCH_POINTING_FILTERS[bench_pointing]
+    skip_off_pointing = pytest.mark.skip(
+        reason=f"--bench-pointing={bench_pointing} excludes this combination"
+    )
     for item in items:
+        is_bench_item = "bench_telescope_pointing" in item.fixturenames
         if "long_telescope_pointing" in item.fixturenames and not runslow:
             item.add_marker(skip_slow)
-        if "bench_telescope_pointing" in item.fixturenames and not runbench:
+        if is_bench_item and not runbench:
             item.add_marker(skip_bench)
+            continue
+        if is_bench_item:
+            tel_pointing = item.callspec.params.get("bench_telescope_pointing")
+            if tel_pointing is not None and tel_pointing[1] not in allowed_angles:
+                item.add_marker(skip_off_pointing)
 
 
 def pytest_addoption(parser):
@@ -201,4 +224,14 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Run benchmark suite comparing jax-nufft to ducc0.",
+    )
+    parser.addoption(
+        "--bench-pointing",
+        choices=("zenith", "off30", "both"),
+        default="zenith",
+        help=(
+            "Which pointings to include in the benchmark suite. "
+            "'zenith' is the default; 'off30' adds w-extent and roughly doubles n_w; "
+            "'both' runs each telescope twice."
+        ),
     )
