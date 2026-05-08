@@ -258,55 +258,67 @@ baselines produce more w-planes &mdash; expected wgridder behaviour.
 
 ### CPU benchmarks vs ducc0
 
-The repository ships an opt-in benchmark suite that times `dirty2vis` and
-`vis2dirty` against `ducc0.wgridder` for each of the four built-in telescope
-configs:
+The repository ships an opt-in benchmark suite that times *and* measures
+peak memory of `dirty2vis` / `vis2dirty` against `ducc0.wgridder`, across
+the four built-in telescope configs and both `w_strategy` choices:
 
 ```sh
 # zenith only (default, fast)
 pixi run -e test pytest tests/test_benchmark_against_ducc.py \
-    --runbench --benchmark-group-by=param -q
-
-# 30-degree off-zenith only
-pixi run -e test pytest tests/test_benchmark_against_ducc.py \
-    --runbench --bench-pointing=off30 --benchmark-group-by=param -q
+    --runbench --benchmark-group-by=param:bench_telescope_pointing -q
 
 # both pointings (full matrix, slowest)
 pixi run -e test pytest tests/test_benchmark_against_ducc.py \
-    --runbench --bench-pointing=both --benchmark-group-by=param -q
+    --runbench --bench-pointing=both \
+    --benchmark-group-by=param:bench_telescope_pointing -q
+
+# memory-only (uses psutil polling; pass -s to see the summary table)
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=both --benchmark-disable -k memory -s
 ```
 
 Indicative numbers from a Mac M-series CPU at eps=1e-6, single-threaded
-(median time):
+(median time, `dirty2vis` first row of each cell, `vis2dirty` second):
 
 **Zenith pointing**
 
-| Telescope     | jax fwd | ducc fwd | jax adj | ducc adj | jax/ducc |
-|---------------|---------|----------|---------|----------|----------|
-| EDA2          |  3.5 ms |  0.7 ms  |  3.8 ms |  0.9 ms  |    ~5x   |
-| MWA_compact   |  2.7 ms |  1.7 ms  |  3.5 ms |  1.9 ms  |   ~1.7x  |
-| MWA_extended  | 27.8 ms |  9.6 ms  | 35.5 ms | 10.7 ms  |    ~3x   |
-| MeerKAT       |  8.7 ms |  7.5 ms  | 11.2 ms |  8.3 ms  |   ~1.3x  |
+| Telescope     | jax/scan        | jax/vmap        | ducc            |
+|---------------|-----------------|-----------------|-----------------|
+| EDA2          | 3.7 / 3.9 ms    | 1.3 / 1.5 ms    | 0.7 / 0.9 ms    |
+| MWA_compact   | 2.9 / 3.2 ms    | 1.8 / 2.1 ms    | 1.7 / 1.9 ms    |
+| MWA_extended  | 31.1 / 37.5 ms  | 21.1 / 27.9 ms  | 9.6 / 10.7 ms   |
+| MeerKAT       | 9.5 / 11.6 ms   | 6.4 / 8.2 ms    | 7.5 / 8.3 ms    |
 
-**30-deg off-zenith pointing** (much more w-extent => larger n_w):
+**30-deg off-zenith pointing** (`n_w` is much larger):
 
-| Telescope     | jax fwd | ducc fwd  | jax adj  | ducc adj  | jax/ducc |
-|---------------|---------|-----------|----------|-----------|----------|
-| EDA2          | 48.0 ms |  1.5 ms   |  53.1 ms |   1.9 ms  |   ~30x   |
-| MWA_compact   | 11.7 ms |  2.1 ms   |  13.6 ms |   2.6 ms  |   ~5.5x  |
-| MWA_extended  | 818 ms  | 34.7 ms   | 1061 ms  |  37.9 ms  |   ~25x   |
-| MeerKAT       | 44.3 ms |  9.8 ms   |  57.2 ms |  11.0 ms  |   ~5x    |
+| Telescope     | jax/scan        | jax/vmap        | ducc            |
+|---------------|-----------------|-----------------|-----------------|
+| EDA2          | 52 / 54 ms      | 14 / 18 ms      | 1.5 / 1.9 ms    |
+| MWA_compact   | 16 / 13 ms      | 7 / 8 ms        | 2.1 / 2.5 ms    |
+| MWA_extended  | 885 / 1119 ms   | 586 / 788 ms    | 35 / 38 ms      |
+| MeerKAT       | 48 / 58 ms      | 31 / 42 ms      | 9.9 / 11 ms     |
 
-The off-zenith case is markedly worse for `jax-nufft` because `n_w` grows
-roughly with `max|n - 1|`, and our `lax.scan` over w-planes pays a fixed
-per-iteration overhead that ducc's hand-tuned single 3D bin sort avoids.
-Switching `w_strategy="vmap"` recovers some of the gap on GPU; on CPU it
-mostly just shifts the cost around.
+`vmap` is consistently 1.4-3.5x faster than `scan` because it reduces the
+per-iteration FINUFFT planning / setpts cost and lets XLA fuse work across
+w-planes. The cost is **memory**: `vmap` materialises the full
+`(n_w, n_l, n_m)` stack of corrected images at once. The opt-in memory
+suite confirms this; for MWA-extended off-zenith with `n_w = 769` and
+`n_pix = 256`:
 
-The intended use case for `jax-nufft` is differentiable or `vmap`-able
-pipelines where ducc's CPU-only, opaque-to-JAX implementation isn't usable.
-If you have a pure CPU forward / adjoint workload with no need for autodiff,
-ducc remains the faster choice.
+| Implementation         | peak RSS delta |
+|------------------------|----------------|
+| jax/scan dirty2vis     | 1.6 MB         |
+| jax/scan vis2dirty     | 0 MB           |
+| **jax/vmap dirty2vis** | **776 MB**     |
+| **jax/vmap vis2dirty** | **1.5 GB**     |
+| ducc dirty2vis         | 0 MB           |
+| ducc vis2dirty         | 0 MB           |
+
+So choose `scan` when `n_w * image_size` would dwarf available memory and
+`vmap` when there's room to trade memory for time. ducc remains the
+fastest CPU implementation in either regime; the jax-nufft value
+proposition is differentiability and the GPU port (where the wasted
+spread / FFT work parallelises cheaply).
 
 ### `vmap` vs `scan`
 
