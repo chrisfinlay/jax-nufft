@@ -1038,8 +1038,8 @@ packages:
   requires_python: '>=3.11'
 - pypi: ./
   name: jax-nufft
-  version: 0.1.0.dev0
-  sha256: 672f1a11f249f7a20da3d6ae6dddb4cf5498c3826c12fedac2b2617ca21804b0
+  version: 0.1.0
+  sha256: b1a3601b37bde195b278aa377028fd15d4fec14506cb21c5bc0c890a67e9a6f2
   requires_dist:
   - jax>=0.4.30
   - jax-finufft>=0.0.7

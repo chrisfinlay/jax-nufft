@@ -260,21 +260,97 @@ baselines produce more w-planes &mdash; expected wgridder behaviour.
 
 The repository ships an opt-in benchmark suite that times *and* measures
 peak memory of `dirty2vis` / `vis2dirty` against `ducc0.wgridder`, across
-the four built-in telescope configs and both `w_strategy` choices:
+the four built-in telescope configs and both `w_strategy` choices.
+
+The benchmarks are gated behind two flags so they don't run by default:
+
+| Flag                          | What it does                                      |
+|-------------------------------|---------------------------------------------------|
+| `--runbench`                  | Enables the bench suite (otherwise all skipped).  |
+| `--bench-pointing={zenith,off30,both}` | Default `zenith`. Picks which pointings run. |
+
+The bench file contains four kinds of test, all parametrised over the
+four telescopes and the chosen pointings:
+
+| Test                             | Strategies          | What it measures   |
+|----------------------------------|---------------------|--------------------|
+| `test_bench_jax_dirty2vis`       | scan, vmap          | wall-clock time    |
+| `test_bench_ducc_dirty2vis`      | n/a                 | wall-clock time    |
+| `test_bench_jax_vis2dirty`       | scan, vmap          | wall-clock time    |
+| `test_bench_ducc_vis2dirty`      | n/a                 | wall-clock time    |
+| `test_memory_jax_dirty2vis`      | scan, vmap          | peak RSS delta     |
+| `test_memory_ducc_dirty2vis`     | n/a                 | peak RSS delta     |
+| `test_memory_jax_vis2dirty`      | scan, vmap          | peak RSS delta     |
+| `test_memory_ducc_vis2dirty`     | n/a                 | peak RSS delta     |
+
+The standard pytest `-k` filter is the usual way to narrow a run.
+Pytest-benchmark's `--benchmark-group-by=param:bench_telescope_pointing`
+groups results so each comparison table contains all the implementations
+(jax/scan, jax/vmap, ducc) for one telescope-pointing.
+
+#### Common invocations
+
+Time benchmarks, zenith only (fastest):
 
 ```sh
-# zenith only (default, fast)
 pixi run -e test pytest tests/test_benchmark_against_ducc.py \
-    --runbench --benchmark-group-by=param:bench_telescope_pointing -q
-
-# both pointings (full matrix, slowest)
-pixi run -e test pytest tests/test_benchmark_against_ducc.py \
-    --runbench --bench-pointing=both \
+    --runbench -k "not memory" \
     --benchmark-group-by=param:bench_telescope_pointing -q
+```
 
-# memory-only (uses psutil polling; pass -s to see the summary table)
+Time benchmarks, off-zenith only:
+
+```sh
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=off30 -k "not memory" \
+    --benchmark-group-by=param:bench_telescope_pointing -q
+```
+
+Time benchmarks, full matrix (both pointings):
+
+```sh
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=both -k "not memory" \
+    --benchmark-group-by=param:bench_telescope_pointing -q
+```
+
+Memory only, all telescopes, both pointings (use `-s` so the summary
+table printed by the autouse fixture isn't captured):
+
+```sh
 pixi run -e test pytest tests/test_benchmark_against_ducc.py \
     --runbench --bench-pointing=both --benchmark-disable -k memory -s
+```
+
+Single telescope (e.g. just MeerKAT), forward only, both strategies:
+
+```sh
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=both \
+    -k "MeerKAT and dirty2vis and not memory" \
+    --benchmark-group-by=param:bench_telescope_pointing -q
+```
+
+vmap only, all telescopes, both pointings:
+
+```sh
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=both \
+    -k "(vmap or ducc) and not memory" \
+    --benchmark-group-by=param:bench_telescope_pointing -q
+```
+
+(The `or ducc` clause keeps the ducc rows visible alongside the jax/vmap
+rows for direct comparison.)
+
+Save and reload runs (handy on quiet machines):
+
+```sh
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --benchmark-save=baseline -k "not memory"
+
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --benchmark-compare=0001_baseline -k "not memory"
 ```
 
 Indicative numbers from a Mac M-series CPU at eps=1e-6, single-threaded
