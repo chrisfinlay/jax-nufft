@@ -256,6 +256,33 @@ plus the FFT and spreading work inside FINUFFT. `n_w` scales with
 `baseline_max_lambda * max|n - 1|`, which means wider FoVs and longer
 baselines produce more w-planes &mdash; expected wgridder behaviour.
 
+### CPU benchmarks vs ducc0
+
+The repository ships an opt-in benchmark suite that times `dirty2vis` and
+`vis2dirty` against `ducc0.wgridder` for each of the four built-in telescope
+configs:
+
+```sh
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --benchmark-group-by=param -q
+```
+
+Indicative numbers from a Mac (M-series, single-threaded, eps=1e-6):
+
+| Telescope     | jax fwd | ducc fwd | jax adj | ducc adj |
+|---------------|---------|----------|---------|----------|
+| EDA2          |  3.5 ms |  0.7 ms  |  3.9 ms |  0.9 ms  |
+| MWA_compact   |  2.7 ms |  1.7 ms  |  3.2 ms |  1.9 ms  |
+| MWA_extended  | 27.3 ms |  9.6 ms  | 34.5 ms | 10.8 ms  |
+| MeerKAT       |  8.3 ms |  7.5 ms  | 10.4 ms |  8.3 ms  |
+
+`jax-nufft` is 1.1x to ~5x slower than ducc on CPU. The gap is largest for
+small problems (where JAX dispatch overhead dominates) and shrinks as the
+NUFFT compute grows. The intended use case for `jax-nufft` is differentiable
+or vmap-able pipelines where ducc's CPU-only, opaque-to-JAX implementation
+isn't usable; if you have a pure CPU forward / adjoint workload with no
+need for autodiff, ducc remains the faster choice.
+
 ### `vmap` vs `scan`
 
 - `"scan"` keeps memory bounded at `O(image_size + n_rows)` regardless of

@@ -160,13 +160,33 @@ def long_telescope_pointing(request) -> tuple[Telescope, float]:
     return request.param
 
 
+# All four telescopes (zenith only) for benchmarking. Off-zenith roughly
+# doubles n_w; running both pointings would double the bench duration
+# without changing the qualitative ranking.
+@pytest.fixture(
+    params=[
+        (EDA2, 0.0),
+        (MWA_COMPACT, 0.0),
+        (MWA_EXTENDED, 0.0),
+        (MEERKAT, 0.0),
+    ],
+    ids=lambda v: _telescope_pointing_id(v),
+)
+def bench_telescope_pointing(request) -> tuple[Telescope, float]:
+    return request.param
+
+
 def pytest_collection_modifyitems(config, items):
-    """Mark anything pulling ``long_telescope_pointing`` as slow by default."""
+    """Mark slow / benchmark tests so they are skipped without their flag."""
     skip_slow = pytest.mark.skip(reason="needs --runslow")
+    skip_bench = pytest.mark.skip(reason="needs --runbench")
     runslow = config.getoption("--runslow", default=False)
+    runbench = config.getoption("--runbench", default=False)
     for item in items:
         if "long_telescope_pointing" in item.fixturenames and not runslow:
             item.add_marker(skip_slow)
+        if "bench_telescope_pointing" in item.fixturenames and not runbench:
+            item.add_marker(skip_bench)
 
 
 def pytest_addoption(parser):
@@ -175,4 +195,10 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Run slow telescope parity tests (MWA_extended, MeerKAT).",
+    )
+    parser.addoption(
+        "--runbench",
+        action="store_true",
+        default=False,
+        help="Run benchmark suite comparing jax-nufft to ducc0.",
     )
