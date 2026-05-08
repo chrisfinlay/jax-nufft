@@ -31,6 +31,22 @@ import numpy as np
 from jax import Array
 
 
+def phi_hat_oversample_for_w(w_kernel_width: int) -> int:
+    """Recommended ``oversample`` for the phi_hat table at width ``W``.
+
+    With v0.1.1's fixed ``x0`` sampling, the maximum eta evaluated by the
+    image-domain correction is ``x0 * W / 2 = W / 8``, which grows with
+    W. Bump the oversample so that cubic-Lagrange interpolation off the
+    phi_hat table stays accurate (the interpolation error scales like
+    ``eta_step**4``, with ``eta_step = 1 / (2 * oversample)``).
+    """
+    if w_kernel_width <= 4:
+        return 32
+    if w_kernel_width <= 8:
+        return 64
+    return 128
+
+
 def kernel_params(epsilon: float) -> tuple[int, float]:
     """Return ``(W, beta)`` for the requested accuracy.
 

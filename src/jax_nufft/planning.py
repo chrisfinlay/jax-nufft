@@ -29,16 +29,22 @@ import numpy as np
 from jax import Array
 
 from jax_nufft._utils import SPEED_OF_LIGHT
-from jax_nufft.kernel import compute_phi_hat_table, kernel_params
+from jax_nufft.kernel import compute_phi_hat_table, kernel_params, phi_hat_oversample_for_w
 
-# Eta_max evaluated for phi_hat is ``x0 * W / 2`` (see the n_w_inner
-# derivation in :func:`make_plan`). With ``x0 = 1 / W`` we get
-# ``eta_max = 0.5``, which keeps the image-domain correction in the
-# well-conditioned region of the exp-of-semicircle phi_hat. The spec
-# nominally suggests ``x0 = 0.5`` (independent of W), but that pushes
-# eta_max well outside the kernel's natural support and produces large
-# aliasing errors for moderate-FoV / large-w-extent cases.
-W_OVERSAMPLE_ETA_MAX = 0.5
+# w-direction sampling step in n-1 units: ``dw = x0 / max|n-1|``, giving
+# ``n_w_inner = ceil(w_extent * max|n-1| / x0)``. ducc uses
+# ``dw = 0.5 / (ofactor * max|n-1+nshift|)`` where ``ofactor`` is the
+# (u,v) oversampling ratio of the chosen kernel (2.0 for the FINUFFT
+# ``sigma=2`` kernel that matches our ``(W, beta=2.30*W)`` choice). That
+# corresponds to ``x0 = 1/(2*ofactor) = 0.25`` for our kernel.
+#
+# v0.1 used a ``W``-dependent ``x0 = 1/W`` (i.e. eta_max pinned at 0.5
+# regardless of W) as a safety margin for the phi_hat correction; v0.1.1
+# reverts to a fixed ``x0`` matching ducc, which reduces ``n_w`` by a
+# factor of ``W/4`` and accepts a wider eta-range that phi_hat is well
+# conditioned on with appropriately bumped oversample (see
+# :func:`jax_nufft.kernel.phi_hat_oversample_for_w`).
+W_OVERSAMPLE_X0 = 0.25
 
 
 @dataclass(frozen=True)
@@ -156,7 +162,7 @@ def make_plan(
     epsilon: float,
     *,
     phi_hat_n_fine: int = 4096,
-    phi_hat_oversample: int = 32,
+    phi_hat_oversample: int | None = None,
 ) -> WGridderPlan:
     """Build the wgridder plan for the given (uvw, freq, image, epsilon).
 
@@ -215,10 +221,9 @@ def make_plan(
         raise AssertionError("internal: negative w-extent")
 
     # --- number of w-planes ---
-    # Pick x0 so that the image-domain argument eta = (n-1) * (dw*W/2) stays
-    # within W_OVERSAMPLE_ETA_MAX. eta_max(x0) = x0 * W / 2, so set
-    # x0 = 2 * eta_max / W, which gives the formula below.
-    x0 = (2.0 * W_OVERSAMPLE_ETA_MAX) / w_kernel_width
+    # Sample w with step dw = x0 / max|n-1|, matching ducc's choice for
+    # ofactor=2 kernels (see W_OVERSAMPLE_X0). This is independent of W.
+    x0 = W_OVERSAMPLE_X0
     n_w_inner = math.ceil(w_extent * max_abs_nm1 / x0)
     n_w_inner = max(n_w_inner, 1)  # always have at least one interior step
     n_w = n_w_inner + w_kernel_width
@@ -236,9 +241,14 @@ def make_plan(
 
     # --- phi_hat_n (precomputed on the n-1 grid) ---
     # Argument to phi_hat is eta = (n - 1) * scale, where scale is the kernel
-    # half-width in wavelengths.
+    # half-width in wavelengths. With the v0.1.1 fixed-x0 sampling the
+    # nominal eta_max is x0 * W / 2 = W/8 (W=4 -> 0.5, W=8 -> 1.0,
+    # W=10 -> 1.25). We size the phi_hat oversample to keep cubic-Lagrange
+    # interpolation accurate on that wider range.
     eta_n = n_minus_1_np * w_kernel_scale
     eta_max_request = max(float(np.max(np.abs(eta_n))), 1e-9)
+    if phi_hat_oversample is None:
+        phi_hat_oversample = phi_hat_oversample_for_w(w_kernel_width)
     phi_hat_table = compute_phi_hat_table(
         beta=beta,
         eta_max_request=eta_max_request,

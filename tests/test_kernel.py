@@ -15,8 +15,10 @@ from jax_nufft.kernel import (
     compute_phi_hat_table,
     kernel_params,
     phi,
+    phi_hat_oversample_for_w,
     phi_numpy,
 )
+from jax_nufft.planning import W_OVERSAMPLE_X0
 
 
 def test_kernel_params_basic() -> None:
@@ -130,6 +132,44 @@ def test_phi_hat_table_safety_floor_triggers() -> None:
     # small beta with large eta_max to drive phi_hat low.
     with pytest.raises(ValueError, match="phi_hat dropped"):
         compute_phi_hat_table(beta=2.0, eta_max_request=10.0, safety_floor=0.1)
+
+
+@pytest.mark.parametrize("w", [4, 6, 8, 10])
+def test_phi_hat_conditioning_at_v011_eta_max(w: int) -> None:
+    """phi_hat must stay above the safety floor over the full v0.1.1 eta range.
+
+    With the W-independent ``x0 = W_OVERSAMPLE_X0`` sampling, the maximum
+    eta encountered by the image-domain correction is ``x0 * W / 2``. This
+    grows with W, so the recommended oversample is W-dependent. Here we
+    verify that for each W the resulting phi_hat table is well-conditioned
+    and that cubic-Lagrange interpolation matches a high-resolution
+    quadrature.
+    """
+    beta = 2.30 * w
+    eta_max = W_OVERSAMPLE_X0 * w / 2.0
+    table = compute_phi_hat_table(
+        beta=beta,
+        eta_max_request=eta_max,
+        oversample=phi_hat_oversample_for_w(w),
+    )
+    eta_grid = np.linspace(-eta_max, eta_max, 401)
+    interp = table.evaluate(eta_grid)
+    # Conditioning: phi_hat must not collapse on the supported range.
+    assert np.all(interp > 0)
+    # Interpolation accuracy: compare against a fine direct quadrature.
+    n_quad = 200_001
+    z = np.linspace(-1.0, 1.0, n_quad)
+    dz = z[1] - z[0]
+    phi_z = phi_numpy(z, beta)
+    eta_check = np.linspace(-eta_max, eta_max, 17)
+    direct = np.array(
+        [np.sum(phi_z * np.exp(-2j * np.pi * e * z)).real * dz for e in eta_check]
+    )
+    interp_check = table.evaluate(eta_check)
+    rel_err = np.max(np.abs(interp_check - direct) / np.abs(direct))
+    # Cubic-Lagrange on a 1/(2*oversample)-spaced grid should comfortably
+    # beat 1e-7 on the smooth phi_hat for our oversample defaults.
+    assert rel_err < 1e-7, f"W={w}: phi_hat interp rel_err = {rel_err:.3e}"
 
 
 def test_phi_hat_table_is_picklable_via_dataclass() -> None:
