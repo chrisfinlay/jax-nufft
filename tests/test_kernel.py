@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import jax
@@ -110,9 +111,7 @@ def test_phi_hat_against_direct_quadrature() -> None:
     dz = z[1] - z[0]
     phi_z = phi_numpy(z, beta)
     eta_test = np.linspace(-1.0, 1.0, 21)
-    direct = np.array(
-        [np.sum(phi_z * np.exp(-2j * np.pi * e * z)).real * dz for e in eta_test]
-    )
+    direct = np.array([np.sum(phi_z * np.exp(-2j * np.pi * e * z)).real * dz for e in eta_test])
     interp = table.evaluate(eta_test)
     # Cubic interpolation on the FFT table should match direct quadrature
     # to well below 1e-6 in this regime (oversample=8, n_fine=4096).
@@ -138,5 +137,5 @@ def test_phi_hat_table_is_picklable_via_dataclass() -> None:
     table = compute_phi_hat_table(beta=13.8, eta_max_request=1.0)
     assert isinstance(table, PhiHatTable)
     # frozen=True means we can't mutate
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         table.beta = 0.0  # type: ignore[misc]

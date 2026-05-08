@@ -53,9 +53,7 @@ def test_forward_parity(short_telescope_pointing: tuple[Telescope, float], eps: 
     # Loosen the tolerance slightly: ducc and our wgridder both target
     # `epsilon` independently, so the gap between them is bounded by ~2*eps
     # in the best case and ~10*eps in practice.
-    assert err < 20 * eps, (
-        f"{tel.name} zen={zen_deg} eps={eps:g}: relative error {err:.3e}"
-    )
+    assert err < 20 * eps, f"{tel.name} zen={zen_deg} eps={eps:g}: relative error {err:.3e}"
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
@@ -66,8 +64,7 @@ def test_adjoint_parity(short_telescope_pointing: tuple[Telescope, float], eps: 
     pix = tel.pixsize
     rng = np.random.default_rng(11)
     vis_np = (
-        rng.standard_normal((tel.n_rows, 1))
-        + 1j * rng.standard_normal((tel.n_rows, 1))
+        rng.standard_normal((tel.n_rows, 1)) + 1j * rng.standard_normal((tel.n_rows, 1))
     ).astype(np.complex128)
 
     plan = make_plan(uvw, freq, (tel.n_pix, tel.n_pix), pix, pix, eps)
@@ -88,9 +85,7 @@ def test_adjoint_parity(short_telescope_pointing: tuple[Telescope, float], eps: 
     )
 
     err = np.linalg.norm(dirty_jax - dirty_ducc) / np.linalg.norm(dirty_ducc)
-    assert err < 20 * eps, (
-        f"{tel.name} zen={zen_deg} eps={eps:g}: relative error {err:.3e}"
-    )
+    assert err < 20 * eps, f"{tel.name} zen={zen_deg} eps={eps:g}: relative error {err:.3e}"
 
 
 @pytest.mark.parametrize("eps", [1e-6])
@@ -104,15 +99,12 @@ def test_forward_parity_with_weights(
     pix = tel.pixsize
     rng = np.random.default_rng(15)
     vis_np = (
-        rng.standard_normal((tel.n_rows, 1))
-        + 1j * rng.standard_normal((tel.n_rows, 1))
+        rng.standard_normal((tel.n_rows, 1)) + 1j * rng.standard_normal((tel.n_rows, 1))
     ).astype(np.complex128)
     wgt = rng.uniform(0.1, 1.0, size=(tel.n_rows, 1)).astype(np.float64)
 
     plan = make_plan(uvw, freq, (tel.n_pix, tel.n_pix), pix, pix, eps)
-    dirty_jax = np.asarray(
-        vis2dirty(plan, jnp.asarray(vis_np), weights=jnp.asarray(wgt))
-    )[0]
+    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis_np), weights=jnp.asarray(wgt)))[0]
 
     dirty_ducc = ducc0.wgridder.vis2dirty(
         uvw=uvw,
@@ -134,9 +126,7 @@ def test_forward_parity_with_weights(
 
 
 @pytest.mark.parametrize("eps", [1e-6])
-def test_forward_parity_long(
-    long_telescope_pointing: tuple[Telescope, float], eps: float
-) -> None:
+def test_forward_parity_long(long_telescope_pointing: tuple[Telescope, float], eps: float) -> None:
     """Slow parity tests for MWA_extended / MeerKAT (skipped without --runslow)."""
     tel, zen_deg = long_telescope_pointing
     uvw = synthetic_uvw(tel, zen_deg, seed=4)

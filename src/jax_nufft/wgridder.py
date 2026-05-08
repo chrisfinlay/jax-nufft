@@ -73,8 +73,7 @@ def _prepare_image(image: Array, plan: WGridderPlan) -> Array:
 def _validate_vis(vis: Array, plan: WGridderPlan) -> Array:
     if vis.ndim != 2 or vis.shape != (plan.n_rows, plan.n_chan):
         raise ValueError(
-            f"vis shape {vis.shape} does not match plan "
-            f"({plan.n_rows}, {plan.n_chan})"
+            f"vis shape {vis.shape} does not match plan ({plan.n_rows}, {plan.n_chan})"
         )
     if not jnp.issubdtype(vis.dtype, jnp.complexfloating):
         # Auto-promote real visibilities to complex (matches user's typical
@@ -89,8 +88,7 @@ def _validate_weights(weights: Array | None, plan: WGridderPlan) -> Array | None
         return None
     if weights.shape != (plan.n_rows, plan.n_chan):
         raise ValueError(
-            f"weights shape {weights.shape} does not match plan "
-            f"({plan.n_rows}, {plan.n_chan})"
+            f"weights shape {weights.shape} does not match plan ({plan.n_rows}, {plan.n_chan})"
         )
     return weights
 
@@ -126,6 +124,7 @@ def _channel_forward(
         return jnp.sum(contributions, axis=0)
 
     if w_strategy == "scan":
+
         def step(acc: Array, w_k: Array) -> tuple[Array, None]:
             return acc + w_plane_contribution(w_k), None
 
@@ -157,9 +156,7 @@ def _channel_adjoint(
         vis_k = vis_c * kernel_w
         # Adjoint of the type-2 NUFFT is type 1 with iflag = +1 (the conjugate
         # of iflag=-1 used in the forward).
-        h_k = nufft1(
-            (plan.n_l, plan.n_m), vis_k, u_ft, v_ft, iflag=+1, eps=plan.epsilon, opts=opts
-        )
+        h_k = nufft1((plan.n_l, plan.n_m), vis_k, u_ft, v_ft, iflag=+1, eps=plan.epsilon, opts=opts)
         # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1)) is its conjugate.
         phase = (two_pi * w_k) * plan.n_minus_1
         shift = jnp.exp((-1j * phase).astype(cdtype))
@@ -170,6 +167,7 @@ def _channel_adjoint(
         return jnp.sum(contributions, axis=0)
 
     if w_strategy == "scan":
+
         def step(acc: Array, w_k: Array) -> tuple[Array, None]:
             return acc + w_plane_contribution(w_k), None
 
@@ -199,6 +197,7 @@ def _dirty2vis_jit(
             lambda im_c, uvw_c: _channel_forward(im_c, uvw_c, plan, opts, w_strategy)
         )(image, plan.uvw_lambda)
     elif channel_strategy == "scan":
+
         def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
             im_c, uvw_c = args
             return None, _channel_forward(im_c, uvw_c, plan, opts, w_strategy)
@@ -277,6 +276,7 @@ def _vis2dirty_jit(
             lambda v_c, uvw_c: _channel_adjoint(v_c, uvw_c, plan, opts, w_strategy)
         )(vis_per_chan, plan.uvw_lambda)
     elif channel_strategy == "scan":
+
         def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
             v_c, uvw_c = args
             return None, _channel_adjoint(v_c, uvw_c, plan, opts, w_strategy)

@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 
@@ -29,9 +28,9 @@ def _tiny_setup(seed: int = 0):
     freq = np.array([1.4e9])
     plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-6)
     image = rng.standard_normal((1, n_l, n_m)) + 1j * rng.standard_normal((1, n_l, n_m))
-    vis = (
-        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
-    ).astype(np.complex128)
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
     return plan, jnp.asarray(image), jnp.asarray(vis)
 
 
@@ -66,7 +65,6 @@ def test_grad_of_dirty2vis_finite_difference() -> None:
     image_flat = np.asarray(image_real).ravel()
     h = 1e-5
     fd = np.zeros_like(image_flat)
-    base = float(loss(image_real))
     for k in sample_idx:
         bumped = image_flat.copy()
         bumped[k] += h
@@ -130,9 +128,7 @@ def test_vmap_over_image_batch() -> None:
     rng = np.random.default_rng(99)
     images = jnp.stack(
         [
-            jnp.asarray(
-                rng.standard_normal(image.shape) + 1j * rng.standard_normal(image.shape)
-            )
+            jnp.asarray(rng.standard_normal(image.shape) + 1j * rng.standard_normal(image.shape))
             for _ in range(batch_n)
         ],
         axis=0,

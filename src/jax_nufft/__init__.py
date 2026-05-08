@@ -5,9 +5,9 @@ from jax_nufft.planning import WGridderPlan, make_plan
 from jax_nufft.wgridder import dirty2vis, vis2dirty
 
 __all__ = [
-    "__version__",
     "WGridderPlan",
-    "make_plan",
+    "__version__",
     "dirty2vis",
+    "make_plan",
     "vis2dirty",
 ]

@@ -106,7 +106,9 @@ def synthetic_uvw(
     # tail of the distribution actually reaches it.
     outer_n = max(1, n_rows // 25)
     outer_idx = rng.choice(n_rows, size=outer_n, replace=False)
-    direction = uv[outer_idx] / np.maximum(np.linalg.norm(uv[outer_idx], axis=1, keepdims=True), 1e-9)
+    direction = uv[outer_idx] / np.maximum(
+        np.linalg.norm(uv[outer_idx], axis=1, keepdims=True), 1e-9
+    )
     uv[outer_idx] = direction * telescope.max_baseline_m
     # Soft-truncate the rest at max_baseline_m.
     radii = np.linalg.norm(uv, axis=1, keepdims=True)

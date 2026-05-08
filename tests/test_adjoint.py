@@ -65,18 +65,16 @@ def test_adjoint_matches_dft_zenith(eps: float, w_strategy: str) -> None:
     uvw[:, 1] = rng.uniform(-50.0, 50.0, size=n_rows)
     uvw[:, 2] = rng.uniform(-2.0, 2.0, size=n_rows)
     freq = np.array([1.4e9])
-    vis = (
-        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
-    ).astype(np.complex128)
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
 
     plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
-    dirty_jax = np.asarray(
-        vis2dirty(plan, jnp.asarray(vis), w_strategy=w_strategy)
-    )
+    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy=w_strategy))
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
-    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10*eps:.3e}"
+    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10 * eps:.3e}"
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
@@ -91,16 +89,16 @@ def test_adjoint_matches_dft_off_zenith(eps: float) -> None:
     uvw[:, 1] = rng.uniform(-100.0, 100.0, size=n_rows)
     uvw[:, 2] = rng.uniform(-30.0, 30.0, size=n_rows)
     freq = np.array([1.0e9])
-    vis = (
-        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
-    ).astype(np.complex128)
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
 
     plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
     dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis)))
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
-    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10*eps:.3e}"
+    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10 * eps:.3e}"
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
@@ -130,9 +128,9 @@ def test_dot_product_identity(eps: float) -> None:
     plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
 
     image = rng.standard_normal((1, n_l, n_m))  # real
-    vis = (
-        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
-    ).astype(np.complex128)
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
 
     n_grid = np.asarray(plan.n_minus_1) + 1.0  # (n_l, n_m), real
     image_n = image * n_grid[None, :, :]
@@ -144,9 +142,7 @@ def test_dot_product_identity(eps: float) -> None:
     rhs = float(np.vdot(image_n.ravel(), Ay.ravel()))  # <n * x, A^* y>_R
 
     rel_err = abs(lhs - rhs) / max(abs(lhs), abs(rhs))
-    assert rel_err < 100 * eps, (
-        f"dot-product relative error {rel_err:.3e}; lhs={lhs}, rhs={rhs}"
-    )
+    assert rel_err < 100 * eps, f"dot-product relative error {rel_err:.3e}; lhs={lhs}, rhs={rhs}"
 
 
 @pytest.mark.parametrize("eps", [1e-6])
@@ -161,16 +157,14 @@ def test_adjoint_weights_match_dft(eps: float) -> None:
     uvw[:, 1] = rng.uniform(-100.0, 100.0, size=n_rows)
     uvw[:, 2] = rng.uniform(-30.0, 30.0, size=n_rows)
     freq = np.array([1.0e9])
-    vis = (
-        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
-    ).astype(np.complex128)
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
     weights = rng.uniform(0.1, 1.0, size=(n_rows, 1)).astype(np.float64)
 
     plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
     dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis), weights=jnp.asarray(weights)))
-    dirty_ref = _reference_adjoint(
-        vis, uvw, freq, (n_l, n_m), pixsize, pixsize, weights=weights
-    )
+    dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize, weights=weights)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
     assert err < 10 * eps

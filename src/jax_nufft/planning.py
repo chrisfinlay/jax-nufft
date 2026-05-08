@@ -20,7 +20,7 @@ without being treated as traced inputs.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from jax_nufft._utils import SPEED_OF_LIGHT, n_minus_1_grid
+from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import compute_phi_hat_table, kernel_params
 
 # Eta_max evaluated for phi_hat is ``x0 * W / 2`` (see the n_w_inner
@@ -171,9 +171,7 @@ def make_plan(
     if n_l <= 0 or n_m <= 0:
         raise ValueError(f"image_shape must be positive; got {image_shape}")
     if pixsize_l <= 0 or pixsize_m <= 0:
-        raise ValueError(
-            f"pixsize_l and pixsize_m must be > 0; got ({pixsize_l}, {pixsize_m})"
-        )
+        raise ValueError(f"pixsize_l and pixsize_m must be > 0; got ({pixsize_l}, {pixsize_m})")
 
     uvw_arr, freq_arr, real_dtype = _coerce_uvw_freq_dtype(uvw, freq)
     n_rows = uvw_arr.shape[0]
