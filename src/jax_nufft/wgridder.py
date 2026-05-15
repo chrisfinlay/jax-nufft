@@ -41,10 +41,12 @@ from jax_nufft.planning import WGridderPlan
 # to the ``dense_*`` variants (the v0.1 algorithm). A future release
 # will add ``windowed_scan`` / ``windowed_vmap`` for the per-plane
 # windowed path; the dense path stays as the parity baseline.
-WStrategy = Literal["dense_scan", "dense_vmap", "scan", "vmap"]
+WStrategy = Literal[
+    "dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap", "scan", "vmap"
+]
 ChannelStrategy = Literal["scan", "vmap"]
 
-_DENSE_W_STRATEGIES = ("dense_scan", "dense_vmap")
+_CANONICAL_W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
 _W_STRATEGY_ALIASES = {"scan": "dense_scan", "vmap": "dense_vmap"}
 
 
@@ -53,7 +55,7 @@ def _canonicalise_w_strategy(name: str) -> str:
 
     Emits :class:`DeprecationWarning` for the v0.1 names.
     """
-    if name in _DENSE_W_STRATEGIES:
+    if name in _CANONICAL_W_STRATEGIES:
         return name
     canonical = _W_STRATEGY_ALIASES.get(name)
     if canonical is not None:
@@ -65,7 +67,7 @@ def _canonicalise_w_strategy(name: str) -> str:
         return canonical
     raise ValueError(
         f"unknown w_strategy: {name!r}; expected one of "
-        f"{_DENSE_W_STRATEGIES + tuple(_W_STRATEGY_ALIASES)}"
+        f"{_CANONICAL_W_STRATEGIES + tuple(_W_STRATEGY_ALIASES)}"
     )
 
 
@@ -165,6 +167,60 @@ def _channel_forward(
     raise ValueError(f"unknown w_strategy: {w_strategy!r}")
 
 
+def _channel_forward_windowed(
+    image_c: Array,
+    uvw_lambda_sorted_c: Array,
+    window_start_c: Array,
+    plan: WGridderPlan,
+    opts: Opts,
+) -> Array:
+    """Windowed forward operator for a single channel.
+
+    Each w-plane processes a contiguous slice (size ``max_window_size``) of
+    the w-sorted visibilities and scatters the per-row contributions back
+    into the original visibility order via ``plan.sort_perm``. Visibilities
+    inside the slice but outside the kernel's natural support pick up
+    ``phi(z) = 0`` automatically, so no explicit mask is needed.
+    """
+    two_pi = 2.0 * jnp.pi
+    u_sorted = (two_pi * plan.pixsize_l) * uvw_lambda_sorted_c[:, 0]
+    v_sorted = (two_pi * plan.pixsize_m) * uvw_lambda_sorted_c[:, 1]
+    w_lambda_sorted = uvw_lambda_sorted_c[:, 2]
+
+    cdtype = image_c.dtype
+    n_rows = plan.n_rows
+    max_window_size = plan.max_window_size
+    # ``dynamic_slice`` clamps out-of-bounds starts, but doing so silently
+    # would change which rows the kernel sees on the right edge. Clamp
+    # explicitly so the slice is always in-bounds.
+    lo_max = max(n_rows - max_window_size, 0)
+
+    def per_plane(vis_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
+        lo_raw, w_k = args
+        lo = jnp.clip(lo_raw, 0, lo_max)
+
+        u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (max_window_size,))
+        v_k = jax.lax.dynamic_slice(v_sorted, (lo,), (max_window_size,))
+        w_k_lambda = jax.lax.dynamic_slice(w_lambda_sorted, (lo,), (max_window_size,))
+
+        phase = (two_pi * w_k) * plan.n_minus_1
+        shift = jnp.exp((1j * phase).astype(cdtype))
+        image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
+
+        contrib = nufft2(image_k, u_k, v_k, iflag=-1, eps=plan.epsilon, opts=opts)
+
+        z = (w_k_lambda - w_k) / plan.w_kernel_scale
+        kernel_w = phi(z, plan.beta).astype(cdtype)
+        contrib = contrib * kernel_w
+
+        rows_k = jax.lax.dynamic_slice(plan.sort_perm, (lo,), (max_window_size,))
+        return vis_acc.at[rows_k].add(contrib), None
+
+    vis_init = jnp.zeros((n_rows,), dtype=cdtype)
+    vis_c, _ = jax.lax.scan(per_plane, vis_init, (window_start_c, plan.w_centers))
+    return vis_c
+
+
 def _channel_adjoint(
     vis_c: Array,
     uvw_c: Array,
@@ -221,6 +277,28 @@ def _dirty2vis_jit(
     nthreads: int,
 ) -> Array:
     opts = Opts(nthreads=nthreads)
+
+    if w_strategy == "windowed_scan":
+        # Windowed path: per-channel function takes pre-permuted coords and
+        # the per-channel window-start table from the plan.
+        if channel_strategy == "vmap":
+            vis_per_chan = jax.vmap(
+                lambda im_c, uvw_s_c, ws_c: _channel_forward_windowed(
+                    im_c, uvw_s_c, ws_c, plan, opts
+                )
+            )(image, plan.uvw_lambda_sorted, plan.window_start)
+        elif channel_strategy == "scan":
+
+            def step_w(_: None, args: tuple[Array, Array, Array]) -> tuple[None, Array]:
+                im_c, uvw_s_c, ws_c = args
+                return None, _channel_forward_windowed(im_c, uvw_s_c, ws_c, plan, opts)
+
+            _, vis_per_chan = jax.lax.scan(
+                step_w, None, (image, plan.uvw_lambda_sorted, plan.window_start)
+            )
+        else:
+            raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
+        return vis_per_chan.T  # (n_rows, n_chan)
 
     if channel_strategy == "vmap":
         vis_per_chan = jax.vmap(
