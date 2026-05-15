@@ -2,7 +2,8 @@
 
 JAX-native wgridder for radio interferometric imaging.
 
-> **Status:** v0.1 in active development. API may change.
+> **Status:** v0.1.1. API stable; planning-side changes only between
+> v0.1 and v0.1.1, plus two new opt-in `w_strategy` values.
 
 ## Overview
 
@@ -144,8 +145,14 @@ For each channel `c`:
      - `vis_k = vis_k * phi((w_lambda - w_k) / w_kernel_scale)`
   4. `vis[:, c] = sum over k of vis_k`
 
-w-plane traversal can be performed via `lax.scan` (default, lower memory) or
-`vmap` (potentially faster on GPU). The same applies to channel traversal.
+w-plane traversal has four strategies (`dense_scan` default, `dense_vmap`,
+`windowed_scan`, `windowed_vmap`). The dense variants evaluate every
+visibility on every w-plane and rely on the kernel zeroing out non-
+contributing rows; the windowed variants take a contiguous slice of
+visibilities (after sorting by `w`) per plane, cutting the spread cost
+to roughly `p * n_rows * W^3` where `p ~ 1.5-3` is the window padding
+overhead. See *Strategy options* below for the trade-offs. Channel
+traversal independently supports `scan` (default) or `vmap`.
 
 ### Adjoint operator (`vis2dirty`)
 
@@ -208,18 +215,26 @@ number of forward and adjoint calls.
 
 ## API reference
 
-### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, phi_hat_n_fine=4096, phi_hat_oversample=32) -> WGridderPlan`
+### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, phi_hat_n_fine=4096, phi_hat_oversample=None) -> WGridderPlan`
 
 Build the wgridder plan. Inputs are host-side numpy / jnp arrays (planning math
 runs on the host); the resulting plan holds JAX device arrays.
 
-### `dirty2vis(plan, image, *, w_strategy="scan", channel_strategy="scan", nthreads=0) -> Array`
+`phi_hat_oversample=None` (the default) picks a width-dependent oversample
+suitable for the kernel chosen by `epsilon` (32 / 64 / 128 for `W <= 4`,
+`<= 8`, `> 8`); pass an explicit integer to override.
+
+The returned plan also exposes `max_window_size` and
+`window_padding_overhead` for callers that want to inspect whether the
+windowed strategies will be efficient on a given uvw distribution.
+
+### `dirty2vis(plan, image, *, w_strategy="dense_scan", channel_strategy="scan", nthreads=0) -> Array`
 
 Forward operator. `image` may be `(n_chan, n_l, n_m)` or `(n_l, n_m)`
 (broadcast across channels), real or complex. Output is complex
 `(n_rows, n_chan)`.
 
-### `vis2dirty(plan, vis, *, weights=None, w_strategy="scan", channel_strategy="scan", nthreads=0) -> Array`
+### `vis2dirty(plan, vis, *, weights=None, w_strategy="dense_scan", channel_strategy="scan", nthreads=0) -> Array`
 
 Adjoint operator. `vis` is complex `(n_rows, n_chan)`; optional `weights` is
 real `(n_rows, n_chan)`. Output is real `(n_chan, n_l, n_m)` with the `1/n`
@@ -227,9 +242,22 @@ factor applied (matching ducc's `divide_by_n=True`).
 
 ### Strategy options
 
-Both operators expose `w_strategy` and `channel_strategy`, each of which can
-be `"scan"` (default, low memory) or `"vmap"` (potentially faster on GPU but
-allocates `O(n_w * image_size)` peak memory for the w-loop).
+`w_strategy` selects how the w-plane loop is structured. There are four
+canonical choices, plus the two v0.1 names kept as deprecated aliases:
+
+| `w_strategy`      | Per-plane work               | Peak transient memory       | Notes                                          |
+|-------------------|------------------------------|-----------------------------|------------------------------------------------|
+| `"dense_scan"`    | `n_rows * W^2`               | `O(image_size + n_rows)`    | default; v0.1 `"scan"` is a deprecated alias.  |
+| `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
+| `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
+
+`channel_strategy` is independently `"scan"` (default) or `"vmap"`.
+
+For the windowed strategies, the plan exposes
+`plan.window_padding_overhead = max_window_size / mean_window_size` as a
+diagnostic. Pathological `w`-distributions can drive this above ~3, at
+which point dense strategies usually win on absolute time.
 
 ### Accuracy expectation
 
@@ -272,21 +300,22 @@ The benchmarks are gated behind two flags so they don't run by default:
 The bench file contains four kinds of test, all parametrised over the
 four telescopes and the chosen pointings:
 
-| Test                             | Strategies          | What it measures   |
-|----------------------------------|---------------------|--------------------|
-| `test_bench_jax_dirty2vis`       | scan, vmap          | wall-clock time    |
-| `test_bench_ducc_dirty2vis`      | n/a                 | wall-clock time    |
-| `test_bench_jax_vis2dirty`       | scan, vmap          | wall-clock time    |
-| `test_bench_ducc_vis2dirty`      | n/a                 | wall-clock time    |
-| `test_memory_jax_dirty2vis`      | scan, vmap          | peak RSS delta     |
-| `test_memory_ducc_dirty2vis`     | n/a                 | peak RSS delta     |
-| `test_memory_jax_vis2dirty`      | scan, vmap          | peak RSS delta     |
-| `test_memory_ducc_vis2dirty`     | n/a                 | peak RSS delta     |
+| Test                             | Strategies                                              | What it measures   |
+|----------------------------------|---------------------------------------------------------|--------------------|
+| `test_bench_jax_dirty2vis`       | dense_scan, dense_vmap, windowed_scan, windowed_vmap    | wall-clock time    |
+| `test_bench_ducc_dirty2vis`      | n/a                                                     | wall-clock time    |
+| `test_bench_jax_vis2dirty`       | dense_scan, dense_vmap, windowed_scan, windowed_vmap    | wall-clock time    |
+| `test_bench_ducc_vis2dirty`      | n/a                                                     | wall-clock time    |
+| `test_memory_jax_dirty2vis`      | dense_scan, dense_vmap, windowed_scan, windowed_vmap    | peak RSS delta     |
+| `test_memory_ducc_dirty2vis`     | n/a                                                     | peak RSS delta     |
+| `test_memory_jax_vis2dirty`      | dense_scan, dense_vmap, windowed_scan, windowed_vmap    | peak RSS delta     |
+| `test_memory_ducc_vis2dirty`     | n/a                                                     | peak RSS delta     |
 
 The standard pytest `-k` filter is the usual way to narrow a run.
 Pytest-benchmark's `--benchmark-group-by=param:bench_telescope_pointing`
 groups results so each comparison table contains all the implementations
-(jax/scan, jax/vmap, ducc) for one telescope-pointing.
+for one telescope-pointing. The `extra_info` row reports
+`max_window_size` and `padding_overhead` alongside each timing.
 
 #### Common invocations
 
@@ -331,7 +360,7 @@ pixi run -e test pytest tests/test_benchmark_against_ducc.py \
     --benchmark-group-by=param:bench_telescope_pointing -q
 ```
 
-vmap only, all telescopes, both pointings:
+vmap variants only, all telescopes, both pointings:
 
 ```sh
 pixi run -e test pytest tests/test_benchmark_against_ducc.py \
@@ -342,6 +371,15 @@ pixi run -e test pytest tests/test_benchmark_against_ducc.py \
 
 (The `or ducc` clause keeps the ducc rows visible alongside the jax/vmap
 rows for direct comparison.)
+
+Windowed variants only, all telescopes, both pointings:
+
+```sh
+pixi run -e test pytest tests/test_benchmark_against_ducc.py \
+    --runbench --bench-pointing=both \
+    -k "(windowed or ducc) and not memory" \
+    --benchmark-group-by=param:bench_telescope_pointing -q
+```
 
 Save and reload runs (handy on quiet machines):
 
@@ -354,55 +392,72 @@ pixi run -e test pytest tests/test_benchmark_against_ducc.py \
 ```
 
 Indicative numbers from a Mac M-series CPU at eps=1e-6, single-threaded
-(median time, `dirty2vis` first row of each cell, `vis2dirty` second):
+(median time, `dirty2vis` / `vis2dirty`). Rerun on your hardware before
+making strategy decisions.
 
 **Zenith pointing**
 
-| Telescope     | jax/scan        | jax/vmap        | ducc            |
-|---------------|-----------------|-----------------|-----------------|
-| EDA2          | 3.7 / 3.9 ms    | 1.3 / 1.5 ms    | 0.7 / 0.9 ms    |
-| MWA_compact   | 2.9 / 3.2 ms    | 1.8 / 2.1 ms    | 1.7 / 1.9 ms    |
-| MWA_extended  | 31.1 / 37.5 ms  | 21.1 / 27.9 ms  | 9.6 / 10.7 ms   |
-| MeerKAT       | 9.5 / 11.6 ms   | 6.4 / 8.2 ms    | 7.5 / 8.3 ms    |
+| Telescope     | dense_scan       | dense_vmap      | windowed_scan    | windowed_vmap    | ducc           |
+|---------------|------------------|-----------------|------------------|------------------|----------------|
+| EDA2          | 2.7 / 3.1 ms     | 1.0 / 1.2 ms    | 2.8 / 3.0 ms     | 1.0 / 1.2 ms     | 0.7 / 0.9 ms   |
+| MWA_compact   | 2.4 / 2.6 ms     | 1.6 / 1.9 ms    | 2.7 / 2.8 ms     | 1.8 / 2.0 ms     | 1.6 / 1.9 ms   |
+| MWA_extended  | 21.7 / 25.7 ms   | 15.3 / 19.3 ms  | 22.1 / 28.0 ms   | 16.7 / 20.8 ms   | 9.6 / 10.7 ms  |
+| MeerKAT       | 9.2 / 11.3 ms    | 6.3 / 8.0 ms    | 8.7 / 11.5 ms    | 6.9 / 10.0 ms    | 7.4 / 8.3 ms   |
 
-**30-deg off-zenith pointing** (`n_w` is much larger):
+**30-deg off-zenith pointing** (`n_w` is much larger; this is where the
+windowed strategies start to show wins on the adjoint):
 
-| Telescope     | jax/scan        | jax/vmap        | ducc            |
-|---------------|-----------------|-----------------|-----------------|
-| EDA2          | 52 / 54 ms      | 14 / 18 ms      | 1.5 / 1.9 ms    |
-| MWA_compact   | 16 / 13 ms      | 7 / 8 ms        | 2.1 / 2.5 ms    |
-| MWA_extended  | 885 / 1119 ms   | 586 / 788 ms    | 35 / 38 ms      |
-| MeerKAT       | 48 / 58 ms      | 31 / 42 ms      | 9.9 / 11 ms     |
+| Telescope     | dense_scan        | dense_vmap        | windowed_scan       | windowed_vmap       | ducc            |
+|---------------|-------------------|-------------------|---------------------|---------------------|-----------------|
+| EDA2          | 33.7 / 35.1 ms    | 9.5 / 12.4 ms     | 32.1 / 34.6 ms      | 7.9 / 15.4 ms       | 1.5 / 1.9 ms    |
+| MWA_compact   | 9.9 / 12.8 ms     | 5.3 / 6.9 ms      | 10.7 / 15.5 ms      | 6.5 / 7.0 ms        | 2.2 / 2.6 ms    |
+| MWA_extended  | 549 / 815 ms      | 391 / 549 ms      | 588 / 584 ms        | 414 / 490 ms        | 34.8 / 38.1 ms  |
+| MeerKAT       | 34.6 / 46.6 ms    | 23.2 / 34.1 ms    | 35.5 / 46.8 ms      | 25.0 / 36.9 ms      | 9.9 / 11.0 ms   |
 
-`vmap` is consistently 1.4-3.5x faster than `scan` because it reduces the
-per-iteration FINUFFT planning / setpts cost and lets XLA fuse work across
-w-planes. The cost is **memory**: `vmap` materialises the full
-`(n_w, n_l, n_m)` stack of corrected images at once. The opt-in memory
-suite confirms this; for MWA-extended off-zenith with `n_w = 769` and
-`n_pix = 256`:
+Compared to v0.1 numbers in the same setup:
+- Part 1's `n_w` change drops MWA-extended off-zenith forward from
+  ~885 ms to ~549 ms (dense_scan) and ~586 ms to ~391 ms (dense_vmap).
+- Part 2's windowed adjoint at MWA-extended off-zenith drops
+  `vis2dirty` from 815 ms (dense_scan) to 584 ms (windowed_scan), and
+  from 549 ms (dense_vmap) to 490 ms (windowed_vmap).
+- Forward is largely a wash between windowed and dense: type-2
+  NUFFT per-point cost doesn't fall with slice size.
 
-| Implementation         | peak RSS delta |
-|------------------------|----------------|
-| jax/scan dirty2vis     | 1.6 MB         |
-| jax/scan vis2dirty     | 0 MB           |
-| **jax/vmap dirty2vis** | **776 MB**     |
-| **jax/vmap vis2dirty** | **1.5 GB**     |
-| ducc dirty2vis         | 0 MB           |
-| ducc vis2dirty         | 0 MB           |
+`vmap` variants are still consistently 1.4-3.5x faster than `scan` because
+they reduce the per-iteration FINUFFT planning / setpts cost and let XLA
+fuse work across w-planes. The cost is **memory**: `vmap` materialises
+the full `(n_w, n_l, n_m)` stack of corrected images at once. For
+MWA-extended off-zenith at `n_pix = 256`:
 
-So choose `scan` when `n_w * image_size` would dwarf available memory and
-`vmap` when there's room to trade memory for time. ducc remains the
-fastest CPU implementation in either regime; the jax-nufft value
-proposition is differentiability and the GPU port (where the wasted
-spread / FFT work parallelises cheaply).
+| Implementation             | peak RSS delta |
+|----------------------------|----------------|
+| jax/dense_scan dirty2vis   | 1.6 MB         |
+| jax/dense_scan vis2dirty   | 0 MB           |
+| **jax/dense_vmap dirty2vis** | **776 MB**   |
+| **jax/dense_vmap vis2dirty** | **1.5 GB**   |
+| ducc dirty2vis             | 0 MB           |
+| ducc vis2dirty             | 0 MB           |
 
-### `vmap` vs `scan`
+(Windowed variants sit between the two: `windowed_scan` is comparable to
+`dense_scan` plus the sort-permutation tables; `windowed_vmap` is
+comparable to `dense_vmap`.)
 
-- `"scan"` keeps memory bounded at `O(image_size + n_rows)` regardless of
-  `n_w` and `n_chan` &mdash; recommended on CPU and for problems where `n_w`
-  is large (say > 50).
-- `"vmap"` allocates `O(n_w * image_size)` (or `O(n_chan * ...)` for
-  channel-vmap) but exposes parallelism that GPUs can use directly.
+ducc remains the fastest CPU implementation in every regime; the
+jax-nufft value proposition is differentiability and the GPU port
+(where the wasted spread / FFT work parallelises cheaply).
+
+### Picking a strategy
+
+- **`dense_scan` (default)** keeps memory bounded at
+  `O(image_size + n_rows)` regardless of `n_w` and `n_chan`. Recommended
+  on CPU and as a safe baseline for any problem.
+- **`dense_vmap`** allocates `O(n_w * image_size)` but is usually the
+  fastest of the four on CPU at the tested scales.
+- **`windowed_scan`** matches `dense_scan` memory and helps on the
+  adjoint when `n_w >> W` and the `w`-distribution is reasonably
+  uniform (`plan.window_padding_overhead < ~3`).
+- **`windowed_vmap`** is the high-memory variant of the windowed path;
+  marginal wins on most cases, kept primarily for GPU parity.
 
 ## Comparison with ducc
 
