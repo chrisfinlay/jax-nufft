@@ -53,7 +53,7 @@ def _reference_adjoint(
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6, 1e-8])
-@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap", "windowed_scan"])
 def test_adjoint_matches_dft_zenith(eps: float, w_strategy: str) -> None:
     rng = np.random.default_rng(11)
     n_l = n_m = 16
@@ -99,6 +99,38 @@ def test_adjoint_matches_dft_off_zenith(eps: float) -> None:
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
     assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10 * eps:.3e}"
+
+
+@pytest.mark.parametrize("eps", [1e-6])
+def test_windowed_dot_product_identity(eps: float) -> None:
+    """Adjoint relation must also hold for windowed forward/adjoint."""
+    rng = np.random.default_rng(34)
+    n_l = n_m = 32
+    n_rows = 64
+    pixsize = 0.01
+
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-100.0, 100.0, size=n_rows)
+    uvw[:, 1] = rng.uniform(-100.0, 100.0, size=n_rows)
+    uvw[:, 2] = rng.uniform(-30.0, 30.0, size=n_rows)
+    freq = np.array([1.4e9])
+
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    image = rng.standard_normal((1, n_l, n_m))
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
+
+    n_grid = np.asarray(plan.n_minus_1) + 1.0
+    image_n = image * n_grid[None, :, :]
+
+    Ax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy="windowed_scan"))
+    Ay = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="windowed_scan"))
+
+    lhs = np.vdot(Ax.ravel(), vis.ravel()).real
+    rhs = float(np.vdot(image_n.ravel(), Ay.ravel()))
+    rel_err = abs(lhs - rhs) / max(abs(lhs), abs(rhs))
+    assert rel_err < 100 * eps, f"windowed dot-product rel err {rel_err:.3e}"
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])

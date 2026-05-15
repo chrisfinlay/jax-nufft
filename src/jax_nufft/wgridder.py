@@ -359,6 +359,55 @@ def dirty2vis(
     )
 
 
+def _channel_adjoint_windowed(
+    vis_sorted_c: Array,
+    uvw_lambda_sorted_c: Array,
+    window_start_c: Array,
+    plan: WGridderPlan,
+    opts: Opts,
+) -> Array:
+    """Windowed adjoint operator for a single channel.
+
+    Mirrors :func:`_channel_forward_windowed`: per plane we take a
+    contiguous slice of the w-sorted visibilities, apply the w-kernel
+    weight (which zeros out padded entries automatically), run a 2D
+    NUFFT type 1 to land an image, and accumulate.
+    """
+    two_pi = 2.0 * jnp.pi
+    u_sorted = (two_pi * plan.pixsize_l) * uvw_lambda_sorted_c[:, 0]
+    v_sorted = (two_pi * plan.pixsize_m) * uvw_lambda_sorted_c[:, 1]
+    w_lambda_sorted = uvw_lambda_sorted_c[:, 2]
+
+    cdtype = vis_sorted_c.dtype
+    max_window_size = plan.max_window_size
+    lo_max = max(plan.n_rows - max_window_size, 0)
+
+    def per_plane(dirty_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
+        lo_raw, w_k = args
+        lo = jnp.clip(lo_raw, 0, lo_max)
+
+        u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (max_window_size,))
+        v_k = jax.lax.dynamic_slice(v_sorted, (lo,), (max_window_size,))
+        w_k_lambda = jax.lax.dynamic_slice(w_lambda_sorted, (lo,), (max_window_size,))
+        vis_k = jax.lax.dynamic_slice(vis_sorted_c, (lo,), (max_window_size,))
+
+        z = (w_k_lambda - w_k) / plan.w_kernel_scale
+        kernel_w = phi(z, plan.beta).astype(cdtype)
+        vis_k = vis_k * kernel_w
+
+        h_k = nufft1(
+            (plan.n_l, plan.n_m), vis_k, u_k, v_k, iflag=+1, eps=plan.epsilon, opts=opts
+        )
+        phase = (two_pi * w_k) * plan.n_minus_1
+        shift = jnp.exp((-1j * phase).astype(cdtype))
+        contrib = h_k * shift / plan.phi_hat_n.astype(cdtype)
+        return dirty_acc + contrib, None
+
+    dirty_init = jnp.zeros((plan.n_l, plan.n_m), dtype=cdtype)
+    dirty_c, _ = jax.lax.scan(per_plane, dirty_init, (window_start_c, plan.w_centers))
+    return dirty_c
+
+
 @partial(
     jax.jit,
     static_argnames=("w_strategy", "channel_strategy", "nthreads", "apply_w_weights"),
@@ -383,7 +432,30 @@ def _vis2dirty_jit(
         weights_per_chan = weights.T.astype(vis_per_chan.dtype)  # type: ignore[union-attr]
         vis_per_chan = vis_per_chan * weights_per_chan
 
-    if channel_strategy == "vmap":
+    if w_strategy == "windowed_scan":
+        # Apply sort_perm once per channel so windowed slices line up with
+        # plan.uvw_lambda_sorted / plan.window_start.
+        vis_sorted_per_chan = vis_per_chan[:, plan.sort_perm]
+        if channel_strategy == "vmap":
+            dirty_per_chan = jax.vmap(
+                lambda v_s_c, uvw_s_c, ws_c: _channel_adjoint_windowed(
+                    v_s_c, uvw_s_c, ws_c, plan, opts
+                )
+            )(vis_sorted_per_chan, plan.uvw_lambda_sorted, plan.window_start)
+        elif channel_strategy == "scan":
+
+            def step_w(_: None, args: tuple[Array, Array, Array]) -> tuple[None, Array]:
+                v_s_c, uvw_s_c, ws_c = args
+                return None, _channel_adjoint_windowed(v_s_c, uvw_s_c, ws_c, plan, opts)
+
+            _, dirty_per_chan = jax.lax.scan(
+                step_w,
+                None,
+                (vis_sorted_per_chan, plan.uvw_lambda_sorted, plan.window_start),
+            )
+        else:
+            raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
+    elif channel_strategy == "vmap":
         dirty_per_chan = jax.vmap(
             lambda v_c, uvw_c: _channel_adjoint(v_c, uvw_c, plan, opts, w_strategy)
         )(vis_per_chan, plan.uvw_lambda)
