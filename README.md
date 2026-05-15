@@ -391,37 +391,100 @@ pixi run -e test pytest tests/test_benchmark_against_ducc.py \
     --runbench --benchmark-compare=0001_baseline -k "not memory"
 ```
 
-Indicative numbers from a Mac M-series CPU at eps=1e-6, single-threaded
-(median time, `dirty2vis` / `vis2dirty`). Rerun on your hardware before
-making strategy decisions.
+#### Indicative numbers (Mac M-series CPU, eps=1e-6, single-threaded)
+
+Median wall-clock time for `dirty2vis` / `vis2dirty`, taken from a
+single sweep of the benchmark suite. Rerun on your hardware before
+making strategy decisions — these are CI-runner sized problems and
+absolute timings vary several-fold across machines.
 
 **Zenith pointing**
 
-| Telescope     | dense_scan       | dense_vmap      | windowed_scan    | windowed_vmap    | ducc           |
-|---------------|------------------|-----------------|------------------|------------------|----------------|
-| EDA2          | 2.7 / 3.1 ms     | 1.0 / 1.2 ms    | 2.8 / 3.0 ms     | 1.0 / 1.2 ms     | 0.7 / 0.9 ms   |
-| MWA_compact   | 2.4 / 2.6 ms     | 1.6 / 1.9 ms    | 2.7 / 2.8 ms     | 1.8 / 2.0 ms     | 1.6 / 1.9 ms   |
-| MWA_extended  | 21.7 / 25.7 ms   | 15.3 / 19.3 ms  | 22.1 / 28.0 ms   | 16.7 / 20.8 ms   | 9.6 / 10.7 ms  |
-| MeerKAT       | 9.2 / 11.3 ms    | 6.3 / 8.0 ms    | 8.7 / 11.5 ms    | 6.9 / 10.0 ms    | 7.4 / 8.3 ms   |
+| Telescope     | dense_scan       | dense_vmap       | windowed_scan    | windowed_vmap    | ducc           |
+|---------------|------------------|------------------|------------------|------------------|----------------|
+| EDA2          | 2.7 / 3.0 ms     | 1.0 / 1.2 ms     | 2.8 / 4.2 ms     | 1.0 / 1.2 ms     | 0.7 / 0.9 ms   |
+| MWA_compact   | 2.7 / 3.8 ms     | 1.6 / 1.8 ms     | 2.7 / 3.3 ms     | 1.9 / 1.9 ms     | 1.7 / 1.9 ms   |
+| MWA_extended  | 22.0 / 33.5 ms   | 15.6 / 20.2 ms   | 21.7 / 31.6 ms   | 16.9 / 22.4 ms   | 9.9 / 10.9 ms  |
+| MeerKAT       | 8.8 / 13.9 ms    | 6.3 / 8.2 ms     | 8.8 / 12.0 ms    | 6.9 / 8.3 ms     | 7.5 / 8.3 ms   |
 
-**30-deg off-zenith pointing** (`n_w` is much larger; this is where the
-windowed strategies start to show wins on the adjoint):
+**30-deg off-zenith pointing** (`n_w` is much larger; this is where
+both improvements have the most to bite into):
 
 | Telescope     | dense_scan        | dense_vmap        | windowed_scan       | windowed_vmap       | ducc            |
 |---------------|-------------------|-------------------|---------------------|---------------------|-----------------|
-| EDA2          | 33.7 / 35.1 ms    | 9.5 / 12.4 ms     | 32.1 / 34.6 ms      | 7.9 / 15.4 ms       | 1.5 / 1.9 ms    |
-| MWA_compact   | 9.9 / 12.8 ms     | 5.3 / 6.9 ms      | 10.7 / 15.5 ms      | 6.5 / 7.0 ms        | 2.2 / 2.6 ms    |
-| MWA_extended  | 549 / 815 ms      | 391 / 549 ms      | 588 / 584 ms        | 414 / 490 ms        | 34.8 / 38.1 ms  |
-| MeerKAT       | 34.6 / 46.6 ms    | 23.2 / 34.1 ms    | 35.5 / 46.8 ms      | 25.0 / 36.9 ms      | 9.9 / 11.0 ms   |
+| EDA2          | 33.2 / 38.3 ms    | 9.4 / 12.9 ms     | 31.4 / 32.7 ms      | 7.7 / 10.5 ms       | 1.5 / 1.9 ms    |
+| MWA_compact   | 10.2 / 13.8 ms    | 5.2 / 6.4 ms      | 10.8 / 9.0 ms       | 5.9 / 6.2 ms        | 2.1 / 2.5 ms    |
+| MWA_extended  | 561 / 872 ms      | 394 / 546 ms      | 566 / 731 ms        | 417 / 482 ms        | 34.7 / 38.4 ms  |
+| MeerKAT       | 32.9 / 44.8 ms    | 23.2 / 30.6 ms    | 34.4 / 42.5 ms      | 25.0 / 32.2 ms      | 10.2 / 10.9 ms  |
 
-Compared to v0.1 numbers in the same setup:
-- Part 1's `n_w` change drops MWA-extended off-zenith forward from
-  ~885 ms to ~549 ms (dense_scan) and ~586 ms to ~391 ms (dense_vmap).
-- Part 2's windowed adjoint at MWA-extended off-zenith drops
-  `vis2dirty` from 815 ms (dense_scan) to 584 ms (windowed_scan), and
-  from 549 ms (dense_vmap) to 490 ms (windowed_vmap).
-- Forward is largely a wash between windowed and dense: type-2
-  NUFFT per-point cost doesn't fall with slice size.
+#### Isolating Part 1 (standard n_w) vs Part 2 (windowed)
+
+We checked out the v0.1.0 tag and ran the same benchmarks with the v0.1
+`scan` / `vmap` strategies, then compared. With the v0.1 `scan` row as
+the baseline:
+
+  * **Part 1 only** = `v0.1 scan / v0.1.1 dense_scan` &mdash; fewer
+    w-planes, same dense algorithm.
+  * **Part 2 only** = `v0.1.1 dense_scan / v0.1.1 windowed_scan` &mdash;
+    same `n_w`, switch to windowed.
+  * **Combined** = `v0.1 scan / v0.1.1 windowed_scan`.
+
+Scan-variant speedups (median-time ratios, higher is better):
+
+| op        | telescope     | pointing | Part 1 only | Part 2 only | Combined |
+|-----------|---------------|----------|-------------|-------------|----------|
+| dirty2vis | EDA2          | zenith   | 1.35x       | 0.98x       | 1.32x    |
+| dirty2vis | EDA2          | off30    | 1.52x       | 1.06x       | 1.61x    |
+| dirty2vis | MWA_compact   | zenith   | 1.05x       | 0.99x       | 1.04x    |
+| dirty2vis | MWA_compact   | off30    | 1.49x       | 0.95x       | 1.41x    |
+| dirty2vis | MWA_extended  | zenith   | 1.40x       | 1.01x       | 1.42x    |
+| dirty2vis | MWA_extended  | off30    | 1.62x       | 0.99x       | 1.60x    |
+| dirty2vis | MeerKAT       | zenith   | 1.06x       | 1.00x       | 1.06x    |
+| dirty2vis | MeerKAT       | off30    | 1.43x       | 0.96x       | 1.37x    |
+| vis2dirty | EDA2          | zenith   | 1.88x       | 0.71x       | 1.33x    |
+| vis2dirty | EDA2          | off30    | 1.50x       | 1.17x       | 1.75x    |
+| vis2dirty | MWA_compact   | zenith   | 0.91x       | 1.17x       | 1.06x    |
+| vis2dirty | MWA_compact   | off30    | 1.22x       | 1.53x       | 1.86x    |
+| vis2dirty | MWA_extended  | zenith   | 1.12x       | 1.06x       | 1.19x    |
+| vis2dirty | MWA_extended  | off30    | 1.22x       | 1.19x       | 1.45x    |
+| vis2dirty | MeerKAT       | zenith   | 0.78x       | 1.15x       | 0.90x    |
+| vis2dirty | MeerKAT       | off30    | 1.25x       | 1.05x       | 1.32x    |
+
+vmap-variant speedups (`v0.1 vmap` &rarr; `v0.1.1 dense_vmap` &rarr;
+`v0.1.1 windowed_vmap`):
+
+| op        | telescope     | pointing | Part 1 only | Part 2 only | Combined |
+|-----------|---------------|----------|-------------|-------------|----------|
+| dirty2vis | EDA2          | zenith   | 1.29x       | 0.99x       | 1.28x    |
+| dirty2vis | EDA2          | off30    | 1.49x       | 1.22x       | 1.81x    |
+| dirty2vis | MWA_compact   | off30    | 1.34x       | 0.89x       | 1.19x    |
+| dirty2vis | MWA_extended  | off30    | 1.48x       | 0.95x       | 1.40x    |
+| dirty2vis | MeerKAT       | off30    | 1.36x       | 0.93x       | 1.26x    |
+| vis2dirty | EDA2          | off30    | 1.42x       | 1.23x       | 1.74x    |
+| vis2dirty | MWA_compact   | off30    | 1.28x       | 1.03x       | 1.32x    |
+| vis2dirty | MWA_extended  | off30    | 1.45x       | 1.13x       | 1.64x    |
+| vis2dirty | MeerKAT       | off30    | 1.45x       | 0.95x       | 1.38x    |
+
+Reading the table:
+
+* **Part 1 wins broadly** &mdash; 1.05x to 1.6x across most cases, with
+  the largest gains at off-zenith where `n_w` was previously inflated
+  most by the v0.1 `x0 = 1/W` choice. This matches the `W/4` theoretical
+  FFT-count reduction: at eps=1e-6 (W=6), expected speedup is 1.5x.
+* **Part 2 helps the adjoint** at off-zenith on most telescopes
+  (1.05–1.53x). Forward is essentially flat: NUFFT type-2 per-point
+  cost doesn't fall with slice size.
+* **At zenith Part 2 is a wash** because `n_w` is already close to `W`,
+  so `max_window_size ~ n_rows` and there's nothing to slice off.
+* **Combined wins** reach 1.6x–1.86x on the off-zenith adjoint cases
+  most users care about.
+
+The MWA-extended off-zenith adjoint (the configuration the v0.1.1 plan
+targeted) drops from **1056 ms** (v0.1 scan) to **872 ms** (Part 1
+only) to **731 ms** (Part 1 + Part 2 windowed_scan) &mdash; a 1.45x
+total speedup, with both parts each contributing ~1.2x.
+
+#### Memory
 
 `vmap` variants are still consistently 1.4-3.5x faster than `scan` because
 they reduce the per-iteration FINUFFT planning / setpts cost and let XLA
