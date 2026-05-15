@@ -63,12 +63,23 @@ class WGridderPlan:
     pixsize_l: float
     pixsize_m: float
     w_kernel_scale: float  # half-width of the w-direction kernel, in wavelengths
+    # v0.1.1 windowed-scan fields:
+    # ``max_window_size`` is the worst-case live-window length across all
+    # (channel, plane) pairs; ``window_padding_overhead`` is
+    # ``max_window_size / mean_window_size`` and is purely diagnostic.
+    max_window_size: int
+    window_padding_overhead: float
 
     # ---- traced arrays (pytree leaves) ----
-    uvw_lambda: Array = field()  # (n_chan, n_rows, 3)
+    uvw_lambda: Array = field()  # (n_chan, n_rows, 3) — input row order
     w_centers: Array = field()  # (n_w,)
     n_minus_1: Array = field()  # (n_l, n_m)
     phi_hat_n: Array = field()  # (n_l, n_m)
+    # v0.1.1 windowed-scan support:
+    sort_perm: Array = field()  # (n_rows,) int — argsort(uvw[:, 2]) ascending
+    uvw_lambda_sorted: Array = field()  # (n_chan, n_rows, 3) — uvw_lambda[:, sort_perm, :]
+    window_start: Array = field()  # (n_chan, n_w) int — start idx in sorted array
+    window_size: Array = field()  # (n_chan, n_w) int — live window length per plane
 
     @property
     def image_shape(self) -> tuple[int, int]:
@@ -88,6 +99,8 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.pixsize_l,
         plan.pixsize_m,
         plan.w_kernel_scale,
+        plan.max_window_size,
+        plan.window_padding_overhead,
     )
 
 
@@ -104,8 +117,19 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         pixsize_l,
         pixsize_m,
         w_kernel_scale,
+        max_window_size,
+        window_padding_overhead,
     ) = aux
-    uvw_lambda, w_centers, n_minus_1, phi_hat_n = children
+    (
+        uvw_lambda,
+        w_centers,
+        n_minus_1,
+        phi_hat_n,
+        sort_perm,
+        uvw_lambda_sorted,
+        window_start,
+        window_size,
+    ) = children
     return WGridderPlan(
         n_l=n_l,
         n_m=n_m,
@@ -118,17 +142,32 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         pixsize_l=pixsize_l,
         pixsize_m=pixsize_m,
         w_kernel_scale=w_kernel_scale,
+        max_window_size=max_window_size,
+        window_padding_overhead=window_padding_overhead,
         uvw_lambda=uvw_lambda,
         w_centers=w_centers,
         n_minus_1=n_minus_1,
         phi_hat_n=phi_hat_n,
+        sort_perm=sort_perm,
+        uvw_lambda_sorted=uvw_lambda_sorted,
+        window_start=window_start,
+        window_size=window_size,
     )
 
 
 jax.tree_util.register_pytree_node(
     WGridderPlan,
     flatten_func=lambda p: (
-        (p.uvw_lambda, p.w_centers, p.n_minus_1, p.phi_hat_n),
+        (
+            p.uvw_lambda,
+            p.w_centers,
+            p.n_minus_1,
+            p.phi_hat_n,
+            p.sort_perm,
+            p.uvw_lambda_sorted,
+            p.window_start,
+            p.window_size,
+        ),
         _plan_aux(p),
     ),
     unflatten_func=_plan_unflatten,
@@ -271,6 +310,46 @@ def make_plan(
             "smaller epsilon."
         )
 
+    # --- v0.1.1 windowed-scan builder ---
+    # Sort visibilities by w in metres (frequency-independent). The same
+    # permutation serves every channel because scaling by ``freq[c]/c`` is
+    # strictly positive and so monotonic.
+    sort_perm_np = np.argsort(uvw_arr[:, 2], kind="stable").astype(np.int32)
+    uvw_lambda_sorted_np = uvw_lambda_np[:, sort_perm_np, :]
+
+    # For each (channel, plane), the contributing rows are those with
+    # ``|w_lambda - w_k| < W/2 * dw = w_kernel_scale`` (the kernel support
+    # cutoff, where ``phi(z) = 0`` outside). After sorting, this is a
+    # contiguous slice; ``searchsorted`` finds the boundaries.
+    window_start_np = np.zeros((n_chan, n_w), dtype=np.int32)
+    window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
+    half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
+    w_centers64 = w_centers_np.astype(np.float64)
+    for c in range(n_chan):
+        w_lambda_c = uvw_lambda_sorted_np[c, :, 2].astype(np.float64)
+        # ``side="left"``  for lower bound, ``side="right"`` for upper bound
+        # gives a half-open interval [lo, hi) of strictly-inside rows. Rows
+        # exactly at ``w_k +/- half_W_dw`` have phi(z=+/-1) = exp(-beta),
+        # numerically tiny but nonzero — including them costs at most one
+        # extra row per side and avoids edge surprises.
+        lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw, side="left")
+        hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw, side="right")
+        window_start_np[c] = lo.astype(np.int32)
+        window_size_np[c] = (hi - lo).astype(np.int32)
+
+    max_window_size = int(window_size_np.max(initial=0))
+    # mean_window_size: ignore empty windows (entirely outside data range)
+    # so that the diagnostic isn't dominated by edge planes.
+    nonzero_windows = window_size_np[window_size_np > 0]
+    if nonzero_windows.size:
+        mean_window_size = float(nonzero_windows.mean())
+        window_padding_overhead = max_window_size / mean_window_size
+    else:
+        window_padding_overhead = 1.0
+    # Clamp max_window_size to at least 1 so the static dynamic_slice
+    # shape is well-defined (e.g. n_rows >= 1 always).
+    max_window_size = max(max_window_size, 1)
+
     return WGridderPlan(
         n_l=int(n_l),
         n_m=int(n_m),
@@ -283,10 +362,16 @@ def make_plan(
         pixsize_l=float(pixsize_l),
         pixsize_m=float(pixsize_m),
         w_kernel_scale=float(w_kernel_scale),
+        max_window_size=int(max_window_size),
+        window_padding_overhead=float(window_padding_overhead),
         uvw_lambda=jnp.asarray(uvw_lambda_np),
         w_centers=jnp.asarray(w_centers_np),
         n_minus_1=jnp.asarray(n_minus_1_np),
         phi_hat_n=jnp.asarray(phi_hat_n_np),
+        sort_perm=jnp.asarray(sort_perm_np),
+        uvw_lambda_sorted=jnp.asarray(uvw_lambda_sorted_np),
+        window_start=jnp.asarray(window_start_np),
+        window_size=jnp.asarray(window_size_np),
     )
 
 

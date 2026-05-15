@@ -189,7 +189,9 @@ def test_plan_is_a_jax_pytree() -> None:
     )
 
     leaves, treedef = jax.tree_util.tree_flatten(plan)
-    assert len(leaves) == 4  # uvw_lambda, w_centers, n_minus_1, phi_hat_n
+    # uvw_lambda, w_centers, n_minus_1, phi_hat_n, sort_perm,
+    # uvw_lambda_sorted, window_start, window_size
+    assert len(leaves) == 8
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
     # Static fields preserved exactly.
@@ -205,6 +207,85 @@ def test_plan_is_a_jax_pytree() -> None:
     out = float(total_phi_hat(plan))
     assert np.isfinite(out)
     assert out > 0
+
+
+def test_window_builder_basic() -> None:
+    """sort_perm sorts by w; per-plane windows are monotonic and in-bounds."""
+    rng = np.random.default_rng(0)
+    n_rows = 400
+    uvw = rng.normal(scale=80.0, size=(n_rows, 3))
+    freq = np.array([1.0e9, 1.2e9])
+
+    plan = make_plan(uvw, freq, (128, 128), 1e-3, 1e-3, epsilon=1e-6)
+
+    sort_perm = np.asarray(plan.sort_perm)
+    # Permutation property: every index appears exactly once.
+    assert sorted(sort_perm.tolist()) == list(range(n_rows))
+    # Applying sort_perm yields ascending w in metres.
+    w_sorted = uvw[sort_perm, 2]
+    assert np.all(np.diff(w_sorted) >= 0)
+
+    # uvw_lambda_sorted matches uvw_lambda[:, sort_perm, :].
+    uvw_lambda = np.asarray(plan.uvw_lambda)
+    uvw_lambda_sorted = np.asarray(plan.uvw_lambda_sorted)
+    np.testing.assert_allclose(uvw_lambda_sorted, uvw_lambda[:, sort_perm, :])
+
+    window_start = np.asarray(plan.window_start)
+    window_size = np.asarray(plan.window_size)
+    assert window_start.shape == (plan.n_chan, plan.n_w)
+    assert window_size.shape == (plan.n_chan, plan.n_w)
+
+    # Window start is monotonic in k (planes scan ascending in w).
+    for c in range(plan.n_chan):
+        assert np.all(np.diff(window_start[c]) >= 0)
+    # All windows stay within [0, n_rows].
+    assert np.all(window_start >= 0)
+    assert np.all(window_start + window_size <= plan.n_rows)
+    # max_window_size matches the per-(c, k) max.
+    assert plan.max_window_size == int(window_size.max())
+    # Padding overhead >= 1 by construction.
+    assert plan.window_padding_overhead >= 1.0
+
+
+def test_window_builder_sum_matches_expected() -> None:
+    """sum_k window_size[c, k] equals n_rows * W (each row contributes to W planes)."""
+    rng = np.random.default_rng(1)
+    n_rows = 250
+    uvw = rng.normal(scale=120.0, size=(n_rows, 3))
+    freq = np.array([1.4e9])
+
+    plan = make_plan(uvw, freq, (128, 128), 5e-4, 5e-4, epsilon=1e-6)
+    window_size = np.asarray(plan.window_size)
+    W = plan.w_kernel_width
+    # Each visibility lies in exactly W consecutive plane-windows (interior
+    # case). Edge planes may pick up fewer when the kernel support hangs off
+    # the end of the data range, so the sum is bounded above by n_rows * W
+    # and below by n_rows * (W - 1) for our test geometry.
+    total = int(window_size.sum())
+    assert total <= plan.n_rows * W
+    assert total >= plan.n_rows * (W - 1)
+
+
+def test_window_builder_clumped_distribution() -> None:
+    """A clumped w-distribution should produce a high padding overhead."""
+    rng = np.random.default_rng(2)
+    n_rows = 400
+    # Two tight clumps in w: padding overhead should be large because most
+    # planes have ~0 rows while the two clump-overlapping planes hold many.
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-100, 100, n_rows)
+    uvw[:, 1] = rng.uniform(-100, 100, n_rows)
+    half = n_rows // 2
+    uvw[:half, 2] = rng.normal(loc=-30.0, scale=0.5, size=half)
+    uvw[half:, 2] = rng.normal(loc=+30.0, scale=0.5, size=n_rows - half)
+    freq = np.array([1.4e9])
+    plan_clumped = make_plan(uvw, freq, (64, 64), 2e-3, 2e-3, epsilon=1e-6)
+
+    uvw_uniform = rng.uniform(-60.0, 60.0, size=(n_rows, 3))
+    plan_uniform = make_plan(uvw_uniform, freq, (64, 64), 2e-3, 2e-3, epsilon=1e-6)
+
+    # Padding overhead should be noticeably higher for the clumped case.
+    assert plan_clumped.window_padding_overhead > plan_uniform.window_padding_overhead
 
 
 def test_plan_sample_consistency() -> None:
