@@ -67,7 +67,9 @@ def _setup_problem(tel: Telescope, zen_deg: float, *, seed: int = 7):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
 def test_bench_jax_dirty2vis(
     benchmark,
     bench_telescope_pointing: tuple[Telescope, float],
@@ -85,6 +87,8 @@ def test_bench_jax_dirty2vis(
     benchmark.extra_info["n_rows"] = tel.n_rows
     benchmark.extra_info["n_w"] = plan.n_w
     benchmark.extra_info["w_strategy"] = w_strategy
+    benchmark.extra_info["max_window_size"] = plan.max_window_size
+    benchmark.extra_info["padding_overhead"] = round(plan.window_padding_overhead, 2)
     benchmark(lambda: dirty2vis(plan, image_j, w_strategy=w_strategy).block_until_ready())
 
 
@@ -111,7 +115,9 @@ def test_bench_ducc_dirty2vis(benchmark, bench_telescope_pointing: tuple[Telesco
     )
 
 
-@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
 def test_bench_jax_vis2dirty(
     benchmark,
     bench_telescope_pointing: tuple[Telescope, float],
@@ -128,6 +134,8 @@ def test_bench_jax_vis2dirty(
     benchmark.extra_info["n_rows"] = tel.n_rows
     benchmark.extra_info["n_w"] = plan.n_w
     benchmark.extra_info["w_strategy"] = w_strategy
+    benchmark.extra_info["max_window_size"] = plan.max_window_size
+    benchmark.extra_info["padding_overhead"] = round(plan.window_padding_overhead, 2)
     benchmark(lambda: vis2dirty(plan, vis_j, w_strategy=w_strategy).block_until_ready())
 
 
@@ -218,7 +226,9 @@ def _peak_rss_during(fn, *, poll_interval_s: float = 0.001, n_iters: int = 5) ->
     return worst_delta
 
 
-@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
 def test_memory_jax_dirty2vis(
     bench_telescope_pointing: tuple[Telescope, float], w_strategy: str
 ) -> None:
@@ -279,7 +289,9 @@ def test_memory_ducc_dirty2vis(bench_telescope_pointing: tuple[Telescope, float]
     )
 
 
-@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
 def test_memory_jax_vis2dirty(
     bench_telescope_pointing: tuple[Telescope, float], w_strategy: str
 ) -> None:
