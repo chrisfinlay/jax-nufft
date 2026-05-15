@@ -9,6 +9,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 
@@ -184,7 +185,18 @@ def test_jit_static_strategy_args() -> None:
 
     @jax.jit
     def vmap_call(im):
-        return dirty2vis(plan, im, w_strategy="vmap", channel_strategy="vmap")
+        return dirty2vis(plan, im, w_strategy="dense_vmap", channel_strategy="vmap")
 
     out = vmap_call(image)
+    assert out.shape == (plan.n_rows, plan.n_chan)
+
+
+def test_w_strategy_aliases_emit_deprecation() -> None:
+    """v0.1 names ``scan``/``vmap`` still work but warn."""
+    plan, image, _ = _tiny_setup(6)
+    with pytest.warns(DeprecationWarning, match=r"scan.*deprecated"):
+        out = dirty2vis(plan, image, w_strategy="scan")
+    assert out.shape == (plan.n_rows, plan.n_chan)
+    with pytest.warns(DeprecationWarning, match=r"vmap.*deprecated"):
+        out = dirty2vis(plan, image, w_strategy="vmap")
     assert out.shape == (plan.n_rows, plan.n_chan)

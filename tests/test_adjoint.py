@@ -53,7 +53,7 @@ def _reference_adjoint(
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6, 1e-8])
-@pytest.mark.parametrize("w_strategy", ["scan", "vmap"])
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
 def test_adjoint_matches_dft_zenith(eps: float, w_strategy: str) -> None:
     rng = np.random.default_rng(11)
     n_l = n_m = 16

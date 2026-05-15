@@ -23,6 +23,7 @@ with the optional ``1/n`` factor applied on the adjoint output (matching ducc's
 
 from __future__ import annotations
 
+import warnings
 from functools import partial
 from typing import Literal
 
@@ -35,8 +36,37 @@ from jax_finufft.options import Opts
 from jax_nufft.kernel import phi
 from jax_nufft.planning import WGridderPlan
 
-WStrategy = Literal["scan", "vmap"]
+# Canonical strategy names introduced in v0.1.1. The bare ``scan`` /
+# ``vmap`` names from v0.1 are accepted as deprecated aliases that map
+# to the ``dense_*`` variants (the v0.1 algorithm). A future release
+# will add ``windowed_scan`` / ``windowed_vmap`` for the per-plane
+# windowed path; the dense path stays as the parity baseline.
+WStrategy = Literal["dense_scan", "dense_vmap", "scan", "vmap"]
 ChannelStrategy = Literal["scan", "vmap"]
+
+_DENSE_W_STRATEGIES = ("dense_scan", "dense_vmap")
+_W_STRATEGY_ALIASES = {"scan": "dense_scan", "vmap": "dense_vmap"}
+
+
+def _canonicalise_w_strategy(name: str) -> str:
+    """Resolve user-facing ``w_strategy`` to a canonical name.
+
+    Emits :class:`DeprecationWarning` for the v0.1 names.
+    """
+    if name in _DENSE_W_STRATEGIES:
+        return name
+    canonical = _W_STRATEGY_ALIASES.get(name)
+    if canonical is not None:
+        warnings.warn(
+            f"w_strategy={name!r} is deprecated; use {canonical!r} instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return canonical
+    raise ValueError(
+        f"unknown w_strategy: {name!r}; expected one of "
+        f"{_DENSE_W_STRATEGIES + tuple(_W_STRATEGY_ALIASES)}"
+    )
 
 
 def _real_to_complex_dtype(dtype: jnp.dtype) -> jnp.dtype:
@@ -119,11 +149,11 @@ def _channel_forward(
         kernel_w = phi(z, plan.beta).astype(cdtype)
         return vis_k * kernel_w
 
-    if w_strategy == "vmap":
+    if w_strategy == "dense_vmap":
         contributions = jax.vmap(w_plane_contribution)(plan.w_centers)
         return jnp.sum(contributions, axis=0)
 
-    if w_strategy == "scan":
+    if w_strategy == "dense_scan":
 
         def step(acc: Array, w_k: Array) -> tuple[Array, None]:
             return acc + w_plane_contribution(w_k), None
@@ -162,11 +192,11 @@ def _channel_adjoint(
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
 
-    if w_strategy == "vmap":
+    if w_strategy == "dense_vmap":
         contributions = jax.vmap(w_plane_contribution)(plan.w_centers)
         return jnp.sum(contributions, axis=0)
 
-    if w_strategy == "scan":
+    if w_strategy == "dense_scan":
 
         def step(acc: Array, w_k: Array) -> tuple[Array, None]:
             return acc + w_plane_contribution(w_k), None
@@ -213,7 +243,7 @@ def dirty2vis(
     plan: WGridderPlan,
     image: Array,
     *,
-    w_strategy: WStrategy = "scan",
+    w_strategy: WStrategy = "dense_scan",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int = 0,
 ) -> Array:
@@ -226,9 +256,12 @@ def dirty2vis(
     image:
         Either ``(n_chan, n_l, n_m)`` or ``(n_l, n_m)`` (broadcast across
         channels). Real or complex; real input is promoted to complex.
-    w_strategy, channel_strategy:
-        ``"scan"`` (default, low memory) or ``"vmap"`` (potentially faster on GPU
-        but allocates ``n_w * image_size`` peak memory).
+    w_strategy:
+        ``"dense_scan"`` (default, low memory) or ``"dense_vmap"`` (potentially
+        faster on GPU but allocates ``n_w * image_size`` peak memory). The bare
+        names ``"scan"`` / ``"vmap"`` are accepted as deprecated aliases.
+    channel_strategy:
+        ``"scan"`` (default) or ``"vmap"`` for the channel loop.
     nthreads:
         Threads to pass to jax-finufft (0 = let FINUFFT decide).
 
@@ -237,6 +270,7 @@ def dirty2vis(
     vis:
         Complex array of shape ``(n_rows, n_chan)``.
     """
+    w_strategy = _canonicalise_w_strategy(w_strategy)
     image = _prepare_image(image, plan)
     return _dirty2vis_jit(
         plan,
@@ -297,7 +331,7 @@ def vis2dirty(
     vis: Array,
     *,
     weights: Array | None = None,
-    w_strategy: WStrategy = "scan",
+    w_strategy: WStrategy = "dense_scan",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int = 0,
 ) -> Array:
@@ -312,9 +346,12 @@ def vis2dirty(
     weights:
         Optional real array of shape ``(n_rows, n_chan)``, multiplied into the
         visibilities before gridding (matches ducc's ``wgt`` argument).
-    w_strategy, channel_strategy:
-        ``"scan"`` (default) or ``"vmap"``; same semantics as in
-        :func:`dirty2vis`.
+    w_strategy:
+        ``"dense_scan"`` (default) or ``"dense_vmap"``; same semantics as in
+        :func:`dirty2vis`. The bare names ``"scan"`` / ``"vmap"`` are accepted
+        as deprecated aliases.
+    channel_strategy:
+        ``"scan"`` (default) or ``"vmap"``.
     nthreads:
         Threads to pass to jax-finufft (0 = let FINUFFT decide).
 
@@ -323,6 +360,7 @@ def vis2dirty(
     dirty:
         Real array of shape ``(n_chan, n_l, n_m)``.
     """
+    w_strategy = _canonicalise_w_strategy(w_strategy)
     vis = _validate_vis(vis, plan)
     weights = _validate_weights(weights, plan)
     apply_w = weights is not None

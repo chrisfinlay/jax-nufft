@@ -5,8 +5,9 @@ Skipped by default. Run with::
     pixi run -e test pytest tests/test_benchmark_against_ducc.py \\
         --runbench -q --benchmark-group-by=param:bench_telescope_pointing
 
-The grouping flag bundles ``test_jax_*`` (scan, vmap) and ``test_ducc_*``
-tests sharing the same telescope ID into a single comparison table.
+The grouping flag bundles ``test_jax_*`` (dense_scan, dense_vmap) and
+``test_ducc_*`` tests sharing the same telescope ID into a single
+comparison table.
 
 Notes on what the numbers do and don't mean:
 
@@ -66,7 +67,7 @@ def _setup_problem(tel: Telescope, zen_deg: float, *, seed: int = 7):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("w_strategy", ["scan", "vmap"])
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
 def test_bench_jax_dirty2vis(
     benchmark,
     bench_telescope_pointing: tuple[Telescope, float],
@@ -110,7 +111,7 @@ def test_bench_ducc_dirty2vis(benchmark, bench_telescope_pointing: tuple[Telesco
     )
 
 
-@pytest.mark.parametrize("w_strategy", ["scan", "vmap"])
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
 def test_bench_jax_vis2dirty(
     benchmark,
     bench_telescope_pointing: tuple[Telescope, float],
@@ -217,7 +218,7 @@ def _peak_rss_during(fn, *, poll_interval_s: float = 0.001, n_iters: int = 5) ->
     return worst_delta
 
 
-@pytest.mark.parametrize("w_strategy", ["scan", "vmap"])
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
 def test_memory_jax_dirty2vis(
     bench_telescope_pointing: tuple[Telescope, float], w_strategy: str
 ) -> None:
@@ -278,7 +279,7 @@ def test_memory_ducc_dirty2vis(bench_telescope_pointing: tuple[Telescope, float]
     )
 
 
-@pytest.mark.parametrize("w_strategy", ["scan", "vmap"])
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
 def test_memory_jax_vis2dirty(
     bench_telescope_pointing: tuple[Telescope, float], w_strategy: str
 ) -> None:
