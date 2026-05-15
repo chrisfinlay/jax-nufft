@@ -391,11 +391,46 @@ pixi run -e test pytest tests/test_benchmark_against_ducc.py \
     --runbench --benchmark-compare=0001_baseline -k "not memory"
 ```
 
+#### What the benchmark numbers include
+
+The jax-nufft timings below are **steady-state per-call cost** &mdash;
+the plan and the JIT compile are excluded from the timed window:
+
+* `make_plan(...)` runs once in setup, then `plan` is reused across
+  every benchmark iteration. This matches the usage pattern in an
+  optimisation loop, where the plan is built once on init and the
+  forward / adjoint are called every step.
+* A warmup `dirty2vis(plan, image).block_until_ready()` runs once
+  before `pytest-benchmark`'s timed loop, so the JIT compile is also
+  excluded.
+
+The one-time costs for MWA-extended off-zenith are:
+
+| One-time cost                                  | Time     |
+|-----------------------------------------------|----------|
+| `make_plan` (host-side numpy, plus device-side `jnp.asarray` copies) | ~5 ms |
+| First `dirty2vis(plan, ..., w_strategy=...)` (JIT compile + execute) | ~700 ms |
+| First `vis2dirty(plan, ..., w_strategy=...)`  | ~700 ms  |
+
+Each JIT cache entry is keyed on the static plan metadata
+(`n_w`, `n_chan`, `n_rows`, `w_strategy`, etc.), so a fresh plan with
+the same shape reuses the same compiled binary.
+
+**ducc asymmetry:** ducc's public Python API (`ducc0.wgridder.dirty2vis`)
+does not separate plan from execute &mdash; each call internally rebuilds
+its bin sort, kernel selection, and other per-call state. The ducc
+numbers below therefore include that per-call planning. In an
+optimisation loop with fixed `(uvw, freq)`, jax-nufft amortises its
+plan cost to nearly zero per step, while ducc pays its full
+per-call cost on every step. Treat the ducc column as a fair
+comparison against current ducc *usage* rather than against a
+hypothetical "ducc with reused plan".
+
 #### Indicative numbers (Mac M-series CPU, eps=1e-6, single-threaded)
 
 Median wall-clock time for `dirty2vis` / `vis2dirty`, taken from a
 single sweep of the benchmark suite. Rerun on your hardware before
-making strategy decisions — these are CI-runner sized problems and
+making strategy decisions &mdash; these are CI-runner sized problems and
 absolute timings vary several-fold across machines.
 
 **Zenith pointing**
