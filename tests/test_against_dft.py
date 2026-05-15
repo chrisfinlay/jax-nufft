@@ -51,7 +51,9 @@ def _reference_forward(
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6, 1e-8])
-@pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap", "windowed_scan"])
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
 def test_forward_matches_dft_single_channel_zenith(eps: float, w_strategy: str) -> None:
     """Tiny zenith problem: w in metres deliberately non-zero but small."""
     rng = np.random.default_rng(123)
