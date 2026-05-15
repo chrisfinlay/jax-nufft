@@ -25,8 +25,11 @@ from jax_nufft import dirty2vis, make_plan, vis2dirty
 from tests.conftest import Telescope, synthetic_uvw
 
 
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "windowed_scan"])
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
-def test_forward_parity(short_telescope_pointing: tuple[Telescope, float], eps: float) -> None:
+def test_forward_parity(
+    short_telescope_pointing: tuple[Telescope, float], eps: float, w_strategy: str
+) -> None:
     tel, zen_deg = short_telescope_pointing
     uvw = synthetic_uvw(tel, zen_deg, seed=0)
     freq = np.array([tel.freq_hz])
@@ -35,7 +38,7 @@ def test_forward_parity(short_telescope_pointing: tuple[Telescope, float], eps: 
     image = rng.standard_normal((tel.n_pix, tel.n_pix))
 
     plan = make_plan(uvw, freq, (tel.n_pix, tel.n_pix), pix, pix, eps)
-    vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image)))
+    vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy=w_strategy))
 
     vis_ducc = ducc0.wgridder.dirty2vis(
         uvw=uvw,
@@ -53,11 +56,16 @@ def test_forward_parity(short_telescope_pointing: tuple[Telescope, float], eps: 
     # Loosen the tolerance slightly: ducc and our wgridder both target
     # `epsilon` independently, so the gap between them is bounded by ~2*eps
     # in the best case and ~10*eps in practice.
-    assert err < 20 * eps, f"{tel.name} zen={zen_deg} eps={eps:g}: relative error {err:.3e}"
+    assert err < 20 * eps, (
+        f"{tel.name} zen={zen_deg} eps={eps:g} {w_strategy}: relative error {err:.3e}"
+    )
 
 
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "windowed_scan"])
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
-def test_adjoint_parity(short_telescope_pointing: tuple[Telescope, float], eps: float) -> None:
+def test_adjoint_parity(
+    short_telescope_pointing: tuple[Telescope, float], eps: float, w_strategy: str
+) -> None:
     tel, zen_deg = short_telescope_pointing
     uvw = synthetic_uvw(tel, zen_deg, seed=1)
     freq = np.array([tel.freq_hz])
@@ -68,7 +76,7 @@ def test_adjoint_parity(short_telescope_pointing: tuple[Telescope, float], eps: 
     ).astype(np.complex128)
 
     plan = make_plan(uvw, freq, (tel.n_pix, tel.n_pix), pix, pix, eps)
-    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis_np)))[0]
+    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis_np), w_strategy=w_strategy))[0]
 
     dirty_ducc = ducc0.wgridder.vis2dirty(
         uvw=uvw,
@@ -85,7 +93,9 @@ def test_adjoint_parity(short_telescope_pointing: tuple[Telescope, float], eps: 
     )
 
     err = np.linalg.norm(dirty_jax - dirty_ducc) / np.linalg.norm(dirty_ducc)
-    assert err < 20 * eps, f"{tel.name} zen={zen_deg} eps={eps:g}: relative error {err:.3e}"
+    assert err < 20 * eps, (
+        f"{tel.name} zen={zen_deg} eps={eps:g} {w_strategy}: relative error {err:.3e}"
+    )
 
 
 @pytest.mark.parametrize("eps", [1e-6])
