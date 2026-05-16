@@ -4,10 +4,10 @@ This file is the orientation doc for Claude Code / other coding agents
 picking up work on this repo. It covers what the project is, how the
 code is laid out, the conventions and invariants you need to respect,
 how to run tests / benchmarks, the history of design decisions taken
-in `v0.1` and `v0.1.1`, and an ideation list for `v0.1.2`.
+in `v0.1` and `v0.1.1`, and the performance plan for `v0.1.2`.
 
 For end-user-facing documentation, see `README.md`. For the most recent
-formal release plan, see `docs/v0.1.1-plan.md`.
+formal release plan, see `docs/v0.1.2-plan.md`.
 
 ---
 
@@ -21,13 +21,28 @@ public operators:
 * `vis2dirty(plan, vis)` — adjoint (visibilities &rarr; image).
 
 Both are fully traceable through `jax.jit`, `jax.vmap`, `jax.grad`. The
-reference baseline for correctness is `ducc0.wgridder`; we target
-relative L2 error `< 10 * epsilon`.
+reference baseline for correctness is `ducc0.wgridder`. Headline
+target is DFT parity within `10 * epsilon`; ducc parity, windowed
+vs. dense, and adjoint reduction-order tolerances are looser — see
+§6 for the full table.
 
 The strategic value-add over ducc is **differentiability and the GPU
 port via cuFINUFFT**, not raw CPU speed (ducc is consistently faster
 on CPU). The intended user is a downstream JAX pipeline doing
 optimisation / sampling / amortised inference over the wgridder.
+
+**Sign convention** (matches ducc's `explicit_degridder` with
+`divide_by_n=True`):
+
+```
+V(u, v, w) = Σ_{l,m} I(l, m) · exp(-2πi (u·l + v·m)) · exp(+2πi w (n-1))
+```
+
+The adjoint applies the conjugate phases and divides the output by
+`n`. **Do not flip these signs** without re-deriving and updating
+the ducc parity tests — and `vis2dirty` also takes an optional
+`weights` arg (`(n_rows, n_chan)` real) that is multiplied into
+visibilities before gridding (matches ducc's `wgt`).
 
 ---
 
@@ -41,9 +56,11 @@ jax-nufft/
 ├── pyproject.toml            # hatchling build, pytest config, ruff config
 ├── pixi.toml                 # pixi workspace + tasks (test, lint, format, …)
 ├── pixi.lock
-├── .github/                  # CI
+├── .github/
+│   └── workflows/test.yml    # CI: lint + fast suite on every push
 ├── docs/
-│   └── v0.1.1-plan.md        # formal v0.1.1 plan with rationale
+│   ├── v0.1.1-plan.md        # formal v0.1.1 plan with rationale
+│   └── v0.1.2-plan.md        # prioritised v0.1.2 performance plan
 ├── src/jax_nufft/
 │   ├── __init__.py           # public API surface
 │   ├── _version.py           # __version__
@@ -74,7 +91,8 @@ jax-nufft/
 | Add a new w-traversal strategy      | `src/jax_nufft/wgridder.py` + `_types.py`         |
 | Add a parity test                   | `tests/test_against_ducc.py` or `_dft.py`         |
 | Run benchmarks                      | `tests/test_benchmark_against_ducc.py` + README   |
-| Understand a design decision        | `docs/v0.1.1-plan.md`                             |
+| Add a benchmark fixture             | `tests/conftest.py` (telescope fixtures) + the benchmark file |
+| Understand a design decision        | `docs/v0.1.1-plan.md` or `docs/v0.1.2-plan.md`    |
 
 ---
 
@@ -118,10 +136,12 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
 
 * `make_plan` is host-side (numpy) and returns a `WGridderPlan` — a
   frozen dataclass that's also a registered JAX pytree.
-* Plan **static fields** (`n_l, n_m, n_w, w_kernel_width, beta,
-  epsilon, pixsize_*, w_kernel_scale, max_window_size,
-  window_padding_overhead`) live in the pytree aux_data and become
-  part of the JIT cache key.
+* Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
+  w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale,
+  max_window_size, window_padding_overhead`) live in the pytree
+  aux_data and become part of the JIT cache key. This list must
+  match `_plan_aux` in `planning.py` exactly — drift here is the
+  most common source of "silent pytree corruption" bugs.
 * Plan **traced fields** (`uvw_lambda, w_centers, n_minus_1,
   phi_hat_n, sort_perm, uvw_lambda_sorted, window_start,
   window_size`) are JAX device arrays.
@@ -168,13 +188,18 @@ counterparts (`_canonicalise_w_strategy` in `wgridder.py`). Plan to
 remove these in v0.2.
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
+The default `"scan"` is the safer choice across `n_chan` and memory
+budgets; `"vmap"` can win on GPU with small `n_chan` because it
+unrolls the channel loop into a single batched call, but it
+allocates `n_chan` × per-channel transient memory. Don't change the
+default without a GPU benchmark.
 
 ---
 
 ## 6. Testing conventions
 
 ```sh
-pixi run -e test pytest                # 118 tests, ~5 s
+pixi run -e test pytest                # fast unit tests, ~5 s
 pixi run -e test pytest --runslow      # adds MWA_extended/MeerKAT parity
 pixi run -e test pytest --runbench     # opt-in benchmarks (~2 min for one pointing)
 pixi run -e dev lint                   # ruff check
@@ -243,6 +268,33 @@ This is exactly what was done to isolate Part 1 vs Part 2 in `v0.1.1`.
 
 ## 8. Verifying a change end-to-end
 
+### Commit-per-step convention (applies to all plan docs)
+
+When implementing a plan document (`docs/v0.1.X-plan.md`), follow
+the per-step commit workflow:
+
+1. **Every commit must leave `pixi run -e test pytest -q` green.**
+   CI (`.github/workflows/test.yml`) runs on every push; a red
+   commit blocks the next push.
+2. **One sub-step = one commit.** Plan docs from v0.1.2 onwards
+   include a "Sub-steps (one commit each)" section per Part with
+   explicit file targets and acceptance gates. Honour those
+   boundaries even if the next sub-step looks trivial — they exist
+   so reverting any single commit leaves the repo working.
+3. **Commit message format:** `v0.1.X Part N.M: <subject>` for
+   per-step commits; `v0.1.X: <subject>` for cross-cutting commits
+   (baseline, README, version bump).
+4. **Plan-field changes require a same-commit checklist.** Any
+   commit that adds or removes a field on `WGridderPlan` must, in
+   the same commit, update: `_plan_aux`, the `register_pytree_node`
+   flatten/unflatten in `planning.py`, AGENTS.md §4's static-vs-leaf
+   list, and any test asserting the pytree leaf count (§11 "Don'ts"
+   covers why).
+5. **Don't squash per-step commits at PR time.** The history is the
+   audit trail for which sub-step introduced any regression.
+
+### Per-change checklist
+
 The "ship a perf change" checklist:
 
 1. `pixi run -e dev lint` &mdash; ruff clean.
@@ -255,6 +307,10 @@ The "ship a perf change" checklist:
 6. Update `README.md` if user-facing.
 7. Update `AGENTS.md` (this file) if conventions or design decisions
    change.
+8. For a tagged release: bump `src/jax_nufft/_version.py`, update the
+   roadmap/history in this file to move the just-shipped items into
+   §9 (history), and add a changelog entry to the corresponding
+   `docs/v0.1.X-plan.md` "Release checklist" section.
 
 ---
 
@@ -276,8 +332,9 @@ Two improvements (`docs/v0.1.1-plan.md` has the full motivation):
 
 **Part 1: standard n_w.** Reverted v0.1's W-dependent oversampling to
 a W-independent `x0 = 0.25` (matching ducc's `ofactor=2` kernels for
-our FINUFFT `sigma=2` kernel choice). `n_w` drops by `W/4`. The
-phi_hat table compensates with a W-dependent oversample
+our FINUFFT `sigma=2` kernel choice). `n_w` shrinks to roughly `4/W`
+of v0.1's value (since v0.1 used `x0 = 1/W` and `n_w_inner ∝ 1/x0`).
+The phi_hat table compensates with a W-dependent oversample
 (`phi_hat_oversample_for_w` in `kernel.py`).
 
 **Part 2: windowed per-plane scan.** Visibilities are sorted by `w`
@@ -324,81 +381,47 @@ The repo name and module layout (`jax_nufft.<feature>`) anticipate
 this expansion. Treat `wgridder.py` as the first of N feature modules
 rather than the whole package.
 
-### v0.1.2 ideation
+### v0.1.2 prioritised performance plan
 
-Two concrete improvements to the current codebase that look ripe for
-a v0.1.2 release. Both are independent and additive; either could be
-shipped alone.
+The detailed v0.1.2 plan lives in `docs/v0.1.2-plan.md`. Plan docs in
+this repo follow a consistent template — when writing the next one
+(`v0.1.3-plan.md`, etc.) preserve the structure:
+**Scope / Non-goals / Baseline / numbered Parts (Problem / Proposed
+change / Tests / Expected impact / Risk) / Lower-priority follow-ups /
+Release checklist**. The Parts are ordered by expected value;
+implementation risk is recorded per-Part rather than driving the
+ordering.
 
-#### Idea 1: Auto-select `w_strategy` from plan diagnostics
+In priority order, the high-value candidates are:
 
-The v0.1.1 benchmark sweep showed that **windowed strategies help on
-the adjoint when `n_w >> W` and the w-distribution is reasonably
-uniform**, while at zenith (`n_w ~ W`) windowed and dense are
-essentially tied. Today users have to know this and pick by hand. A
-small heuristic in `make_plan` (or in `dirty2vis` / `vis2dirty`)
-could pick automatically:
-
-```python
-def _auto_w_strategy(plan, *, is_adjoint: bool) -> str:
-    if plan.n_w <= plan.w_kernel_width + 2:
-        return "dense_scan"               # too few planes to slice
-    if plan.window_padding_overhead > 5.0:
-        return "dense_scan"               # pathological w-distribution
-    if is_adjoint and plan.n_w / plan.w_kernel_width > 2.0:
-        return "windowed_scan"            # adjoint where windowing wins
-    return "dense_scan"
-```
-
-Concrete tasks:
-* Add `w_strategy="auto"` as a new accepted value that runs this
-  heuristic at call time (cheap; just a Python `if`).
-* Make it the default for `dirty2vis` / `vis2dirty` once the
-  heuristic is benchmark-validated.
-* Add a small benchmark-driven test that the heuristic doesn't pick a
-  loser on any of the four telescopes x both pointings.
-* Document `plan.window_padding_overhead` and the auto rules in the
-  README.
-
-Risk: low. The dense path is always a valid fallback, and the
-heuristic only narrows choice — it doesn't change algorithmic
-behaviour.
-
-Expected impact: 1.2–1.5x adjoint speedup on the typical off-zenith
-workloads, for users who haven't bothered to pick by hand.
-
-#### Idea 2: GPU benchmark sweep + cuFINUFFT-aware defaults
-
-All v0.1.1 strategy decisions are based on CPU measurements. The
-`pixi.toml` already has a `gpu` feature gated on Linux+CUDA, but no
-GPU benchmarks have been run. The most likely surprises:
-
-* `windowed_vmap` may become the clear winner on GPU even though it's
-  marginal on CPU, because the type-1/type-2 NUFFT throughput on
-  cuFINUFFT scales much more favourably with batch size than CPU
-  FINUFFT does, *and* the `n_w * image_size` transient memory that
-  hurts CPU `vmap` variants is fine on consumer GPUs.
-* The scatter-add `vis_acc.at[rows_k].add(contrib)` in the windowed
-  forward must compile to an efficient XLA scatter on GPU. If it
-  shows up hot in nsys profiling, alternatives are
-  `jax.ops.segment_sum` (we have sorted indices, so this is a free
-  upgrade) or a custom XLA op.
-
-Concrete tasks:
-* Provision a Linux+CUDA machine, install `pixi run -e gpu`, run the
-  benchmark sweep at `--bench-pointing=both`.
-* Compare GPU rankings vs CPU rankings; if the rankings invert,
-  consider making the auto-select heuristic platform-aware
-  (`jax.devices()[0].platform`).
-* If scatter-add is hot, replace with `segment_sum`.
-
-Risk: medium. The investigation may surface real cuFINUFFT
-ergonomics issues (e.g., compile time per `(uvw, plan)` pair) that
-need a workaround.
-
-Expected impact: hard to predict in advance; the goal is to get a
-defensible "this is the right default on GPU" answer rather than a
-specific speedup.
+1. **Windowed forward accumulation without per-plane full-row
+   scatter.** `_channel_forward_windowed` currently builds a full
+   `(n_rows,)` zero vector for every w-plane and scatters the window
+   contribution back to original row order. Since the coordinates are
+   already w-sorted, accumulate in sorted order with contiguous slice
+   updates and unsort once at the end. This is the clearest local hot
+   path improvement.
+2. **No-w / constant-w fast path.** If the plan has zero or tiny
+   w-extent, bypass the w-plane stack and use a single 2D NUFFT pair.
+   This should give an immediate `~n_w` win for coplanar / zenith-like
+   workloads.
+3. **Precompute FINUFFT coordinates in the plan.** Store
+   `u_finufft`, `v_finufft`, and sorted variants as plan leaves
+   instead of recomputing them inside every channel call.
+4. **Add `w_strategy="auto"` from plan diagnostics.** Use
+   `n_w / W` and `window_padding_overhead` to avoid making users pick
+   the slow strategy manually. Keep `"dense_scan"` as the conservative
+   fallback and benchmark before making `"auto"` the default.
+5. **Build a GPU benchmarking suite (GH200 target).** The existing
+   `pytest-benchmark`-based suite isn't accurate on GPU (no async
+   sync, no compile/run separation, no HBM metric). Adds a
+   harness module + `tests/test_benchmark_gpu.py` with hardware
+   fingerprint, async-aware timing, and a stable JSON schema. Land
+   first; Part 6 uses it.
+6. **Run a GPU benchmark sweep and tune defaults for cuFINUFFT.**
+   Use the Part 5 suite on GH200. Confirm whether `windowed_vmap`,
+   sorted accumulation, or a new strategy becomes preferable on GPU
+   before changing GPU-facing defaults.
 
 ### Other ideas (not yet sized)
 
@@ -409,14 +432,14 @@ These are seeds for later releases, not v0.1.2 candidates:
   `(n_chan, n_rows)` we could keep only `sort_perm` and apply it at
   scan time, trading one gather per scan iter for half the plan
   memory.
-* **Plan-time pre-compilation cache.** Currently each
+* **Plan-time pre-compilation cache (JIT-level).** Currently each
   `dirty2vis(plan, ..., w_strategy=...)` JIT-compiles on the first
   call. A `jax_nufft.compile_plan(plan, w_strategy=...)` helper that
   forces the compile at plan-time would let optimisation pipelines
-  amortise compile cost into setup.
-* **`segment_sum` everywhere.** Replace the scatter-add in
-  `_channel_forward_windowed` with `jax.ops.segment_sum`. Already
-  noted as a GPU candidate; may also help CPU.
+  amortise compile cost into setup. This is distinct from the
+  FINUFFT-plan reuse idea under "Strategic intent" above, which is
+  about caching cuFINUFFT/FINUFFT plans (a C-library object) across
+  calls — solving the same problem at a different layer.
 * **Per-channel `n_w`.** Currently `n_w`, `dw`, `w_kernel_scale` are
   shared across channels (taken from the worst-case w-extent). For
   wide-bandwidth observations this can be wasteful at the low end of
@@ -432,7 +455,7 @@ These are seeds for later releases, not v0.1.2 candidates:
   and confirming `min(phi_hat) > safety_floor` across `W in {4, 6, 8, 10}`.
   v0.1.1 picks the oversample as a function of `W` precisely because
   v0.1's constant-32 default broke conditioning at the wider eta
-  range.
+  range. (`safety_floor` is defined in `src/jax_nufft/kernel.py`.)
 * Don't bypass `_canonicalise_w_strategy` by hard-coding the v0.1
   names in new code. They are user-input aliases only; the internal
   dispatch uses the canonical names.
@@ -440,7 +463,8 @@ These are seeds for later releases, not v0.1.2 candidates:
   `_plan_aux` (for static fields) AND the `register_pytree_node`
   flatten / unflatten (for traced fields). The pytree registration
   is positional; mismatching it produces silent corruption rather
-  than a clean error.
+  than a clean error. See §8 commit-per-step rule 4 for the full
+  plan-field checklist (this don't is its load-bearing subset).
 * Don't introduce mutable state (caches, module-level dicts, etc.)
   in the call path. The whole point of the plan-then-call API is that
   every per-call state is in the plan.
