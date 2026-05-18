@@ -200,8 +200,14 @@ def _channel_forward_windowed(
     # explicitly so the slice is always in-bounds.
     lo_max = max(n_rows - max_window_size, 0)
 
-    def plane_to_vis(lo_raw: Array, w_k: Array) -> Array:
-        """Return the per-row vis contribution from plane k as a (n_rows,) array."""
+    def plane_to_window(lo_raw: Array, w_k: Array) -> tuple[Array, Array]:
+        """Compute one w-plane's per-window contribution.
+
+        Returns ``(lo, contrib)`` where ``lo`` is the clamped sorted-row
+        start of the window and ``contrib`` is the ``(max_window_size,)``
+        complex contribution in sorted-row order (i.e. aligned with
+        ``plan.uvw_lambda_sorted[c, lo:lo+max_window_size]``).
+        """
         lo = jnp.clip(lo_raw, 0, lo_max)
 
         u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (max_window_size,))
@@ -216,24 +222,35 @@ def _channel_forward_windowed(
 
         z = (w_k_lambda - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
-        contrib = contrib * kernel_w
-
-        rows_k = jax.lax.dynamic_slice(plan.sort_perm, (lo,), (max_window_size,))
-        # vmap variant materialises one (n_rows,) array per plane; scan
-        # variant folds it into the carry below.
-        return jnp.zeros((n_rows,), dtype=cdtype).at[rows_k].add(contrib)
+        return lo, contrib * kernel_w
 
     if w_strategy == "windowed_vmap":
-        contributions = jax.vmap(plane_to_vis)(window_start_c, plan.w_centers)
+        # vmap path materialises one (n_rows,) row-order vector per plane
+        # and sums; unchanged from the v0.1.1 behaviour aside from the
+        # plane_to_window factoring.
+        def plane_to_full_rows(lo_raw: Array, w_k: Array) -> Array:
+            lo, contrib = plane_to_window(lo_raw, w_k)
+            rows_k = jax.lax.dynamic_slice(plan.sort_perm, (lo,), (max_window_size,))
+            return jnp.zeros((n_rows,), dtype=cdtype).at[rows_k].add(contrib)
+
+        contributions = jax.vmap(plane_to_full_rows)(window_start_c, plan.w_centers)
         return jnp.sum(contributions, axis=0)
 
-    def step(vis_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
+    # windowed_scan path: keep the carry in sorted-row order so each plane
+    # touches only its (max_window_size,)-sized slice. The per-step
+    # dynamic_slice + add + dynamic_update_slice is O(max_window_size); the
+    # v0.1.1 code paid O(n_rows) per plane for a full-row zero + scatter.
+    def step(vis_sorted_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
         lo_raw, w_k = args
-        return vis_acc + plane_to_vis(lo_raw, w_k), None
+        lo, contrib = plane_to_window(lo_raw, w_k)
+        old = jax.lax.dynamic_slice(vis_sorted_acc, (lo,), (max_window_size,))
+        new = old + contrib
+        return jax.lax.dynamic_update_slice(vis_sorted_acc, new, (lo,)), None
 
-    vis_init = jnp.zeros((n_rows,), dtype=cdtype)
-    vis_c, _ = jax.lax.scan(step, vis_init, (window_start_c, plan.w_centers))
-    return vis_c
+    vis_sorted_init = jnp.zeros((n_rows,), dtype=cdtype)
+    vis_sorted, _ = jax.lax.scan(step, vis_sorted_init, (window_start_c, plan.w_centers))
+    # Unsort once: sorted[i] is the contribution for original row sort_perm[i].
+    return jnp.empty_like(vis_sorted).at[plan.sort_perm].set(vis_sorted)
 
 
 def _channel_adjoint(
