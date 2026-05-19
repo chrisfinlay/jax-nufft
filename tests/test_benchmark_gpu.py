@@ -122,6 +122,8 @@ def _common_row_fields(
         "n_rows": int(plan.n_rows),
         "n_pix": int(plan.n_l),
         "n_w": int(plan.n_w),
+        "w_kernel_width": int(plan.w_kernel_width),
+        "window_padding_overhead": float(plan.window_padding_overhead),
         "is_constant_w": bool(plan.is_constant_w),
         "median_s": stats["median_s"],
         "min_s": stats["min_s"],
