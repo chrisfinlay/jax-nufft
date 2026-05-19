@@ -29,7 +29,11 @@ import numpy as np
 import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
-from tests.bench_harness import capture_fingerprint, time_jax_callable
+from tests.bench_harness import (
+    capture_fingerprint,
+    snapshot_hbm,
+    time_jax_callable,
+)
 from tests.conftest import Telescope, synthetic_uvw
 
 
@@ -95,7 +99,18 @@ def _common_row_fields(
     channel_strategy: str,
     stats: dict,
     compile_s: float,
+    hbm_pre: dict[str, int] | None,
+    hbm_post: dict[str, int] | None,
 ) -> dict[str, Any]:
+    # device.memory_stats() peak_bytes_in_use is monotonic across the
+    # process. We record the raw post value plus pre snapshots so
+    # downstream can compute the per-cell delta:
+    #   transient_bytes = peak_post - bytes_in_use_pre   (if peak_post > peak_pre)
+    # When peak_post == peak_pre, this cell's transient did NOT exceed any
+    # earlier cell's; the bound is (peak_pre - bytes_in_use_pre).
+    def _pull(snap: dict[str, int] | None, key: str) -> int | None:
+        return None if snap is None else snap[key]
+
     return {
         "op": op,
         "w_strategy": w_strategy,
@@ -117,10 +132,11 @@ def _common_row_fields(
         "cv": stats["cv"],
         "iters": stats["iters"],
         "warmup": stats["warmup"],
-        # peak HBM via jax.profiler.device_memory_profile is a serialized
-        # protobuf and parsing it is a Part-5-followup; record None for now
-        # so the schema stays stable.
-        "peak_hbm_bytes": None,
+        "peak_hbm_bytes": _pull(hbm_post, "peak_bytes_in_use"),
+        "bytes_in_use_pre": _pull(hbm_pre, "bytes_in_use"),
+        "peak_bytes_in_use_pre": _pull(hbm_pre, "peak_bytes_in_use"),
+        "bytes_in_use_post": _pull(hbm_post, "bytes_in_use"),
+        "largest_alloc_size_post": _pull(hbm_post, "largest_alloc_size"),
         "compile_s": compile_s,
     }
 
@@ -148,6 +164,13 @@ def _measure_op(op: str, plan, image, vis, w_strategy: str, channel_strategy: st
                 channel_strategy=channel_strategy,
             )
 
+    # Snapshot HBM *before* the first call so per-cell deltas exclude any
+    # session-resident plan / inputs that already lived on-device. Note
+    # that the plan + image/vis arrays *were* placed on device by the
+    # caller before _measure_op runs, so they count as "pre-resident"
+    # baseline -- bytes_in_use_pre reflects that.
+    hbm_pre = snapshot_hbm()
+
     # Time the very first call so we can report a rough compile_s.
     t0 = time.perf_counter()
     jax.block_until_ready(fn())
@@ -158,7 +181,8 @@ def _measure_op(op: str, plan, image, vis, w_strategy: str, channel_strategy: st
     # subtracting steady-state median is a coarse but plan-doc-sanctioned
     # estimate of the compile cost.
     compile_s = max(first_call_s - stats["median_s"], 0.0)
-    return stats, compile_s
+    hbm_post = snapshot_hbm()
+    return stats, compile_s, hbm_pre, hbm_post
 
 
 # -- the parametrised matrix ------------------------------------------------
@@ -179,12 +203,21 @@ def test_bench_gpu_bench_pointing(
 ) -> None:
     tel, zen_deg = bench_telescope_pointing
     _, plan, image, vis = _make_inputs(tel, zen_deg, seed=7)
-    stats, compile_s = _measure_op(
+    stats, compile_s, hbm_pre, hbm_post = _measure_op(
         op, plan, image, vis, w_strategy, channel_strategy
     )
     gpu_bench_results.append(
         _common_row_fields(
-            tel, zen_deg, plan, op, w_strategy, channel_strategy, stats, compile_s
+            tel,
+            zen_deg,
+            plan,
+            op,
+            w_strategy,
+            channel_strategy,
+            stats,
+            compile_s,
+            hbm_pre,
+            hbm_post,
         )
     )
 
@@ -204,11 +237,20 @@ def test_bench_gpu_large_pointing(
 ) -> None:
     tel, zen_deg = gh200_large_pointing
     _, plan, image, vis = _make_inputs(tel, zen_deg, seed=11)
-    stats, compile_s = _measure_op(
+    stats, compile_s, hbm_pre, hbm_post = _measure_op(
         op, plan, image, vis, w_strategy, channel_strategy
     )
     gpu_bench_results.append(
         _common_row_fields(
-            tel, zen_deg, plan, op, w_strategy, channel_strategy, stats, compile_s
+            tel,
+            zen_deg,
+            plan,
+            op,
+            w_strategy,
+            channel_strategy,
+            stats,
+            compile_s,
+            hbm_pre,
+            hbm_post,
         )
     )

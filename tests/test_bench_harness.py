@@ -14,7 +14,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from tests.bench_harness import capture_fingerprint, time_jax_callable
+from tests.bench_harness import (
+    capture_fingerprint,
+    snapshot_hbm,
+    time_jax_callable,
+)
 
 
 def _double(x):
@@ -144,6 +148,52 @@ def test_capture_fingerprint_gpu_fields_consistent_with_backend() -> None:
     else:
         assert isinstance(gpus, list) and gpus
         assert isinstance(drv, str) and drv
+
+
+def test_snapshot_hbm_shape_or_none() -> None:
+    """``snapshot_hbm`` must return either a stable-key dict (GPU host) or
+    ``None`` (CPU host where ``device.memory_stats`` is missing). The
+    schema of the dict must match the keys the GPU bench writes into the
+    JSON, otherwise downstream consumers break silently."""
+    snap = snapshot_hbm()
+    if snap is None:
+        # CPU host: confirm we are on CPU; if we report None on GPU
+        # something has gone wrong in the wrapper.
+        assert jax.default_backend() == "cpu", (
+            "snapshot_hbm returned None on a non-CPU backend"
+        )
+        return
+    assert set(snap.keys()) == {
+        "bytes_in_use",
+        "peak_bytes_in_use",
+        "largest_alloc_size",
+    }
+    for k, v in snap.items():
+        assert isinstance(v, int), f"{k} must be int, got {type(v).__name__}"
+        assert v >= 0, f"{k} must be non-negative"
+
+
+def test_snapshot_hbm_peak_is_monotonic() -> None:
+    """``peak_bytes_in_use`` is documented as monotonic. If we allocate a
+    bigger array than anything seen so far, the second snapshot must
+    report a peak >= the first; allocating + freeing must not *decrease*
+    the peak (free-then-snapshot still sees the high-water mark)."""
+    snap0 = snapshot_hbm()
+    if snap0 is None:
+        pytest.skip("snapshot_hbm unsupported on this backend")
+    # Allocate ~16 MB, force materialisation, then read again. The peak
+    # must be >= snap0.peak. We deliberately do not assert equality with
+    # snap0.bytes_in_use + payload size since JAX may have pre-existing
+    # device buffers from earlier tests in the session.
+    payload = jnp.ones((2048, 2048), dtype=jnp.float32)
+    jax.block_until_ready(payload)
+    snap1 = snapshot_hbm()
+    assert snap1 is not None
+    assert snap1["peak_bytes_in_use"] >= snap0["peak_bytes_in_use"]
+    del payload
+    snap2 = snapshot_hbm()
+    assert snap2 is not None
+    assert snap2["peak_bytes_in_use"] >= snap1["peak_bytes_in_use"]
 
 
 def test_time_jax_callable_pytree_output_syncs() -> None:

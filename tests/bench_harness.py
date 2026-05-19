@@ -13,6 +13,8 @@ Public surface
   a dict of summary statistics.
 * :func:`capture_fingerprint` -- (added in Part 5.2) capture a reproducible
   hardware/software fingerprint to embed in benchmark JSON.
+* :func:`snapshot_hbm` -- (Part 5.5) lightweight wrapper around
+  ``jax.devices()[0].memory_stats()`` for HBM accounting in the GPU bench.
 
 This module is import-safe on CPU (no GPU-only deps, no jax-finufft
 imports at module load).
@@ -249,6 +251,46 @@ def capture_fingerprint(include_hostname: bool = False) -> dict[str, Any]:
     if include_hostname:
         fp["hostname"] = socket.gethostname()
     return fp
+
+
+def snapshot_hbm(device: Any | None = None) -> dict[str, int] | None:
+    """Return a small HBM snapshot from JAX's BFC allocator.
+
+    Wraps ``device.memory_stats()`` and pulls the three keys the GPU bench
+    needs for per-cell accounting: current live bytes, the session-wide
+    peak, and the largest single allocation seen. The peak is *monotonic*
+    across a process lifetime -- JAX does not expose a reset for it -- so
+    consumers comparing cells should look at the *delta* between the
+    pre-cell and post-cell snapshots rather than the raw post value.
+
+    Parameters
+    ----------
+    device:
+        A JAX device. Defaults to ``jax.devices()[0]``.
+
+    Returns
+    -------
+    A dict with int keys ``bytes_in_use``, ``peak_bytes_in_use``,
+    ``largest_alloc_size`` on platforms where the API is available;
+    ``None`` on CPU or older JAX versions where ``memory_stats`` is
+    missing / unsupported.
+    """
+    if device is None:
+        device = jax.devices()[0]
+    fn = getattr(device, "memory_stats", None)
+    if fn is None:
+        return None
+    try:
+        raw = fn()
+    except Exception:  # noqa: BLE001 -- CPU backends raise, swallow.
+        return None
+    if not raw:
+        return None
+    return {
+        "bytes_in_use": int(raw.get("bytes_in_use", 0)),
+        "peak_bytes_in_use": int(raw.get("peak_bytes_in_use", 0)),
+        "largest_alloc_size": int(raw.get("largest_alloc_size", 0)),
+    }
 
 
 def _cli_main(argv: list[str]) -> int:

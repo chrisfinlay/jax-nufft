@@ -72,8 +72,11 @@ metadata. Stable keys (the merge script in v0.1.3+ keys joins by these):
 | `mean_s`           | `float` | Time-harness mean                                                 |
 | `stdev_s`, `cv`    | `float` | Time-harness stdev / coefficient of variation                     |
 | `iters`, `warmup`  | `int`   | Time-harness configuration used                                   |
-| `peak_hbm_bytes`   | `int`/null | From `jax.profiler.device_memory_profile` (Part 5.4+);          |
-|                    |         | `null` on platforms where the profile API is unavailable          |
+| `peak_hbm_bytes`           | `int`/null | `device.memory_stats()["peak_bytes_in_use"]` measured *after* the cell's warmup + timed iters. Monotonic across the pytest session: equal across cells whose transient did not exceed any earlier cell's. |
+| `bytes_in_use_pre`         | `int`/null | Live HBM at cell start (plan + inputs resident before the op runs). Subtract from `peak_hbm_bytes` to bound this cell's transient (only meaningful when `peak_hbm_bytes > peak_bytes_in_use_pre`). |
+| `peak_bytes_in_use_pre`    | `int`/null | Session peak at cell start. If `peak_hbm_bytes == peak_bytes_in_use_pre` the cell's transient was bounded by some earlier cell; if greater, this cell pushed a new high-water mark. |
+| `bytes_in_use_post`        | `int`/null | Live HBM at cell end (sanity check: should usually return to roughly `bytes_in_use_pre`). |
+| `largest_alloc_size_post`  | `int`/null | Largest single allocation seen on this device, from `memory_stats()`. Also monotonic. |
 | `compile_s`        | `float` | First-call wall-clock minus steady-state median                   |
 
 Result schema constraints:
