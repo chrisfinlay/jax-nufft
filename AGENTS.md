@@ -148,8 +148,11 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   window_size, u_finufft, v_finufft`) are JAX device arrays.
   `u_finufft` / `v_finufft` are `(n_chan, n_rows)` precomputed
   FINUFFT-input coordinates (`2π · pixsize_* · uvw_lambda[..., axis]`,
-  v0.1.2+). Sorted variants are not stored; the windowed helpers
-  gather them via `plan.sort_perm` at scan time.
+  v0.1.2+). They add roughly `2 · n_chan · n_rows · sizeof(real)` to the
+  plan's HBM footprint (about +33% on top of the dense `uvw_lambda*`
+  arrays since each is now-half the shape). Sorted variants are not
+  stored; the windowed helpers gather them via `plan.sort_perm` at
+  scan time, trading half the memory for one gather per channel iter.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and
