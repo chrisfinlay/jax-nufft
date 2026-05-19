@@ -76,6 +76,20 @@ MEERKAT = Telescope(
     n_pix=256,
     fov_rad=math.radians(1.5),
 )
+# v0.1.2 Part 5.4: a GH200-class fixture for the GPU bench suite. Sized so
+# the transient dense_vmap allocation (n_w * n_pix^2 complex64) is on the
+# order of ~10-20 GB -- big enough to demand real HBM bandwidth, far below
+# the GH200's 96 GB so we don't OOM. Off-zenith pointing produces ~n_w in
+# the low hundreds with these parameters.
+GH200_LARGE = Telescope(
+    name="GH200_large",
+    freq_hz=1.4e9,
+    n_rows=50_000,
+    sigma_uv_m=4000.0,
+    max_baseline_m=12_000.0,
+    n_pix=2048,
+    fov_rad=math.radians(2.0),
+)
 
 
 def synthetic_uvw(
@@ -181,6 +195,21 @@ def bench_telescope_pointing(request) -> tuple[Telescope, float]:
     return request.param
 
 
+@pytest.fixture(
+    params=[
+        (GH200_LARGE, 0.0),
+        (GH200_LARGE, 30.0),
+    ],
+    ids=lambda v: _telescope_pointing_id(v),
+)
+def gh200_large_pointing(request) -> tuple[Telescope, float]:
+    """GH200-sized fixture for the v0.1.2 GPU bench suite. Only used by
+    ``tests/test_benchmark_gpu.py``; gated by ``--runbench-gpu`` and a GPU
+    backend so accidental CPU collection doesn't try to allocate the
+    multi-GB transient arrays."""
+    return request.param
+
+
 _BENCH_POINTING_FILTERS: dict[str, set[float]] = {
     "zenith": {0.0},
     "off30": {30.0},
@@ -230,7 +259,9 @@ def pytest_collection_modifyitems(config, items):
             if platform != "gpu":
                 item.add_marker(skip_bench_gpu_platform)
                 continue
-        if is_bench_item and not runbench:
+            # --runbench-gpu tests are gated only by their own flag +
+            # platform; don't apply --runbench gating below.
+        elif is_bench_item and not runbench:
             item.add_marker(skip_bench)
             continue
         if is_bench_item:
