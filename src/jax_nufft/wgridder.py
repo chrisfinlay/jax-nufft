@@ -127,27 +127,31 @@ def _validate_weights(weights: Array | None, plan: WGridderPlan) -> Array | None
 
 def _channel_forward(
     image_c: Array,
-    uvw_c: Array,
+    u_ft_c: Array,
+    v_ft_c: Array,
+    w_lambda_c: Array,
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
 ) -> Array:
-    """Forward operator for a single channel: image (n_l, n_m) -> vis (n_rows,)."""
-    two_pi = 2.0 * jnp.pi
-    u_ft = (two_pi * plan.pixsize_l) * uvw_c[:, 0]
-    v_ft = (two_pi * plan.pixsize_m) * uvw_c[:, 1]
-    w_lambda = uvw_c[:, 2]
+    """Forward operator for a single channel: image (n_l, n_m) -> vis (n_rows,).
 
+    ``u_ft_c`` / ``v_ft_c`` are the precomputed FINUFFT input coordinates for
+    this channel (``2π · pixsize_* · uvw_lambda[c, :, 0|1]``); ``w_lambda_c``
+    is the per-channel w-component in wavelengths used for the kernel z and
+    image-domain shift.
+    """
+    two_pi = 2.0 * jnp.pi
     cdtype = image_c.dtype
-    n_rows = uvw_c.shape[0]
+    n_rows = u_ft_c.shape[0]
 
     def w_plane_contribution(w_k: Array) -> Array:
         phase = (two_pi * w_k) * plan.n_minus_1  # (n_l, n_m), real
         shift = jnp.exp((1j * phase).astype(cdtype))
         image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
-        vis_k = nufft2(image_k, u_ft, v_ft, iflag=-1, eps=plan.epsilon, opts=opts)
+        vis_k = nufft2(image_k, u_ft_c, v_ft_c, iflag=-1, eps=plan.epsilon, opts=opts)
         # w-direction kernel applied at the visibility output
-        z = (w_lambda - w_k) / plan.w_kernel_scale
+        z = (w_lambda_c - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
         return vis_k * kernel_w
 
@@ -255,26 +259,27 @@ def _channel_forward_windowed(
 
 def _channel_adjoint(
     vis_c: Array,
-    uvw_c: Array,
+    u_ft_c: Array,
+    v_ft_c: Array,
+    w_lambda_c: Array,
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
 ) -> Array:
-    """Adjoint operator for a single channel: vis (n_rows,) -> dirty (n_l, n_m)."""
-    two_pi = 2.0 * jnp.pi
-    u_ft = (two_pi * plan.pixsize_l) * uvw_c[:, 0]
-    v_ft = (two_pi * plan.pixsize_m) * uvw_c[:, 1]
-    w_lambda = uvw_c[:, 2]
+    """Adjoint operator for a single channel: vis (n_rows,) -> dirty (n_l, n_m).
 
+    See :func:`_channel_forward` for the coord-arg convention.
+    """
+    two_pi = 2.0 * jnp.pi
     cdtype = vis_c.dtype
 
     def w_plane_contribution(w_k: Array) -> Array:
-        z = (w_lambda - w_k) / plan.w_kernel_scale
+        z = (w_lambda_c - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
         vis_k = vis_c * kernel_w
         # Adjoint of the type-2 NUFFT is type 1 with iflag = +1 (the conjugate
         # of iflag=-1 used in the forward).
-        h_k = nufft1((plan.n_l, plan.n_m), vis_k, u_ft, v_ft, iflag=+1, eps=plan.epsilon, opts=opts)
+        h_k = nufft1((plan.n_l, plan.n_m), vis_k, u_ft_c, v_ft_c, iflag=+1, eps=plan.epsilon, opts=opts)
         # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1)) is its conjugate.
         phase = (two_pi * w_k) * plan.n_minus_1
         shift = jnp.exp((-1j * phase).astype(cdtype))
@@ -334,17 +339,26 @@ def _dirty2vis_jit(
             raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
         return vis_per_chan.T  # (n_rows, n_chan)
 
+    w_lambda = plan.uvw_lambda[..., 2]  # (n_chan, n_rows)
     if channel_strategy == "vmap":
         vis_per_chan = jax.vmap(
-            lambda im_c, uvw_c: _channel_forward(im_c, uvw_c, plan, opts, w_strategy)
-        )(image, plan.uvw_lambda)
+            lambda im_c, u_c, v_c, w_c: _channel_forward(
+                im_c, u_c, v_c, w_c, plan, opts, w_strategy
+            )
+        )(image, plan.u_finufft, plan.v_finufft, w_lambda)
     elif channel_strategy == "scan":
 
-        def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
-            im_c, uvw_c = args
-            return None, _channel_forward(im_c, uvw_c, plan, opts, w_strategy)
+        def step(
+            _: None, args: tuple[Array, Array, Array, Array]
+        ) -> tuple[None, Array]:
+            im_c, u_c, v_c, w_c = args
+            return None, _channel_forward(
+                im_c, u_c, v_c, w_c, plan, opts, w_strategy
+            )
 
-        _, vis_per_chan = jax.lax.scan(step, None, (image, plan.uvw_lambda))
+        _, vis_per_chan = jax.lax.scan(
+            step, None, (image, plan.u_finufft, plan.v_finufft, w_lambda)
+        )
     else:
         raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
 
@@ -501,16 +515,26 @@ def _vis2dirty_jit(
         else:
             raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
     elif channel_strategy == "vmap":
+        w_lambda = plan.uvw_lambda[..., 2]
         dirty_per_chan = jax.vmap(
-            lambda v_c, uvw_c: _channel_adjoint(v_c, uvw_c, plan, opts, w_strategy)
-        )(vis_per_chan, plan.uvw_lambda)
+            lambda v_c, u_c, vv_c, w_c: _channel_adjoint(
+                v_c, u_c, vv_c, w_c, plan, opts, w_strategy
+            )
+        )(vis_per_chan, plan.u_finufft, plan.v_finufft, w_lambda)
     elif channel_strategy == "scan":
+        w_lambda = plan.uvw_lambda[..., 2]
 
-        def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
-            v_c, uvw_c = args
-            return None, _channel_adjoint(v_c, uvw_c, plan, opts, w_strategy)
+        def step(
+            _: None, args: tuple[Array, Array, Array, Array]
+        ) -> tuple[None, Array]:
+            v_c, u_c, vv_c, w_c = args
+            return None, _channel_adjoint(
+                v_c, u_c, vv_c, w_c, plan, opts, w_strategy
+            )
 
-        _, dirty_per_chan = jax.lax.scan(step, None, (vis_per_chan, plan.uvw_lambda))
+        _, dirty_per_chan = jax.lax.scan(
+            step, None, (vis_per_chan, plan.u_finufft, plan.v_finufft, w_lambda)
+        )
     else:
         raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
 
