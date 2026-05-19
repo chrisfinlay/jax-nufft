@@ -145,7 +145,11 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   "silent pytree corruption" bugs.
 * Plan **traced fields** (`uvw_lambda, w_centers, n_minus_1,
   phi_hat_n, sort_perm, uvw_lambda_sorted, window_start,
-  window_size`) are JAX device arrays.
+  window_size, u_finufft, v_finufft`) are JAX device arrays.
+  `u_finufft` / `v_finufft` are `(n_chan, n_rows)` precomputed
+  FINUFFT-input coordinates (`2π · pixsize_* · uvw_lambda[..., axis]`,
+  v0.1.2+). Sorted variants are not stored; the windowed helpers
+  gather them via `plan.sort_perm` at scan time.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and

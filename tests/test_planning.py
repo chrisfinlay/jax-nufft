@@ -73,6 +73,31 @@ def test_plan_uvw_lambda_correct() -> None:
     np.testing.assert_allclose(np.asarray(plan.uvw_lambda), expected, rtol=1e-6)
 
 
+def test_plan_finufft_coords_match_uvw_lambda() -> None:
+    """v0.1.2 Part 3.1: ``u_finufft`` / ``v_finufft`` must equal
+    ``2π · pixsize_* · uvw_lambda[..., axis]`` so the channel helpers can
+    read them directly from the plan instead of recomputing per call."""
+    uvw = _baseline_uvw(n_rows=12, max_baseline=80.0)
+    freq = np.array([1.4e9, 2.0e9])
+    pixsize_l = 1.3e-3
+    pixsize_m = 1.7e-3
+    plan = make_plan(
+        uvw=uvw,
+        freq=freq,
+        image_shape=(32, 32),
+        pixsize_l=pixsize_l,
+        pixsize_m=pixsize_m,
+        epsilon=1e-6,
+    )
+    expected_u = (2.0 * np.pi * pixsize_l) * np.asarray(plan.uvw_lambda)[..., 0]
+    expected_v = (2.0 * np.pi * pixsize_m) * np.asarray(plan.uvw_lambda)[..., 1]
+    np.testing.assert_allclose(np.asarray(plan.u_finufft), expected_u, rtol=1e-12)
+    np.testing.assert_allclose(np.asarray(plan.v_finufft), expected_v, rtol=1e-12)
+    # And shape matches uvw_lambda's leading dimensions.
+    assert plan.u_finufft.shape == (plan.n_chan, plan.n_rows)
+    assert plan.v_finufft.shape == (plan.n_chan, plan.n_rows)
+
+
 def test_plan_w_centers_span_data() -> None:
     """w-plane centres must extend symmetrically beyond the data range."""
     uvw = _baseline_uvw(n_rows=200, max_baseline=300.0)
@@ -231,8 +256,9 @@ def test_plan_is_a_jax_pytree() -> None:
 
     leaves, treedef = jax.tree_util.tree_flatten(plan)
     # uvw_lambda, w_centers, n_minus_1, phi_hat_n, sort_perm,
-    # uvw_lambda_sorted, window_start, window_size
-    assert len(leaves) == 8
+    # uvw_lambda_sorted, window_start, window_size,
+    # u_finufft, v_finufft  (v0.1.2 Part 3.1 added the last two)
+    assert len(leaves) == 10
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
     # Static fields preserved exactly.

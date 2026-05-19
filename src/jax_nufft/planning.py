@@ -87,6 +87,12 @@ class WGridderPlan:
     uvw_lambda_sorted: Array = field()  # (n_chan, n_rows, 3) — uvw_lambda[:, sort_perm, :]
     window_start: Array = field()  # (n_chan, n_w) int — start idx in sorted array
     window_size: Array = field()  # (n_chan, n_w) int — live window length per plane
+    # v0.1.2 precomputed FINUFFT coordinates (option (b) from the v0.1.2 plan):
+    # ``u_finufft[c, r] = 2π · pixsize_l · uvw_lambda[c, r, 0]`` and likewise
+    # for ``v_finufft``. Sorted variants are NOT stored — the windowed helpers
+    # gather via ``plan.sort_perm`` + ``dynamic_slice`` at scan time.
+    u_finufft: Array = field()  # (n_chan, n_rows) — input row order
+    v_finufft: Array = field()  # (n_chan, n_rows) — input row order
 
     @property
     def image_shape(self) -> tuple[int, int]:
@@ -140,6 +146,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         uvw_lambda_sorted,
         window_start,
         window_size,
+        u_finufft,
+        v_finufft,
     ) = children
     return WGridderPlan(
         n_l=n_l,
@@ -165,6 +173,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         uvw_lambda_sorted=uvw_lambda_sorted,
         window_start=window_start,
         window_size=window_size,
+        u_finufft=u_finufft,
+        v_finufft=v_finufft,
     )
 
 
@@ -180,6 +190,8 @@ jax.tree_util.register_pytree_node(
             p.uvw_lambda_sorted,
             p.window_start,
             p.window_size,
+            p.u_finufft,
+            p.v_finufft,
         ),
         _plan_aux(p),
     ),
@@ -404,6 +416,15 @@ def make_plan(
         # shape is well-defined (e.g. n_rows >= 1 always).
         max_window_size = max(max_window_size, 1)
 
+    # v0.1.2 Part 3: precompute the per-call (2π * pixsize) scaling on u, v
+    # so the channel helpers can read them directly from the plan instead of
+    # re-deriving them on every JIT invocation. Sorted variants are NOT
+    # stored (option (b) in the v0.1.2 plan); the windowed helpers gather
+    # via plan.sort_perm at scan time.
+    two_pi = 2.0 * np.pi
+    u_finufft_np = (two_pi * pixsize_l) * uvw_lambda_np[..., 0]
+    v_finufft_np = (two_pi * pixsize_m) * uvw_lambda_np[..., 1]
+
     return WGridderPlan(
         n_l=int(n_l),
         n_m=int(n_m),
@@ -432,6 +453,8 @@ def make_plan(
         uvw_lambda_sorted=jnp.asarray(uvw_lambda_sorted_np),
         window_start=jnp.asarray(window_start_np),
         window_size=jnp.asarray(window_size_np),
+        u_finufft=jnp.asarray(u_finufft_np),
+        v_finufft=jnp.asarray(v_finufft_np),
     )
 
 
