@@ -36,7 +36,6 @@ from tests.bench_harness import (
 )
 from tests.conftest import Telescope, synthetic_uvw
 
-
 # -- session-scoped accumulator + teardown ----------------------------------
 
 # Default warm + iter counts tuned so the GPU bench suite finishes in
@@ -57,9 +56,7 @@ def gpu_bench_results(request) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
 
     def _finalise() -> None:
-        out_path = os.environ.get(
-            "JAX_NUFFT_BENCH_OUTPUT", "/tmp/jax_nufft_bench_gpu.json"
-        )
+        out_path = os.environ.get("JAX_NUFFT_BENCH_OUTPUT", "/tmp/jax_nufft_bench_gpu.json")
         payload = {
             "fingerprint": capture_fingerprint(),
             "rows": rows,
@@ -82,10 +79,9 @@ def _make_inputs(tel: Telescope, zen_deg: float, seed: int = 0):
     rng = np.random.default_rng(seed + 1)
     image = jnp.asarray(rng.standard_normal((tel.n_pix, tel.n_pix)))
     vis = jnp.asarray(
-        (
-            rng.standard_normal((tel.n_rows, 1))
-            + 1j * rng.standard_normal((tel.n_rows, 1))
-        ).astype(np.complex128)
+        (rng.standard_normal((tel.n_rows, 1)) + 1j * rng.standard_normal((tel.n_rows, 1))).astype(
+            np.complex128
+        )
     )
     return tel, plan, image, vis
 
@@ -115,9 +111,7 @@ def _common_row_fields(
         "op": op,
         "w_strategy": w_strategy,
         "channel_strategy": channel_strategy,
-        "fixture": (
-            f"{tel.name}_{'zenith' if zen_deg == 0.0 else f'off{int(zen_deg)}'}"
-        ),
+        "fixture": (f"{tel.name}_{'zenith' if zen_deg == 0.0 else f'off{int(zen_deg)}'}"),
         "n_chan": int(plan.n_chan),
         "n_rows": int(plan.n_rows),
         "n_pix": int(plan.n_l),
@@ -150,6 +144,7 @@ def _measure_op(op: str, plan, image, vis, w_strategy: str, channel_strategy: st
     Returns ``(stats_dict, compile_s)``.
     """
     if op == "dirty2vis":
+
         def fn():
             return dirty2vis(
                 plan,
@@ -158,6 +153,7 @@ def _measure_op(op: str, plan, image, vis, w_strategy: str, channel_strategy: st
                 channel_strategy=channel_strategy,
             )
     else:
+
         def fn():
             return vis2dirty(
                 plan,

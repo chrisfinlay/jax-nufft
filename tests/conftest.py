@@ -224,7 +224,7 @@ def _jax_platform() -> str:
     machines instead of failing inside cuFINUFFT.
     """
     try:
-        import jax  # noqa: WPS433  -- intentional inline import
+        import jax
     except Exception:  # pragma: no cover
         return "cpu"
     return jax.default_backend()

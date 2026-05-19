@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import warnings
 from functools import partial
-from typing import Literal
+from typing import Literal, cast
 
 import jax
 import jax.numpy as jnp
@@ -53,7 +53,7 @@ WStrategy = Literal[
 ChannelStrategy = Literal["scan", "vmap"]
 
 _CANONICAL_W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
-_W_STRATEGY_ALIASES = {"scan": "dense_scan", "vmap": "dense_vmap"}
+_W_STRATEGY_ALIASES: dict[str, WStrategy] = {"scan": "dense_scan", "vmap": "dense_vmap"}
 
 
 def _canonicalise_w_strategy(
@@ -61,7 +61,7 @@ def _canonicalise_w_strategy(
     *,
     plan: WGridderPlan | None = None,
     is_adjoint: bool | None = None,
-) -> str:
+) -> WStrategy:
     """Resolve user-facing ``w_strategy`` to a canonical name.
 
     ``"auto"`` is resolved here -- in the public wrapper, before the JIT
@@ -81,7 +81,7 @@ def _canonicalise_w_strategy(
             )
         return _auto_w_strategy(plan, is_adjoint=is_adjoint)
     if name in _CANONICAL_W_STRATEGIES:
-        return name
+        return cast(WStrategy, name)
     canonical = _W_STRATEGY_ALIASES.get(name)
     if canonical is not None:
         warnings.warn(
@@ -92,11 +92,11 @@ def _canonicalise_w_strategy(
         return canonical
     raise ValueError(
         f"unknown w_strategy: {name!r}; expected one of "
-        f"{_CANONICAL_W_STRATEGIES + ('auto',) + tuple(_W_STRATEGY_ALIASES)}"
+        f"{(*_CANONICAL_W_STRATEGIES, 'auto', *_W_STRATEGY_ALIASES)}"
     )
 
 
-def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> str:
+def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     """CPU-tuned heuristic from ``docs/v0.1.2-plan.md`` Part 4.
 
     Thresholds calibrated from AGENTS.md §9 CPU measurements where:
@@ -132,7 +132,7 @@ _GPU_PADDING_CUTOFF = 3.0
 _GPU_FORWARD_RATIO_CUTOFF = 3.0
 
 
-def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> str:
+def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     """GPU-tuned heuristic from the v0.1.2 GH200 baseline sweep.
 
     On GH200 (cuFINUFFT on Hopper), the four-way picture across 20
@@ -176,7 +176,7 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> str:
     return "dense_vmap"
 
 
-def _auto_w_strategy(plan: WGridderPlan, *, is_adjoint: bool) -> str:
+def _auto_w_strategy(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     """Pick a canonical ``w_strategy`` for a given plan and operator.
 
     Dispatches to :func:`_auto_w_strategy_cpu` or
@@ -419,7 +419,9 @@ def _channel_adjoint(
         vis_k = vis_c * kernel_w
         # Adjoint of the type-2 NUFFT is type 1 with iflag = +1 (the conjugate
         # of iflag=-1 used in the forward).
-        h_k = nufft1((plan.n_l, plan.n_m), vis_k, u_ft_c, v_ft_c, iflag=+1, eps=plan.epsilon, opts=opts)
+        h_k = nufft1(
+            (plan.n_l, plan.n_m), vis_k, u_ft_c, v_ft_c, iflag=+1, eps=plan.epsilon, opts=opts
+        )
         # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1)) is its conjugate.
         phase = (two_pi * w_k) * plan.n_minus_1
         shift = jnp.exp((-1j * phase).astype(cdtype))
@@ -508,13 +510,9 @@ def _dirty2vis_jit(
         )(image, plan.u_finufft, plan.v_finufft, w_lambda)
     elif channel_strategy == "scan":
 
-        def step(
-            _: None, args: tuple[Array, Array, Array, Array]
-        ) -> tuple[None, Array]:
+        def step(_: None, args: tuple[Array, Array, Array, Array]) -> tuple[None, Array]:
             im_c, u_c, v_c, w_c = args
-            return None, _channel_forward(
-                im_c, u_c, v_c, w_c, plan, opts, w_strategy
-            )
+            return None, _channel_forward(im_c, u_c, v_c, w_c, plan, opts, w_strategy)
 
         _, vis_per_chan = jax.lax.scan(
             step, None, (image, plan.u_finufft, plan.v_finufft, w_lambda)
@@ -613,9 +611,7 @@ def _channel_adjoint_windowed(
         kernel_w = phi(z, plan.beta).astype(cdtype)
         vis_k = vis_k * kernel_w
 
-        h_k = nufft1(
-            (plan.n_l, plan.n_m), vis_k, u_k, v_k, iflag=+1, eps=plan.epsilon, opts=opts
-        )
+        h_k = nufft1((plan.n_l, plan.n_m), vis_k, u_k, v_k, iflag=+1, eps=plan.epsilon, opts=opts)
         phase = (two_pi * w_k) * plan.n_minus_1
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
@@ -708,13 +704,9 @@ def _vis2dirty_jit(
     elif channel_strategy == "scan":
         w_lambda = plan.uvw_lambda[..., 2]
 
-        def step(
-            _: None, args: tuple[Array, Array, Array, Array]
-        ) -> tuple[None, Array]:
+        def step(_: None, args: tuple[Array, Array, Array, Array]) -> tuple[None, Array]:
             v_c, u_c, vv_c, w_c = args
-            return None, _channel_adjoint(
-                v_c, u_c, vv_c, w_c, plan, opts, w_strategy
-            )
+            return None, _channel_adjoint(v_c, u_c, vv_c, w_c, plan, opts, w_strategy)
 
         _, dirty_per_chan = jax.lax.scan(
             step, None, (vis_per_chan, plan.u_finufft, plan.v_finufft, w_lambda)

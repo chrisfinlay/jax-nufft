@@ -53,23 +53,15 @@ def _parity_check(
     plan = make_plan(uvw, freq, (n_pix, n_pix), pixsize, pixsize, eps)
 
     vis_dense = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy="dense_scan"))
-    vis_windowed = np.asarray(
-        dirty2vis(plan, jnp.asarray(image), w_strategy="windowed_scan")
-    )
-    fwd_err = np.linalg.norm(vis_windowed - vis_dense) / max(
-        np.linalg.norm(vis_dense), 1e-30
-    )
+    vis_windowed = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy="windowed_scan"))
+    fwd_err = np.linalg.norm(vis_windowed - vis_dense) / max(np.linalg.norm(vis_dense), 1e-30)
     # Forward: scatter-add reduces identical contributing rows in identical
     # order, so the windowed path is bit-equal to dense (zero error).
     assert fwd_err < 1e-12, f"forward windowed-vs-dense err {fwd_err:.3e}"
 
     dirty_dense = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="dense_scan"))
-    dirty_windowed = np.asarray(
-        vis2dirty(plan, jnp.asarray(vis), w_strategy="windowed_scan")
-    )
-    adj_err = np.linalg.norm(dirty_windowed - dirty_dense) / max(
-        np.linalg.norm(dirty_dense), 1e-30
-    )
+    dirty_windowed = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="windowed_scan"))
+    adj_err = np.linalg.norm(dirty_windowed - dirty_dense) / max(np.linalg.norm(dirty_dense), 1e-30)
     # Adjoint: the NUFFT type 1 sums depend on the set of rows in the
     # batch; the dense/windowed reductions differ in summation order. We
     # accept up to 100*eps relative difference (well within the per-call
@@ -149,19 +141,15 @@ def test_small_nw_zenith_regression() -> None:
     assert plan.n_w <= plan.w_kernel_width + 2
 
     image = rng.standard_normal((32, 32))
-    vis = (
-        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
-    ).astype(np.complex128)
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
 
     vis_dense = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy="dense_scan"))
-    vis_windowed = np.asarray(
-        dirty2vis(plan, jnp.asarray(image), w_strategy="windowed_scan")
-    )
+    vis_windowed = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy="windowed_scan"))
     assert np.allclose(vis_dense, vis_windowed, atol=1e-12, rtol=1e-12)
 
     dirty_dense = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="dense_scan"))
-    dirty_windowed = np.asarray(
-        vis2dirty(plan, jnp.asarray(vis), w_strategy="windowed_scan")
-    )
+    dirty_windowed = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="windowed_scan"))
     err = np.linalg.norm(dirty_windowed - dirty_dense) / np.linalg.norm(dirty_dense)
     assert err < 1e-5

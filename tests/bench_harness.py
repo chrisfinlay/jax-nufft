@@ -31,7 +31,8 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import jax
 
@@ -108,12 +109,13 @@ def time_jax_callable(
     else:
         stdev = 0.0
     cv = stdev / mean if mean > 0 else 0.0
+
     # Percentiles by nearest-rank, robust on small iter counts.
     def _pctile(p: float) -> float:
         if iters == 1:
             return samples_sorted[0]
         # 0-indexed nearest-rank.
-        k = max(0, min(iters - 1, int(round((p / 100.0) * (iters - 1)))))
+        k = max(0, min(iters - 1, round((p / 100.0) * (iters - 1))))
         return samples_sorted[k]
 
     return {
@@ -142,8 +144,7 @@ def _run_cmd(args: list[str], timeout: float = 5.0) -> str | None:
     try:
         out = subprocess.run(
             args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=timeout,
             check=False,
         )
@@ -193,7 +194,7 @@ def _jax_finufft_version() -> str | None:
     """
     try:
         import jax_finufft  # type: ignore
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     return getattr(jax_finufft, "__version__", None)
 
@@ -282,7 +283,7 @@ def snapshot_hbm(device: Any | None = None) -> dict[str, int] | None:
         return None
     try:
         raw = fn()
-    except Exception:  # noqa: BLE001 -- CPU backends raise, swallow.
+    except Exception:
         return None
     if not raw:
         return None

@@ -122,9 +122,7 @@ def test_capture_fingerprint_required_keys_present() -> None:
     assert isinstance(fp["jax_version"], str)
     assert isinstance(fp["jax_devices"], list) and len(fp["jax_devices"]) >= 1
     # platform must be one of the JAX-recognised values.
-    assert fp["jax_default_platform"] in {"cpu", "gpu", "tpu", "rocm"}, fp[
-        "jax_default_platform"
-    ]
+    assert fp["jax_default_platform"] in {"cpu", "gpu", "tpu", "rocm"}, fp["jax_default_platform"]
     # hostname is opt-in.
     assert "hostname" not in fp
 
@@ -159,9 +157,7 @@ def test_snapshot_hbm_shape_or_none() -> None:
     if snap is None:
         # CPU host: confirm we are on CPU; if we report None on GPU
         # something has gone wrong in the wrapper.
-        assert jax.default_backend() == "cpu", (
-            "snapshot_hbm returned None on a non-CPU backend"
-        )
+        assert jax.default_backend() == "cpu", "snapshot_hbm returned None on a non-CPU backend"
         return
     assert set(snap.keys()) == {
         "bytes_in_use",

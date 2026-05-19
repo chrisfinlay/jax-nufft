@@ -169,9 +169,7 @@ def test_gpu_high_padding_overhead_forces_dense_vmap(is_adjoint: bool) -> None:
     """``window_padding_overhead > 3.0`` cancels the windowed win
     even on the large-row fixture, matching the MWA_extended_off30
     cell (n_w=515)."""
-    plan = _stub_plan(
-        n_w=100, w_kernel_width=6, window_padding_overhead=4.0, n_rows=50_000
-    )
+    plan = _stub_plan(n_w=100, w_kernel_width=6, window_padding_overhead=4.0, n_rows=50_000)
     assert _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint) == "dense_vmap"
 
 
@@ -179,9 +177,7 @@ def test_gpu_adjoint_large_rows_picks_windowed_vmap() -> None:
     """Adjoint headline win on GH200: large-row plans favour windowed
     regardless of pointing. Matches GH200_large_off30 and
     GH200_large_zenith vis2dirty cells."""
-    plan = _stub_plan(
-        n_w=77, w_kernel_width=6, window_padding_overhead=2.5, n_rows=50_000
-    )
+    plan = _stub_plan(n_w=77, w_kernel_width=6, window_padding_overhead=2.5, n_rows=50_000)
     assert _auto_w_strategy_gpu(plan, is_adjoint=True) == "windowed_vmap"
 
 
@@ -189,9 +185,7 @@ def test_gpu_forward_large_rows_low_n_w_picks_windowed_vmap() -> None:
     """Forward on GPU only wins on windowed at low ``n_w`` (zenith-like)
     on large-row plans. Matches the GH200_large_zenith dirty2vis cell
     (n_w=13)."""
-    plan = _stub_plan(
-        n_w=13, w_kernel_width=6, window_padding_overhead=1.5, n_rows=50_000
-    )
+    plan = _stub_plan(n_w=13, w_kernel_width=6, window_padding_overhead=1.5, n_rows=50_000)
     assert _auto_w_strategy_gpu(plan, is_adjoint=False) == "windowed_vmap"
 
 
@@ -199,9 +193,7 @@ def test_gpu_forward_large_rows_high_n_w_stays_dense_vmap() -> None:
     """Forward at high ``n_w`` on a large plan falls back to dense_vmap;
     matches the GH200_large_off30 dirty2vis cell where n_w=77 puts the
     ratio above the forward cutoff."""
-    plan = _stub_plan(
-        n_w=77, w_kernel_width=6, window_padding_overhead=2.5, n_rows=50_000
-    )
+    plan = _stub_plan(n_w=77, w_kernel_width=6, window_padding_overhead=2.5, n_rows=50_000)
     assert _auto_w_strategy_gpu(plan, is_adjoint=False) == "dense_vmap"
 
 
@@ -211,22 +203,16 @@ def test_gpu_small_rows_picks_dense_vmap(is_adjoint: bool) -> None:
     slice-size advantage disappears; matches every non-GH200_large
     fixture in the baseline (MWA, MeerKAT, EDA2 with n_rows in
     {400, 600})."""
-    plan = _stub_plan(
-        n_w=200, w_kernel_width=6, window_padding_overhead=1.5, n_rows=600
-    )
+    plan = _stub_plan(n_w=200, w_kernel_width=6, window_padding_overhead=1.5, n_rows=600)
     assert _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint) == "dense_vmap"
 
 
 def test_gpu_n_rows_boundary_is_inclusive() -> None:
     """The 10_000 ``n_rows`` cutoff is ``>=``: at exactly 10_000 we
     take the windowed branch (when other gates pass)."""
-    plan = _stub_plan(
-        n_w=20, w_kernel_width=6, window_padding_overhead=1.5, n_rows=10_000
-    )
+    plan = _stub_plan(n_w=20, w_kernel_width=6, window_padding_overhead=1.5, n_rows=10_000)
     assert _auto_w_strategy_gpu(plan, is_adjoint=True) == "windowed_vmap"
-    plan = _stub_plan(
-        n_w=20, w_kernel_width=6, window_padding_overhead=1.5, n_rows=9_999
-    )
+    plan = _stub_plan(n_w=20, w_kernel_width=6, window_padding_overhead=1.5, n_rows=9_999)
     assert _auto_w_strategy_gpu(plan, is_adjoint=True) == "dense_vmap"
 
 
@@ -246,9 +232,7 @@ def test_dispatcher_routes_to_gpu_branch(monkeypatch: pytest.MonkeyPatch) -> Non
     """``_auto_w_strategy`` must dispatch to the GPU helper when
     ``jax.devices()[0].platform == "gpu"``."""
     _patch_platform(monkeypatch, "gpu")
-    plan = _stub_plan(
-        n_w=77, w_kernel_width=6, window_padding_overhead=2.5, n_rows=50_000
-    )
+    plan = _stub_plan(n_w=77, w_kernel_width=6, window_padding_overhead=2.5, n_rows=50_000)
     # GPU branch picks windowed_vmap (large-row adjoint) here -- the
     # CPU branch would also pick windowed but with the scan variant, so
     # this case discriminates the dispatch.
@@ -280,9 +264,7 @@ def test_canonicalise_auto_dispatches_to_helper_forward(
     _patch_platform(monkeypatch, "cpu")
     plan = _stub_plan(n_w=10, w_kernel_width=8)
     expected = _auto_w_strategy(plan, is_adjoint=False)
-    assert (
-        _canonicalise_w_strategy("auto", plan=plan, is_adjoint=False) == expected
-    )
+    assert _canonicalise_w_strategy("auto", plan=plan, is_adjoint=False) == expected
 
 
 def test_canonicalise_auto_dispatches_to_helper_adjoint(
@@ -294,9 +276,7 @@ def test_canonicalise_auto_dispatches_to_helper_adjoint(
     plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=1.4)
     expected = _auto_w_strategy(plan, is_adjoint=True)
     assert expected == "windowed_scan"  # sanity
-    assert (
-        _canonicalise_w_strategy("auto", plan=plan, is_adjoint=True) == expected
-    )
+    assert _canonicalise_w_strategy("auto", plan=plan, is_adjoint=True) == expected
 
 
 def test_canonicalise_auto_requires_context() -> None:
@@ -304,12 +284,12 @@ def test_canonicalise_auto_requires_context() -> None:
     (the public wrappers always supply them); raise to catch wiring
     regressions early rather than silently returning a wrong canonical
     name."""
-    with pytest.raises(ValueError, match="auto.*plan.*is_adjoint"):
+    with pytest.raises(ValueError, match=r"auto.*plan.*is_adjoint"):
         _canonicalise_w_strategy("auto")
     plan = _stub_plan(n_w=10)
-    with pytest.raises(ValueError, match="auto.*plan.*is_adjoint"):
+    with pytest.raises(ValueError, match=r"auto.*plan.*is_adjoint"):
         _canonicalise_w_strategy("auto", plan=plan)
-    with pytest.raises(ValueError, match="auto.*plan.*is_adjoint"):
+    with pytest.raises(ValueError, match=r"auto.*plan.*is_adjoint"):
         _canonicalise_w_strategy("auto", is_adjoint=False)
 
 
@@ -350,19 +330,21 @@ def _small_offzenith_plan_and_arrays(seed: int = 0):
     )
     image = jnp.asarray(rng.standard_normal((64, 64)))
     vis = jnp.asarray(
-        (
-            rng.standard_normal((n_rows, 1))
-            + 1j * rng.standard_normal((n_rows, 1))
-        ).astype(np.complex128)
+        (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+            np.complex128
+        )
     )
     return plan, image, vis
 
 
 def test_dirty2vis_auto_matches_explicit_resolved() -> None:
-    """``dirty2vis(..., w_strategy="auto")`` must produce bit-equal
-    output to the call that passes the explicitly-resolved canonical
-    name, and the JIT cache size must NOT grow when the auto call comes
-    after the explicit one (cache hit)."""
+    """``dirty2vis(..., w_strategy="auto")`` must resolve to the
+    explicitly-resolved canonical name *before* the JIT boundary -- the
+    load-bearing assertion is that the cache size does NOT grow when the
+    auto call follows the explicit one (a recompile would mean the
+    literal ``"auto"`` leaked into the static arg). dirty2vis is a
+    type-2 NUFFT (interpolation) and is bit-reproducible, so the outputs
+    are compared exactly."""
     plan, image, _ = _small_offzenith_plan_and_arrays(seed=3)
     resolved = _auto_w_strategy(plan, is_adjoint=False)
 
@@ -386,8 +368,13 @@ def test_dirty2vis_auto_matches_explicit_resolved() -> None:
 def test_vis2dirty_auto_matches_explicit_resolved() -> None:
     """Same as above on the adjoint. The resolved canonical name is
     platform-dependent (windowed_scan on CPU, dense_vmap on GPU for
-    this fixture's row count), so the test asserts only the
-    load-bearing semantics: bit-equality and shared JIT cache."""
+    this fixture's row count), so the test asserts the load-bearing
+    semantics: shared JIT cache (no recompile). vis2dirty is a type-1
+    NUFFT (parallel scatter-add) whose reduction order is not fixed
+    across calls on a multithreaded CPU FINUFFT build, so the outputs
+    are compared with ``allclose`` at rtol=1e-10 -- ~12x above the
+    measured ~8e-12 run-to-run jitter, and far below the O(1) scale a
+    mis-resolved strategy would produce."""
     plan, _, vis = _small_offzenith_plan_and_arrays(seed=5)
     resolved = _auto_w_strategy(plan, is_adjoint=True)
 
@@ -400,7 +387,9 @@ def test_vis2dirty_auto_matches_explicit_resolved() -> None:
     jax.block_until_ready(out_auto)
     cache_after_auto = _vis2dirty_jit._cache_size()
 
-    np.testing.assert_array_equal(np.asarray(out_auto), np.asarray(out_explicit))
+    np.testing.assert_allclose(
+        np.asarray(out_auto), np.asarray(out_explicit), rtol=1e-10, atol=1e-11
+    )
     assert cache_after_auto == cache_after_explicit, (
         f"vis2dirty(...w_strategy='auto') triggered a recompile: "
         f"cache {cache_after_explicit} -> {cache_after_auto}."

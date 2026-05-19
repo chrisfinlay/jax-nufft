@@ -14,13 +14,11 @@ is exactly zero, so the resulting generic plan is runnable.
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
-
 
 _EPS = 1e-6
 # Relative-norm tolerance: each path has wgridder error ~10*eps relative to
@@ -111,9 +109,7 @@ def test_constant_w_fast_vs_generic_vis2dirty(w_const_m: float, w_strategy: str)
 
     rng = np.random.default_rng(1)
     n_rows = uvw.shape[0]
-    vis = jnp.asarray(
-        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
-    )
+    vis = jnp.asarray(rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1)))
 
     dirty_fast = np.asarray(vis2dirty(plan_fast, vis, w_strategy=w_strategy))
     dirty_generic = np.asarray(vis2dirty(plan_generic, vis, w_strategy=w_strategy))

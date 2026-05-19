@@ -190,9 +190,7 @@ def test_constant_w_collapses_n_w() -> None:
     # In wavelengths, the constant value is w_m * freq / c. Single channel
     # here so the per-channel and worst-case values coincide.
     w_const_lambda = w_const_m * float(freq_hz[0]) / SPEED_OF_LIGHT
-    np.testing.assert_allclose(
-        np.asarray(plan.w_centers), [w_const_lambda], rtol=0.0, atol=1e-9
-    )
+    np.testing.assert_allclose(np.asarray(plan.w_centers), [w_const_lambda], rtol=0.0, atol=1e-9)
     # phi_hat_n is unity for the fast path (no correction needed).
     np.testing.assert_allclose(np.asarray(plan.phi_hat_n), 1.0)
     # Windowed metadata: single window per channel covering all rows.

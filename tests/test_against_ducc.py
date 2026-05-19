@@ -194,9 +194,7 @@ def test_constant_w_ducc_parity(op: str, w_strategy: str) -> None:
     if op == "dirty2vis":
         rng = np.random.default_rng(7)
         image = rng.standard_normal((tel.n_pix, tel.n_pix))
-        vis_jax = np.asarray(
-            dirty2vis(plan, jnp.asarray(image), w_strategy=w_strategy)
-        )
+        vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy=w_strategy))
         vis_ducc = ducc0.wgridder.dirty2vis(
             uvw=uvw,
             freq=freq,
@@ -212,12 +210,9 @@ def test_constant_w_ducc_parity(op: str, w_strategy: str) -> None:
     else:
         rng = np.random.default_rng(11)
         vis_np = (
-            rng.standard_normal((tel.n_rows, 1))
-            + 1j * rng.standard_normal((tel.n_rows, 1))
+            rng.standard_normal((tel.n_rows, 1)) + 1j * rng.standard_normal((tel.n_rows, 1))
         ).astype(np.complex128)
-        dirty_jax = np.asarray(
-            vis2dirty(plan, jnp.asarray(vis_np), w_strategy=w_strategy)
-        )[0]
+        dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis_np), w_strategy=w_strategy))[0]
         dirty_ducc = ducc0.wgridder.vis2dirty(
             uvw=uvw,
             freq=freq,

@@ -29,10 +29,7 @@ import pytest
 
 from jax_nufft.wgridder import _auto_w_strategy_gpu
 
-_BASELINE = (
-    Path(__file__).resolve().parent.parent
-    / "docs/benchmarks/v0.1.2-baseline-gpu.json"
-)
+_BASELINE = Path(__file__).resolve().parent.parent / "docs/benchmarks/v0.1.2-baseline-gpu.json"
 _ACCEPTANCE_FACTOR = 1.15
 
 
@@ -72,9 +69,7 @@ _CELLS = _cells()
     _CELLS,
     ids=[f"{op}-{fix}" for op, fix, _ in _CELLS],
 )
-def test_gpu_auto_within_15pct_of_best(
-    op: str, fixture: str, rows: list[dict]
-) -> None:
+def test_gpu_auto_within_15pct_of_best(op: str, fixture: str, rows: list[dict]) -> None:
     is_adjoint = op == "vis2dirty"
     plan = _plan_stub_from_row(rows[0])
     picked = _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint)
@@ -82,9 +77,7 @@ def test_gpu_auto_within_15pct_of_best(
     # Best median achievable with the auto-picked w_strategy (over the
     # two channel_strategy variants), vs the global best in this cell.
     picked_rows = [r for r in rows if r["w_strategy"] == picked]
-    assert picked_rows, (
-        f"auto picked {picked!r} but no such row exists for {op}/{fixture}"
-    )
+    assert picked_rows, f"auto picked {picked!r} but no such row exists for {op}/{fixture}"
     auto_best = min(r["median_s"] for r in picked_rows)
     global_best = min(r["median_s"] for r in rows)
     best_row = min(rows, key=lambda r: r["median_s"])
