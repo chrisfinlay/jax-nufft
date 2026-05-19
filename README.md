@@ -284,6 +284,22 @@ plus the FFT and spreading work inside FINUFFT. `n_w` scales with
 `baseline_max_lambda * max|n - 1|`, which means wider FoVs and longer
 baselines produce more w-planes &mdash; expected wgridder behaviour.
 
+### Constant-w fast path (v0.1.2+)
+
+When every `uvw_lambda[:, :, 2]` entry is identical &mdash; e.g. a perfectly
+coplanar array, snapshot data at fixed pointing, or any case where
+`plan.w_extent == 0` after planning &mdash; `make_plan` collapses the
+w-plane loop to a single plane at the constant w-value. Expected speedup
+is roughly `w_kernel_width + 1` (one NUFFT instead of `W+1`), which is
+about 7&times; for the default `epsilon = 1e-6` (`W = 6`).
+
+The user-visible signal that the specialisation engaged is
+`plan.n_w == 1` (and `plan.is_constant_w == True`). All four
+`w_strategy` choices reduce to the same single-plane work in this
+regime, so picking one vs another has no effect on output. Both
+operators stay bit-identical across strategies in this case and match
+ducc within `20 * epsilon`.
+
 ### CPU benchmarks vs ducc0
 
 The repository ships an opt-in benchmark suite that times *and* measures
