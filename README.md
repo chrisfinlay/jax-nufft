@@ -2,10 +2,11 @@
 
 JAX-native wgridder for radio interferometric imaging.
 
-> **Status:** v0.1.1. API stable; planning-side changes only between
-> v0.1 and v0.1.1, plus two new opt-in `w_strategy` values. v0.1.2 adds
-> a third opt-in value, `"auto"`, which resolves to one of the four
-> canonical strategies via a plan-based heuristic; defaults are unchanged.
+> **Status:** v0.1.2. API stable; v0.1.2 is a performance release
+> (sorted-order windowed forward, constant-w fast path, precomputed
+> FINUFFT coords, GPU benchmark suite) plus a third opt-in `w_strategy`
+> value, `"auto"`, which resolves to one of the four canonical
+> strategies via a platform-aware heuristic; defaults are unchanged.
 
 ## Overview
 
