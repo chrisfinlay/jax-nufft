@@ -215,6 +215,7 @@ def make_plan(
     *,
     phi_hat_n_fine: int = 4096,
     phi_hat_oversample: int | None = None,
+    _force_generic: bool = False,
 ) -> WGridderPlan:
     """Build the wgridder plan for the given (uvw, freq, image, epsilon).
 
@@ -222,6 +223,12 @@ def make_plan(
     :func:`jax_nufft.vis2dirty`. All planning math runs on the host (numpy);
     the resulting numerical arrays live as JAX device arrays so that the
     JIT-compiled operators see them as constants.
+
+    ``_force_generic`` is a private test-only escape hatch that skips the
+    v0.1.2 constant-w fast path even when ``w_extent == 0``, building the
+    generic-shape plan (``n_w == w_kernel_width + 1``) for direct
+    fast-vs-generic comparison in tests. Not part of the public API; do
+    not use in application code.
     """
     if epsilon <= 0:
         raise ValueError(f"epsilon must be > 0; got {epsilon}")
@@ -273,8 +280,9 @@ def make_plan(
         raise AssertionError("internal: negative w-extent")
 
     is_constant_w_val = bool(w_extent == 0.0)
+    use_fast_path = is_constant_w_val and not _force_generic
 
-    if is_constant_w_val:
+    if use_fast_path:
         # --- v0.1.2 constant-w fast path ---
         # All visibilities share a single w-value (in wavelengths, across all
         # channels). The dense path would set dw=0 and produce NaN at call
@@ -309,9 +317,14 @@ def make_plan(
         n_w = n_w_inner + w_kernel_width
 
         # --- w-plane centres (spec sec 4.2 step 4) ---
-        if n_w_inner == 0:
-            # Degenerate: w-extent tiny relative to kernel; fall back to a single plane.
-            dw = 1.0
+        if w_extent == 0.0:
+            # Reachable only via ``_force_generic`` on constant-w data
+            # (the v0.1.2 fast path normally handles w_extent==0). Pick dw
+            # matching the "one inner step" sampling we would use for the
+            # smallest non-zero w_extent so the resulting plan is well-
+            # defined (in particular, ``w_kernel_scale > 0`` avoids the
+            # ``z = 0/0`` NaN that the dense operator would otherwise hit).
+            dw = x0 / max_abs_nm1
         else:
             dw = w_extent / n_w_inner
         w_kernel_scale = dw * w_kernel_width / 2.0
@@ -406,7 +419,11 @@ def make_plan(
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
         w_extent=float(w_extent),
-        is_constant_w=is_constant_w_val,
+        # ``is_constant_w`` reflects the plan SHAPE (n_w==1 collapse), not
+        # the data shape. When ``_force_generic`` builds a generic plan
+        # over constant-w data, this stays False so downstream selectors
+        # (Part 4 auto, etc.) see the actual structure of this plan.
+        is_constant_w=use_fast_path,
         uvw_lambda=jnp.asarray(uvw_lambda_np),
         w_centers=jnp.asarray(w_centers_np),
         n_minus_1=jnp.asarray(n_minus_1_np),
