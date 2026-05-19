@@ -71,6 +71,57 @@ def _canonicalise_w_strategy(name: str) -> str:
     )
 
 
+def _auto_w_strategy(plan: WGridderPlan, *, is_adjoint: bool) -> str:
+    """Pick a canonical ``w_strategy`` for a given plan and operator.
+
+    This is the CPU-derived heuristic from
+    ``docs/v0.1.2-plan.md`` Part 4. The thresholds are calibrated from
+    AGENTS.md §9 CPU measurements where:
+
+      * the windowed adjoint only wins at off-zenith when ``n_w`` is at
+        least a factor of two above the w-kernel width, and
+      * the windowed forward never measurably beats dense on the v0.1.1
+        algorithm, so we never auto-pick a windowed forward.
+
+    A high ``window_padding_overhead`` (the per-plane max/mean window
+    size ratio set by :func:`~jax_nufft.planning.make_plan`) means that
+    windowed traversal would waste enough cycles on padded plane rows
+    that dense wins -- the 5x cutoff is conservative.
+
+    The constant-w fast path collapses ``n_w`` to one, so the small-``n_w``
+    branch always picks ``dense_scan`` there and matches the dense path.
+
+    TODO(v0.1.2 Part 6): make this platform-aware via
+    ``jax.devices()[0].platform`` once the GH200 sweep lands; the v0.1.2
+    GPU baseline in ``docs/benchmarks/v0.1.2-baseline-gpu.json`` shows
+    that the ``_vmap`` variants dominate on GH200 (the ``_scan`` variants
+    are ~10x slower), so this heuristic will need a GPU branch.
+
+    Parameters
+    ----------
+    plan:
+        The plan returned by :func:`~jax_nufft.planning.make_plan`.
+        Only ``plan.n_w``, ``plan.w_kernel_width``, and
+        ``plan.window_padding_overhead`` are read.
+    is_adjoint:
+        ``True`` for ``vis2dirty`` (gridder, adjoint), ``False`` for
+        ``dirty2vis`` (degridder, forward). Threaded in by the public
+        wrappers in Part 4.2.
+
+    Returns
+    -------
+    A canonical ``w_strategy`` name (one of
+    :data:`_CANONICAL_W_STRATEGIES`).
+    """
+    if plan.n_w <= plan.w_kernel_width + 2:
+        return "dense_scan"
+    if plan.window_padding_overhead > 5.0:
+        return "dense_scan"
+    if is_adjoint and plan.n_w / plan.w_kernel_width > 2.0:
+        return "windowed_scan"
+    return "dense_scan"
+
+
 def _real_to_complex_dtype(dtype: jnp.dtype) -> jnp.dtype:
     """Promote a real dtype to its matching complex dtype."""
     if jnp.issubdtype(dtype, jnp.complexfloating):
