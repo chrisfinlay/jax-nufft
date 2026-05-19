@@ -118,7 +118,13 @@ def test_plan_nw_scales_with_w_extent() -> None:
 
 
 def test_plan_zero_w_extent_is_handled() -> None:
-    """All-zero w (perfectly zenith, coplanar array) must not blow up."""
+    """All-zero w (perfectly zenith, coplanar array) collapses to a single
+    plane via the v0.1.2 constant-w fast path.
+
+    Before v0.1.2 the dense path would produce ``dw=0`` and ``w_kernel_scale=0``,
+    which yielded NaN at call time via ``z = 0/0``. The fast path replaces
+    that with ``n_w=1`` and a unit phi_hat correction.
+    """
     uvw = _baseline_uvw(n_rows=20, max_baseline=50.0)
     uvw[:, 2] = 0.0
     plan = make_plan(
@@ -129,10 +135,45 @@ def test_plan_zero_w_extent_is_handled() -> None:
         pixsize_m=1e-3,
         epsilon=1e-6,
     )
-    # Inner w-plane count is at least 1 by construction.
-    assert plan.n_w >= 1 + plan.w_kernel_width
-    # All centres should still be finite.
+    assert plan.is_constant_w
+    assert plan.w_extent == 0.0
+    assert plan.n_w == 1
     assert np.all(np.isfinite(np.asarray(plan.w_centers)))
+
+
+def test_constant_w_collapses_n_w() -> None:
+    """Non-zero constant w (snapshot at fixed pointing) also triggers the
+    fast path and pins ``w_centers[0]`` to the constant w-value in wavelengths.
+    """
+    uvw = _baseline_uvw(n_rows=64, max_baseline=400.0)
+    # Replace the w column with a non-zero constant in metres.
+    w_const_m = 12.5
+    uvw[:, 2] = w_const_m
+    freq_hz = np.array([200e6])
+    plan = make_plan(
+        uvw=uvw,
+        freq=freq_hz,
+        image_shape=(64, 64),
+        pixsize_l=1e-3,
+        pixsize_m=1e-3,
+        epsilon=1e-6,
+    )
+    # The plan-level invariant.
+    assert plan.is_constant_w == (plan.w_extent == 0.0)
+    assert plan.is_constant_w
+    assert plan.n_w == 1
+    # In wavelengths, the constant value is w_m * freq / c. Single channel
+    # here so the per-channel and worst-case values coincide.
+    w_const_lambda = w_const_m * float(freq_hz[0]) / SPEED_OF_LIGHT
+    np.testing.assert_allclose(
+        np.asarray(plan.w_centers), [w_const_lambda], rtol=0.0, atol=1e-9
+    )
+    # phi_hat_n is unity for the fast path (no correction needed).
+    np.testing.assert_allclose(np.asarray(plan.phi_hat_n), 1.0)
+    # Windowed metadata: single window per channel covering all rows.
+    assert plan.max_window_size == plan.n_rows
+    assert np.asarray(plan.window_start).shape == (1, 1)
+    assert int(np.asarray(plan.window_size)[0, 0]) == plan.n_rows
 
 
 def test_plan_phi_hat_n_strictly_positive() -> None:
