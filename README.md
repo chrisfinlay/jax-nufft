@@ -254,7 +254,7 @@ names are kept as deprecated aliases:
 | `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
 | `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
-| `"auto"`          | resolves to one of the above | matches the resolved choice | v0.1.2; opt-in. CPU-tuned heuristic, not the default. |
+| `"auto"`          | resolves to one of the above | matches the resolved choice | v0.1.2; opt-in. Platform-aware heuristic, not the default. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
 
@@ -266,31 +266,40 @@ which point dense strategies usually win on absolute time.
 #### `w_strategy="auto"` (v0.1.2+, opt-in)
 
 `"auto"` resolves to one of the four canonical names before the JIT
-boundary, using `plan.n_w`, `plan.w_kernel_width`, and
-`plan.window_padding_overhead` plus the operator's adjoint flag. The
-heuristic is conservative and CPU-tuned: it never picks a windowed
-forward (no measured win on the v0.1.1 algorithm), and only picks
-`windowed_scan` on the adjoint when `n_w / w_kernel_width > 2` and the
-windowed padding overhead is below 5x. Otherwise it falls back to
-`dense_scan`. Resolution happens in the public wrapper, so an `"auto"`
-call shares a JIT cache entry with the explicit equivalent on the same
-plan.
+boundary, using `plan.n_w`, `plan.w_kernel_width`,
+`plan.window_padding_overhead`, and (on GPU) `plan.n_rows`, plus the
+operator's adjoint flag. Resolution happens in the public wrapper, so
+an `"auto"` call shares a JIT cache entry with the explicit equivalent
+on the same plan. The heuristic is **platform-aware**
+(`jax.devices()[0].platform`):
+
+- **CPU.** Conservative: never picks a windowed forward (no measured
+  win on the v0.1.1 algorithm), and only picks `windowed_scan` on the
+  adjoint when `n_w / w_kernel_width > 2` and the windowed padding
+  overhead is below 5x. Otherwise `dense_scan`.
+- **GPU** (tuned on the GH200 baseline sweep). Never picks a `_scan`
+  variant (5-30x slower than `_vmap` there). Picks `windowed_vmap` only
+  on large-row plans (`n_rows >= 10000`) with padding overhead below 3x
+  -- on the adjoint at any pointing, and on the forward when `n_w` is
+  low (`n_w <= 3 * w_kernel_width`). Otherwise `dense_vmap`.
+- **Other platforms** (e.g. TPU) fall back to the CPU heuristic.
 
 ```python
-# Recommended for new code: let the heuristic pick per call.
+# Recommended for new code: let the heuristic pick per call and per
+# platform.
 vis   = dirty2vis(plan, image, w_strategy="auto")
 dirty = vis2dirty(plan, vis,   w_strategy="auto")
 
 # For reproducing benchmarks, pin the strategy explicitly:
-vis   = dirty2vis(plan, image, w_strategy="windowed_scan")
+vis   = dirty2vis(plan, image, w_strategy="dense_vmap")
 ```
 
 `"auto"` is **not** the default in v0.1.2 (defaults stay on
-`"dense_scan"`); promotion to default is gated on the v0.1.2 Part 6 GPU
-benchmark sweep finding no losers on the standard telescope matrix. The
-heuristic will also grow a GPU branch in Part 6 -- the v0.1.2 GH200
-baseline shows the `_vmap` variants dominate there, so the CPU choice
-above is a regression on GPU today.
+`"dense_scan"`); promotion to default is deferred to a later release.
+The GPU gates are validated against `docs/benchmarks/v0.1.2-baseline-gpu.json`
+by `tests/test_auto_strategy_acceptance.py`, which asserts the picked
+strategy is within 15% of the best measured strategy for every
+(operator, telescope) cell.
 
 ### Accuracy expectation
 
