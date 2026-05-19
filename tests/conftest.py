@@ -188,21 +188,48 @@ _BENCH_POINTING_FILTERS: dict[str, set[float]] = {
 }
 
 
+def _jax_platform() -> str:
+    """Detect the JAX default platform without importing at conftest top.
+
+    Used to gate ``--runbench-gpu`` tests so they skip cleanly on CPU
+    machines instead of failing inside cuFINUFFT.
+    """
+    try:
+        import jax  # noqa: WPS433  -- intentional inline import
+    except Exception:  # pragma: no cover
+        return "cpu"
+    return jax.default_backend()
+
+
 def pytest_collection_modifyitems(config, items):
     """Mark slow / benchmark tests so they are skipped without their flag."""
     skip_slow = pytest.mark.skip(reason="needs --runslow")
     skip_bench = pytest.mark.skip(reason="needs --runbench")
+    skip_bench_gpu_flag = pytest.mark.skip(reason="needs --runbench-gpu")
+    skip_bench_gpu_platform = pytest.mark.skip(
+        reason="runbench_gpu requires jax.default_backend() == 'gpu'"
+    )
     runslow = config.getoption("--runslow", default=False)
     runbench = config.getoption("--runbench", default=False)
+    runbench_gpu = config.getoption("--runbench-gpu", default=False)
     bench_pointing = config.getoption("--bench-pointing", default="zenith")
     allowed_angles = _BENCH_POINTING_FILTERS[bench_pointing]
     skip_off_pointing = pytest.mark.skip(
         reason=f"--bench-pointing={bench_pointing} excludes this combination"
     )
+    platform = _jax_platform()
     for item in items:
         is_bench_item = "bench_telescope_pointing" in item.fixturenames
+        is_runbench_gpu = "runbench_gpu" in item.keywords
         if "long_telescope_pointing" in item.fixturenames and not runslow:
             item.add_marker(skip_slow)
+        if is_runbench_gpu:
+            if not runbench_gpu:
+                item.add_marker(skip_bench_gpu_flag)
+                continue
+            if platform != "gpu":
+                item.add_marker(skip_bench_gpu_platform)
+                continue
         if is_bench_item and not runbench:
             item.add_marker(skip_bench)
             continue
@@ -210,6 +237,16 @@ def pytest_collection_modifyitems(config, items):
             tel_pointing = item.callspec.params.get("bench_telescope_pointing")
             if tel_pointing is not None and tel_pointing[1] not in allowed_angles:
                 item.add_marker(skip_off_pointing)
+
+
+def pytest_configure(config):
+    """Register custom markers so ``pytest -m`` is happy and PYTHONDEVMODE
+    doesn't print a warning."""
+    config.addinivalue_line(
+        "markers",
+        "runbench_gpu: opt-in GPU benchmark suite "
+        "(needs --runbench-gpu and jax.default_backend() == 'gpu')",
+    )
 
 
 def pytest_addoption(parser):
@@ -224,6 +261,16 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Run benchmark suite comparing jax-nufft to ducc0.",
+    )
+    parser.addoption(
+        "--runbench-gpu",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the v0.1.2 GPU benchmark suite (tests/test_benchmark_gpu.py). "
+            "Tests are also gated on jax.default_backend() == 'gpu' so a CPU "
+            "host produces SKIPPED, not FAILED."
+        ),
     )
     parser.addoption(
         "--bench-pointing",
