@@ -41,3 +41,6 @@ htmlcov/
 
 # Build artefacts
 *.log
+
+# Repo-local scratch (ephemeral probes, ad-hoc benches, notes)
+tmp/
