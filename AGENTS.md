@@ -138,10 +138,11 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   frozen dataclass that's also a registered JAX pytree.
 * Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
   w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale,
-  max_window_size, window_padding_overhead`) live in the pytree
-  aux_data and become part of the JIT cache key. This list must
-  match `_plan_aux` in `planning.py` exactly — drift here is the
-  most common source of "silent pytree corruption" bugs.
+  max_window_size, window_padding_overhead, w_extent,
+  is_constant_w`) live in the pytree aux_data and become part of
+  the JIT cache key. This list must match `_plan_aux` in
+  `planning.py` exactly — drift here is the most common source of
+  "silent pytree corruption" bugs.
 * Plan **traced fields** (`uvw_lambda, w_centers, n_minus_1,
   phi_hat_n, sort_perm, uvw_lambda_sorted, window_start,
   window_size`) are JAX device arrays.

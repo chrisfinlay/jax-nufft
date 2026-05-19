@@ -69,6 +69,13 @@ class WGridderPlan:
     # ``max_window_size / mean_window_size`` and is purely diagnostic.
     max_window_size: int
     window_padding_overhead: float
+    # v0.1.2 w-degeneracy metadata:
+    # ``w_extent`` is ``max(w_lambda) - min(w_lambda)`` over all channels (in
+    # wavelengths); ``is_constant_w`` is True iff ``w_extent == 0.0`` exactly.
+    # Static so a future ``is_constant_w`` fast path can be selected
+    # plan-side without re-tracing.
+    w_extent: float
+    is_constant_w: bool
 
     # ---- traced arrays (pytree leaves) ----
     uvw_lambda: Array = field()  # (n_chan, n_rows, 3) — input row order
@@ -101,6 +108,8 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.w_kernel_scale,
         plan.max_window_size,
         plan.window_padding_overhead,
+        plan.w_extent,
+        plan.is_constant_w,
     )
 
 
@@ -119,6 +128,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w_kernel_scale,
         max_window_size,
         window_padding_overhead,
+        w_extent,
+        is_constant_w,
     ) = aux
     (
         uvw_lambda,
@@ -144,6 +155,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w_kernel_scale=w_kernel_scale,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
+        w_extent=w_extent,
+        is_constant_w=is_constant_w,
         uvw_lambda=uvw_lambda,
         w_centers=w_centers,
         n_minus_1=n_minus_1,
@@ -364,6 +377,8 @@ def make_plan(
         w_kernel_scale=float(w_kernel_scale),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
+        w_extent=float(w_extent),
+        is_constant_w=bool(w_extent == 0.0),
         uvw_lambda=jnp.asarray(uvw_lambda_np),
         w_centers=jnp.asarray(w_centers_np),
         n_minus_1=jnp.asarray(n_minus_1_np),
