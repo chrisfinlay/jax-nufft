@@ -42,7 +42,13 @@ from jax_nufft.planning import WGridderPlan
 # will add ``windowed_scan`` / ``windowed_vmap`` for the per-plane
 # windowed path; the dense path stays as the parity baseline.
 WStrategy = Literal[
-    "dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap", "scan", "vmap"
+    "dense_scan",
+    "dense_vmap",
+    "windowed_scan",
+    "windowed_vmap",
+    "auto",
+    "scan",
+    "vmap",
 ]
 ChannelStrategy = Literal["scan", "vmap"]
 
@@ -50,11 +56,30 @@ _CANONICAL_W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowe
 _W_STRATEGY_ALIASES = {"scan": "dense_scan", "vmap": "dense_vmap"}
 
 
-def _canonicalise_w_strategy(name: str) -> str:
+def _canonicalise_w_strategy(
+    name: str,
+    *,
+    plan: WGridderPlan | None = None,
+    is_adjoint: bool | None = None,
+) -> str:
     """Resolve user-facing ``w_strategy`` to a canonical name.
+
+    ``"auto"`` is resolved here -- in the public wrapper, before the JIT
+    boundary -- via :func:`_auto_w_strategy`. The static arg fed into
+    :func:`_dirty2vis_jit` / :func:`_vis2dirty_jit` is therefore always
+    one of the four canonical names, so two callers using ``"auto"`` on
+    the same plan still share a JIT cache entry with each other and with
+    the explicit canonical caller.
 
     Emits :class:`DeprecationWarning` for the v0.1 names.
     """
+    if name == "auto":
+        if plan is None or is_adjoint is None:
+            raise ValueError(
+                "w_strategy='auto' must be resolved with plan + is_adjoint "
+                "context; this is handled by dirty2vis / vis2dirty."
+            )
+        return _auto_w_strategy(plan, is_adjoint=is_adjoint)
     if name in _CANONICAL_W_STRATEGIES:
         return name
     canonical = _W_STRATEGY_ALIASES.get(name)
@@ -67,7 +92,7 @@ def _canonicalise_w_strategy(name: str) -> str:
         return canonical
     raise ValueError(
         f"unknown w_strategy: {name!r}; expected one of "
-        f"{_CANONICAL_W_STRATEGIES + tuple(_W_STRATEGY_ALIASES)}"
+        f"{_CANONICAL_W_STRATEGIES + ('auto',) + tuple(_W_STRATEGY_ALIASES)}"
     )
 
 
@@ -465,8 +490,12 @@ def dirty2vis(
         channels). Real or complex; real input is promoted to complex.
     w_strategy:
         ``"dense_scan"`` (default, low memory) or ``"dense_vmap"`` (potentially
-        faster on GPU but allocates ``n_w * image_size`` peak memory). The bare
-        names ``"scan"`` / ``"vmap"`` are accepted as deprecated aliases.
+        faster on GPU but allocates ``n_w * image_size`` peak memory).
+        ``"windowed_scan"`` / ``"windowed_vmap"`` use the per-plane windowed
+        path. ``"auto"`` resolves to a canonical name before the JIT boundary
+        via :func:`_auto_w_strategy` (so cache sharing is preserved); see that
+        helper's docstring for the heuristic. The bare names ``"scan"`` /
+        ``"vmap"`` are accepted as deprecated aliases.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"`` for the channel loop.
     nthreads:
@@ -477,7 +506,7 @@ def dirty2vis(
     vis:
         Complex array of shape ``(n_rows, n_chan)``.
     """
-    w_strategy = _canonicalise_w_strategy(w_strategy)
+    w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=False)
     image = _prepare_image(image, plan)
     return _dirty2vis_jit(
         plan,
@@ -667,7 +696,8 @@ def vis2dirty(
         Optional real array of shape ``(n_rows, n_chan)``, multiplied into the
         visibilities before gridding (matches ducc's ``wgt`` argument).
     w_strategy:
-        ``"dense_scan"`` (default) or ``"dense_vmap"``; same semantics as in
+        ``"dense_scan"`` (default), ``"dense_vmap"``, ``"windowed_scan"``,
+        ``"windowed_vmap"``, or ``"auto"``; same semantics as in
         :func:`dirty2vis`. The bare names ``"scan"`` / ``"vmap"`` are accepted
         as deprecated aliases.
     channel_strategy:
@@ -680,7 +710,7 @@ def vis2dirty(
     dirty:
         Real array of shape ``(n_chan, n_l, n_m)``.
     """
-    w_strategy = _canonicalise_w_strategy(w_strategy)
+    w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=True)
     vis = _validate_vis(vis, plan)
     weights = _validate_weights(weights, plan)
     apply_w = weights is not None
