@@ -3,7 +3,9 @@
 JAX-native wgridder for radio interferometric imaging.
 
 > **Status:** v0.1.1. API stable; planning-side changes only between
-> v0.1 and v0.1.1, plus two new opt-in `w_strategy` values.
+> v0.1 and v0.1.1, plus two new opt-in `w_strategy` values. v0.1.2 adds
+> a third opt-in value, `"auto"`, which resolves to one of the four
+> canonical strategies via a plan-based heuristic; defaults are unchanged.
 
 ## Overview
 
@@ -243,7 +245,8 @@ factor applied (matching ducc's `divide_by_n=True`).
 ### Strategy options
 
 `w_strategy` selects how the w-plane loop is structured. There are four
-canonical choices, plus the two v0.1 names kept as deprecated aliases:
+canonical choices plus an opt-in `"auto"` resolver, and the two v0.1
+names are kept as deprecated aliases:
 
 | `w_strategy`      | Per-plane work               | Peak transient memory       | Notes                                          |
 |-------------------|------------------------------|-----------------------------|------------------------------------------------|
@@ -251,6 +254,7 @@ canonical choices, plus the two v0.1 names kept as deprecated aliases:
 | `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
 | `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
+| `"auto"`          | resolves to one of the above | matches the resolved choice | v0.1.2; opt-in. CPU-tuned heuristic, not the default. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
 
@@ -258,6 +262,35 @@ For the windowed strategies, the plan exposes
 `plan.window_padding_overhead = max_window_size / mean_window_size` as a
 diagnostic. Pathological `w`-distributions can drive this above ~3, at
 which point dense strategies usually win on absolute time.
+
+#### `w_strategy="auto"` (v0.1.2+, opt-in)
+
+`"auto"` resolves to one of the four canonical names before the JIT
+boundary, using `plan.n_w`, `plan.w_kernel_width`, and
+`plan.window_padding_overhead` plus the operator's adjoint flag. The
+heuristic is conservative and CPU-tuned: it never picks a windowed
+forward (no measured win on the v0.1.1 algorithm), and only picks
+`windowed_scan` on the adjoint when `n_w / w_kernel_width > 2` and the
+windowed padding overhead is below 5x. Otherwise it falls back to
+`dense_scan`. Resolution happens in the public wrapper, so an `"auto"`
+call shares a JIT cache entry with the explicit equivalent on the same
+plan.
+
+```python
+# Recommended for new code: let the heuristic pick per call.
+vis   = dirty2vis(plan, image, w_strategy="auto")
+dirty = vis2dirty(plan, vis,   w_strategy="auto")
+
+# For reproducing benchmarks, pin the strategy explicitly:
+vis   = dirty2vis(plan, image, w_strategy="windowed_scan")
+```
+
+`"auto"` is **not** the default in v0.1.2 (defaults stay on
+`"dense_scan"`); promotion to default is gated on the v0.1.2 Part 6 GPU
+benchmark sweep finding no losers on the standard telescope matrix. The
+heuristic will also grow a GPU branch in Part 6 -- the v0.1.2 GH200
+baseline shows the `_vmap` variants dominate there, so the CPU choice
+above is a regression on GPU today.
 
 ### Accuracy expectation
 
