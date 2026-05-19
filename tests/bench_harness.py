@@ -20,7 +20,14 @@ imports at module load).
 
 from __future__ import annotations
 
+import json
+import os
+import platform
+import shutil
+import socket
 import statistics
+import subprocess
+import sys
 import time
 from typing import Any, Callable
 
@@ -120,3 +127,142 @@ def time_jax_callable(
         "sync": sync,
         "samples_s": samples,
     }
+
+
+def _run_cmd(args: list[str], timeout: float = 5.0) -> str | None:
+    """Run a shell command, return stripped stdout or None if it failed.
+
+    Used for ``nvidia-smi`` calls; deliberately tolerant -- a missing
+    binary or a non-GPU host should not raise here.
+    """
+    if shutil.which(args[0]) is None:
+        return None
+    try:
+        out = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode("utf-8", errors="replace").strip() or None
+
+
+def _nvidia_smi_list_gpus() -> list[str] | None:
+    """Return parsed ``nvidia-smi -L`` lines, or None on non-GPU hosts."""
+    raw = _run_cmd(["nvidia-smi", "-L"])
+    if raw is None:
+        return None
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _nvidia_smi_driver_version() -> str | None:
+    """Driver version per nvidia-smi.
+
+    ``--query-gpu`` returns one line per GPU. On a multi-GPU node they
+    all share the same driver, so we return the first line (matching the
+    v0.1.2 plan's "parse the first line" guidance). If a future system
+    has heterogeneous driver versions, the per-GPU info still lives in
+    ``nvidia_smi_gpus``.
+    """
+    raw = _run_cmd(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader",
+        ]
+    )
+    if raw is None:
+        return None
+    first_line = raw.splitlines()[0].strip()
+    return first_line or None
+
+
+def _jax_finufft_version() -> str | None:
+    """Return ``jax_finufft.__version__`` if importable, else None.
+
+    The fingerprint must work on hosts without jax_finufft installed
+    (CI lint runs on CPU only and may skip the optional dep), so
+    swallow ImportError silently.
+    """
+    try:
+        import jax_finufft  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    return getattr(jax_finufft, "__version__", None)
+
+
+def capture_fingerprint(include_hostname: bool = False) -> dict[str, Any]:
+    """Capture a reproducible hardware/software fingerprint.
+
+    Designed so that running this on the same machine with the same env
+    yields a byte-equal dict (modulo ``hostname`` which is opt-in). GPU-
+    specific fields are recorded as ``None`` on hosts without
+    ``nvidia-smi`` or jax_finufft so the fingerprint shape stays stable
+    across CPU and GPU runs.
+
+    Parameters
+    ----------
+    include_hostname:
+        Whether to record ``socket.gethostname()`` under ``hostname``.
+        Off by default so the fingerprint is comparable across machines
+        with the same software stack; useful to flip on for internal
+        provenance.
+
+    Returns
+    -------
+    dict with the following keys (some may be ``None``):
+
+    * ``jax_version``: ``jax.__version__``.
+    * ``jax_finufft_version``: as above (or ``None``).
+    * ``jax_devices``: list of ``repr(d)`` strings for ``jax.devices()``.
+    * ``jax_default_platform``: ``jax.default_backend()`` (``"cpu"`` /
+      ``"gpu"`` / etc.).
+    * ``nvidia_smi_gpus``: parsed ``nvidia-smi -L`` lines, or ``None`` on
+      non-GPU hosts.
+    * ``nvidia_smi_driver_version``: parsed
+      ``--query-gpu=driver_version`` output, or ``None``.
+    * ``env_OMP_NUM_THREADS``, ``env_XLA_FLAGS``: relevant env vars
+      (``None`` if unset).
+    * ``python_version``: ``sys.version`` summary line.
+    * ``platform_machine``: ``platform.machine()`` (``aarch64`` on
+      GH200, ``x86_64`` on usual workstations).
+    * ``hostname``: only if ``include_hostname=True``.
+    """
+    devices = jax.devices()
+    fp: dict[str, Any] = {
+        "jax_version": getattr(jax, "__version__", None),
+        "jax_finufft_version": _jax_finufft_version(),
+        "jax_devices": [repr(d) for d in devices],
+        "jax_default_platform": jax.default_backend(),
+        "nvidia_smi_gpus": _nvidia_smi_list_gpus(),
+        "nvidia_smi_driver_version": _nvidia_smi_driver_version(),
+        "env_OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
+        "env_XLA_FLAGS": os.environ.get("XLA_FLAGS"),
+        "python_version": sys.version.splitlines()[0],
+        "platform_machine": platform.machine(),
+    }
+    if include_hostname:
+        fp["hostname"] = socket.gethostname()
+    return fp
+
+
+def _cli_main(argv: list[str]) -> int:
+    """``python -m tests.bench_harness fingerprint`` entry point."""
+    if len(argv) >= 2 and argv[1] == "fingerprint":
+        include_hostname = "--hostname" in argv[2:]
+        print(json.dumps(capture_fingerprint(include_hostname=include_hostname), indent=2))
+        return 0
+    print(
+        "usage: python -m tests.bench_harness fingerprint [--hostname]",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(_cli_main(sys.argv))

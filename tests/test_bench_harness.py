@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from tests.bench_harness import time_jax_callable
+from tests.bench_harness import capture_fingerprint, time_jax_callable
 
 
 def _double(x):
@@ -94,6 +94,56 @@ def test_time_jax_callable_validates_inputs() -> None:
         time_jax_callable(lambda x: x, jnp.zeros(2), iters=0)
     with pytest.raises(ValueError, match="warmup must be >= 0"):
         time_jax_callable(lambda x: x, jnp.zeros(2), warmup=-1)
+
+
+def test_capture_fingerprint_required_keys_present() -> None:
+    """The fingerprint shape must be stable across CPU and GPU runs --
+    GPU-only fields read as None on non-GPU hosts rather than missing
+    keys -- so JSON consumers can rely on a fixed schema."""
+    fp = capture_fingerprint()
+    for key in (
+        "jax_version",
+        "jax_finufft_version",
+        "jax_devices",
+        "jax_default_platform",
+        "nvidia_smi_gpus",
+        "nvidia_smi_driver_version",
+        "env_OMP_NUM_THREADS",
+        "env_XLA_FLAGS",
+        "python_version",
+        "platform_machine",
+    ):
+        assert key in fp, f"missing fingerprint key {key!r}"
+    # jax_version is always present (we import jax at module load).
+    assert isinstance(fp["jax_version"], str)
+    assert isinstance(fp["jax_devices"], list) and len(fp["jax_devices"]) >= 1
+    # platform must be one of the JAX-recognised values.
+    assert fp["jax_default_platform"] in {"cpu", "gpu", "tpu", "rocm"}, fp[
+        "jax_default_platform"
+    ]
+    # hostname is opt-in.
+    assert "hostname" not in fp
+
+
+def test_capture_fingerprint_hostname_opt_in() -> None:
+    fp = capture_fingerprint(include_hostname=True)
+    assert "hostname" in fp
+    assert isinstance(fp["hostname"], str) and fp["hostname"]
+
+
+def test_capture_fingerprint_gpu_fields_consistent_with_backend() -> None:
+    """If ``nvidia-smi`` is present (GPU host), it must report at least
+    one GPU and the driver version; if absent (CPU-only host), both
+    GPU-related fields must be None. Catches a partial-fail like
+    ``nvidia-smi`` returning OK but the driver version query failing."""
+    fp = capture_fingerprint()
+    gpus = fp["nvidia_smi_gpus"]
+    drv = fp["nvidia_smi_driver_version"]
+    if gpus is None:
+        assert drv is None
+    else:
+        assert isinstance(gpus, list) and gpus
+        assert isinstance(drv, str) and drv
 
 
 def test_time_jax_callable_pytree_output_syncs() -> None:
