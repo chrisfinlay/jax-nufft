@@ -36,16 +36,28 @@ def _tiny_setup(seed: int = 0):
 
 
 def test_jit_idempotent_with_eager() -> None:
-    """Wrapping the already-jitted operators with another jax.jit must not change output."""
+    """Wrapping the already-jitted operators with another jax.jit must not change output.
+
+    ``dirty2vis`` (a type-2 NUFFT / interpolation) is bit-reproducible,
+    so it is checked exactly. ``vis2dirty`` (a type-1 NUFFT / spreading)
+    accumulates via a parallel scatter-add whose reduction order is not
+    fixed across calls on a multithreaded FINUFFT CPU build, so it is
+    checked with ``allclose`` at a tolerance just above the measured
+    run-to-run jitter (max ~8e-12 relative over 30 trials on the 72-core
+    Grace CPU; a real jit-vs-eager bug would be orders of magnitude
+    larger). rtol=1e-10 leaves ~12x headroom over that floor.
+    """
     plan, image, vis = _tiny_setup(0)
 
     eager_vis = dirty2vis(plan, image)
     jitted_vis = jax.jit(dirty2vis)(plan, image)
-    np.testing.assert_array_equal(np.asarray(eager_vis), np.asarray(jitted_vis))
+    np.testing.assert_array_equal(np.asarray(jitted_vis), np.asarray(eager_vis))
 
     eager_dirty = vis2dirty(plan, vis)
     jitted_dirty = jax.jit(vis2dirty)(plan, vis)
-    np.testing.assert_array_equal(np.asarray(eager_dirty), np.asarray(jitted_dirty))
+    np.testing.assert_allclose(
+        np.asarray(jitted_dirty), np.asarray(eager_dirty), rtol=1e-10, atol=1e-11
+    )
 
 
 def test_grad_of_dirty2vis_finite_difference() -> None:

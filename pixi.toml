@@ -3,17 +3,33 @@ name = "jax-nufft"
 description = "Pure-JAX wgridder for radio interferometric imaging."
 authors = ["jax-nufft contributors"]
 channels = ["conda-forge"]
-platforms = ["osx-arm64", "osx-64", "linux-64"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [dependencies]
-python = ">=3.10,<3.13"
+python = ">=3.11,<3.15"
 numpy = ">=1.24"
 pip = "*"
 
 [pypi-dependencies]
-jax = ">=0.4.30"
-jax-finufft = ">=0.0.7"
 jax-nufft = { path = ".", editable = true }
+
+# CPU stack: conda-forge ships a `cpu_*` jax-finufft build for all three
+# platforms (incl. linux-aarch64), so the cpu/dev/test envs run natively
+# on the GH200 dev host as well as on x86 / macOS CI.
+[feature.cpu]
+
+[feature.cpu.dependencies]
+jax = ">=0.5.0"
+jax-finufft = { version = ">=1.3.0", build = "cpu_*" }
+
+[feature.gpu]
+platforms = ["linux-64", "linux-aarch64"]
+system-requirements = { cuda = "12.0" }
+
+[feature.gpu.dependencies]
+jax = ">=0.5.0"
+jax-finufft = { version = ">=1.3.0", build = "cuda*" }
+cuda-version = ">=12.0,<13"
 
 [feature.test.dependencies]
 pytest = ">=7.4"
@@ -26,18 +42,46 @@ ruff = ">=0.6.0"
 mypy = ">=1.10"
 pre-commit = ">=3.7"
 
-[feature.gpu]
-platforms = ["linux-64"]
-system-requirements = { cuda = "12.0" }
+# Python-version pins for the CI test matrix. conda-forge has no
+# jax-finufft build for 3.10 (it needs >=3.11), so 3.10 is not supported;
+# CI tests the supported versions 3.11 / 3.12 / 3.13 / 3.14.
+[feature.py311.dependencies]
+python = "3.11.*"
 
-[feature.gpu.pypi-dependencies]
-jax = { version = ">=0.4.30", extras = ["cuda12"] }
+[feature.py312.dependencies]
+python = "3.12.*"
+
+[feature.py313.dependencies]
+python = "3.13.*"
+
+[feature.py314.dependencies]
+python = "3.14.*"
 
 [environments]
-default = { solve-group = "default" }
-test = { features = ["test"], solve-group = "default" }
-dev = { features = ["dev", "test"], solve-group = "default" }
-gpu = { features = ["gpu", "test"], solve-group = "gpu" }
+# CPU stack (works on osx-arm64, linux-64, linux-aarch64):
+#   default  -- runtime only (import + run the code)
+#   test     -- + pytest / ducc parity
+#   dev      -- + ruff / mypy / pre-commit (lint + typecheck + tests)
+#   test-py311 / test-py313 / test-py314 -- extra CI matrix legs
+#   (3.11 / 3.13 / 3.14, own solves)
+# The default/test/dev envs pin Python 3.12 via the py312 feature so the
+# local env is explicit and stable; test-py311/313/314 are the other CI
+# matrix legs.
+default = { features = ["cpu", "py312"], solve-group = "cpu" }
+test = { features = ["cpu", "test", "py312"], solve-group = "cpu" }
+dev = { features = ["cpu", "dev", "test", "py312"], solve-group = "cpu" }
+test-py311 = { features = ["cpu", "test", "py311"], solve-group = "cpu-py311" }
+test-py313 = { features = ["cpu", "test", "py313"], solve-group = "cpu-py313" }
+test-py314 = { features = ["cpu", "test", "py314"], solve-group = "cpu-py314" }
+# GPU stack (linux-64, linux-aarch64 with CUDA 12):
+#   gpu      -- runtime only, for simply running the code on a GPU
+#   gpu-dev  -- + test + dev tooling, for development / benchmarking on
+#               the GH200 (this is what the --runbench-gpu sweep uses)
+# Both pin Python 3.12 (the CUDA jax-finufft build may not cover 3.13) so
+# relaxing the workspace cap to <3.14 for the 3.13 CPU leg doesn't drift
+# the GPU stack.
+gpu = { features = ["gpu", "py312"], solve-group = "gpu" }
+gpu-dev = { features = ["gpu", "test", "dev", "py312"], solve-group = "gpu" }
 
 [tasks]
 test = "pytest"

@@ -138,13 +138,21 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   frozen dataclass that's also a registered JAX pytree.
 * Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
   w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale,
-  max_window_size, window_padding_overhead`) live in the pytree
-  aux_data and become part of the JIT cache key. This list must
-  match `_plan_aux` in `planning.py` exactly — drift here is the
-  most common source of "silent pytree corruption" bugs.
+  max_window_size, window_padding_overhead, w_extent,
+  is_constant_w`) live in the pytree aux_data and become part of
+  the JIT cache key. This list must match `_plan_aux` in
+  `planning.py` exactly — drift here is the most common source of
+  "silent pytree corruption" bugs.
 * Plan **traced fields** (`uvw_lambda, w_centers, n_minus_1,
   phi_hat_n, sort_perm, uvw_lambda_sorted, window_start,
-  window_size`) are JAX device arrays.
+  window_size, u_finufft, v_finufft`) are JAX device arrays.
+  `u_finufft` / `v_finufft` are `(n_chan, n_rows)` precomputed
+  FINUFFT-input coordinates (`2π · pixsize_* · uvw_lambda[..., axis]`,
+  v0.1.2+). They add roughly `2 · n_chan · n_rows · sizeof(real)` to the
+  plan's HBM footprint (about +33% on top of the dense `uvw_lambda*`
+  arrays since each is now-half the shape). Sorted variants are not
+  stored; the windowed helpers gather them via `plan.sort_perm` at
+  scan time, trading half the memory for one gather per channel iter.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and
@@ -354,6 +362,50 @@ mask: the kernel weight `phi(z)` is zero outside the support.
 (old names accepted as deprecated aliases for one release; remove in
 v0.2).
 
+### v0.1.2 (branch `feature/v0.1.2-perf-gpu`)
+
+Performance release, GPU-focused. Full motivation in
+`docs/v0.1.2-plan.md`; six Parts, landed in per-sub-step commits.
+
+**Part 1: sorted-order windowed forward.** `_channel_forward_windowed`
+accumulates in w-sorted order with contiguous-slice updates and
+unsorts once at the end, instead of building a full `(n_rows,)` zero
+vector and scattering per plane.
+
+**Part 2: constant-w fast path.** `make_plan` collapses zero-w-extent
+data to a single plane (`n_w == 1`, `is_constant_w == True`), giving a
+~`W+1` win on coplanar / zenith-like workloads. All four `w_strategy`
+values reduce to the same single-plane work in this regime.
+
+**Part 3: precomputed FINUFFT coordinates.** `u_finufft` / `v_finufft`
+are stored as plan leaves (option (b): dense-order only; windowed
+helpers gather via `sort_perm`) rather than recomputed inside every
+channel call. Pytree leaf count bumped accordingly.
+
+**Part 4: `w_strategy="auto"`.** Opt-in value resolved to a canonical
+name *before* the JIT boundary (so cache sharing is preserved), via
+`_auto_w_strategy`. Defaults stay on `dense_scan`.
+
+**Part 5: GPU benchmark suite.** `tests/bench_harness.py` (async-aware
+timing, hardware fingerprint, HBM capture via `device.memory_stats()`)
+plus `tests/test_benchmark_gpu.py`, gated behind `--runbench-gpu`.
+Stable JSON schema documented in `docs/benchmarks/README.md`.
+
+**Part 6: GPU sweep + platform-aware defaults.** 160-cell GH200 sweep
+(`docs/benchmarks/v0.1.2-baseline-gpu.json`) showed `_scan` variants
+5-30x slower than `_vmap`, `dense_vmap` winning 17/20 cells, and
+`windowed_vmap` winning only the 50k-row `GH200_large` fixture.
+`_auto_w_strategy` is now platform-aware (`jax.devices()[0].platform`);
+unknown platforms fall back to the CPU heuristic.
+`tests/test_auto_strategy_acceptance.py` asserts the GPU pick is within
+15% of best on every cell.
+
+**Measured wins.** CPU (Mac M-series, eps=1e-6): Parts 1-3 carry the
+v0.1.1 windowed-adjoint gains forward; constant-w gives ~`W+1` on
+coplanar data. GPU (GH200): `dense_vmap` / `windowed_vmap` dominate;
+the auto heuristic picks the measured winner in 20/20 (op, fixture)
+cells.
+
 ---
 
 ## 10. Roadmap
@@ -381,47 +433,16 @@ The repo name and module layout (`jax_nufft.<feature>`) anticipate
 this expansion. Treat `wgridder.py` as the first of N feature modules
 rather than the whole package.
 
-### v0.1.2 prioritised performance plan
+### Plan-doc template
 
-The detailed v0.1.2 plan lives in `docs/v0.1.2-plan.md`. Plan docs in
-this repo follow a consistent template — when writing the next one
-(`v0.1.3-plan.md`, etc.) preserve the structure:
+Plan docs in this repo follow a consistent template — when writing the
+next one (`v0.1.3-plan.md`, etc.) preserve the structure:
 **Scope / Non-goals / Baseline / numbered Parts (Problem / Proposed
 change / Tests / Expected impact / Risk) / Lower-priority follow-ups /
 Release checklist**. The Parts are ordered by expected value;
 implementation risk is recorded per-Part rather than driving the
-ordering.
-
-In priority order, the high-value candidates are:
-
-1. **Windowed forward accumulation without per-plane full-row
-   scatter.** `_channel_forward_windowed` currently builds a full
-   `(n_rows,)` zero vector for every w-plane and scatters the window
-   contribution back to original row order. Since the coordinates are
-   already w-sorted, accumulate in sorted order with contiguous slice
-   updates and unsort once at the end. This is the clearest local hot
-   path improvement.
-2. **No-w / constant-w fast path.** If the plan has zero or tiny
-   w-extent, bypass the w-plane stack and use a single 2D NUFFT pair.
-   This should give an immediate `~n_w` win for coplanar / zenith-like
-   workloads.
-3. **Precompute FINUFFT coordinates in the plan.** Store
-   `u_finufft`, `v_finufft`, and sorted variants as plan leaves
-   instead of recomputing them inside every channel call.
-4. **Add `w_strategy="auto"` from plan diagnostics.** Use
-   `n_w / W` and `window_padding_overhead` to avoid making users pick
-   the slow strategy manually. Keep `"dense_scan"` as the conservative
-   fallback and benchmark before making `"auto"` the default.
-5. **Build a GPU benchmarking suite (GH200 target).** The existing
-   `pytest-benchmark`-based suite isn't accurate on GPU (no async
-   sync, no compile/run separation, no HBM metric). Adds a
-   harness module + `tests/test_benchmark_gpu.py` with hardware
-   fingerprint, async-aware timing, and a stable JSON schema. Land
-   first; Part 6 uses it.
-6. **Run a GPU benchmark sweep and tune defaults for cuFINUFFT.**
-   Use the Part 5 suite on GH200. Confirm whether `windowed_vmap`,
-   sorted accumulation, or a new strategy becomes preferable on GPU
-   before changing GPU-facing defaults.
+ordering. The v0.1.2 plan (`docs/v0.1.2-plan.md`, shipped — see §9) is
+a worked example.
 
 ### Other ideas (not yet sized)
 

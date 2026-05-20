@@ -73,6 +73,31 @@ def test_plan_uvw_lambda_correct() -> None:
     np.testing.assert_allclose(np.asarray(plan.uvw_lambda), expected, rtol=1e-6)
 
 
+def test_plan_finufft_coords_match_uvw_lambda() -> None:
+    """v0.1.2 Part 3.1: ``u_finufft`` / ``v_finufft`` must equal
+    ``2π · pixsize_* · uvw_lambda[..., axis]`` so the channel helpers can
+    read them directly from the plan instead of recomputing per call."""
+    uvw = _baseline_uvw(n_rows=12, max_baseline=80.0)
+    freq = np.array([1.4e9, 2.0e9])
+    pixsize_l = 1.3e-3
+    pixsize_m = 1.7e-3
+    plan = make_plan(
+        uvw=uvw,
+        freq=freq,
+        image_shape=(32, 32),
+        pixsize_l=pixsize_l,
+        pixsize_m=pixsize_m,
+        epsilon=1e-6,
+    )
+    expected_u = (2.0 * np.pi * pixsize_l) * np.asarray(plan.uvw_lambda)[..., 0]
+    expected_v = (2.0 * np.pi * pixsize_m) * np.asarray(plan.uvw_lambda)[..., 1]
+    np.testing.assert_allclose(np.asarray(plan.u_finufft), expected_u, rtol=1e-12)
+    np.testing.assert_allclose(np.asarray(plan.v_finufft), expected_v, rtol=1e-12)
+    # And shape matches uvw_lambda's leading dimensions.
+    assert plan.u_finufft.shape == (plan.n_chan, plan.n_rows)
+    assert plan.v_finufft.shape == (plan.n_chan, plan.n_rows)
+
+
 def test_plan_w_centers_span_data() -> None:
     """w-plane centres must extend symmetrically beyond the data range."""
     uvw = _baseline_uvw(n_rows=200, max_baseline=300.0)
@@ -118,7 +143,13 @@ def test_plan_nw_scales_with_w_extent() -> None:
 
 
 def test_plan_zero_w_extent_is_handled() -> None:
-    """All-zero w (perfectly zenith, coplanar array) must not blow up."""
+    """All-zero w (perfectly zenith, coplanar array) collapses to a single
+    plane via the v0.1.2 constant-w fast path.
+
+    Before v0.1.2 the dense path would produce ``dw=0`` and ``w_kernel_scale=0``,
+    which yielded NaN at call time via ``z = 0/0``. The fast path replaces
+    that with ``n_w=1`` and a unit phi_hat correction.
+    """
     uvw = _baseline_uvw(n_rows=20, max_baseline=50.0)
     uvw[:, 2] = 0.0
     plan = make_plan(
@@ -129,10 +160,43 @@ def test_plan_zero_w_extent_is_handled() -> None:
         pixsize_m=1e-3,
         epsilon=1e-6,
     )
-    # Inner w-plane count is at least 1 by construction.
-    assert plan.n_w >= 1 + plan.w_kernel_width
-    # All centres should still be finite.
+    assert plan.is_constant_w
+    assert plan.w_extent == 0.0
+    assert plan.n_w == 1
     assert np.all(np.isfinite(np.asarray(plan.w_centers)))
+
+
+def test_constant_w_collapses_n_w() -> None:
+    """Non-zero constant w (snapshot at fixed pointing) also triggers the
+    fast path and pins ``w_centers[0]`` to the constant w-value in wavelengths.
+    """
+    uvw = _baseline_uvw(n_rows=64, max_baseline=400.0)
+    # Replace the w column with a non-zero constant in metres.
+    w_const_m = 12.5
+    uvw[:, 2] = w_const_m
+    freq_hz = np.array([200e6])
+    plan = make_plan(
+        uvw=uvw,
+        freq=freq_hz,
+        image_shape=(64, 64),
+        pixsize_l=1e-3,
+        pixsize_m=1e-3,
+        epsilon=1e-6,
+    )
+    # The plan-level invariant.
+    assert plan.is_constant_w == (plan.w_extent == 0.0)
+    assert plan.is_constant_w
+    assert plan.n_w == 1
+    # In wavelengths, the constant value is w_m * freq / c. Single channel
+    # here so the per-channel and worst-case values coincide.
+    w_const_lambda = w_const_m * float(freq_hz[0]) / SPEED_OF_LIGHT
+    np.testing.assert_allclose(np.asarray(plan.w_centers), [w_const_lambda], rtol=0.0, atol=1e-9)
+    # phi_hat_n is unity for the fast path (no correction needed).
+    np.testing.assert_allclose(np.asarray(plan.phi_hat_n), 1.0)
+    # Windowed metadata: single window per channel covering all rows.
+    assert plan.max_window_size == plan.n_rows
+    assert np.asarray(plan.window_start).shape == (1, 1)
+    assert int(np.asarray(plan.window_size)[0, 0]) == plan.n_rows
 
 
 def test_plan_phi_hat_n_strictly_positive() -> None:
@@ -190,8 +254,9 @@ def test_plan_is_a_jax_pytree() -> None:
 
     leaves, treedef = jax.tree_util.tree_flatten(plan)
     # uvw_lambda, w_centers, n_minus_1, phi_hat_n, sort_perm,
-    # uvw_lambda_sorted, window_start, window_size
-    assert len(leaves) == 8
+    # uvw_lambda_sorted, window_start, window_size,
+    # u_finufft, v_finufft  (v0.1.2 Part 3.1 added the last two)
+    assert len(leaves) == 10
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
     # Static fields preserved exactly.
