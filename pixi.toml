@@ -13,11 +13,10 @@ pip = "*"
 [pypi-dependencies]
 jax-nufft = { path = ".", editable = true }
 
-# CPU stack lives in its own feature so we can platform-gate it: there is
-# no `cpu` build of jax-finufft on linux-aarch64 in conda-forge, only the
-# cuda variant. Anyone working on aarch64 uses the gpu env.
+# CPU stack: conda-forge ships a `cpu_*` jax-finufft build for all three
+# platforms (incl. linux-aarch64), so the cpu/dev/test envs run natively
+# on the GH200 dev host as well as on x86 / macOS CI.
 [feature.cpu]
-platforms = ["osx-arm64", "linux-64"]
 
 [feature.cpu.dependencies]
 jax = ">=0.5.0"
@@ -44,10 +43,19 @@ mypy = ">=1.10"
 pre-commit = ">=3.7"
 
 [environments]
+# CPU stack (works on osx-arm64, linux-64, linux-aarch64):
+#   default  -- runtime only (import + run the code)
+#   test     -- + pytest / ducc parity
+#   dev      -- + ruff / mypy / pre-commit (lint + typecheck + tests)
 default = { features = ["cpu"], solve-group = "cpu" }
 test = { features = ["cpu", "test"], solve-group = "cpu" }
 dev = { features = ["cpu", "dev", "test"], solve-group = "cpu" }
-gpu = { features = ["gpu", "test"], solve-group = "gpu" }
+# GPU stack (linux-64, linux-aarch64 with CUDA 12):
+#   gpu      -- runtime only, for simply running the code on a GPU
+#   gpu-dev  -- + test + dev tooling, for development / benchmarking on
+#               the GH200 (this is what the --runbench-gpu sweep uses)
+gpu = { features = ["gpu"], solve-group = "gpu" }
+gpu-dev = { features = ["gpu", "test", "dev"], solve-group = "gpu" }
 
 [tasks]
 test = "pytest"
