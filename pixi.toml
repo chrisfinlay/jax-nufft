@@ -6,7 +6,7 @@ channels = ["conda-forge"]
 platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [dependencies]
-python = ">=3.11,<3.13"
+python = ">=3.11,<3.15"
 numpy = ">=1.24"
 pip = "*"
 
@@ -44,32 +44,44 @@ pre-commit = ">=3.7"
 
 # Python-version pins for the CI test matrix. conda-forge has no
 # jax-finufft build for 3.10 (it needs >=3.11), so 3.10 is not supported;
-# CI tests the two supported versions, 3.11 and 3.12.
+# CI tests the supported versions 3.11 / 3.12 / 3.13 / 3.14.
 [feature.py311.dependencies]
 python = "3.11.*"
 
 [feature.py312.dependencies]
 python = "3.12.*"
 
+[feature.py313.dependencies]
+python = "3.13.*"
+
+[feature.py314.dependencies]
+python = "3.14.*"
+
 [environments]
 # CPU stack (works on osx-arm64, linux-64, linux-aarch64):
 #   default  -- runtime only (import + run the code)
 #   test     -- + pytest / ducc parity
 #   dev      -- + ruff / mypy / pre-commit (lint + typecheck + tests)
-#   test-py311 -- CI matrix leg pinning Python 3.11 (own solve)
-# The default/test/dev envs pin Python 3.12 (the highest supported) via
-# the py312 feature so the local env is explicit and stable; test-py311
-# is the second CI matrix leg.
+#   test-py311 / test-py313 / test-py314 -- extra CI matrix legs
+#   (3.11 / 3.13 / 3.14, own solves)
+# The default/test/dev envs pin Python 3.12 via the py312 feature so the
+# local env is explicit and stable; test-py311/313/314 are the other CI
+# matrix legs.
 default = { features = ["cpu", "py312"], solve-group = "cpu" }
 test = { features = ["cpu", "test", "py312"], solve-group = "cpu" }
 dev = { features = ["cpu", "dev", "test", "py312"], solve-group = "cpu" }
 test-py311 = { features = ["cpu", "test", "py311"], solve-group = "cpu-py311" }
+test-py313 = { features = ["cpu", "test", "py313"], solve-group = "cpu-py313" }
+test-py314 = { features = ["cpu", "test", "py314"], solve-group = "cpu-py314" }
 # GPU stack (linux-64, linux-aarch64 with CUDA 12):
 #   gpu      -- runtime only, for simply running the code on a GPU
 #   gpu-dev  -- + test + dev tooling, for development / benchmarking on
 #               the GH200 (this is what the --runbench-gpu sweep uses)
-gpu = { features = ["gpu"], solve-group = "gpu" }
-gpu-dev = { features = ["gpu", "test", "dev"], solve-group = "gpu" }
+# Both pin Python 3.12 (the CUDA jax-finufft build may not cover 3.13) so
+# relaxing the workspace cap to <3.14 for the 3.13 CPU leg doesn't drift
+# the GPU stack.
+gpu = { features = ["gpu", "py312"], solve-group = "gpu" }
+gpu-dev = { features = ["gpu", "test", "dev", "py312"], solve-group = "gpu" }
 
 [tasks]
 test = "pytest"

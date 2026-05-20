@@ -18,10 +18,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Python version matrix via pixi envs: `test` pins 3.12,
-        # `test-py311` pins 3.11. conda-forge has no jax-finufft build for
-        # 3.10, so 3.10 is not supported (see pixi.toml / pyproject).
-        environment: [test, test-py311]
+        # Python version matrix via pixi envs: test-py311=3.11, test=3.12,
+        # test-py313=3.13, test-py314=3.14. conda-forge has no jax-finufft
+        # build for 3.10, so 3.10 is unsupported (see pixi.toml / pyproject).
+        environment: [test-py311, test, test-py313, test-py314]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
