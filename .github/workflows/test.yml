@@ -13,8 +13,15 @@ concurrency:
 
 jobs:
   test:
-    name: pytest
+    name: pytest (${{ matrix.environment }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python version matrix via pixi envs: `test` pins 3.12,
+        # `test-py311` pins 3.11. conda-forge has no jax-finufft build for
+        # 3.10, so 3.10 is not supported (see pixi.toml / pyproject).
+        environment: [test, test-py311]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -24,14 +31,14 @@ jobs:
         with:
           # Resolve the CPU test env from conda-forge (jax-finufft cpu
           # build); the lockfile pins exact versions for reproducibility.
-          environments: test
+          environments: ${{ matrix.environment }}
           locked: true
 
       - name: Run pytest (fast)
-        run: pixi run -e test test -ra
+        run: pixi run -e ${{ matrix.environment }} test -ra
 
       - name: Run pytest (slow ducc parity)
-        run: pixi run -e test test -ra --runslow
+        run: pixi run -e ${{ matrix.environment }} test -ra --runslow
 
   lint:
     name: ruff + mypy

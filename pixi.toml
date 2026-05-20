@@ -42,14 +42,28 @@ ruff = ">=0.6.0"
 mypy = ">=1.10"
 pre-commit = ">=3.7"
 
+# Python-version pins for the CI test matrix. conda-forge has no
+# jax-finufft build for 3.10 (it needs >=3.11), so 3.10 is not supported;
+# CI tests the two supported versions, 3.11 and 3.12.
+[feature.py311.dependencies]
+python = "3.11.*"
+
+[feature.py312.dependencies]
+python = "3.12.*"
+
 [environments]
 # CPU stack (works on osx-arm64, linux-64, linux-aarch64):
 #   default  -- runtime only (import + run the code)
 #   test     -- + pytest / ducc parity
 #   dev      -- + ruff / mypy / pre-commit (lint + typecheck + tests)
-default = { features = ["cpu"], solve-group = "cpu" }
-test = { features = ["cpu", "test"], solve-group = "cpu" }
-dev = { features = ["cpu", "dev", "test"], solve-group = "cpu" }
+#   test-py311 -- CI matrix leg pinning Python 3.11 (own solve)
+# The default/test/dev envs pin Python 3.12 (the highest supported) via
+# the py312 feature so the local env is explicit and stable; test-py311
+# is the second CI matrix leg.
+default = { features = ["cpu", "py312"], solve-group = "cpu" }
+test = { features = ["cpu", "test", "py312"], solve-group = "cpu" }
+dev = { features = ["cpu", "dev", "test", "py312"], solve-group = "cpu" }
+test-py311 = { features = ["cpu", "test", "py311"], solve-group = "cpu-py311" }
 # GPU stack (linux-64, linux-aarch64 with CUDA 12):
 #   gpu      -- runtime only, for simply running the code on a GPU
 #   gpu-dev  -- + test + dev tooling, for development / benchmarking on
