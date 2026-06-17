@@ -69,6 +69,13 @@ class WGridderPlan:
     # ``max_window_size / mean_window_size`` and is purely diagnostic.
     max_window_size: int
     window_padding_overhead: float
+    # v0.1.2 w-degeneracy metadata:
+    # ``w_extent`` is ``max(w_lambda) - min(w_lambda)`` over all channels (in
+    # wavelengths); ``is_constant_w`` is True iff ``w_extent == 0.0`` exactly.
+    # Static so a future ``is_constant_w`` fast path can be selected
+    # plan-side without re-tracing.
+    w_extent: float
+    is_constant_w: bool
 
     # ---- traced arrays (pytree leaves) ----
     uvw_lambda: Array = field()  # (n_chan, n_rows, 3) — input row order
@@ -80,6 +87,12 @@ class WGridderPlan:
     uvw_lambda_sorted: Array = field()  # (n_chan, n_rows, 3) — uvw_lambda[:, sort_perm, :]
     window_start: Array = field()  # (n_chan, n_w) int — start idx in sorted array
     window_size: Array = field()  # (n_chan, n_w) int — live window length per plane
+    # v0.1.2 precomputed FINUFFT coordinates (option (b) from the v0.1.2 plan):
+    # ``u_finufft[c, r] = 2π · pixsize_l · uvw_lambda[c, r, 0]`` and likewise
+    # for ``v_finufft``. Sorted variants are NOT stored — the windowed helpers
+    # gather via ``plan.sort_perm`` + ``dynamic_slice`` at scan time.
+    u_finufft: Array = field()  # (n_chan, n_rows) — input row order
+    v_finufft: Array = field()  # (n_chan, n_rows) — input row order
 
     @property
     def image_shape(self) -> tuple[int, int]:
@@ -101,6 +114,8 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.w_kernel_scale,
         plan.max_window_size,
         plan.window_padding_overhead,
+        plan.w_extent,
+        plan.is_constant_w,
     )
 
 
@@ -119,6 +134,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w_kernel_scale,
         max_window_size,
         window_padding_overhead,
+        w_extent,
+        is_constant_w,
     ) = aux
     (
         uvw_lambda,
@@ -129,6 +146,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         uvw_lambda_sorted,
         window_start,
         window_size,
+        u_finufft,
+        v_finufft,
     ) = children
     return WGridderPlan(
         n_l=n_l,
@@ -144,6 +163,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w_kernel_scale=w_kernel_scale,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
+        w_extent=w_extent,
+        is_constant_w=is_constant_w,
         uvw_lambda=uvw_lambda,
         w_centers=w_centers,
         n_minus_1=n_minus_1,
@@ -152,6 +173,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         uvw_lambda_sorted=uvw_lambda_sorted,
         window_start=window_start,
         window_size=window_size,
+        u_finufft=u_finufft,
+        v_finufft=v_finufft,
     )
 
 
@@ -167,6 +190,8 @@ jax.tree_util.register_pytree_node(
             p.uvw_lambda_sorted,
             p.window_start,
             p.window_size,
+            p.u_finufft,
+            p.v_finufft,
         ),
         _plan_aux(p),
     ),
@@ -202,6 +227,7 @@ def make_plan(
     *,
     phi_hat_n_fine: int = 4096,
     phi_hat_oversample: int | None = None,
+    _force_generic: bool = False,
 ) -> WGridderPlan:
     """Build the wgridder plan for the given (uvw, freq, image, epsilon).
 
@@ -209,6 +235,12 @@ def make_plan(
     :func:`jax_nufft.vis2dirty`. All planning math runs on the host (numpy);
     the resulting numerical arrays live as JAX device arrays so that the
     JIT-compiled operators see them as constants.
+
+    ``_force_generic`` is a private test-only escape hatch that skips the
+    v0.1.2 constant-w fast path even when ``w_extent == 0``, building the
+    generic-shape plan (``n_w == w_kernel_width + 1``) for direct
+    fast-vs-generic comparison in tests. Not part of the public API; do
+    not use in application code.
     """
     if epsilon <= 0:
         raise ValueError(f"epsilon must be > 0; got {epsilon}")
@@ -259,96 +291,139 @@ def make_plan(
         # Should be unreachable with a real telescope; guard anyway.
         raise AssertionError("internal: negative w-extent")
 
-    # --- number of w-planes ---
-    # Sample w with step dw = x0 / max|n-1|, matching ducc's choice for
-    # ofactor=2 kernels (see W_OVERSAMPLE_X0). This is independent of W.
-    x0 = W_OVERSAMPLE_X0
-    n_w_inner = math.ceil(w_extent * max_abs_nm1 / x0)
-    n_w_inner = max(n_w_inner, 1)  # always have at least one interior step
-    n_w = n_w_inner + w_kernel_width
+    is_constant_w_val = bool(w_extent == 0.0)
+    use_fast_path = is_constant_w_val and not _force_generic
 
-    # --- w-plane centres (spec sec 4.2 step 4) ---
-    if n_w_inner == 0:
-        # Degenerate: w-extent tiny relative to kernel; fall back to a single plane.
-        dw = 1.0
-    else:
-        dw = w_extent / n_w_inner
-    w_kernel_scale = dw * w_kernel_width / 2.0
-    k = np.arange(n_w)
-    w_centers_np = w_min_all + (k - w_kernel_width / 2.0) * dw
-    w_centers_np = w_centers_np.astype(real_dtype)
-
-    # --- phi_hat_n (precomputed on the n-1 grid) ---
-    # Argument to phi_hat is eta = (n - 1) * scale, where scale is the kernel
-    # half-width in wavelengths. With the v0.1.1 fixed-x0 sampling the
-    # nominal eta_max is x0 * W / 2 = W/8 (W=4 -> 0.5, W=8 -> 1.0,
-    # W=10 -> 1.25). We size the phi_hat oversample to keep cubic-Lagrange
-    # interpolation accurate on that wider range.
-    eta_n = n_minus_1_np * w_kernel_scale
-    eta_max_request = max(float(np.max(np.abs(eta_n))), 1e-9)
-    if phi_hat_oversample is None:
-        phi_hat_oversample = phi_hat_oversample_for_w(w_kernel_width)
-    phi_hat_table = compute_phi_hat_table(
-        beta=beta,
-        eta_max_request=eta_max_request,
-        n_fine=phi_hat_n_fine,
-        oversample=phi_hat_oversample,
-    )
-    # The image-domain correction needs a (W/2) factor to convert the discrete
-    # w-plane sum used in the gridder into the continuous w-integral that
-    # corresponds to the "literal sum" definition of the visibility (matching
-    # ducc's dirty2vis). Concretely: sum_k phi((w-w_k)/scale) g(w_k) ~= (1/dw)
-    # * integral phi((w-w')/scale) g(w') dw', and dw = 2*scale/W, so the
-    # discrete sum picks up a (scale/dw) = W/2 multiplier relative to the
-    # continuous-FT-based correction phi_hat(scale * (n-1)).
-    phi_hat_dim = phi_hat_table.evaluate(eta_n)
-    phi_hat_n_np = ((w_kernel_width / 2.0) * phi_hat_dim).astype(real_dtype)
-    if not np.all(phi_hat_n_np > 0):
-        raise ValueError(
-            "phi_hat_n contains non-positive values; planning would produce "
-            "infinite/garbage corrections. Try a larger oversample or a "
-            "smaller epsilon."
-        )
-
-    # --- v0.1.1 windowed-scan builder ---
-    # Sort visibilities by w in metres (frequency-independent). The same
-    # permutation serves every channel because scaling by ``freq[c]/c`` is
-    # strictly positive and so monotonic.
-    sort_perm_np = np.argsort(uvw_arr[:, 2], kind="stable").astype(np.int32)
-    uvw_lambda_sorted_np = uvw_lambda_np[:, sort_perm_np, :]
-
-    # For each (channel, plane), the contributing rows are those with
-    # ``|w_lambda - w_k| < W/2 * dw = w_kernel_scale`` (the kernel support
-    # cutoff, where ``phi(z) = 0`` outside). After sorting, this is a
-    # contiguous slice; ``searchsorted`` finds the boundaries.
-    window_start_np = np.zeros((n_chan, n_w), dtype=np.int32)
-    window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
-    half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
-    w_centers64 = w_centers_np.astype(np.float64)
-    for c in range(n_chan):
-        w_lambda_c = uvw_lambda_sorted_np[c, :, 2].astype(np.float64)
-        # ``side="left"``  for lower bound, ``side="right"`` for upper bound
-        # gives a half-open interval [lo, hi) of strictly-inside rows. Rows
-        # exactly at ``w_k +/- half_W_dw`` have phi(z=+/-1) = exp(-beta),
-        # numerically tiny but nonzero — including them costs at most one
-        # extra row per side and avoids edge surprises.
-        lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw, side="left")
-        hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw, side="right")
-        window_start_np[c] = lo.astype(np.int32)
-        window_size_np[c] = (hi - lo).astype(np.int32)
-
-    max_window_size = int(window_size_np.max(initial=0))
-    # mean_window_size: ignore empty windows (entirely outside data range)
-    # so that the diagnostic isn't dominated by edge planes.
-    nonzero_windows = window_size_np[window_size_np > 0]
-    if nonzero_windows.size:
-        mean_window_size = float(nonzero_windows.mean())
-        window_padding_overhead = max_window_size / mean_window_size
-    else:
+    if use_fast_path:
+        # --- v0.1.2 constant-w fast path ---
+        # All visibilities share a single w-value (in wavelengths, across all
+        # channels). The dense path would set dw=0 and produce NaN at call
+        # time via z=0/0; here we collapse to one w-plane at the constant
+        # value. Math: V = NUFFT[I * exp(2πi w_const (n-1))]. No kernel
+        # discretisation, no sum approximating an integral, so phi_hat_n
+        # carries no correction (the operator code multiplies by
+        # phi((w_lambda-w_k)/scale) = phi(0) = 1, and there is nothing to
+        # invert).
+        w_constant = w_min_all  # = w_max_all by construction
+        n_w = 1
+        # Any nonzero ``w_kernel_scale`` makes ``z = (w_lambda - w_k)/scale``
+        # well-defined; with z=0 the kernel weight phi(0, beta) = 1 by
+        # construction so the value doesn't affect output.
+        w_kernel_scale = 1.0
+        w_centers_np = np.array([w_constant], dtype=real_dtype)
+        phi_hat_n_np = np.ones((n_l, n_m), dtype=real_dtype)
+        # Single-window builder: one window per channel, covering all rows.
+        sort_perm_np = np.arange(n_rows, dtype=np.int32)
+        uvw_lambda_sorted_np = uvw_lambda_np
+        window_start_np = np.zeros((n_chan, 1), dtype=np.int32)
+        window_size_np = np.full((n_chan, 1), n_rows, dtype=np.int32)
+        max_window_size = max(n_rows, 1)
         window_padding_overhead = 1.0
-    # Clamp max_window_size to at least 1 so the static dynamic_slice
-    # shape is well-defined (e.g. n_rows >= 1 always).
-    max_window_size = max(max_window_size, 1)
+    else:
+        # --- number of w-planes ---
+        # Sample w with step dw = x0 / max|n-1|, matching ducc's choice for
+        # ofactor=2 kernels (see W_OVERSAMPLE_X0). This is independent of W.
+        x0 = W_OVERSAMPLE_X0
+        n_w_inner = math.ceil(w_extent * max_abs_nm1 / x0)
+        n_w_inner = max(n_w_inner, 1)  # always have at least one interior step
+        n_w = n_w_inner + w_kernel_width
+
+        # --- w-plane centres (spec sec 4.2 step 4) ---
+        if w_extent == 0.0:
+            # Reachable only via ``_force_generic`` on constant-w data
+            # (the v0.1.2 fast path normally handles w_extent==0). Pick dw
+            # matching the "one inner step" sampling we would use for the
+            # smallest non-zero w_extent so the resulting plan is well-
+            # defined (in particular, ``w_kernel_scale > 0`` avoids the
+            # ``z = 0/0`` NaN that the dense operator would otherwise hit).
+            dw = x0 / max_abs_nm1
+        else:
+            dw = w_extent / n_w_inner
+        w_kernel_scale = dw * w_kernel_width / 2.0
+        k = np.arange(n_w)
+        w_centers_np = w_min_all + (k - w_kernel_width / 2.0) * dw
+        w_centers_np = w_centers_np.astype(real_dtype)
+
+        # --- phi_hat_n (precomputed on the n-1 grid) ---
+        # Argument to phi_hat is eta = (n - 1) * scale, where scale is the kernel
+        # half-width in wavelengths. With the v0.1.1 fixed-x0 sampling the
+        # nominal eta_max is x0 * W / 2 = W/8 (W=4 -> 0.5, W=8 -> 1.0,
+        # W=10 -> 1.25). We size the phi_hat oversample to keep cubic-Lagrange
+        # interpolation accurate on that wider range.
+        eta_n = n_minus_1_np * w_kernel_scale
+        eta_max_request = max(float(np.max(np.abs(eta_n))), 1e-9)
+        if phi_hat_oversample is None:
+            phi_hat_oversample = phi_hat_oversample_for_w(w_kernel_width)
+        phi_hat_table = compute_phi_hat_table(
+            beta=beta,
+            eta_max_request=eta_max_request,
+            n_fine=phi_hat_n_fine,
+            oversample=phi_hat_oversample,
+        )
+        # The image-domain correction needs a (W/2) factor to convert the discrete
+        # w-plane sum used in the gridder into the continuous w-integral that
+        # corresponds to the "literal sum" definition of the visibility (matching
+        # ducc's dirty2vis). Concretely: sum_k phi((w-w_k)/scale) g(w_k) ~= (1/dw)
+        # * integral phi((w-w')/scale) g(w') dw', and dw = 2*scale/W, so the
+        # discrete sum picks up a (scale/dw) = W/2 multiplier relative to the
+        # continuous-FT-based correction phi_hat(scale * (n-1)).
+        phi_hat_dim = phi_hat_table.evaluate(eta_n)
+        phi_hat_n_np = ((w_kernel_width / 2.0) * phi_hat_dim).astype(real_dtype)
+        if not np.all(phi_hat_n_np > 0):
+            raise ValueError(
+                "phi_hat_n contains non-positive values; planning would produce "
+                "infinite/garbage corrections. Try a larger oversample or a "
+                "smaller epsilon."
+            )
+
+        # --- v0.1.1 windowed-scan builder ---
+        # Sort visibilities by w in metres (frequency-independent). The same
+        # permutation serves every channel because scaling by ``freq[c]/c`` is
+        # strictly positive and so monotonic.
+        sort_perm_np = np.argsort(uvw_arr[:, 2], kind="stable").astype(np.int32)
+        uvw_lambda_sorted_np = uvw_lambda_np[:, sort_perm_np, :]
+
+        # For each (channel, plane), the contributing rows are those with
+        # ``|w_lambda - w_k| < W/2 * dw = w_kernel_scale`` (the kernel support
+        # cutoff, where ``phi(z) = 0`` outside). After sorting, this is a
+        # contiguous slice; ``searchsorted`` finds the boundaries.
+        window_start_np = np.zeros((n_chan, n_w), dtype=np.int32)
+        window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
+        half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
+        w_centers64 = w_centers_np.astype(np.float64)
+        for c in range(n_chan):
+            w_lambda_c = uvw_lambda_sorted_np[c, :, 2].astype(np.float64)
+            # ``side="left"``  for lower bound, ``side="right"`` for upper bound
+            # gives a half-open interval [lo, hi) of strictly-inside rows. Rows
+            # exactly at ``w_k +/- half_W_dw`` have phi(z=+/-1) = exp(-beta),
+            # numerically tiny but nonzero — including them costs at most one
+            # extra row per side and avoids edge surprises.
+            lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw, side="left")
+            hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw, side="right")
+            window_start_np[c] = lo.astype(np.int32)
+            window_size_np[c] = (hi - lo).astype(np.int32)
+
+        max_window_size = int(window_size_np.max(initial=0))
+        # mean_window_size: ignore empty windows (entirely outside data range)
+        # so that the diagnostic isn't dominated by edge planes.
+        nonzero_windows = window_size_np[window_size_np > 0]
+        if nonzero_windows.size:
+            mean_window_size = float(nonzero_windows.mean())
+            window_padding_overhead = max_window_size / mean_window_size
+        else:
+            window_padding_overhead = 1.0
+        # Clamp max_window_size to at least 1 so the static dynamic_slice
+        # shape is well-defined (e.g. n_rows >= 1 always).
+        max_window_size = max(max_window_size, 1)
+
+    # v0.1.2 Part 3: precompute the per-call (2π * pixsize) scaling on u, v
+    # so the channel helpers can read them directly from the plan instead of
+    # re-deriving them on every JIT invocation. Sorted variants are NOT
+    # stored (option (b) in the v0.1.2 plan); the windowed helpers gather
+    # via plan.sort_perm at scan time.
+    two_pi = 2.0 * np.pi
+    u_finufft_np = (two_pi * pixsize_l) * uvw_lambda_np[..., 0]
+    v_finufft_np = (two_pi * pixsize_m) * uvw_lambda_np[..., 1]
 
     return WGridderPlan(
         n_l=int(n_l),
@@ -364,6 +439,12 @@ def make_plan(
         w_kernel_scale=float(w_kernel_scale),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
+        w_extent=float(w_extent),
+        # ``is_constant_w`` reflects the plan SHAPE (n_w==1 collapse), not
+        # the data shape. When ``_force_generic`` builds a generic plan
+        # over constant-w data, this stays False so downstream selectors
+        # (Part 4 auto, etc.) see the actual structure of this plan.
+        is_constant_w=use_fast_path,
         uvw_lambda=jnp.asarray(uvw_lambda_np),
         w_centers=jnp.asarray(w_centers_np),
         n_minus_1=jnp.asarray(n_minus_1_np),
@@ -372,6 +453,8 @@ def make_plan(
         uvw_lambda_sorted=jnp.asarray(uvw_lambda_sorted_np),
         window_start=jnp.asarray(window_start_np),
         window_size=jnp.asarray(window_size_np),
+        u_finufft=jnp.asarray(u_finufft_np),
+        v_finufft=jnp.asarray(v_finufft_np),
     )
 
 

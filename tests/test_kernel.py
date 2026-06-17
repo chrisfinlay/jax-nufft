@@ -162,9 +162,7 @@ def test_phi_hat_conditioning_at_v011_eta_max(w: int) -> None:
     dz = z[1] - z[0]
     phi_z = phi_numpy(z, beta)
     eta_check = np.linspace(-eta_max, eta_max, 17)
-    direct = np.array(
-        [np.sum(phi_z * np.exp(-2j * np.pi * e * z)).real * dz for e in eta_check]
-    )
+    direct = np.array([np.sum(phi_z * np.exp(-2j * np.pi * e * z)).real * dz for e in eta_check])
     interp_check = table.evaluate(eta_check)
     rel_err = np.max(np.abs(interp_check - direct) / np.abs(direct))
     # Cubic-Lagrange on a 1/(2*oversample)-spaced grid should comfortably

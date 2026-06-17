@@ -76,6 +76,20 @@ MEERKAT = Telescope(
     n_pix=256,
     fov_rad=math.radians(1.5),
 )
+# v0.1.2 Part 5.4: a GH200-class fixture for the GPU bench suite. Sized so
+# the transient dense_vmap allocation (n_w * n_pix^2 complex64) is on the
+# order of ~10-20 GB -- big enough to demand real HBM bandwidth, far below
+# the GH200's 96 GB so we don't OOM. Off-zenith pointing produces ~n_w in
+# the low hundreds with these parameters.
+GH200_LARGE = Telescope(
+    name="GH200_large",
+    freq_hz=1.4e9,
+    n_rows=50_000,
+    sigma_uv_m=4000.0,
+    max_baseline_m=12_000.0,
+    n_pix=2048,
+    fov_rad=math.radians(2.0),
+)
 
 
 def synthetic_uvw(
@@ -181,6 +195,21 @@ def bench_telescope_pointing(request) -> tuple[Telescope, float]:
     return request.param
 
 
+@pytest.fixture(
+    params=[
+        (GH200_LARGE, 0.0),
+        (GH200_LARGE, 30.0),
+    ],
+    ids=lambda v: _telescope_pointing_id(v),
+)
+def gh200_large_pointing(request) -> tuple[Telescope, float]:
+    """GH200-sized fixture for the v0.1.2 GPU bench suite. Only used by
+    ``tests/test_benchmark_gpu.py``; gated by ``--runbench-gpu`` and a GPU
+    backend so accidental CPU collection doesn't try to allocate the
+    multi-GB transient arrays."""
+    return request.param
+
+
 _BENCH_POINTING_FILTERS: dict[str, set[float]] = {
     "zenith": {0.0},
     "off30": {30.0},
@@ -188,28 +217,67 @@ _BENCH_POINTING_FILTERS: dict[str, set[float]] = {
 }
 
 
+def _jax_platform() -> str:
+    """Detect the JAX default platform without importing at conftest top.
+
+    Used to gate ``--runbench-gpu`` tests so they skip cleanly on CPU
+    machines instead of failing inside cuFINUFFT.
+    """
+    try:
+        import jax
+    except Exception:  # pragma: no cover
+        return "cpu"
+    return jax.default_backend()
+
+
 def pytest_collection_modifyitems(config, items):
     """Mark slow / benchmark tests so they are skipped without their flag."""
     skip_slow = pytest.mark.skip(reason="needs --runslow")
     skip_bench = pytest.mark.skip(reason="needs --runbench")
+    skip_bench_gpu_flag = pytest.mark.skip(reason="needs --runbench-gpu")
+    skip_bench_gpu_platform = pytest.mark.skip(
+        reason="runbench_gpu requires jax.default_backend() == 'gpu'"
+    )
     runslow = config.getoption("--runslow", default=False)
     runbench = config.getoption("--runbench", default=False)
+    runbench_gpu = config.getoption("--runbench-gpu", default=False)
     bench_pointing = config.getoption("--bench-pointing", default="zenith")
     allowed_angles = _BENCH_POINTING_FILTERS[bench_pointing]
     skip_off_pointing = pytest.mark.skip(
         reason=f"--bench-pointing={bench_pointing} excludes this combination"
     )
+    platform = _jax_platform()
     for item in items:
         is_bench_item = "bench_telescope_pointing" in item.fixturenames
+        is_runbench_gpu = "runbench_gpu" in item.keywords
         if "long_telescope_pointing" in item.fixturenames and not runslow:
             item.add_marker(skip_slow)
-        if is_bench_item and not runbench:
+        if is_runbench_gpu:
+            if not runbench_gpu:
+                item.add_marker(skip_bench_gpu_flag)
+                continue
+            if platform != "gpu":
+                item.add_marker(skip_bench_gpu_platform)
+                continue
+            # --runbench-gpu tests are gated only by their own flag +
+            # platform; don't apply --runbench gating below.
+        elif is_bench_item and not runbench:
             item.add_marker(skip_bench)
             continue
         if is_bench_item:
             tel_pointing = item.callspec.params.get("bench_telescope_pointing")
             if tel_pointing is not None and tel_pointing[1] not in allowed_angles:
                 item.add_marker(skip_off_pointing)
+
+
+def pytest_configure(config):
+    """Register custom markers so ``pytest -m`` is happy and PYTHONDEVMODE
+    doesn't print a warning."""
+    config.addinivalue_line(
+        "markers",
+        "runbench_gpu: opt-in GPU benchmark suite "
+        "(needs --runbench-gpu and jax.default_backend() == 'gpu')",
+    )
 
 
 def pytest_addoption(parser):
@@ -224,6 +292,16 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Run benchmark suite comparing jax-nufft to ducc0.",
+    )
+    parser.addoption(
+        "--runbench-gpu",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the v0.1.2 GPU benchmark suite (tests/test_benchmark_gpu.py). "
+            "Tests are also gated on jax.default_backend() == 'gpu' so a CPU "
+            "host produces SKIPPED, not FAILED."
+        ),
     )
     parser.addoption(
         "--bench-pointing",
