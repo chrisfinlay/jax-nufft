@@ -107,6 +107,11 @@ if not X64:
         "test_benchmark_against_ducc.py",
         "test_boundary_planes.py",
         "test_jax_integration.py",
+        # Same reason as test_benchmark_against_ducc.py: builds a default
+        # (float64) plan and calls jax.config.update("jax_enable_x64", True)
+        # at import time (issue #24 timing gate; opt-in via --runtiming, but
+        # the import-time x64 flip happens regardless of that flag).
+        "test_timing_nthreads.py",
         # Build default (float64) plans with no ``dtype=`` argument: 62 tests
         # across these four now stop at the new ``make_plan`` ValueError.
         "test_against_ducc.py",
@@ -340,10 +345,12 @@ def pytest_collection_modifyitems(config, items):
     skip_bench_gpu_platform = pytest.mark.skip(
         reason="runbench_gpu requires jax.default_backend() == 'gpu'"
     )
+    skip_timing = pytest.mark.skip(reason="needs --runtiming")
     runslow = config.getoption("--runslow", default=False)
     runsweep = config.getoption("--runsweep", default=False)
     runbench = config.getoption("--runbench", default=False)
     runbench_gpu = config.getoption("--runbench-gpu", default=False)
+    runtiming = config.getoption("--runtiming", default=False)
     bench_pointing = config.getoption("--bench-pointing", default="zenith")
     allowed_angles = _BENCH_POINTING_FILTERS[bench_pointing]
     skip_off_pointing = pytest.mark.skip(
@@ -359,6 +366,13 @@ def pytest_collection_modifyitems(config, items):
         # and skip the rest of the checks for those items.
         if "runsweep" in item.keywords and not runsweep:
             item.add_marker(skip_sweep)
+            continue
+        # The nthreads timing gate (issue #24) is wall-clock-based and thus
+        # flaky on shared/noisy CI runners, same rationale as --runbench;
+        # it gets its own flag rather than piggybacking on --runbench so it
+        # can be run in isolation without the full (slower) benchmark suite.
+        if "runtiming" in item.keywords and not runtiming:
+            item.add_marker(skip_timing)
             continue
         if "long_telescope_pointing" in item.fixturenames and not runslow:
             item.add_marker(skip_slow)
@@ -391,6 +405,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "runsweep: opt-in exact-DFT accuracy sweep (needs --runsweep)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "runtiming: opt-in nthreads timing gate, issue #24 (needs --runtiming)",
     )
 
 
@@ -436,5 +454,16 @@ def pytest_addoption(parser):
             "seven review fixtures x eight epsilon values x forward/adjoint. Every "
             "issue that says 're-run the accuracy sweep' means this flag. Add -s to "
             "see the printed ratio table."
+        ),
+    )
+    parser.addoption(
+        "--runtiming",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the issue #24 nthreads timing gate (tests/test_timing_nthreads.py): "
+            "asserts dense_scan's default nthreads is within 1.2x of an explicit "
+            "nthreads=1 on the same machine. Wall-clock based, so it is opt-in and "
+            "excluded from the default suite the same way --runbench is."
         ),
     )

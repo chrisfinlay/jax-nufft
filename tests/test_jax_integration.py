@@ -203,6 +203,69 @@ def test_jit_static_strategy_args() -> None:
     assert out.shape == (plan.n_rows, plan.n_chan)
 
 
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+def test_dirty2vis_nthreads_invariant(w_strategy: str) -> None:
+    """``nthreads`` is a scheduling knob, not a semantic one: dirty2vis at
+    ``nthreads=None`` (issue #24's new default) and ``nthreads=2`` must
+    match ``nthreads=1`` exactly to within 1e-11, across every w_strategy.
+
+    dirty2vis is a type-2 NUFFT (interpolation), which has no thread-order-
+    dependent reduction, so in principle this could be checked exactly; the
+    1e-11 bound is kept for parity with the adjoint check below and with
+    the issue's stated contract. Against the current default (``nthreads:
+    int = 0``, no ``None`` handling), the ``nthreads=None`` case fails
+    immediately with a jax-finufft ``Opts`` validation error rather than a
+    numerical mismatch -- that failure is the point: this test cannot pass
+    until ``nthreads: int | None = None`` resolves before the JIT boundary.
+    """
+    plan, image, _ = _tiny_setup(11)
+    reference = np.asarray(dirty2vis(plan, image, w_strategy=w_strategy, nthreads=1))
+    for nthreads in (None, 2):
+        out = np.asarray(dirty2vis(plan, image, w_strategy=w_strategy, nthreads=nthreads))
+        np.testing.assert_allclose(
+            out,
+            reference,
+            atol=1e-11,
+            rtol=0,
+            err_msg=(
+                f"dirty2vis(nthreads={nthreads}) vs nthreads=1 mismatch "
+                f"for w_strategy={w_strategy!r}"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+def test_vis2dirty_nthreads_invariant(w_strategy: str) -> None:
+    """Adjoint counterpart of ``test_dirty2vis_nthreads_invariant``.
+
+    vis2dirty is a type-1 NUFFT (parallel scatter-add), so its reduction
+    order is not fixed across calls on a multithreaded FINUFFT CPU build --
+    ``nthreads=None``/``1``/``2`` are expected to differ only at that
+    floor, which ``test_jit_idempotent_with_eager`` above measured at up to
+    ~8e-12 relative on a 72-core build; 1e-11 leaves headroom over that
+    while still catching a strategy/threading wiring bug (which would be
+    O(1), not O(1e-11)).
+    """
+    plan, _, vis = _tiny_setup(12)
+    reference = np.asarray(vis2dirty(plan, vis, w_strategy=w_strategy, nthreads=1))
+    for nthreads in (None, 2):
+        out = np.asarray(vis2dirty(plan, vis, w_strategy=w_strategy, nthreads=nthreads))
+        np.testing.assert_allclose(
+            out,
+            reference,
+            atol=1e-11,
+            rtol=0,
+            err_msg=(
+                f"vis2dirty(nthreads={nthreads}) vs nthreads=1 mismatch "
+                f"for w_strategy={w_strategy!r}"
+            ),
+        )
+
+
 def test_w_strategy_aliases_emit_deprecation() -> None:
     """v0.1 names ``scan``/``vmap`` still work but warn."""
     plan, image, _ = _tiny_setup(6)
