@@ -39,27 +39,90 @@ def phi_hat_oversample_for_w(w_kernel_width: int) -> int:
     W. Bump the oversample so that cubic-Lagrange interpolation off the
     phi_hat table stays accurate (the interpolation error scales like
     ``eta_step**4``, with ``eta_step = 1 / (2 * oversample)``).
+
+    Conditioning is not the binding constraint: the smallest ``phi_hat`` over
+    ``|eta| <= x0 * W / 2`` is 8.2e-2 at W = 13 and 5.8e-2 at W = 15, four
+    orders of magnitude above the table's 1e-6 safety floor. The binding
+    constraint is *interpolation accuracy*, because ``phi_hat_n`` is divided
+    into the image: whatever relative error the table carries lands
+    one-for-one in the output. The requested accuracy for a width is
+    ``eps = 10**-(W - 1)`` (:func:`kernel_params` inverted), so the table has
+    to be good to roughly ``eps / 10``, and off-grid interpolation error
+    measured against a 64x finer table is
+
+        W      = 4        8        10       11       12       13
+        os=32    4.9e-08  2.8e-08  2.3e-08  2.0e-08  1.8e-08  1.5e-08
+        os=64    3.1e-09  1.7e-09  1.4e-09  1.3e-09  1.1e-09  9.4e-10
+        os=128   1.9e-10  1.1e-10  8.8e-11  7.8e-11  6.8e-11  5.9e-11
+        os=512   7.5e-13  4.1e-13  3.5e-13  3.1e-13  2.7e-13  2.3e-13
+
+    i.e. a factor 16 per doubling (``eta_step**4`` with
+    ``eta_step = 1 / (2 * oversample)``) against a requirement that tightens
+    by 10 per digit -- so the oversample doubles once per digit above W = 9
+    and keeps a growing margin. Issue #9 added the steps above 128: at
+    eps = 1e-12 (W = 13) the old flat 128 left a 5.9e-11 table error, which
+    showed up end-to-end as 1.4e-11 relative -- 14x the requested epsilon,
+    with the w-kernel itself already well inside its budget. The cap at 2048
+    is where the table's own float64 noise (~1e-16 relative) takes over;
+    building it costs about 190 ms and 270 MB of transient host memory at
+    plan time, and only for eps <= 1e-12 requests.
+
+    Note this is *not* measured by ``test_phi_hat_conditioning_at_v011_eta_max``
+    in the test suite: that test's check points land exactly on table nodes,
+    where cubic Lagrange is exact by construction.
     """
     if w_kernel_width <= 4:
         return 32
     if w_kernel_width <= 8:
         return 64
-    return 128
+    # W >= 9: one doubling per requested digit, capped where float64 noise wins.
+    return min(2048, 128 * 2 ** (w_kernel_width - 9))
 
 
 def kernel_params(epsilon: float) -> tuple[int, float]:
     """Return ``(W, beta)`` for the requested accuracy.
 
-    The width ``W`` follows the rough rule from the spec
-    (``W = ceil(-log10(eps) * 2/pi) + 2``), and ``beta = 2.30 * W`` matches the
-    FINUFFT default for upsampling factor ``sigma = 2``. These are conservative
-    choices: jax-finufft itself may pick a slightly different ``W`` internally
-    for the (u,v) directions, but using the same kernel shape for the w-direction
-    is what matters for self-consistency of the gridder.
+    The width follows the practical rule of [Barnett+2019] eq. 10 -- "W is one
+    more than the desired number of digits" -- i.e.
+
+        W = ceil(-log10(epsilon / 10))
+
+    which is what FINUFFT itself implements in ``src/spreadinterp.cpp::
+    setup_spreader`` at upsampling factor ``sigma = 2``. ``beta = 2.30 * W`` is
+    the matching shape parameter from the same equation.
+
+    The rule is not a fudge factor: [Barnett+2019] Theorem 7 bounds the
+    aliasing error of the exp-of-semicircle kernel by
+    ``exp(-pi * W * gamma * sqrt(1 - 1/sigma))``, which at ``sigma = 2`` and the
+    standard ``gamma`` is ``~exp(-2.2 * W)`` -- exactly one decimal digit per
+    unit of ``W``, with no margin. So the number of cells has to be the number
+    of digits requested, plus one for the constants the bound drops.
+
+    Before issue #9 this used ``W = ceil(-log10(eps) * 2/pi) + 2``, which grows
+    by only ``2/pi < 1`` per digit and was therefore 0, 0, 0, 1, 1, 1, 2, 3
+    cells short across ``eps = 1e-3 .. 1e-12``; it also mapped 1e-5 and 1e-6
+    (and 1e-9/1e-10, 1e-11/1e-12) onto the same width, so tightening epsilon
+    across those pairs bought no accuracy at all. Measured against the exact
+    DFT the shortfall was 3-4.4x epsilon at 1e-6..1e-8 and 26-550x at
+    1e-10..1e-12; with this rule every cell of the accuracy sweep lands within
+    2x (see ``tests/test_accuracy_sweep.py``).
+
+    jax-finufft may still pick a slightly different ``W`` internally for the
+    (u,v) directions; what matters here is that the w-direction kernel is
+    provisioned for the epsilon the caller asked for.
     """
     if not 0.0 < epsilon < 1.0:
         raise ValueError(f"epsilon must be in (0, 1); got {epsilon!r}")
-    w = math.ceil(-math.log10(epsilon) * 2.0 / math.pi) + 2
+    # Below 1e-14 the rule asks for W > 15. That is past what the phi_hat table
+    # and the float64 kernel can honour (and past what the (u,v) NUFFT can
+    # deliver anyway), so refuse rather than silently return a width that does
+    # not buy the requested accuracy.
+    if epsilon < 1e-14:
+        raise ValueError(
+            f"epsilon={epsilon!r} is below the smallest supported value 1e-14 "
+            "(the width rule would ask for W > 15)"
+        )
+    w = math.ceil(-math.log10(epsilon / 10.0))
     # Clip to a sensible minimum: W < 2 has effectively no kernel support.
     w = max(w, 2)
     beta = 2.30 * w

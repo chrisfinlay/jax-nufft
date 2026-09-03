@@ -239,6 +239,45 @@ def test_phi_hat_conditioning_at_v011_eta_max(w: int) -> None:
     assert rel_err < 1e-7, f"W={w}: phi_hat interp rel_err = {rel_err:.3e}"
 
 
+@pytest.mark.parametrize("w", [4, 8, 10, 11, 12, 13])
+def test_phi_hat_interpolation_error_off_node(w: int) -> None:
+    """Off-node interpolation must be worth the epsilon the width promises.
+
+    ``test_phi_hat_conditioning_at_v011_eta_max`` above samples
+    ``linspace(-eta_max, eta_max, 17)``, and with ``eta_max = x0 * W / 2`` and
+    an eta step of ``1 / (2 * oversample)`` every one of those points lands
+    exactly on a table node, where cubic Lagrange reproduces the node value by
+    construction. It therefore measures the table's quadrature error and not
+    its interpolation error, which is what issue #9 tripped over: at W = 13 the
+    flat oversample of 128 carried a 5.9e-11 off-node error -- invisible to
+    that test -- and ``phi_hat_n`` is *divided* into the image, so it showed up
+    one-for-one as 1.4e-11 relative in the operator output, 14x the requested
+    eps = 1e-12.
+
+    The reference here is the same table at 4x the oversample: its own
+    interpolation error is 1/256 of the one under test (the error goes like
+    ``eta_step**4``), so the difference is the error of the coarse table to
+    better than a percent, and the shared ``n_fine`` discretisation cancels.
+    """
+    eps = 10.0 ** -(w - 1)  # the epsilon this width is chosen for (kernel_params)
+    beta = 2.30 * w
+    eta_max = W_OVERSAMPLE_X0 * w / 2.0
+    oversample = phi_hat_oversample_for_w(w)
+    table = compute_phi_hat_table(beta=beta, eta_max_request=eta_max, oversample=oversample)
+    fine = compute_phi_hat_table(beta=beta, eta_max_request=eta_max, oversample=4 * oversample)
+    # Deliberately off-node: an odd number of points over the range plus a
+    # small irrational-ish offset, so no sample coincides with a table node.
+    eta = np.linspace(-eta_max, eta_max, 1999) + 1e-4
+    eta = eta[np.abs(eta) <= eta_max]
+    rel_err = float(
+        np.max(np.abs(table.evaluate(eta) - fine.evaluate(eta)) / np.abs(fine.evaluate(eta)))
+    )
+    assert rel_err < eps / 10.0, (
+        f"W={w} (eps={eps:.0e}, oversample={oversample}): phi_hat interpolation "
+        f"error {rel_err:.3e} exceeds eps/10={eps / 10.0:.3e}"
+    )
+
+
 def test_phi_hat_table_is_picklable_via_dataclass() -> None:
     """The table is a frozen dataclass so it composes with jax pytrees and caches."""
     table = compute_phi_hat_table(beta=13.8, eta_max_request=1.0)

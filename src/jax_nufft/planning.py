@@ -445,6 +445,18 @@ def make_plan(
         # --- number of w-planes ---
         # Sample w with step dw = x0 / max|n-1|, matching ducc's choice for
         # ofactor=2 kernels (see W_OVERSAMPLE_X0). This is independent of W.
+        #
+        # ``n_w = n_w_inner + W``: only the W half-widths of kernel overhang at
+        # the two ends of the w-range depend on the kernel, so the plane count
+        # grows by exactly one plane per unit of W. That is the whole cost of
+        # issue #9's wider width rule, and it is a rounding error wherever the
+        # w-range is what sets n_w: on the review fixtures, going from
+        # eps = 1e-3 (W = 4) to eps = 1e-12 (W = 13) takes MWA_extended off30
+        # from 492 to 501 planes (+1.8%) but MWA_compact zenith, where
+        # n_w_inner is 1, from 5 to 14 (+180%). Per epsilon step the increase
+        # is the width step itself: +1 plane at 1e-6, 1e-7, 1e-8 and +3 at
+        # 1e-12 relative to the pre-#9 rule (worst relative case on the
+        # fixtures: MWA_compact zenith at 1e-12, 11 -> 14 planes, +27%).
         x0 = W_OVERSAMPLE_X0
         n_w_inner = math.ceil(w_extent * max_abs_nm1 / x0)
         n_w_inner = max(n_w_inner, 1)  # always have at least one interior step

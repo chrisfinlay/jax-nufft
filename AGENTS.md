@@ -106,9 +106,13 @@ NUFFTs indexed by `w`-plane by approximating the `exp(2πi w (n-1))`
 phase with a kernel-interpolation scheme.
 
 The plan-time work picks the number of w-planes `n_w`, the kernel
-half-width `W`, the kernel shape `beta`, the w-plane centres
-`w_centers`, and a per-image correction `phi_hat_n` that compensates
-for the kernel's image-domain footprint. The call-time work, for each
+half-width `W` (`ceil(-log10(eps/10))`, so `n_w = n_w_inner + W` grows
+by one plane per requested digit), the kernel shape `beta`, the
+w-plane centres `w_centers`, and a per-image correction `phi_hat_n`
+that compensates for the kernel's image-domain footprint. The
+caller's `epsilon` is a budget shared by two error sources, so the
+(u,v) NUFFT is asked for `epsilon / 10` (`_nufft_epsilon` in
+`wgridder.py`) and the w-kernel carries the rest. The call-time work, for each
 w-plane `k`, multiplies the image by the w-correction
 `exp(2πi w_k (n-1)) / phi_hat_n`, runs a 2D NUFFT to land at the
 visibilities, and weights each visibility by `phi((w-w_k) / scale)`.
@@ -490,11 +494,17 @@ These are seeds for later releases, not v0.1.2 candidates:
 ## 11. Don'ts
 
 * Don't change `phi_hat_oversample`'s default behaviour without
-  re-running the phi_hat-conditioning tests in `tests/test_kernel.py`
-  and confirming `min(phi_hat) > safety_floor` across `W in {4, 6, 8, 10}`.
-  v0.1.1 picks the oversample as a function of `W` precisely because
-  v0.1's constant-32 default broke conditioning at the wider eta
-  range. (`safety_floor` is defined in `src/jax_nufft/kernel.py`.)
+  re-running the phi_hat tests in `tests/test_kernel.py`: both
+  `test_phi_hat_conditioning_at_v011_eta_max` (`min(phi_hat) >
+  safety_floor` across `W in {4, 6, 8, 10, 11, 13}`) and
+  `test_phi_hat_interpolation_error_off_node` (`< eps/10` off the
+  table nodes). v0.1.1 picks the oversample as a function of `W`
+  because v0.1's constant-32 default broke conditioning at the wider
+  eta range; #9 added the doublings above `W = 8` because `phi_hat_n`
+  is divided into the image, so a 5.9e-11 table error at `W = 13`
+  showed up as 14x epsilon in the operator output. Node-aligned
+  sampling hides that, which is why the off-node test exists.
+  (`safety_floor` is defined in `src/jax_nufft/kernel.py`.)
 * Don't bypass `_canonicalise_w_strategy` by hard-coding the v0.1
   names in new code. They are user-input aliases only; the internal
   dispatch uses the canonical names.
