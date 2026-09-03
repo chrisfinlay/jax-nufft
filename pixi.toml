@@ -41,6 +41,9 @@ psutil = ">=5.9"
 ruff = ">=0.6.0"
 mypy = ">=1.10"
 pre-commit = ">=3.7"
+# Used by the offline calibration tooling under `tools/` (kernel-parameter
+# fitting needs `scipy.optimize`); not a runtime or test dependency.
+scipy = ">=1.11"
 
 # Python-version pins for the CI test matrix. conda-forge has no
 # jax-finufft build for 3.10 (it needs >=3.11), so 3.10 is not supported;

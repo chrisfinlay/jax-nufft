@@ -48,6 +48,8 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.10",
     "pre-commit>=3.7",
+    # Offline calibration tooling under `tools/` only (scipy.optimize).
+    "scipy>=1.11",
 ]
 
 [project.urls]
