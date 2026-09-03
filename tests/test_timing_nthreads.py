@@ -26,16 +26,13 @@ timed call), so it is reused here rather than reinventing a timing loop.
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from jax_nufft import dirty2vis, make_plan
 from tests.bench_harness import time_jax_callable
-from tests.conftest import MWA_EXTENDED, synthetic_uvw
-
-jax.config.update("jax_enable_x64", True)
+from tests.conftest import MWA_EXTENDED, requires_x64, synthetic_uvw
 
 # Same accuracy budget as the rest of the benchmark suite
 # (tests/test_benchmark_against_ducc.py::BENCH_EPSILON) -- the timing gate
@@ -50,6 +47,7 @@ _TIMING_ITERS = 9
 _MAX_DEFAULT_OVER_EXPLICIT_RATIO = 1.2
 
 
+@requires_x64
 @pytest.mark.runtiming
 def test_dense_scan_default_nthreads_within_1_2x_of_explicit_nthreads_1() -> None:
     """dense_scan at the *default* nthreads must be within 1.2x of the same

@@ -107,11 +107,6 @@ if not X64:
         "test_benchmark_against_ducc.py",
         "test_boundary_planes.py",
         "test_jax_integration.py",
-        # Same reason as test_benchmark_against_ducc.py: builds a default
-        # (float64) plan and calls jax.config.update("jax_enable_x64", True)
-        # at import time (issue #24 timing gate; opt-in via --runtiming, but
-        # the import-time x64 flip happens regardless of that flag).
-        "test_timing_nthreads.py",
         # Build default (float64) plans with no ``dtype=`` argument: 62 tests
         # across these four now stop at the new ``make_plan`` ValueError.
         "test_against_ducc.py",
