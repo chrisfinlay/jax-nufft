@@ -353,6 +353,21 @@ epsilon`) while `epsilon = 1e-6` is not. `make_plan` emits a `UserWarning` for
 a float32 plan with `epsilon < 1e-5` rather than quietly missing the target.
 Use float64 whenever you need more.
 
+**Known limits of the float32 path.** The ~1e-5 figure is measured on the
+telescope fixtures in `tests/conftest.py`. Two further effects degrade
+single-precision accuracy beyond it and are not yet addressed:
+
+- **Large absolute `w`.** The per-plane phase `2*pi*w_k*(n-1)` is formed and
+  exponentiated directly in float32 with no range reduction, so its rounding
+  error grows with `|w|`. Tracked in
+  [#13](https://github.com/chrisfinlay/jax-nufft/issues/13).
+- **Pixels near the horizon.** The adjoint reconstructs `n` from `n - 1` by a
+  cancelling subtraction and then divides by it, so relative accuracy is lost
+  as `n` approaches zero. Tracked in
+  [#12](https://github.com/chrisfinlay/jax-nufft/issues/12).
+
+Neither affects the default float64 path.
+
 **Mixing dtypes.** Per-call arrays are measured against the plan: an image,
 `vis` or `weights` array *narrower* than the plan is cast up (a float32 image
 into a float64 plan gives a complex128 result), while a *wider* one raises

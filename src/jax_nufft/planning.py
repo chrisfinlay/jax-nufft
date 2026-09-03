@@ -55,6 +55,13 @@ W_OVERSAMPLE_X0 = 0.25
 # taken into account. Requests below this floor are honoured structurally
 # (the plan builds, the kernel width still grows) but cannot be met
 # numerically, so ``make_plan`` warns instead of silently missing the target.
+#
+# The floor is a fixture-level figure, not a guarantee: single precision loses
+# further accuracy with large ``|w|`` (the per-plane phase is exponentiated in
+# float32 with no range reduction, so its rounding error grows with the phase
+# magnitude — issue #13) and for pixels near the horizon (the adjoint rebuilds
+# ``n`` from ``n - 1`` by a cancelling subtraction and then divides by it —
+# issue #12). Neither affects a float64 plan.
 FLOAT32_EPSILON_FLOOR = 1e-5
 
 
