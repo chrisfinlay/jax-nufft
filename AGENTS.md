@@ -499,16 +499,22 @@ These are seeds for later releases, not v0.1.2 candidates:
 ## 11. Don'ts
 
 * Don't change `phi_hat_oversample`'s default behaviour without
-  re-running the phi_hat tests in `tests/test_kernel.py`: both
+  re-running the phi_hat tests in `tests/test_kernel.py`:
+  `test_phi_hat_oversample_schedule_is_pinned` (the full returned
+  schedule, `W` from 4 through 15, pinned to concrete integers -- cheap,
+  and the only test that covers `W = 15` at all);
   `test_phi_hat_conditioning_at_v011_eta_max` (`min(phi_hat) >
-  safety_floor` across `W in {4, 6, 8, 10, 11, 13}`) and
+  safety_floor` across `W in {4, 6, 8, 10, 11, 13}`); and
   `test_phi_hat_interpolation_error_off_node` / its `--runslow`
   counterpart `test_phi_hat_interpolation_error_off_node_slow`
   (`< eps/10` off the table nodes; `W in {4, 8, 10}` run by default,
-  `W in {11, 12, 13}` gated behind `--runslow` because their
+  `W in {11, 12, 13, 14}` gated behind `--runslow` because their
   4x-oversample reference tables get big -- see
-  `phi_hat_oversample_for_w`'s docstring for the memory accounting).
-  v0.1.1 picks the oversample as a function of `W` because v0.1's
+  `phi_hat_oversample_for_w`'s docstring for the memory accounting;
+  `W = 15` is skipped even there, its reference alone pushing the
+  `--runslow` leg from ~1.2 GB to ~5.5 GB peak memory footprint, so the
+  schedule pin above is its only regression guard). v0.1.1 picks the
+  oversample as a function of `W` because v0.1's
   constant-32 default broke conditioning at the wider eta range; #9
   added the doublings above `W = 8` because `phi_hat_n` is divided
   into the image, so a 5.9e-11 table error at `W = 13` showed up as

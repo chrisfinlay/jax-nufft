@@ -305,13 +305,18 @@ def _resolve_plan_dtypes(dtype: DTypeLike) -> tuple[np.dtype[Any], np.dtype[Any]
 def _warn_if_below_float32_floor(real_dtype: np.dtype[Any], epsilon: float) -> None:
     """Warn when a float32 plan is asked for an ``epsilon`` it cannot reach.
 
-    Called *after* ``uvw`` / ``freq`` have been validated, and deliberately
-    so: the suite (and many downstream users) run with
-    ``filterwarnings = ["error"]``, which turns this into a raised
-    ``UserWarning``. Emitting it earlier would mean a caller who passes a
-    malformed ``uvw`` at a tight epsilon gets an accuracy complaint instead of
-    the shape error that actually describes their bug. Only a plan that is
-    otherwise buildable gets to hear about its accuracy.
+    Called *after* every input-rejection check in ``make_plan`` -- ``uvw`` /
+    ``freq`` shape and kind, and (since issue #9's review follow-up)
+    ``kernel_params(epsilon)``'s own ``ValueError`` for an epsilon below
+    1e-14 -- and deliberately so: the suite (and many downstream users) run
+    with ``filterwarnings = ["error"]``, which turns this into a raised
+    ``UserWarning``. Emitting it earlier would mean a caller hits the wrong
+    diagnostic for their actual bug: a malformed ``uvw`` at a tight epsilon
+    would get an accuracy complaint instead of the shape error, and
+    ``dtype=jnp.float32`` at an epsilon ``kernel_params`` refuses outright
+    (< 1e-14) would get this warning's "the plan will build" claim instead of
+    the ``ValueError`` saying it can't. Only a plan that is otherwise
+    buildable gets to hear about its accuracy.
     """
     if real_dtype == np.dtype(np.float32) and epsilon < FLOAT32_EPSILON_FLOOR:
         warnings.warn(
@@ -370,14 +375,24 @@ def make_plan(
     # before ``jnp.asarray`` gets a chance to truncate anything.
     real_dtype, complex_dtype = _resolve_plan_dtypes(dtype)
     uvw_arr, freq_arr = _coerce_uvw_freq_dtype(uvw, freq, real_dtype)
-    # Only now, with every argument known good, complain about accuracy the
-    # requested precision cannot deliver (see _warn_if_below_float32_floor).
-    _warn_if_below_float32_floor(real_dtype, epsilon)
     n_rows = uvw_arr.shape[0]
     n_chan = freq_arr.shape[0]
 
     # --- kernel parameters ---
+    # Every input-rejection ValueError (uvw/freq shape and kind above, the
+    # epsilon-too-tight check inside kernel_params here) must run before
+    # _warn_if_below_float32_floor: with filterwarnings = ["error"] that
+    # warning becomes an exception too, and if it fired first, a caller
+    # asking for dtype=jnp.float32 at an epsilon kernel_params flatly cannot
+    # honour (< 1e-14) would see a UserWarning claiming "the plan will
+    # build" instead of the ValueError that actually applies. So this call
+    # -- and its result, reused below rather than called again -- has to
+    # come first.
     w_kernel_width, beta = kernel_params(epsilon)
+    # Only now, with every argument known good and the epsilon itself
+    # confirmed reachable, complain about accuracy the requested precision
+    # cannot deliver (see _warn_if_below_float32_floor).
+    _warn_if_below_float32_floor(real_dtype, epsilon)
 
     # --- n - 1 grid (numpy, host-side) ---
     # For pixels inside the unit disc (l^2 + m^2 <= 1) this is the usual

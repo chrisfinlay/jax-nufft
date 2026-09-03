@@ -199,6 +199,41 @@ def test_phi_hat_table_safety_floor_triggers() -> None:
         compute_phi_hat_table(beta=2.0, eta_max_request=10.0, safety_floor=0.1)
 
 
+# The full schedule, W = 4 through 15 (the whole range kernel_params can ever
+# produce), pinned to concrete integers rather than re-derived from the
+# formula. This is deliberate, and it is the cheap half of the regression
+# guard for the schedule calibrated in phi_hat_oversample_for_w's docstring:
+# it costs nothing (no phi_hat table is built), but it is also the one that
+# actually catches a regression back to the schedule issue #9's review found
+# one doubling too generous (``min(2048, 128 * 2 ** (w_kernel_width - 9))``,
+# equivalently a flat cap at 1024 for every W >= 13) -- the numerical
+# off-node tests below only run W up to 13 by default and W up to 14 with
+# --runslow (see the comment on test_phi_hat_interpolation_error_off_node_slow
+# for why W = 15's reference table is left out of even that leg), so a
+# regressed cap at W = 15 alone would not be caught numerically anywhere in
+# this suite without this pin.
+_EXPECTED_OVERSAMPLE: dict[int, int] = {
+    4: 32,
+    5: 64,
+    6: 64,
+    7: 64,
+    8: 64,
+    9: 128,
+    10: 128,
+    11: 256,
+    12: 512,
+    13: 1024,
+    14: 2048,
+    15: 4096,
+}
+
+
+def test_phi_hat_oversample_schedule_is_pinned() -> None:
+    """Pin the full ``phi_hat_oversample_for_w`` schedule, W = 4 through 15."""
+    got = {w: phi_hat_oversample_for_w(w) for w in _EXPECTED_OVERSAMPLE}
+    assert got == _EXPECTED_OVERSAMPLE, got
+
+
 # W = 11 and 13 are the widths the FINUFFT rule asks for at eps = 1e-10 and
 # 1e-12 (issue #9). They are included here so that widening the width rule
 # cannot outrun ``phi_hat_oversample_for_w``: eta_max = x0 * W / 2 grows with W,
@@ -283,17 +318,19 @@ def test_phi_hat_interpolation_error_off_node(w: int) -> None:
 
     At W = 10 the 4x-oversample reference is ``phi_hat_oversample_for_w(10) *
     4 = 512``, an ``n_fft = n_fine * 512 ~= 2.1M``-element table (tens of MB).
-    W in {11, 12, 13} moved to :func:`test_phi_hat_interpolation_error_off_node_slow`
-    below: at W = 13 the reference alone is oversample 4096 (``n_fft ~= 16.8M``),
-    and building it alongside the table under test previously reached
-    multiple GB of transient host memory -- in the *default* suite, on every
-    pull request. See that test and ``phi_hat_oversample_for_w`` for the
-    memory accounting (issue #9 follow-up).
+    W in {11, 12, 13, 14} moved to
+    :func:`test_phi_hat_interpolation_error_off_node_slow` below (and W = 15
+    is skipped there too -- see that test's docstring): at W = 13 the
+    reference alone is oversample 4096 (``n_fft ~= 16.8M``), and building it
+    alongside the table under test previously reached multiple GB of
+    transient host memory -- in the *default* suite, on every pull request.
+    See that test and ``phi_hat_oversample_for_w`` for the memory accounting
+    (issue #9 follow-up).
     """
     _phi_hat_interpolation_error_off_node(w)
 
 
-@pytest.mark.parametrize("w", [11, 12, 13])
+@pytest.mark.parametrize("w", [11, 12, 13, 14])
 def test_phi_hat_interpolation_error_off_node_slow(w: int, pytestconfig: pytest.Config) -> None:
     """``--runslow`` leg: widths where the 4x-oversample reference gets big.
 
@@ -303,6 +340,21 @@ def test_phi_hat_interpolation_error_off_node_slow(w: int, pytestconfig: pytest.
     ``pytest -q`` never has to hold the W = 13 pair (table + oversample-4096
     reference) in memory at once. Skipped, not xfailed, without the flag --
     this is a cost gate, not a correctness gate.
+
+    W = 15 (eps = 1e-14, the tightest ``kernel_params`` allows) is left out
+    even here: its reference is oversample 16384 (``n_fft = n_fine * 16384
+    ~= 67M``), and measured with ``/usr/bin/time -l`` this one parametrised
+    case alone pushes ``pytest -q --runslow tests/test_kernel.py`` from
+    ~1.2 GB to ~5.5 GB peak memory footprint (~2.3 GB with only W <= 14) --
+    on top of the ducc parity legs --runslow also runs, that risks OOMing a
+    standard CI runner. W = 15's *numerical* off-node check is therefore
+    skipped everywhere; the schedule regression guard for it is
+    ``test_phi_hat_oversample_schedule_is_pinned`` above (cheap, and it does
+    cover W = 15), backed by these measured numbers (against a common,
+    far-finer independent reference, eps/10 = 1e-15): os=1024 -> 1.08e-14
+    (fails), os=2048 -> 1.16e-15 (fails, marginally), os=4096 -> 6.57e-16
+    (passes) -- confirming the schedule's os=4096 at W = 15 is both
+    necessary and sufficient without re-deriving it inside a test.
     """
     if not pytestconfig.getoption("--runslow"):
         pytest.skip("needs --runslow")

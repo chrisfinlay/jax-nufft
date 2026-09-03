@@ -151,9 +151,15 @@ For each channel `c`:
   2. `u_finufft, v_finufft = 2*pi * uvw_lambda[:, 0:2] * pixsize`
   3. For each w-plane `k`:
      - `image_k = B[c] * exp(+2 pi i w_k (n - 1)) / phi_hat_n`
-     - `vis_k = NUFFT2(image_k, u_finufft, v_finufft, iflag = -1, eps = epsilon)`
+     - `vis_k = NUFFT2(image_k, u_finufft, v_finufft, iflag = -1, eps = max(epsilon / 10, 1e-14))`
      - `vis_k = vis_k * phi((w_lambda - w_k) / w_kernel_scale)`
   4. `vis[:, c] = sum over k of vis_k`
+
+The `(u, v)` NUFFT is asked for `max(epsilon / 10, 1e-14)`, not `epsilon`
+itself (`_nufft_epsilon` in `wgridder.py`): the caller's budget is shared
+between the w-kernel and the `(u, v)` NUFFT, and FINUFFT's `eps` is a target
+rather than a bound, so the NUFFT gets one extra digit of headroom (issue
+#9). The same call appears in the adjoint operator below.
 
 w-plane traversal has four strategies (`dense_scan` default, `dense_vmap`,
 `windowed_scan`, `windowed_vmap`). The dense variants evaluate every
@@ -176,7 +182,7 @@ For each channel `c`:
   2. `vis_w = vis[:, c] * weights[:, c]` if weights are provided.
   3. For each w-plane `k`:
      - `vis_k = vis_w * phi((w_lambda - w_k) / w_kernel_scale)`
-     - `H_k = NUFFT1((u_finufft, v_finufft), vis_k, image_shape, iflag = +1, eps = epsilon)`
+     - `H_k = NUFFT1((u_finufft, v_finufft), vis_k, image_shape, iflag = +1, eps = max(epsilon / 10, 1e-14))`
      - `I_k = H_k * exp(-2 pi i w_k (n - 1)) / phi_hat_n`
   4. `dirty[c] = (sum over k of I_k).real / n`,
      where the `1/n` factor matches ducc's `divide_by_n=True` convention.
@@ -347,9 +353,13 @@ float64 plan when `jax_enable_x64` is off, and warning on a float32 plan
 below `epsilon = 1e-5`) and issue #13 for the underlying precision-vs-epsilon
 tradeoff.
 
-The contract holds with the default `phi_hat_oversample=None`, which sizes the
-phi_hat table for the width `epsilon` asks for; you only need to pass an
-explicit oversample if you also override the kernel width.
+The contract holds with the default `phi_hat_oversample=None`, which
+automatically sizes the phi_hat table to the width `kernel_params(epsilon)`
+picks (see `phi_hat_oversample_for_w`). There is no public API to override
+the kernel width itself -- it is derived from `epsilon` alone -- so ordinary
+callers never need to pass `phi_hat_oversample` explicitly; it exists as an
+escape hatch for testing the phi_hat table at a size other than the
+schedule's default.
 
 ### Precision
 
@@ -432,14 +442,16 @@ coplanar array, snapshot data at fixed pointing, or any case where
 `plan.w_extent == 0` after planning &mdash; `make_plan` collapses the
 w-plane loop to a single plane at the constant w-value. Expected speedup
 is roughly `w_kernel_width + 1` (one NUFFT instead of `W+1`), which is
-about 7&times; for the default `epsilon = 1e-6` (`W = 6`).
+about 8&times; for the default `epsilon = 1e-6` (`W = 7`).
 
 The user-visible signal that the specialisation engaged is
 `plan.n_w == 1` (and `plan.is_constant_w == True`). All four
 `w_strategy` choices reduce to the same single-plane work in this
 regime, so picking one vs another has no effect on output. Both
 operators stay bit-identical across strategies in this case and match
-ducc within `20 * epsilon`.
+ducc within `3 * epsilon` (issue #9 tightened this from `20 * epsilon`,
+the same DFT-width-rule fix behind the headline accuracy contract
+above).
 
 ### CPU benchmarks vs ducc0
 

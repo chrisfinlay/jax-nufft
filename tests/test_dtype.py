@@ -561,6 +561,33 @@ def test_malformed_uvw_beats_the_float32_epsilon_warning() -> None:
         )
 
 
+@requires_x64
+def test_unreachable_epsilon_beats_the_float32_epsilon_warning() -> None:
+    """``kernel_params``'s own rejection must also beat the accuracy warning.
+
+    Same class of ordering bug as the malformed-``uvw`` case above, surfaced
+    by the rebase onto issue #11: ``epsilon=1e-15`` is both below
+    ``FLOAT32_EPSILON_FLOOR`` (so ``_warn_if_below_float32_floor`` would fire)
+    and below the 1e-14 floor ``kernel_params`` refuses outright. With
+    ``filterwarnings = ["error"]`` the warning would raise first if it ran
+    first, and its own text ("the plan will build") would be false -- the
+    plan cannot build at this epsilon at all, in any dtype. ``make_plan``
+    must raise the ``ValueError`` naming the unreachable epsilon, not a
+    ``UserWarning`` about accuracy.
+    """
+    uvw, freq, _image, _vis, pixsize = _fixture_arrays()
+    with pytest.raises(ValueError, match=r"1e-14"):
+        make_plan(
+            uvw,
+            freq,
+            (EDA2.n_pix, EDA2.n_pix),
+            pixsize,
+            pixsize,
+            1e-15,
+            dtype=jnp.float32,
+        )
+
+
 _MIXED_CASES = (
     "float64_plan_float32_image",
     "float64_plan_complex64_vis",
