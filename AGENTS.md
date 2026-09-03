@@ -229,20 +229,32 @@ pixi run -e dev typecheck              # mypy (best-effort)
 * `pyproject.toml` sets `filterwarnings = ["error"]` &mdash; any
   unexpected warning fails the test. If you intentionally emit a
   `DeprecationWarning`, test it with `pytest.warns(DeprecationWarning, …)`.
-* Parity tolerances (tightened in #9): `err < 2 * eps` against the
-  exact DFT. That one is the accuracy *contract*, not a comparison --
-  the DFT is the definition of the answer, whereas ducc is a second
-  implementation with its own error budget. `err < 3 * eps` for ducc
-  parity and for the constant-w fast-vs-generic comparison (ducc lands
-  at `~0.1 * eps`, so the gap is dominated by our own `2 * eps`).
-  `err < 100 * eps` still applies to dense-vs-windowed adjoint
-  (different reduction order across NUFFT batches). The former
-  `10 * eps` / `20 * eps` allowances predated the FINUFFT w-kernel
-  width rule and were loose enough to hide a `W` that was up to three
-  cells short of the requested epsilon. All of the above are for the
-  default float64 plan with `jax_enable_x64` enabled -- `float32` /
-  `complex64` inputs are accuracy-limited and do not meet these bounds
-  (issues #11, #13).
+* **Tolerance contract** (current as of issue #10; all bounds below are
+  for the default float64 plan with `jax_enable_x64` enabled -- `float32`
+  / `complex64` inputs are accuracy-limited and do not meet them, issues
+  #11, #13):
+
+  | Comparison                                   | Bound          | Measured (this repo, 2026-09 review)       |
+  |-----------------------------------------------|----------------|---------------------------------------------|
+  | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; comfortably under `2 * eps` after it |
+  | vs. ducc0 (forward + adjoint, constant-w fast path) | `err < 3 * eps`  | ducc0 lands at `~0.1 * eps` against the DFT; the `3 * eps` gap is dominated by our own `2 * eps` budget |
+  | Strategy equivalence (`w_strategy` x `channel_strategy`, `tests/test_strategies_equivalent.py`) | `err < 1e-11`  | largest pairwise difference between any two of the eight combinations: 2e-12 at eps=1e-8, <=5e-14 at eps=1e-6 |
+  | Adjointness (dot-product identity, dense-vs-windowed adjoint) | `err < 1e-11`  | dot-product residual 1e-16 .. 7e-13 (ducc0 itself: 1e-14 .. 8e-11, for comparison only) |
+
+  The DFT bound is an accuracy *contract*, not a comparison -- the DFT is
+  the definition of the answer, whereas ducc0 is a second implementation
+  with its own error budget. The strategy-equivalence and adjointness
+  bounds are reduction-order comparisons between mathematically identical
+  operators (AGENTS.md §3), so unlike the two above they are
+  **eps-independent**: `1e-11` is roughly `100 * n_rows * eps_machine` and
+  does not loosen as `eps` tightens. Issue #10 tightened both from
+  `100 * eps` (1e-4 at eps=1e-6 -- ten orders of magnitude looser than
+  what the code actually achieves, wide enough to hide a bug that dropped
+  a whole window row from the adjoint) after measuring the numbers in the
+  table above. If a bound doesn't hold on a given platform (Linux CI sorts
+  FINUFFT bins differently from macOS arm64), the fix is to measure the
+  worst case there and set the bound at 10x it, not higher -- record the
+  measurement in a comment, don't just loosen it to whatever passes.
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.
@@ -253,6 +265,15 @@ pixi run -e dev typecheck              # mypy (best-effort)
   Whenever an issue says "re-run the accuracy sweep" it means
   `pytest --runsweep -s tests/test_accuracy_sweep.py`; the printed
   table is what goes into the PR description.
+* **Precision leg.** `JAX_ENABLE_X64=0 pytest -q` runs the fast suite in
+  float32 (`tests/conftest.py`'s `X64` / `tol()` / `real_dtype` /
+  `complex_dtype`, issue #11). `conftest.collect_ignore` names the
+  modules that are not yet precision-aware and are skipped at collection
+  time under that leg -- a shrinking backlog, not a design; new test
+  modules should be written precision-aware from the start (build the
+  plan with `dtype=real_dtype`, scale tolerances with `tol(f64, f32)`)
+  and never added to that list. `tests/test_strategies_equivalent.py` is
+  the first module written this way.
 
 When adding a feature, the right test files to update are:
 - algorithmic correctness &rarr; `test_against_dft.py` (small problems)
@@ -260,6 +281,8 @@ When adding a feature, the right test files to update are:
 - structural / API behaviour &rarr; `test_planning.py`,
   `test_jax_integration.py`
 - regression on synthetic edge cases &rarr; `test_boundary_planes.py`
+- cross-strategy regression (any change to the w-plane or channel loop
+  structure) &rarr; `test_strategies_equivalent.py`
 
 ---
 

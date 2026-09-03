@@ -63,10 +63,17 @@ def _parity_check(
     dirty_windowed = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="windowed_scan"))
     adj_err = np.linalg.norm(dirty_windowed - dirty_dense) / max(np.linalg.norm(dirty_dense), 1e-30)
     # Adjoint: the NUFFT type 1 sums depend on the set of rows in the
-    # batch; the dense/windowed reductions differ in summation order. We
-    # accept up to 100*eps relative difference (well within the per-call
-    # epsilon target of each implementation).
-    assert adj_err < 100 * eps, f"adjoint windowed-vs-dense err {adj_err:.3e} (eps={eps:g})"
+    # batch; the dense/windowed reductions differ in summation order, so
+    # this is a reduction-order comparison, not an accuracy contract, and
+    # the bound below is deliberately eps-independent rather than scaled by
+    # the requested epsilon. Issue #10 measured the actual worst-case
+    # pairwise disagreement between the four w_strategy values across these
+    # boundary fixtures at 2e-12 (eps=1e-8) and <=5e-14 (eps=1e-6); the
+    # former ``100 * eps`` bound (1e-4 at eps=1e-6) was ten orders of
+    # magnitude looser than that and would not have caught a bug that
+    # dropped a whole window row from the adjoint. 1e-11 is roughly
+    # ``100 * n_rows * eps_machine`` and stays flat as eps tightens.
+    assert adj_err < 1e-11, f"adjoint windowed-vs-dense err {adj_err:.3e} (eps={eps:g})"
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
@@ -152,4 +159,6 @@ def test_small_nw_zenith_regression() -> None:
     dirty_dense = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="dense_scan"))
     dirty_windowed = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="windowed_scan"))
     err = np.linalg.norm(dirty_windowed - dirty_dense) / np.linalg.norm(dirty_dense)
-    assert err < 1e-5
+    # Same eps-independent bound as ``_parity_check`` above (issue #10); see
+    # its comment for the measured values behind 1e-11.
+    assert err < 1e-11
