@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import math
 
 import jax
@@ -25,9 +26,73 @@ def test_kernel_params_basic() -> None:
     w, beta = kernel_params(1e-6)
     assert isinstance(w, int)
     assert w >= 2
-    # Spec rule: W = ceil(-log10(eps) * 2/pi) + 2 = ceil(6 * 2/pi) + 2 = 4 + 2 = 6
-    assert w == math.ceil(6 * 2 / math.pi) + 2
+    # FINUFFT rule at sigma = 2: W = ceil(-log10(eps/10)) = ceil(7) = 7.
+    assert w == math.ceil(-math.log10(1e-6 / 10.0))
+    assert w == 7
     assert beta == pytest.approx(2.30 * w)
+
+
+# The FINUFFT width rule at upsampling factor sigma = 2 ([Barnett+2019] eq. 10,
+# implemented in FINUFFT's ``setup_spreader``): ``W = ceil(-log10(eps/10))``,
+# i.e. "one more than the number of digits requested". The expected integers are
+# spelled out rather than only recomputed from the formula so that a future edit
+# to ``kernel_params`` has to change this table too, deliberately.
+#
+# The rule the repo used before issue #9 -- ``W = ceil(-log10(eps)*2/pi) + 2``
+# -> 4, 5, 6, 6, 7, 8, 9, 9, 10, 10 for the same epsilons -- is short by 0-3
+# cells and, worse, maps 1e-5 and 1e-6 (and 1e-9/1e-10, 1e-11/1e-12) onto the
+# *same* width, so asking for a tighter epsilon bought no accuracy at all.
+_EXPECTED_WIDTHS: dict[float, int] = {
+    1e-3: 4,
+    1e-4: 5,
+    1e-5: 6,
+    1e-6: 7,
+    1e-7: 8,
+    1e-8: 9,
+    1e-9: 10,
+    1e-10: 11,
+    1e-11: 12,
+    1e-12: 13,
+}
+
+
+@pytest.mark.parametrize(("eps", "expected_w"), sorted(_EXPECTED_WIDTHS.items(), reverse=True))
+def test_kernel_params_follows_finufft_width_rule(eps: float, expected_w: int) -> None:
+    """``W = ceil(-log10(eps/10))`` at sigma = 2, with beta = 2.30 * W."""
+    w, beta = kernel_params(eps)
+    assert w == expected_w, f"eps={eps:g}: expected W={expected_w}, got {w}"
+    # Same value stated as the formula, so the table above and the rule cannot
+    # drift apart silently.
+    assert w == math.ceil(-math.log10(eps / 10.0))
+    # The module documents beta = 2.30 * W ([Barnett+2019] eq. 10 for sigma = 2);
+    # the wider kernel must carry the matching shape parameter, otherwise the
+    # aliasing floor exp(-pi*W*sqrt(1 - 1/sigma)) does not move with W.
+    assert beta == pytest.approx(2.30 * expected_w)
+
+
+def test_kernel_params_width_increases_by_one_per_digit() -> None:
+    """One extra cell per requested digit -- no plateaus.
+
+    This is the property the old rule violated: ``ceil(-log10(eps)*2/pi) + 2``
+    grows by 2/pi < 1 per digit, so consecutive epsilons repeatedly collapsed
+    onto one width.
+    """
+    eps_list = [10.0**-k for k in range(3, 13)]
+    widths = [kernel_params(e)[0] for e in eps_list]
+    deltas = [b - a for a, b in itertools.pairwise(widths)]
+    assert deltas == [1] * len(deltas), f"widths {widths} do not step by one per digit"
+
+
+def test_kernel_params_rejects_unreachable_epsilon() -> None:
+    """Below 1e-14 the rule would ask for W > 15, beyond what the table and the
+    float64 kernel can deliver, so ``kernel_params`` must refuse rather than
+    silently return a width it cannot honour."""
+    # 1e-14 is the tightest supported request (W = 15).
+    assert kernel_params(1e-14)[0] == 15
+    with pytest.raises(ValueError):
+        kernel_params(1e-15)
+    with pytest.raises(ValueError):
+        kernel_params(1e-16)
 
 
 def test_kernel_params_monotonic_in_epsilon() -> None:
@@ -134,7 +199,11 @@ def test_phi_hat_table_safety_floor_triggers() -> None:
         compute_phi_hat_table(beta=2.0, eta_max_request=10.0, safety_floor=0.1)
 
 
-@pytest.mark.parametrize("w", [4, 6, 8, 10])
+# W = 11 and 13 are the widths the FINUFFT rule asks for at eps = 1e-10 and
+# 1e-12 (issue #9). They are included here so that widening the width rule
+# cannot outrun ``phi_hat_oversample_for_w``: eta_max = x0 * W / 2 grows with W,
+# and if the table's oversample stops keeping up, this is where it shows.
+@pytest.mark.parametrize("w", [4, 6, 8, 10, 11, 13])
 def test_phi_hat_conditioning_at_v011_eta_max(w: int) -> None:
     """phi_hat must stay above the safety floor over the full v0.1.1 eta range.
 

@@ -3,6 +3,17 @@
 These tests use a small image and small ``Nrow`` so that we can afford the
 full O(Nrow * Nl * Nm) reference DFT. They verify the *math* of the wgridder
 end-to-end at the smallest non-trivial scale, independent of ducc.
+
+The exact DFT is the *definition* of the answer, so the acceptance bound here
+is the accuracy contract of the whole library: ``err < 2 * eps``. The former
+``10 * eps`` allowance predated the FINUFFT width rule and was loose enough to
+hide a ``w_kernel_width`` that was up to three cells short of what the
+requested epsilon needs (see issue #9): the measured ratio was ~4x eps at
+1e-6..1e-8 and several hundred x eps at 1e-12, while ducc0 stays at or below
+0.24x eps on the same inputs. Two is a deliberately small constant -- it
+allows for the reference DFT's own conditioning and for the fact that jax and
+FINUFFT each target epsilon independently -- but not for a systematically
+under-provisioned kernel.
 """
 
 from __future__ import annotations
@@ -12,10 +23,39 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jax_nufft import dirty2vis, make_plan
+from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
+from tests.conftest import MWA_COMPACT, synthetic_uvw
+from tests.test_adjoint import _reference_adjoint
 
 jax.config.update("jax_enable_x64", True)
+
+# Accuracy contract against the exact DFT (issue #9). See the module docstring.
+DFT_TOL_FACTOR = 2.0
+
+
+def reference_lmn_grids(
+    image_shape: tuple[int, int], pixsize_l: float, pixsize_m: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(l, m, n - 1)`` on the image grid, matching ``planning.make_plan``.
+
+    Inside the unit disc this is the usual ``n - 1 = sqrt(1 - l^2 - m^2) - 1``.
+    Outside it (reachable for wide-FoV fixtures such as EDA2's 120-degree
+    field) we use the same analytic extension as ducc and
+    :func:`jax_nufft.planning.make_plan`, ``n - 1 = -sqrt(l^2 + m^2 - 1) - 1``.
+    Clipping to ``n - 1 = -1`` there instead would make the reference disagree
+    with the operator under test by O(1) on the corner pixels, which has
+    nothing to do with the gridding accuracy we are trying to measure.
+    """
+    n_l, n_m = image_shape
+    i = np.arange(n_l) - n_l // 2
+    j = np.arange(n_m) - n_m // 2
+    ll, mm = np.meshgrid(i * pixsize_l, j * pixsize_m, indexing="ij")
+    r2 = ll * ll + mm * mm
+    inside_disc = r2 <= 1.0
+    inside_val = np.sqrt(np.where(inside_disc, 1.0 - r2, 0.0)) - 1.0
+    outside_val = -np.sqrt(np.where(inside_disc, 0.0, r2 - 1.0)) - 1.0
+    return ll, mm, np.where(inside_disc, inside_val, outside_val)
 
 
 def _reference_forward(
@@ -30,13 +70,7 @@ def _reference_forward(
     """
     n_chan, n_l, n_m = image.shape
     n_rows = uvw.shape[0]
-    i = np.arange(n_l) - n_l // 2
-    j = np.arange(n_m) - n_m // 2
-    ll = i * pixsize_l
-    mm = j * pixsize_m
-    LL, MM = np.meshgrid(ll, mm, indexing="ij")
-    inside = np.maximum(1.0 - LL**2 - MM**2, 0.0)
-    nm1 = np.sqrt(inside) - 1.0
+    LL, MM, nm1 = reference_lmn_grids((n_l, n_m), pixsize_l, pixsize_m)
     out = np.zeros((n_rows, n_chan), dtype=np.complex128)
     for c in range(n_chan):
         scale = freq[c] / SPEED_OF_LIGHT
@@ -74,7 +108,9 @@ def test_forward_matches_dft_single_channel_zenith(eps: float, w_strategy: str) 
     vis_ref = _reference_forward(image, uvw, freq, pixsize, pixsize)
 
     err = np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref)
-    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10 * eps:.3e}"
+    assert err < DFT_TOL_FACTOR * eps, (
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+    )
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
@@ -98,7 +134,71 @@ def test_forward_matches_dft_off_zenith(eps: float) -> None:
     vis_ref = _reference_forward(image, uvw, freq, pixsize, pixsize)
 
     err = np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref)
-    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10 * eps:.3e}"
+    assert err < DFT_TOL_FACTOR * eps, (
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+    )
+
+
+_TRACKING_EPS = [1e-3, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12]
+
+
+def test_accuracy_tracks_epsilon() -> None:
+    """Error must follow ``epsilon`` down, not plateau (issue #9).
+
+    A single test rather than a parametrised one because the interesting
+    assertion is *across* epsilon values: with the old width rule
+    ``W = ceil(-log10(eps) * 2/pi) + 2``, eps=1e-5 and eps=1e-6 both mapped to
+    W=6 and produced the *same* error, so asking for a tighter epsilon bought
+    nothing. The monotonicity check below is the regression guard for that; the
+    per-epsilon bound is the same ``2 * eps`` contract as the rest of the file.
+
+    MWA_compact off30 (128 px, 600 rows) is the smallest review fixture with
+    real w-content, and the row-loop DFT reference over 128^2 pixels costs a
+    fraction of a second, so this stays in the default (non-``--runslow``) run.
+    """
+    tel = MWA_COMPACT
+    uvw = synthetic_uvw(tel, 30.0, seed=0)
+    freq = np.array([tel.freq_hz])
+    pix = tel.pixsize
+    shape = (tel.n_pix, tel.n_pix)
+    rng = np.random.default_rng(7)
+    image = rng.standard_normal((1, *shape))
+    vis = (rng.standard_normal((tel.n_rows, 1)) + 1j * rng.standard_normal((tel.n_rows, 1))).astype(
+        np.complex128
+    )
+
+    # References are epsilon-independent, so compute each exactly once.
+    vis_ref = _reference_forward(image.astype(np.complex128), uvw, freq, pix, pix)
+    dirty_ref = _reference_adjoint(vis, uvw, freq, shape, pix, pix)
+
+    fwd_err: list[float] = []
+    adj_err: list[float] = []
+    for eps in _TRACKING_EPS:
+        plan = make_plan(uvw, freq, shape, pix, pix, eps)
+        vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image)))
+        dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis)))
+        e_f = float(np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref))
+        e_a = float(np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref))
+        fwd_err.append(e_f)
+        adj_err.append(e_a)
+        assert e_f < DFT_TOL_FACTOR * eps, (
+            f"forward eps={eps:g}: relative error {e_f:.3e} is {e_f / eps:.2f}x eps "
+            f"(W={plan.w_kernel_width}, n_w={plan.n_w})"
+        )
+        assert e_a < DFT_TOL_FACTOR * eps, (
+            f"adjoint eps={eps:g}: relative error {e_a:.3e} is {e_a / eps:.2f}x eps "
+            f"(W={plan.w_kernel_width}, n_w={plan.n_w})"
+        )
+
+    # Strict monotonicity: every tightening of epsilon must actually buy
+    # accuracy. Equal consecutive errors mean two epsilon values collapsed onto
+    # the same kernel width.
+    for name, errs in (("forward", fwd_err), ("adjoint", adj_err)):
+        for k in range(1, len(_TRACKING_EPS)):
+            assert errs[k] < errs[k - 1], (
+                f"{name}: error did not improve going from eps={_TRACKING_EPS[k - 1]:g} "
+                f"({errs[k - 1]:.3e}) to eps={_TRACKING_EPS[k]:g} ({errs[k]:.3e})"
+            )
 
 
 def test_forward_real_image_promotes_to_complex() -> None:

@@ -329,12 +329,14 @@ def _jax_platform() -> str:
 def pytest_collection_modifyitems(config, items):
     """Mark slow / benchmark tests so they are skipped without their flag."""
     skip_slow = pytest.mark.skip(reason="needs --runslow")
+    skip_sweep = pytest.mark.skip(reason="needs --runsweep")
     skip_bench = pytest.mark.skip(reason="needs --runbench")
     skip_bench_gpu_flag = pytest.mark.skip(reason="needs --runbench-gpu")
     skip_bench_gpu_platform = pytest.mark.skip(
         reason="runbench_gpu requires jax.default_backend() == 'gpu'"
     )
     runslow = config.getoption("--runslow", default=False)
+    runsweep = config.getoption("--runsweep", default=False)
     runbench = config.getoption("--runbench", default=False)
     runbench_gpu = config.getoption("--runbench-gpu", default=False)
     bench_pointing = config.getoption("--bench-pointing", default="zenith")
@@ -346,6 +348,13 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         is_bench_item = "bench_telescope_pointing" in item.fixturenames
         is_runbench_gpu = "runbench_gpu" in item.keywords
+        # The accuracy sweep is its own opt-in axis: it is neither a parity
+        # test nor a benchmark, and it is expensive (7 fixtures x 8 epsilon
+        # x 2 directions, each with an exact-DFT reference). Gate it first
+        # and skip the rest of the checks for those items.
+        if "runsweep" in item.keywords and not runsweep:
+            item.add_marker(skip_sweep)
+            continue
         if "long_telescope_pointing" in item.fixturenames and not runslow:
             item.add_marker(skip_slow)
         if is_runbench_gpu:
@@ -373,6 +382,10 @@ def pytest_configure(config):
         "markers",
         "runbench_gpu: opt-in GPU benchmark suite "
         "(needs --runbench-gpu and jax.default_backend() == 'gpu')",
+    )
+    config.addinivalue_line(
+        "markers",
+        "runsweep: opt-in exact-DFT accuracy sweep (needs --runsweep)",
     )
 
 
@@ -407,5 +420,16 @@ def pytest_addoption(parser):
             "Which pointings to include in the benchmark suite. "
             "'zenith' is the default; 'off30' adds w-extent and roughly doubles n_w; "
             "'both' runs each telescope twice."
+        ),
+    )
+    parser.addoption(
+        "--runsweep",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the exact-DFT accuracy sweep (tests/test_accuracy_sweep.py): the "
+            "seven review fixtures x eight epsilon values x forward/adjoint. Every "
+            "issue that says 're-run the accuracy sweep' means this flag. Add -s to "
+            "see the printed ratio table."
         ),
     )

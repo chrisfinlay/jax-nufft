@@ -22,7 +22,7 @@ public operators:
 
 Both are fully traceable through `jax.jit`, `jax.vmap`, `jax.grad`. The
 reference baseline for correctness is `ducc0.wgridder`. Headline
-target is DFT parity within `10 * epsilon`; ducc parity, windowed
+target is DFT parity within `2 * epsilon`; ducc parity, windowed
 vs. dense, and adjoint reduction-order tolerances are looser — see
 §6 for the full table.
 
@@ -213,6 +213,7 @@ default without a GPU benchmark.
 ```sh
 pixi run -e test pytest                # fast unit tests, ~5 s
 pixi run -e test pytest --runslow      # adds MWA_extended/MeerKAT parity
+pixi run -e test pytest --runsweep -s tests/test_accuracy_sweep.py  # exact-DFT accuracy sweep
 pixi run -e test pytest --runbench     # opt-in benchmarks (~2 min for one pointing)
 pixi run -e dev lint                   # ruff check
 pixi run -e dev format                 # ruff format (apply)
@@ -222,14 +223,27 @@ pixi run -e dev typecheck              # mypy (best-effort)
 * `pyproject.toml` sets `filterwarnings = ["error"]` &mdash; any
   unexpected warning fails the test. If you intentionally emit a
   `DeprecationWarning`, test it with `pytest.warns(DeprecationWarning, …)`.
-* Parity tolerances: `err < 10 * eps` for DFT parity and dense-vs-windowed
-  forward; `err < 20 * eps` for ducc parity (ducc and jax both target
-  `eps` independently so the gap is bounded by `~2*eps` to `~10*eps`).
-  `err < 100 * eps` for dense-vs-windowed adjoint (different reduction
-  order across NUFFT batches).
+* Parity tolerances (tightened in #9): `err < 2 * eps` against the
+  exact DFT. That one is the accuracy *contract*, not a comparison --
+  the DFT is the definition of the answer, whereas ducc is a second
+  implementation with its own error budget. `err < 3 * eps` for ducc
+  parity and for the constant-w fast-vs-generic comparison (ducc lands
+  at `~0.1 * eps`, so the gap is dominated by our own `2 * eps`).
+  `err < 100 * eps` still applies to dense-vs-windowed adjoint
+  (different reduction order across NUFFT batches). The former
+  `10 * eps` / `20 * eps` allowances predated the FINUFFT w-kernel
+  width rule and were loose enough to hide a `W` that was up to three
+  cells short of the requested epsilon.
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.
+* `tests/test_accuracy_sweep.py` is the reusable accuracy harness: the
+  seven review fixtures x eight epsilon values x forward/adjoint,
+  measured against the exact DFT and asserted at `<= 2 * eps`. It is
+  gated behind `--runsweep` and skipped without `jax_enable_x64`.
+  Whenever an issue says "re-run the accuracy sweep" it means
+  `pytest --runsweep -s tests/test_accuracy_sweep.py`; the printed
+  table is what goes into the PR description.
 
 When adding a feature, the right test files to update are:
 - algorithmic correctness &rarr; `test_against_dft.py` (small problems)
