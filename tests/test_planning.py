@@ -10,6 +10,7 @@ import pytest
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
 from jax_nufft.planning import W_OVERSAMPLE_X0, WGridderPlan, make_plan
+from tests.conftest import requires_x64
 
 
 def _baseline_uvw(n_rows: int = 50, max_baseline: float = 100.0, seed: int = 0) -> np.ndarray:
@@ -241,6 +242,7 @@ def test_plan_invalid_inputs() -> None:
         make_plan(uvw[..., :2], freq, (64, 64), 1e-3, 1e-3, epsilon=1e-6)
 
 
+@requires_x64
 def test_plan_is_a_jax_pytree() -> None:
     """The plan can flow through pytree-aware transforms (jit, vmap, etc.)."""
     plan = make_plan(
@@ -255,7 +257,8 @@ def test_plan_is_a_jax_pytree() -> None:
     leaves, treedef = jax.tree_util.tree_flatten(plan)
     # uvw_lambda, w_centers, n_minus_1, phi_hat_n, sort_perm,
     # uvw_lambda_sorted, window_start, window_size,
-    # u_finufft, v_finufft  (v0.1.2 Part 3.1 added the last two)
+    # u_finufft, v_finufft  (v0.1.2 Part 3.1 added the last two).
+    # The issue #11 dtype metadata is *static*, so it must not show up here.
     assert len(leaves) == 10
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
@@ -263,6 +266,27 @@ def test_plan_is_a_jax_pytree() -> None:
     assert rebuilt.n_l == plan.n_l
     assert rebuilt.n_w == plan.n_w
     assert rebuilt.beta == plan.beta
+    # issue #11: real_dtype / complex_dtype are aux data, so they survive the
+    # round-trip unchanged (AGENTS.md sec 4 plan-field checklist).
+    assert rebuilt.real_dtype == plan.real_dtype
+    assert rebuilt.complex_dtype == plan.complex_dtype
+    assert np.dtype(plan.real_dtype) == np.dtype(jnp.float64)
+    assert np.dtype(plan.complex_dtype) == np.dtype(jnp.complex128)
+
+    # Being aux data also means the dtype is part of the JIT cache key: two
+    # plans that differ only in dtype must not share a treedef.
+    plan32 = make_plan(
+        uvw=_baseline_uvw(n_rows=10),
+        freq=np.array([200e6]),
+        image_shape=(32, 32),
+        pixsize_l=1e-3,
+        pixsize_m=1e-3,
+        epsilon=1e-4,
+        dtype=jnp.float32,
+    )
+    assert np.dtype(plan32.real_dtype) == np.dtype(jnp.float32)
+    assert np.dtype(plan32.complex_dtype) == np.dtype(jnp.complex64)
+    assert jax.tree_util.tree_structure(plan32) != treedef
 
     # And we can read it through a jit'd function.
     @jax.jit
