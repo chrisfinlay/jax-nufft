@@ -6,9 +6,14 @@ so the adjoint must land within ``2 * eps`` of it too. Issue #9 tightened these
 from ``10 * eps``, which was loose enough to hide a ``w_kernel_width`` that was
 up to three cells short of the requested epsilon.
 
-The ``100 * eps`` bounds on the dot-product identities below are a different
-quantity -- a reduction-order comparison between two operators, not a
-comparison against truth -- and are left alone here on purpose.
+The dot-product identities below are a different quantity again -- a
+reduction-order comparison between two operators (forward vs adjoint), not a
+comparison against truth. Issue #10 tightened their bound from ``100 * eps``
+(1e-4 at eps=1e-6, ten orders of magnitude looser than what the code
+actually achieves) to the eps-independent ``1e-11``: the measured residual
+is 1e-16 .. 7e-13 for jax-nufft on these fixtures (ducc0 itself: 1e-14 ..
+8e-11, for comparison -- not asserted here since ducc0 is used only as a
+black-box test oracle elsewhere).
 """
 
 from __future__ import annotations
@@ -142,6 +147,12 @@ def test_windowed_dot_product_identity(eps: float) -> None:
         np.complex128
     )
 
+    # ``n * x`` undoes the 1/n the adjoint applies on its output relative to
+    # the literal adjoint of A (see test_dot_product_identity's docstring for
+    # the full derivation). This form is only exact where n_grid > 0, i.e.
+    # every pixel inside the unit disc; the fixture's small image is fully
+    # inside it here, so no masking is needed. It will be replaced with the
+    # cleaner divide_by_n-exposed form once that lands (a later issue).
     n_grid = np.asarray(plan.n_minus_1) + 1.0
     image_n = image * n_grid[None, :, :]
 
@@ -151,7 +162,9 @@ def test_windowed_dot_product_identity(eps: float) -> None:
     lhs = np.vdot(Ax.ravel(), vis.ravel()).real
     rhs = float(np.vdot(image_n.ravel(), Ay.ravel()))
     rel_err = abs(lhs - rhs) / max(abs(lhs), abs(rhs))
-    assert rel_err < 100 * eps, f"windowed dot-product rel err {rel_err:.3e}"
+    # Issue #10: eps-independent bound, see the module docstring for the
+    # measured residual behind 1e-11.
+    assert rel_err < 1e-11, f"windowed dot-product rel err {rel_err:.3e}"
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
@@ -165,7 +178,12 @@ def test_dot_product_identity(eps: float) -> None:
         Re(<A x, y>_C) = <n * x, A^* y>_R
 
     (the n multiplier on the RHS undoes the 1/n that A^* applies on its
-    output relative to the literal adjoint of A).
+    output relative to the literal adjoint of A). This identity holds only
+    where n_grid = n_minus_1 + 1 > 0, i.e. every pixel is inside the unit
+    disc -- outside it ``n - 1`` is ducc's analytic extension (see
+    ``planning.make_plan``), not the true ``n``, and the relation above
+    breaks down. The fixture's image is fully inside the disc, so no
+    masking is needed here.
     """
     rng = np.random.default_rng(33)
     n_l = n_m = 32
@@ -195,7 +213,9 @@ def test_dot_product_identity(eps: float) -> None:
     rhs = float(np.vdot(image_n.ravel(), Ay.ravel()))  # <n * x, A^* y>_R
 
     rel_err = abs(lhs - rhs) / max(abs(lhs), abs(rhs))
-    assert rel_err < 100 * eps, f"dot-product relative error {rel_err:.3e}; lhs={lhs}, rhs={rhs}"
+    # Issue #10: eps-independent bound, see the module docstring for the
+    # measured residual behind 1e-11.
+    assert rel_err < 1e-11, f"dot-product relative error {rel_err:.3e}; lhs={lhs}, rhs={rhs}"
 
 
 @pytest.mark.parametrize("eps", [1e-6])
