@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import warnings
 from functools import partial
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax_finufft import nufft1, nufft2
 from jax_finufft.options import Opts
@@ -201,19 +202,52 @@ def _auto_w_strategy(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     return _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint)
 
 
-def _real_to_complex_dtype(dtype: jnp.dtype) -> jnp.dtype:
-    """Promote a real dtype to its matching complex dtype."""
-    if jnp.issubdtype(dtype, jnp.complexfloating):
-        return dtype
-    if dtype == jnp.float32:
-        return jnp.complex64
-    if dtype == jnp.float64:
-        return jnp.complex128
-    raise TypeError(f"unsupported dtype for wgridder: {dtype!r}")
+def _cast_to_plan_dtype(
+    array: Array,
+    plan: WGridderPlan,
+    *,
+    name: str,
+    target: np.dtype[Any],
+) -> Array:
+    """Cast ``array`` up to ``target``, or refuse to cast it *down* (issue #11).
+
+    The plan owns the precision (``make_plan(dtype=...)``), so an input that
+    is narrower than the plan is simply promoted — that is lossless, and it
+    keeps the common "float32 image, float64 plan" workflow working. An input
+    that is *wider* is a different matter: silently truncating it would throw
+    away precision the caller deliberately produced, so it is a ``TypeError``
+    naming both dtypes.
+
+    Both branches exist to keep jax-finufft's bare, message-less
+    ``AssertionError()`` on a dtype mismatch away from the caller: it names
+    neither the offending array nor the fix.
+    """
+    in_dtype = np.dtype(array.dtype)
+    # Compare like with like: a complex input is measured against the plan's
+    # complex dtype, a real one against its real dtype, so "wider" means more
+    # bits *per component* rather than merely "complex vs real".
+    reference = (
+        plan.complex_dtype if jnp.issubdtype(in_dtype, jnp.complexfloating) else plan.real_dtype
+    )
+    if in_dtype.itemsize > reference.itemsize:
+        raise TypeError(
+            f"{name} has dtype {in_dtype}, which is wider than this plan's "
+            f"{reference}: casting it down would silently discard precision. "
+            f"Either narrow {name} to {reference} yourself, or build the plan at "
+            f"that precision with make_plan(..., dtype=jnp.float64) (which needs "
+            "jax_enable_x64)."
+        )
+    return array.astype(target)
 
 
 def _prepare_image(image: Array, plan: WGridderPlan) -> Array:
-    """Broadcast / cast the input image to ``(n_chan, n_l, n_m)`` complex."""
+    """Broadcast / cast the input image to ``(n_chan, n_l, n_m)`` complex.
+
+    The output dtype is the *plan's* ``complex_dtype``, never the image's: an
+    image narrower than the plan is cast up (see :func:`_cast_to_plan_dtype`),
+    a wider one is rejected. Deriving it from the image instead is what used
+    to hand jax-finufft mismatched arrays.
+    """
     if image.ndim == 2:
         if image.shape != (plan.n_l, plan.n_m):
             raise ValueError(
@@ -228,31 +262,38 @@ def _prepare_image(image: Array, plan: WGridderPlan) -> Array:
             )
     else:
         raise ValueError(f"image must be 2- or 3-dimensional; got ndim={image.ndim}")
-    cdtype = _real_to_complex_dtype(image.dtype)
-    return image.astype(cdtype)
+    return _cast_to_plan_dtype(image, plan, name="image", target=plan.complex_dtype)
 
 
 def _validate_vis(vis: Array, plan: WGridderPlan) -> Array:
+    """Check the visibility shape and cast it to the plan's complex dtype.
+
+    A real ``vis`` is auto-promoted to complex (the typical workflow where the
+    caller built it with a zero imaginary part), and a narrower complex one is
+    cast up to the plan's precision; a wider one raises ``TypeError``.
+    """
     if vis.ndim != 2 or vis.shape != (plan.n_rows, plan.n_chan):
         raise ValueError(
             f"vis shape {vis.shape} does not match plan ({plan.n_rows}, {plan.n_chan})"
         )
-    if not jnp.issubdtype(vis.dtype, jnp.complexfloating):
-        # Auto-promote real visibilities to complex (matches user's typical
-        # workflow where they constructed vis with zero imaginary part).
-        cdtype = _real_to_complex_dtype(vis.dtype)
-        vis = vis.astype(cdtype)
-    return vis
+    return _cast_to_plan_dtype(vis, plan, name="vis", target=plan.complex_dtype)
 
 
 def _validate_weights(weights: Array | None, plan: WGridderPlan) -> Array | None:
+    """Check the weight shape and cast the weights to the plan's real dtype.
+
+    Same rule as the image and visibilities: narrower is cast up, wider is a
+    ``TypeError``. ``weights`` are real (they multiply the visibilities before
+    gridding, matching ducc's ``wgt``), so the reference is
+    ``plan.real_dtype``.
+    """
     if weights is None:
         return None
     if weights.shape != (plan.n_rows, plan.n_chan):
         raise ValueError(
             f"weights shape {weights.shape} does not match plan ({plan.n_rows}, {plan.n_chan})"
         )
-    return weights
+    return _cast_to_plan_dtype(weights, plan, name="weights", target=plan.real_dtype)
 
 
 def _channel_forward(
@@ -539,7 +580,10 @@ def dirty2vis(
         Pre-built plan from :func:`~jax_nufft.planning.make_plan`.
     image:
         Either ``(n_chan, n_l, n_m)`` or ``(n_l, n_m)`` (broadcast across
-        channels). Real or complex; real input is promoted to complex.
+        channels). Real or complex; real input is promoted to complex. The
+        precision is the plan's, not the image's: an image narrower than
+        ``plan.complex_dtype`` is cast up to it, a wider one raises
+        ``TypeError`` (issue #11).
     w_strategy:
         ``"dense_scan"`` (default, low memory) or ``"dense_vmap"`` (potentially
         faster on GPU but allocates ``n_w * image_size`` peak memory).
@@ -556,7 +600,8 @@ def dirty2vis(
     Returns
     -------
     vis:
-        Complex array of shape ``(n_rows, n_chan)``.
+        Complex array of shape ``(n_rows, n_chan)`` and dtype
+        ``plan.complex_dtype``.
     """
     w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=False)
     image = _prepare_image(image, plan)
@@ -737,10 +782,14 @@ def vis2dirty(
     plan:
         Pre-built plan from :func:`~jax_nufft.planning.make_plan`.
     vis:
-        Complex array of shape ``(n_rows, n_chan)``.
+        Complex array of shape ``(n_rows, n_chan)``. As for the image in
+        :func:`dirty2vis`, the plan owns the precision: a narrower ``vis``
+        (or a real one) is cast up to ``plan.complex_dtype``, a wider one
+        raises ``TypeError`` (issue #11).
     weights:
         Optional real array of shape ``(n_rows, n_chan)``, multiplied into the
-        visibilities before gridding (matches ducc's ``wgt`` argument).
+        visibilities before gridding (matches ducc's ``wgt`` argument). Cast
+        to ``plan.real_dtype`` under the same rule.
     w_strategy:
         ``"dense_scan"`` (default), ``"dense_vmap"``, ``"windowed_scan"``,
         ``"windowed_vmap"``, or ``"auto"``; same semantics as in
@@ -754,7 +803,8 @@ def vis2dirty(
     Returns
     -------
     dirty:
-        Real array of shape ``(n_chan, n_l, n_m)``.
+        Real array of shape ``(n_chan, n_l, n_m)`` and dtype
+        ``plan.real_dtype``.
     """
     w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=True)
     vis = _validate_vis(vis, plan)

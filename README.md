@@ -55,10 +55,15 @@ parity tests.
 ## Quick start
 
 ```python
+import jax
 import jax.numpy as jnp
 import numpy as np
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
+
+# Plans are float64 by default, which needs x64 (see "Precision" below).
+# This must run before the first JAX array is created.
+jax.config.update("jax_enable_x64", True)
 
 # Synthetic problem
 n_l = n_m = 128
@@ -218,10 +223,14 @@ number of forward and adjoint calls.
 
 ## API reference
 
-### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, phi_hat_n_fine=4096, phi_hat_oversample=None) -> WGridderPlan`
+### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, dtype=jnp.float64, phi_hat_n_fine=4096, phi_hat_oversample=None) -> WGridderPlan`
 
 Build the wgridder plan. Inputs are host-side numpy / jnp arrays (planning math
 runs on the host); the resulting plan holds JAX device arrays.
+
+`dtype` fixes the precision of the whole plan — `uvw` and `freq` are cast to
+it, and the operators accept and return the matching real / complex dtypes.
+See [Precision](#precision) below.
 
 `phi_hat_oversample=None` (the default) picks a width-dependent oversample
 suitable for the kernel chosen by `epsilon` (32 / 64 / 128 for `W <= 4`,
@@ -308,6 +317,47 @@ strategy is within 15% of the best measured strategy for every
 `divide_by_n` flags) to within ~10x the requested `epsilon`. For tighter
 `epsilon`, you may need to bump `phi_hat_oversample` to keep the
 phi_hat-table interpolation error below the wgridder accuracy floor.
+
+### Precision
+
+The plan owns the precision. `make_plan(..., dtype=...)` takes `jnp.float64`
+(the default) or `jnp.float32`; the choice sets the dtype of every plan array
+and is exposed as `plan.real_dtype` / `plan.complex_dtype`.
+
+**float64 (default) requires `jax_enable_x64`.** JAX ships with x64 *off*, in
+which case it silently truncates every array to single precision — a plan that
+looks like float64 but isn't. `make_plan` refuses to build one instead:
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)   # before the first JAX array
+# or: JAX_ENABLE_X64=1 in the environment
+```
+
+**Opting into float32.** Single precision halves the plan's memory footprint
+and is the natural choice on GPUs where fp32 throughput dominates:
+
+```python
+plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-4,
+                 dtype=jnp.float32)
+vis = dirty2vis(plan, jnp.asarray(image, dtype=jnp.float32))  # complex64 out
+```
+
+This works with x64 either on or off; `uvw` and `freq` are cast to the plan
+dtype, so float64 inputs are fine.
+
+**Achievable accuracy in single precision is about `epsilon = 1e-5`.** The
+measured relative-error floor across the telescope fixtures is ~3.4e-5, so
+`epsilon = 1e-4` is comfortably reachable (parity with `ducc0` within `3 *
+epsilon`) while `epsilon = 1e-6` is not. `make_plan` emits a `UserWarning` for
+a float32 plan with `epsilon < 1e-5` rather than quietly missing the target.
+Use float64 whenever you need more.
+
+**Mixing dtypes.** Per-call arrays are measured against the plan: an image,
+`vis` or `weights` array *narrower* than the plan is cast up (a float32 image
+into a float64 plan gives a complex128 result), while a *wider* one raises
+`TypeError` naming both dtypes rather than silently discarding the precision
+you produced.
 
 ## Performance notes
 

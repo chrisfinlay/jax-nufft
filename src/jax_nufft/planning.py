@@ -20,6 +20,7 @@ without being treated as traced inputs.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.typing import DTypeLike
 
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import compute_phi_hat_table, kernel_params, phi_hat_oversample_for_w
@@ -45,6 +47,15 @@ from jax_nufft.kernel import compute_phi_hat_table, kernel_params, phi_hat_overs
 # conditioned on with appropriately bumped oversample (see
 # :func:`jax_nufft.kernel.phi_hat_oversample_for_w`).
 W_OVERSAMPLE_X0 = 0.25
+
+# Smallest ``epsilon`` a float32 plan can plausibly deliver. Measured in the
+# 2026-09 review: with every plan array in single precision the relative L2
+# error against a float64 reference floors at ~3.4e-5 across the review
+# fixtures, i.e. roughly ``1e-5`` once the usual few-times-epsilon slack is
+# taken into account. Requests below this floor are honoured structurally
+# (the plan builds, the kernel width still grows) but cannot be met
+# numerically, so ``make_plan`` warns instead of silently missing the target.
+FLOAT32_EPSILON_FLOOR = 1e-5
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,14 @@ class WGridderPlan:
     # plan-side without re-tracing.
     w_extent: float
     is_constant_w: bool
+    # issue #11 precision metadata: the dtype the plan was *requested* with
+    # (``make_plan(dtype=...)``), not one inferred from the uvw/freq inputs.
+    # ``real_dtype`` is the dtype of every floating plan leaf and of the
+    # accepted ``weights``; ``complex_dtype`` is its complex counterpart and
+    # governs the image / visibility dtype the operators accept and return.
+    # Static, so a float32 and a float64 plan never share a JIT cache entry.
+    real_dtype: np.dtype[Any]
+    complex_dtype: np.dtype[Any]
 
     # ---- traced arrays (pytree leaves) ----
     uvw_lambda: Array = field()  # (n_chan, n_rows, 3) — input row order
@@ -116,6 +135,8 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.window_padding_overhead,
         plan.w_extent,
         plan.is_constant_w,
+        plan.real_dtype,
+        plan.complex_dtype,
     )
 
 
@@ -136,6 +157,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         window_padding_overhead,
         w_extent,
         is_constant_w,
+        real_dtype,
+        complex_dtype,
     ) = aux
     (
         uvw_lambda,
@@ -165,6 +188,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         window_padding_overhead=window_padding_overhead,
         w_extent=w_extent,
         is_constant_w=is_constant_w,
+        real_dtype=real_dtype,
+        complex_dtype=complex_dtype,
         uvw_lambda=uvw_lambda,
         w_centers=w_centers,
         n_minus_1=n_minus_1,
@@ -200,21 +225,83 @@ jax.tree_util.register_pytree_node(
 
 
 def _coerce_uvw_freq_dtype(
-    uvw: np.ndarray, freq: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.dtype]:
-    """Resolve a single shared real dtype for uvw and freq."""
+    uvw: np.ndarray, freq: np.ndarray, real_dtype: np.dtype[Any]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate the shape/kind of ``uvw`` / ``freq`` and cast them to the plan dtype.
+
+    Since issue #11 the plan's precision is *requested* through
+    ``make_plan(dtype=...)`` rather than inherited from the inputs, so this
+    helper no longer resolves a dtype: it only checks shapes and rejects
+    non-real input, then casts unconditionally. Passing float64 ``uvw`` to a
+    float32 plan is therefore explicitly allowed — planning inputs are
+    metadata, not the user's data, and the cast is what the caller asked for
+    by naming the plan dtype.
+    """
     uvw_arr = np.asarray(uvw)
     freq_arr = np.asarray(freq)
     if uvw_arr.ndim != 2 or uvw_arr.shape[1] != 3:
         raise ValueError(f"uvw must have shape (N, 3); got {uvw_arr.shape}")
     if freq_arr.ndim != 1:
         raise ValueError(f"freq must have shape (Nchan,); got {freq_arr.shape}")
-    if uvw_arr.dtype.kind != "f" or freq_arr.dtype.kind != "f":
-        # Promote integer/object inputs to float64.
-        uvw_arr = uvw_arr.astype(np.float64)
-        freq_arr = freq_arr.astype(np.float64)
-    out_dtype = np.result_type(uvw_arr.dtype, freq_arr.dtype)
-    return uvw_arr.astype(out_dtype), freq_arr.astype(out_dtype), out_dtype
+    # "b" (bool), "i"/"u" (integers) and "f" all cast losslessly enough for
+    # coordinates; complex/object/str input is a mistake worth naming.
+    for name, arr in (("uvw", uvw_arr), ("freq", freq_arr)):
+        if arr.dtype.kind not in "bfiu":
+            raise TypeError(f"{name} must be a real numeric array; got dtype {arr.dtype}")
+    return uvw_arr.astype(real_dtype), freq_arr.astype(real_dtype)
+
+
+def _resolve_plan_dtypes(dtype: DTypeLike, epsilon: float) -> tuple[np.dtype[Any], np.dtype[Any]]:
+    """Turn the requested ``dtype`` into the plan's ``(real, complex)`` pair.
+
+    Also enforces the two precision guards of issue #11:
+
+    * float64 is only meaningful with ``jax.config.jax_enable_x64`` on. With
+      x64 off (JAX's default) every array handed to ``jnp.asarray`` is
+      truncated to float32 *silently*, so a "float64" plan would quietly be a
+      float32 one whose error floors near 3.4e-5. Refuse rather than degrade.
+    * float32 cannot deliver ``epsilon < FLOAT32_EPSILON_FLOOR``; warn so the
+      caller knows the requested accuracy will be missed.
+    """
+    real_dtype: np.dtype[Any] = np.dtype(dtype)
+    complex_dtype: np.dtype[Any]
+    if real_dtype == np.dtype(np.float32):
+        complex_dtype = np.dtype(np.complex64)
+    elif real_dtype == np.dtype(np.float64):
+        complex_dtype = np.dtype(np.complex128)
+    else:
+        raise ValueError(
+            f"unsupported plan dtype {real_dtype}; make_plan accepts jnp.float32 or jnp.float64"
+        )
+
+    # Ask JAX what it would actually do with a float64 array rather than
+    # reading ``jax.config.jax_enable_x64``: ``canonicalize_dtype`` *is* the
+    # step that silently truncates, so this cannot drift from the behaviour
+    # being guarded against.
+    x64_enabled = np.dtype(jax.dtypes.canonicalize_dtype(np.float64)) == np.dtype(np.float64)
+    if real_dtype == np.dtype(np.float64) and not x64_enabled:
+        raise ValueError(
+            "make_plan(dtype=float64) requires jax_enable_x64, which is off in this "
+            "process: JAX would truncate every plan array to float32 without "
+            "telling you, and the accuracy would floor near 3.4e-5. Either enable "
+            "it (jax.config.update('jax_enable_x64', True), or JAX_ENABLE_X64=1 in "
+            "the environment, before the first JAX array is created), or pass "
+            "dtype=jnp.float32 to opt into single precision deliberately "
+            "(achievable epsilon ~ 1e-5)."
+        )
+
+    if real_dtype == np.dtype(np.float32) and epsilon < FLOAT32_EPSILON_FLOOR:
+        warnings.warn(
+            f"epsilon={epsilon:g} is below the accuracy a float32 plan can deliver "
+            "(measured relative-error floor ~3.4e-5, i.e. an achievable epsilon of "
+            "about 1e-5). The plan will build, but the result will not reach the "
+            "requested epsilon. Use dtype=jnp.float64 with jax_enable_x64 on for "
+            "epsilon < 1e-5.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    return real_dtype, complex_dtype
 
 
 def make_plan(
@@ -225,6 +312,7 @@ def make_plan(
     pixsize_m: float,
     epsilon: float,
     *,
+    dtype: DTypeLike = jnp.float64,
     phi_hat_n_fine: int = 4096,
     phi_hat_oversample: int | None = None,
     _force_generic: bool = False,
@@ -235,6 +323,13 @@ def make_plan(
     :func:`jax_nufft.vis2dirty`. All planning math runs on the host (numpy);
     the resulting numerical arrays live as JAX device arrays so that the
     JIT-compiled operators see them as constants.
+
+    ``dtype`` (``jnp.float64``, the default, or ``jnp.float32``) sets the
+    precision of the whole plan: ``uvw`` and ``freq`` are *cast* to it, every
+    floating plan leaf carries it, and the operators accept and return the
+    matching real/complex dtypes (see ``plan.real_dtype`` /
+    ``plan.complex_dtype``). float64 requires ``jax_enable_x64``; float32
+    warns for ``epsilon < 1e-5``, which single precision cannot reach.
 
     ``_force_generic`` is a private test-only escape hatch that skips the
     v0.1.2 constant-w fast path even when ``w_extent == 0``, building the
@@ -250,7 +345,12 @@ def make_plan(
     if pixsize_l <= 0 or pixsize_m <= 0:
         raise ValueError(f"pixsize_l and pixsize_m must be > 0; got ({pixsize_l}, {pixsize_m})")
 
-    uvw_arr, freq_arr, real_dtype = _coerce_uvw_freq_dtype(uvw, freq)
+    # Resolve precision before touching any array: the x64 guard has to fire
+    # before ``jnp.asarray`` gets a chance to truncate anything, and the
+    # float32 epsilon warning should not be emitted for a call that is going
+    # to be rejected for an unrelated reason anyway.
+    real_dtype, complex_dtype = _resolve_plan_dtypes(dtype, epsilon)
+    uvw_arr, freq_arr = _coerce_uvw_freq_dtype(uvw, freq, real_dtype)
     n_rows = uvw_arr.shape[0]
     n_chan = freq_arr.shape[0]
 
@@ -421,9 +521,13 @@ def make_plan(
     # re-deriving them on every JIT invocation. Sorted variants are NOT
     # stored (option (b) in the v0.1.2 plan); the windowed helpers gather
     # via plan.sort_perm at scan time.
+    # The explicit ``astype`` is not redundant: ``pixsize_*`` are Python
+    # floats, and value-based promotion rules differ across numpy versions,
+    # so pin the result to the plan's dtype rather than trusting the scalar
+    # to stay weak.
     two_pi = 2.0 * np.pi
-    u_finufft_np = (two_pi * pixsize_l) * uvw_lambda_np[..., 0]
-    v_finufft_np = (two_pi * pixsize_m) * uvw_lambda_np[..., 1]
+    u_finufft_np = ((two_pi * pixsize_l) * uvw_lambda_np[..., 0]).astype(real_dtype)
+    v_finufft_np = ((two_pi * pixsize_m) * uvw_lambda_np[..., 1]).astype(real_dtype)
 
     return WGridderPlan(
         n_l=int(n_l),
@@ -445,6 +549,8 @@ def make_plan(
         # over constant-w data, this stays False so downstream selectors
         # (Part 4 auto, etc.) see the actual structure of this plan.
         is_constant_w=use_fast_path,
+        real_dtype=real_dtype,
+        complex_dtype=complex_dtype,
         uvw_lambda=jnp.asarray(uvw_lambda_np),
         w_centers=jnp.asarray(w_centers_np),
         n_minus_1=jnp.asarray(n_minus_1_np),

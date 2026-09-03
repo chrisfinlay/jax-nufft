@@ -40,6 +40,29 @@ jobs:
       - name: Run pytest (slow ducc parity)
         run: pixi run -e ${{ matrix.environment }} test -ra --runslow
 
+  test-float32:
+    # Separate job rather than another matrix dimension: a single-precision
+    # failure then shows up as its own line in the checks list instead of
+    # hiding inside a Python-version cell. Scope is deliberately narrow --
+    # `collect_ignore` in tests/conftest.py skips the modules that are not
+    # precision-aware yet, and later issues shrink that list.
+    name: pytest (float32)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          environments: test
+          locked: true
+
+      - name: Run pytest with jax_enable_x64 off
+        env:
+          JAX_ENABLE_X64: "0"
+        run: pixi run -e test test -ra
+
   lint:
     name: ruff + mypy
     runs-on: ubuntu-latest
