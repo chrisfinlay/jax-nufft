@@ -219,6 +219,20 @@ try:
 except Exception as exc:
     out["warn_probe_error"] = describe(exc)
 
+# (d) A RAW NUMPY float64 2-D image into a float32 plan must still be refused.
+#     This case only exists with x64 off: `jnp.broadcast_to` is where a numpy
+#     array enters JAX, and that entry silently narrows float64 to float32, so
+#     broadcasting before the dtype check would make the 2-D path accept an
+#     image the 3-D path rejects.
+try:
+    plan = make_plan(uvw, freq, (n_pix, n_pix), pixsize, pixsize, 1e-4, dtype=jnp.float32)
+    result = dirty2vis(plan, np.asarray(image, dtype=np.float64))
+except Exception as exc:
+    out["wide_numpy_image_error"] = describe(exc)
+else:
+    out["wide_numpy_image_error"] = None
+    out["wide_numpy_image_dtype"] = str(np.asarray(result).dtype)
+
 print("<<<JSON>>>" + json.dumps(out))
 '''
 
@@ -309,6 +323,26 @@ def test_x64_off_float32_adjoint_matches_ducc(x64_off_report: dict[str, Any]) ->
     assert x64_off_report["dirty_dtype"] == "float32"
     rel = x64_off_report["adjoint_rel_err_1e_4"]
     assert rel < 3 * 1e-4, f"float32 adjoint vs ducc0 at eps=1e-4: relative error {rel:.3e}"
+
+
+def test_x64_off_float32_plan_rejects_a_raw_float64_numpy_image(
+    x64_off_report: dict[str, Any],
+) -> None:
+    """The 2-D broadcast must not launder a wide numpy image into the plan.
+
+    With x64 off, entering JAX narrows float64 to float32 silently, so a
+    ``jnp.broadcast_to`` ahead of the dtype check would let the 2-D path
+    accept exactly the image the 3-D path refuses.
+    """
+    err = x64_off_report["wide_numpy_image_error"]
+    assert err is not None, (
+        "a raw numpy float64 image was accepted by a float32 plan; the 2-D path "
+        f"broadcast before checking the dtype (result dtype "
+        f"{x64_off_report.get('wide_numpy_image_dtype')})"
+    )
+    assert err["type"] == "TypeError", err
+    assert "float64" in err["message"], err["message"]
+    assert "float32" in err["message"], err["message"]
 
 
 def test_x64_off_float32_plan_warns_below_the_floor(x64_off_report: dict[str, Any]) -> None:

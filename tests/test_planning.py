@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -275,17 +277,28 @@ def test_plan_is_a_jax_pytree() -> None:
 
     # Being aux data also means the dtype is part of the JIT cache key: two
     # plans that differ only in dtype must not share a treedef.
-    plan32 = make_plan(
-        uvw=_baseline_uvw(n_rows=10),
-        freq=np.array([200e6]),
-        image_shape=(32, 32),
-        pixsize_l=1e-3,
-        pixsize_m=1e-3,
-        epsilon=1e-4,
-        dtype=jnp.float32,
+    #
+    # The swap is done with ``dataclasses.replace`` rather than a second
+    # ``make_plan(dtype=jnp.float32)`` call *on purpose*. A separately built
+    # plan would also need a different epsilon (float32 warns below 1e-5, and
+    # the suite runs with filterwarnings=error), which changes the kernel
+    # width, beta, n_w and w_kernel_scale too -- so the treedefs would compare
+    # unequal even if the dtype pair were dropped from ``_plan_aux``
+    # entirely, and the assertion would prove nothing. Here every other aux
+    # entry and every leaf is identical by construction, so this fails if and
+    # only if the dtype is not part of the pytree aux data.
+    plan32 = dataclasses.replace(
+        plan,
+        real_dtype=np.dtype(np.float32),
+        complex_dtype=np.dtype(np.complex64),
     )
     assert np.dtype(plan32.real_dtype) == np.dtype(jnp.float32)
     assert np.dtype(plan32.complex_dtype) == np.dtype(jnp.complex64)
+    leaves32 = jax.tree_util.tree_leaves(plan32)
+    assert all(a is b for a, b in zip(leaves32, leaves, strict=True)), (
+        "the dtype swap must not disturb the leaves, or the treedef comparison "
+        "below would not isolate the aux data"
+    )
     assert jax.tree_util.tree_structure(plan32) != treedef
 
     # And we can read it through a jit'd function.

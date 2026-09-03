@@ -247,13 +247,20 @@ def _prepare_image(image: Array, plan: WGridderPlan) -> Array:
     image narrower than the plan is cast up (see :func:`_cast_to_plan_dtype`),
     a wider one is rejected. Deriving it from the image instead is what used
     to hand jax-finufft mismatched arrays.
+
+    Order matters here. The dtype check runs on the array the caller passed,
+    *before* the 2-D broadcast: ``jnp.broadcast_to`` is the point where a raw
+    numpy array enters JAX, and with ``jax_enable_x64`` off that entry
+    silently narrows float64/complex128 to 32 bits. Checking afterwards would
+    make a float32 plan accept a float64 numpy image on the 2-D path while
+    correctly rejecting the same image on the 3-D path, which touches nothing
+    before the check.
     """
     if image.ndim == 2:
         if image.shape != (plan.n_l, plan.n_m):
             raise ValueError(
                 f"image shape {image.shape} does not match plan ({plan.n_l}, {plan.n_m})"
             )
-        image = jnp.broadcast_to(image, (plan.n_chan, plan.n_l, plan.n_m))
     elif image.ndim == 3:
         if image.shape != (plan.n_chan, plan.n_l, plan.n_m):
             raise ValueError(
@@ -262,7 +269,10 @@ def _prepare_image(image: Array, plan: WGridderPlan) -> Array:
             )
     else:
         raise ValueError(f"image must be 2- or 3-dimensional; got ndim={image.ndim}")
-    return _cast_to_plan_dtype(image, plan, name="image", target=plan.complex_dtype)
+    image = _cast_to_plan_dtype(image, plan, name="image", target=plan.complex_dtype)
+    if image.ndim == 2:
+        image = jnp.broadcast_to(image, (plan.n_chan, plan.n_l, plan.n_m))
+    return image
 
 
 def _validate_vis(vis: Array, plan: WGridderPlan) -> Array:
