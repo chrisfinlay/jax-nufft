@@ -112,6 +112,11 @@ if not X64:
         "test_against_ducc.py",
         "test_auto_strategy.py",
         "test_constant_w.py",
+        # Both: it builds default (float64) plans, and it imports the DFT
+        # references from ``test_adjoint`` / ``test_against_dft``, whose
+        # import-time ``jax.config.update("jax_enable_x64", True)`` would
+        # switch this leg back to float64 for everything collected after it.
+        "test_accuracy_sweep.py",
         "test_planning.py",
     ]
 

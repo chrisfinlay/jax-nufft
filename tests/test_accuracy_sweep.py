@@ -46,7 +46,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -59,18 +58,11 @@ from tests.conftest import (
     MWA_COMPACT,
     MWA_EXTENDED,
     Telescope,
+    requires_x64,
     synthetic_uvw,
 )
 from tests.test_adjoint import _reference_adjoint
 from tests.test_against_dft import _reference_forward, reference_lmn_grids
-
-# A parallel branch is adding a shared ``requires_x64`` marker to conftest;
-# until that lands this module carries its own copy, and the two get reconciled
-# at rebase time.
-requires_x64 = pytest.mark.skipif(
-    not jax.config.jax_enable_x64,
-    reason="the accuracy sweep measures down to eps=1e-12 and needs jax_enable_x64",
-)
 
 # The accuracy contract this sweep enforces: the achieved relative L2 error
 # against the exact DFT must not exceed twice the requested epsilon, in either
