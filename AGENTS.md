@@ -238,7 +238,7 @@ pixi run -e dev typecheck              # mypy (best-effort)
   |-----------------------------------------------|----------------|---------------------------------------------|
   | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; comfortably under `2 * eps` after it |
   | vs. ducc0 (forward + adjoint, constant-w fast path) | `err < 3 * eps`  | ducc0 lands at `~0.1 * eps` against the DFT; the `3 * eps` gap is dominated by our own `2 * eps` budget |
-  | Strategy equivalence (`w_strategy` x `channel_strategy`, `tests/test_strategies_equivalent.py`) | `err < 1e-11`  | largest pairwise difference between any two of the eight combinations: 2e-12 at eps=1e-8, <=5e-14 at eps=1e-6 |
+  | Strategy equivalence (`w_strategy` x `channel_strategy`, `tests/test_strategies_equivalent.py`) | `err < 1e-11` (float64), `err < 1.3e-6` (float32) | worst pairwise difference between any two of the eight combinations, 3 short fixtures x eps in {1e-4,1e-6,1e-8}: float64 2.0e-13 (MWA_compact off30, eps=1e-6); float32 1.21e-7 (MWA_compact off30, eps=1e-8) -- float32 bound is ~10x that measurement, see the module docstring |
   | Adjointness (dot-product identity, dense-vs-windowed adjoint) | `err < 1e-11`  | dot-product residual 1e-16 .. 7e-13 (ducc0 itself: 1e-14 .. 8e-11, for comparison only) |
 
   The DFT bound is an accuracy *contract*, not a comparison -- the DFT is
@@ -251,7 +251,10 @@ pixi run -e dev typecheck              # mypy (best-effort)
   `100 * eps` (1e-4 at eps=1e-6 -- ten orders of magnitude looser than
   what the code actually achieves, wide enough to hide a bug that dropped
   a whole window row from the adjoint) after measuring the numbers in the
-  table above. If a bound doesn't hold on a given platform (Linux CI sorts
+  table above. Strategy equivalence gets a second, separate bound for
+  float32 (`1.3e-6`) rather than reusing `1e-11`: float32 has essentially
+  no headroom above its own rounding floor, so `1e-11` simply does not
+  hold there. If a bound doesn't hold on a given platform (Linux CI sorts
   FINUFFT bins differently from macOS arm64), the fix is to measure the
   worst case there and set the bound at 10x it, not higher -- record the
   measurement in a comment, don't just loosen it to whatever passes.

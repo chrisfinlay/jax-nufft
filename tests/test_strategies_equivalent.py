@@ -145,15 +145,57 @@ def _build_problem(
 
 def _pairwise_max_rel_err(
     results: dict[tuple[WStrategy, ChannelStrategy], np.ndarray],
+    *,
+    label: str,
 ) -> tuple[
     float, tuple[tuple[WStrategy, ChannelStrategy], tuple[WStrategy, ChannelStrategy]] | None
 ]:
-    """Largest relative L2 disagreement between any two strategy results, and which pair."""
+    """Largest relative L2 disagreement between any two strategy results, and which pair.
+
+    This is the load-bearing comparison behind every assertion in this
+    module: each strategy-equivalence check in ``test_strategies_agree_pairwise``
+    reduces to "the value this function returns is below STRATEGY_TOL". That
+    makes its behaviour on non-finite input part of the contract, not an
+    implementation detail one level down -- a running max via ``>`` is NOT
+    NaN-safe by itself: ``nan > worst`` is always False, so a NaN error
+    would never overwrite ``worst`` and a completely broken strategy (e.g.
+    one that returns all-NaN) could hide behind a healthy pair, reporting a
+    passing "worst case" of 0.0. That is exactly the "passes while gating
+    nothing" failure mode issue #10 exists to eliminate, so this function
+    closes it with two independent guards:
+
+    1. Every result is asserted finite up front, naming the offending
+       ``(w_strategy, channel_strategy)`` pair and ``label`` (which of
+       forward/adjoint, plus fixture and eps) so a NaN/inf strategy output
+       fails loudly and specifically, before it can reach any comparison.
+    2. Even so, any non-finite *pairwise* error (which finite inputs can in
+       principle still produce, e.g. overflow in the subtraction) is
+       coerced to +inf before the ``>`` reduction, so it can never lose to
+       a smaller "worst" by a comparison quirk alone.
+
+    See ``test_pairwise_max_rel_err_rejects_nan`` for the regression test
+    pinning guard (1); it demonstrated (via Codex review round 1 on this
+    issue) that the original version of this function returned ``(0.0,
+    None)`` -- a clean pass -- when handed one all-NaN strategy result.
+    """
+    for key, value in results.items():
+        n_total = int(np.size(value))
+        n_bad = n_total - int(np.sum(np.isfinite(value)))
+        assert n_bad == 0, (
+            f"{label}: strategy {key[0]}/{key[1]} produced {n_bad}/{n_total} "
+            "non-finite (nan/inf) value(s) -- a broken strategy must fail loudly "
+            "right here, not flow into the pairwise comparison below where a `>` "
+            "reduction could silently treat it as 'not the worst'"
+        )
+
     worst = 0.0
     worst_pair = None
     for key_a, key_b in itertools.combinations(results.keys(), 2):
         a, b = results[key_a], results[key_b]
-        err = float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-30))
+        raw_err = float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-30))
+        # Second line of defence (see docstring): never let a non-finite
+        # pairwise error be silently "not the worst" under `>`.
+        err = raw_err if np.isfinite(raw_err) else float("inf")
         if err > worst:
             worst = err
             worst_pair = (key_a, key_b)
@@ -188,14 +230,37 @@ def test_strategies_agree_pairwise(
             vis2dirty(plan, vis, w_strategy=w_strategy, channel_strategy=channel_strategy)
         )
 
-    fwd_err, fwd_pair = _pairwise_max_rel_err(forward)
+    case_id = f"{tel.name} zen={zen_deg:g} eps={eps:g}"
+
+    fwd_err, fwd_pair = _pairwise_max_rel_err(forward, label=f"{case_id} forward")
     assert fwd_err < STRATEGY_TOL, (
-        f"{tel.name} zen={zen_deg:g} eps={eps:g}: forward strategies disagree, "
+        f"{case_id}: forward strategies disagree, "
         f"worst pair {fwd_pair} rel err {fwd_err:.3e} >= {STRATEGY_TOL:.3e}"
     )
 
-    adj_err, adj_pair = _pairwise_max_rel_err(adjoint)
+    adj_err, adj_pair = _pairwise_max_rel_err(adjoint, label=f"{case_id} adjoint")
     assert adj_err < STRATEGY_TOL, (
-        f"{tel.name} zen={zen_deg:g} eps={eps:g}: adjoint strategies disagree, "
+        f"{case_id}: adjoint strategies disagree, "
         f"worst pair {adj_pair} rel err {adj_err:.3e} >= {STRATEGY_TOL:.3e}"
     )
+
+
+def test_pairwise_max_rel_err_rejects_nan() -> None:
+    """Regression test for the NaN-swallowing hole Codex review round 1 found in
+    ``_pairwise_max_rel_err``: a naive running-max reduction via ``>`` never
+    overwrites ``worst`` with a NaN error (``nan > worst`` is always False), so
+    a completely broken (all-NaN) strategy could previously hide behind a
+    healthy pair and the function would report a passing ``(0.0, None)``.
+
+    This feeds the helper a NaN result directly -- no plan, no JAX call -- so
+    it stays fast and pins the guard without depending on any real strategy
+    actually being broken. It must raise, not return quietly.
+    """
+    healthy = np.array([1.0, 2.0, 3.0])
+    broken = np.array([np.nan, np.nan, np.nan])
+    results: dict[tuple[WStrategy, ChannelStrategy], np.ndarray] = {
+        ("dense_scan", "scan"): healthy,
+        ("dense_scan", "vmap"): broken,
+    }
+    with pytest.raises(AssertionError, match="non-finite"):
+        _pairwise_max_rel_err(results, label="unit test")
