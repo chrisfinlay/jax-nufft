@@ -305,18 +305,23 @@ def _resolve_plan_dtypes(dtype: DTypeLike) -> tuple[np.dtype[Any], np.dtype[Any]
 def _warn_if_below_float32_floor(real_dtype: np.dtype[Any], epsilon: float) -> None:
     """Warn when a float32 plan is asked for an ``epsilon`` it cannot reach.
 
-    Called *after* every input-rejection check in ``make_plan`` -- ``uvw`` /
-    ``freq`` shape and kind, and (since issue #9's review follow-up)
+    Called *after* every input-rejection check in ``make_plan``, with no
+    exceptions -- ``uvw`` / ``freq`` shape and kind, ``epsilon``,
+    ``image_shape``, ``pixsize_l`` / ``pixsize_m``, ``phi_hat_n_fine`` /
+    ``phi_hat_oversample``, and (since issue #9's review follow-up)
     ``kernel_params(epsilon)``'s own ``ValueError`` for an epsilon below
     1e-14 -- and deliberately so: the suite (and many downstream users) run
     with ``filterwarnings = ["error"]``, which turns this into a raised
     ``UserWarning``. Emitting it earlier would mean a caller hits the wrong
     diagnostic for their actual bug: a malformed ``uvw`` at a tight epsilon
-    would get an accuracy complaint instead of the shape error, and
+    would get an accuracy complaint instead of the shape error,
     ``dtype=jnp.float32`` at an epsilon ``kernel_params`` refuses outright
     (< 1e-14) would get this warning's "the plan will build" claim instead of
-    the ``ValueError`` saying it can't. Only a plan that is otherwise
-    buildable gets to hear about its accuracy.
+    the ``ValueError`` saying it can't, and the same is true of an invalid
+    ``phi_hat_n_fine`` / ``phi_hat_oversample`` -- ``compute_phi_hat_table``
+    (kernel.py) validates those too, but it is only called much later in
+    ``make_plan``, well after this warning would already have fired. Only a
+    plan that is otherwise buildable gets to hear about its accuracy.
     """
     if real_dtype == np.dtype(np.float32) and epsilon < FLOAT32_EPSILON_FLOOR:
         warnings.warn(
@@ -370,6 +375,15 @@ def make_plan(
         raise ValueError(f"image_shape must be positive; got {image_shape}")
     if pixsize_l <= 0 or pixsize_m <= 0:
         raise ValueError(f"pixsize_l and pixsize_m must be > 0; got ({pixsize_l}, {pixsize_m})")
+    # Mirrors compute_phi_hat_table's own checks (kernel.py), but validated
+    # here too: that function is only called later, after
+    # _warn_if_below_float32_floor, so without this a bad phi_hat_n_fine /
+    # phi_hat_oversample would reach the accuracy warning first -- see the
+    # ordering comment below.
+    if phi_hat_n_fine % 2 != 0:
+        raise ValueError(f"phi_hat_n_fine must be even; got {phi_hat_n_fine}")
+    if phi_hat_oversample is not None and phi_hat_oversample < 1:
+        raise ValueError(f"phi_hat_oversample must be >= 1; got {phi_hat_oversample}")
 
     # Resolve precision before touching any array: the x64 guard has to fire
     # before ``jnp.asarray`` gets a chance to truncate anything.
@@ -379,15 +393,17 @@ def make_plan(
     n_chan = freq_arr.shape[0]
 
     # --- kernel parameters ---
-    # Every input-rejection ValueError (uvw/freq shape and kind above, the
-    # epsilon-too-tight check inside kernel_params here) must run before
-    # _warn_if_below_float32_floor: with filterwarnings = ["error"] that
-    # warning becomes an exception too, and if it fired first, a caller
-    # asking for dtype=jnp.float32 at an epsilon kernel_params flatly cannot
-    # honour (< 1e-14) would see a UserWarning claiming "the plan will
-    # build" instead of the ValueError that actually applies. So this call
-    # -- and its result, reused below rather than called again -- has to
-    # come first.
+    # Every input-rejection ValueError -- epsilon <= 0, image_shape,
+    # pixsize, phi_hat_n_fine, phi_hat_oversample above, and the
+    # epsilon-too-tight check inside kernel_params here -- must run before
+    # _warn_if_below_float32_floor, with no exceptions: with
+    # filterwarnings = ["error"] that warning becomes an exception too, and
+    # if it fired first, a caller asking for dtype=jnp.float32 at an epsilon
+    # kernel_params flatly cannot honour (< 1e-14), or at any epsilon with a
+    # malformed phi_hat_n_fine / phi_hat_oversample, would see a UserWarning
+    # claiming "the plan will build" instead of the ValueError that
+    # actually applies. So this call -- and its result, reused below rather
+    # than called again -- has to come first.
     w_kernel_width, beta = kernel_params(epsilon)
     # Only now, with every argument known good and the epsilon itself
     # confirmed reachable, complain about accuracy the requested precision
