@@ -1,23 +1,119 @@
-"""Shared pytest fixtures: synthetic telescope uvw + pointings.
+"""Shared pytest fixtures: synthetic telescope uvw + pointings, precision switch.
 
 Each ``Telescope`` describes a synthetic observing setup: the uv distribution
 parameters, the image size / FoV, and the central frequency. ``synthetic_uvw``
 turns those parameters (plus a chosen pointing) into a ``(n_rows, 3)`` uvw
 array in metres, with controllable w-content for both zenith and 30-degree
 off-zenith cases.
+
+Precision
+---------
+The suite runs in float64 by default (see the ``JAX_ENABLE_X64`` block below);
+``JAX_ENABLE_X64=0`` in the environment selects the single-precision leg, which
+is what a user gets from JAX out of the box. The public handles are:
+
+``X64``
+    Module-level ``bool`` recording the resolved setting.
+``requires_x64``
+    A plain ``pytest.mark.skipif`` marker for float64-only tests; import it with
+    ``from tests.conftest import requires_x64``.
+``tol(f64, f32)``
+    Returns ``f64`` under x64 and ``f32`` otherwise, so precision-scaled
+    tolerances are written once here instead of being reinvented per module.
+``precision`` / ``real_dtype`` / ``complex_dtype``
+    Session-scoped fixtures giving the active precision as a string
+    (``"float64"`` / ``"float32"``) and as the matching ``jnp`` dtypes.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.typing import DTypeLike
 
-# Switch x64 on globally so the parity tests have headroom at eps=1e-8.
-jax.config.update("jax_enable_x64", True)
+# --- precision switch (issue #11) -------------------------------------------
+# Default float64 so the ducc/DFT parity tests keep their headroom at eps=1e-8;
+# ``JAX_ENABLE_X64=0`` (also ``false`` / ``False``) selects the float32 leg.
+# This must run before any JAX array is created, hence its position at the top
+# of the file.
+X64: bool = os.environ.get("JAX_ENABLE_X64", "1").strip().lower() not in ("0", "false")
+jax.config.update("jax_enable_x64", X64)
+
+# A marker object, not a collection hook: test modules apply it per test with
+# ``@requires_x64`` so a float32 run reports SKIPPED rather than FAILED.
+requires_x64 = pytest.mark.skipif(
+    not X64,
+    reason="needs jax_enable_x64 (this run has JAX_ENABLE_X64=0, i.e. float32)",
+)
+
+
+def tol(f64: float, f32: float) -> float:
+    """Pick a tolerance for the active precision: ``f64`` under x64, else ``f32``."""
+    return f64 if X64 else f32
+
+
+@pytest.fixture(scope="session")
+def precision() -> str:
+    """``"float64"`` or ``"float32"`` — the precision this run was configured with."""
+    return "float64" if X64 else "float32"
+
+
+@pytest.fixture(scope="session")
+def real_dtype() -> DTypeLike:
+    """The real dtype matching the active precision."""
+    return jnp.float64 if X64 else jnp.float32
+
+
+@pytest.fixture(scope="session")
+def complex_dtype() -> DTypeLike:
+    """The complex dtype matching the active precision."""
+    return jnp.complex128 if X64 else jnp.complex64
+
+
+# --- what the float32 leg covers today (issue #11) --------------------------
+# This is an explicit BACKLOG, not a design. Under ``JAX_ENABLE_X64=0`` the
+# modules listed below are skipped at collection time because they are not
+# precision-aware yet: each either builds a default (float64) plan, which
+# ``make_plan`` now refuses with a ``ValueError`` when x64 is off, or calls
+# ``jax.config.update("jax_enable_x64", True)`` at import time, which would
+# silently turn the whole "float32" run back into a float64 one and make the
+# leg meaningless.
+#
+# The list was determined empirically (run the leg, see what breaks), not by
+# guessing, and it is expected to SHRINK: later issues in the 2026-09 review
+# plan parametrise these modules over precision -- using the ``precision`` /
+# ``real_dtype`` / ``complex_dtype`` fixtures and ``tol(f64, f32)`` above
+# instead of hard-coding float64 -- and drop them from here one at a time, one
+# module per issue, until the list is empty. Nothing should ever be added.
+#
+# ``tests/test_dtype.py`` is deliberately absent: it is the module this leg
+# exists to run today. So is every module that is already precision-agnostic
+# (pure-host kernel/plan structure, strategy selection, benchmark harness).
+collect_ignore: list[str] = []
+if not X64:
+    collect_ignore = [
+        # Call ``jax.config.update("jax_enable_x64", True)`` at import time, so
+        # merely collecting them turns the float32 run back into a float64 one
+        # for every module that follows. (They also assert DFT / ducc parity
+        # down to eps=1e-8, which single precision cannot reach.)
+        "test_adjoint.py",
+        "test_against_dft.py",
+        "test_benchmark_against_ducc.py",
+        "test_boundary_planes.py",
+        "test_jax_integration.py",
+        # Build default (float64) plans with no ``dtype=`` argument: 62 tests
+        # across these four now stop at the new ``make_plan`` ValueError.
+        "test_against_ducc.py",
+        "test_auto_strategy.py",
+        "test_constant_w.py",
+        "test_planning.py",
+    ]
 
 
 @dataclass(frozen=True)
