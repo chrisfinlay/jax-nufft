@@ -305,13 +305,23 @@ def _resolve_plan_dtypes(dtype: DTypeLike) -> tuple[np.dtype[Any], np.dtype[Any]
 def _warn_if_below_float32_floor(real_dtype: np.dtype[Any], epsilon: float) -> None:
     """Warn when a float32 plan is asked for an ``epsilon`` it cannot reach.
 
-    Called *after* ``uvw`` / ``freq`` have been validated, and deliberately
-    so: the suite (and many downstream users) run with
-    ``filterwarnings = ["error"]``, which turns this into a raised
-    ``UserWarning``. Emitting it earlier would mean a caller who passes a
-    malformed ``uvw`` at a tight epsilon gets an accuracy complaint instead of
-    the shape error that actually describes their bug. Only a plan that is
-    otherwise buildable gets to hear about its accuracy.
+    Called *after* every input-rejection check in ``make_plan``, with no
+    exceptions -- ``uvw`` / ``freq`` shape and kind, ``epsilon``,
+    ``image_shape``, ``pixsize_l`` / ``pixsize_m``, ``phi_hat_n_fine`` /
+    ``phi_hat_oversample``, and (since issue #9's review follow-up)
+    ``kernel_params(epsilon)``'s own ``ValueError`` for an epsilon below
+    1e-14 -- and deliberately so: the suite (and many downstream users) run
+    with ``filterwarnings = ["error"]``, which turns this into a raised
+    ``UserWarning``. Emitting it earlier would mean a caller hits the wrong
+    diagnostic for their actual bug: a malformed ``uvw`` at a tight epsilon
+    would get an accuracy complaint instead of the shape error,
+    ``dtype=jnp.float32`` at an epsilon ``kernel_params`` refuses outright
+    (< 1e-14) would get this warning's "the plan will build" claim instead of
+    the ``ValueError`` saying it can't, and the same is true of an invalid
+    ``phi_hat_n_fine`` / ``phi_hat_oversample`` -- ``compute_phi_hat_table``
+    (kernel.py) validates those too, but it is only called much later in
+    ``make_plan``, well after this warning would already have fired. Only a
+    plan that is otherwise buildable gets to hear about its accuracy.
     """
     if real_dtype == np.dtype(np.float32) and epsilon < FLOAT32_EPSILON_FLOOR:
         warnings.warn(
@@ -365,19 +375,40 @@ def make_plan(
         raise ValueError(f"image_shape must be positive; got {image_shape}")
     if pixsize_l <= 0 or pixsize_m <= 0:
         raise ValueError(f"pixsize_l and pixsize_m must be > 0; got ({pixsize_l}, {pixsize_m})")
+    # Mirrors compute_phi_hat_table's own checks (kernel.py), but validated
+    # here too: that function is only called later, after
+    # _warn_if_below_float32_floor, so without this a bad phi_hat_n_fine /
+    # phi_hat_oversample would reach the accuracy warning first -- see the
+    # ordering comment below.
+    if phi_hat_n_fine % 2 != 0:
+        raise ValueError(f"phi_hat_n_fine must be even; got {phi_hat_n_fine}")
+    if phi_hat_oversample is not None and phi_hat_oversample < 1:
+        raise ValueError(f"phi_hat_oversample must be >= 1; got {phi_hat_oversample}")
 
     # Resolve precision before touching any array: the x64 guard has to fire
     # before ``jnp.asarray`` gets a chance to truncate anything.
     real_dtype, complex_dtype = _resolve_plan_dtypes(dtype)
     uvw_arr, freq_arr = _coerce_uvw_freq_dtype(uvw, freq, real_dtype)
-    # Only now, with every argument known good, complain about accuracy the
-    # requested precision cannot deliver (see _warn_if_below_float32_floor).
-    _warn_if_below_float32_floor(real_dtype, epsilon)
     n_rows = uvw_arr.shape[0]
     n_chan = freq_arr.shape[0]
 
     # --- kernel parameters ---
+    # Every input-rejection ValueError -- epsilon <= 0, image_shape,
+    # pixsize, phi_hat_n_fine, phi_hat_oversample above, and the
+    # epsilon-too-tight check inside kernel_params here -- must run before
+    # _warn_if_below_float32_floor, with no exceptions: with
+    # filterwarnings = ["error"] that warning becomes an exception too, and
+    # if it fired first, a caller asking for dtype=jnp.float32 at an epsilon
+    # kernel_params flatly cannot honour (< 1e-14), or at any epsilon with a
+    # malformed phi_hat_n_fine / phi_hat_oversample, would see a UserWarning
+    # claiming "the plan will build" instead of the ValueError that
+    # actually applies. So this call -- and its result, reused below rather
+    # than called again -- has to come first.
     w_kernel_width, beta = kernel_params(epsilon)
+    # Only now, with every argument known good and the epsilon itself
+    # confirmed reachable, complain about accuracy the requested precision
+    # cannot deliver (see _warn_if_below_float32_floor).
+    _warn_if_below_float32_floor(real_dtype, epsilon)
 
     # --- n - 1 grid (numpy, host-side) ---
     # For pixels inside the unit disc (l^2 + m^2 <= 1) this is the usual
@@ -445,6 +476,18 @@ def make_plan(
         # --- number of w-planes ---
         # Sample w with step dw = x0 / max|n-1|, matching ducc's choice for
         # ofactor=2 kernels (see W_OVERSAMPLE_X0). This is independent of W.
+        #
+        # ``n_w = n_w_inner + W``: only the W half-widths of kernel overhang at
+        # the two ends of the w-range depend on the kernel, so the plane count
+        # grows by exactly one plane per unit of W. That is the whole cost of
+        # issue #9's wider width rule, and it is a rounding error wherever the
+        # w-range is what sets n_w: on the review fixtures, going from
+        # eps = 1e-3 (W = 4) to eps = 1e-12 (W = 13) takes MWA_extended off30
+        # from 492 to 501 planes (+1.8%) but MWA_compact zenith, where
+        # n_w_inner is 1, from 5 to 14 (+180%). Per epsilon step the increase
+        # is the width step itself: +1 plane at 1e-6, 1e-7, 1e-8 and +3 at
+        # 1e-12 relative to the pre-#9 rule (worst relative case on the
+        # fixtures: MWA_compact zenith at 1e-12, 11 -> 14 planes, +27%).
         x0 = W_OVERSAMPLE_X0
         n_w_inner = math.ceil(w_extent * max_abs_nm1 / x0)
         n_w_inner = max(n_w_inner, 1)  # always have at least one interior step

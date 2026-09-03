@@ -7,7 +7,13 @@ adjoint, we configure ducc consistently:
   * forward parity: ``ducc0.wgridder.dirty2vis(divide_by_n=False, ...)``
   * adjoint parity: ``ducc0.wgridder.vis2dirty(divide_by_n=True, ...)``
 
-The acceptance threshold is ``10 * epsilon`` per the spec.
+The acceptance threshold is ``3 * epsilon`` (issue #9). ducc0 itself lands at
+roughly ``0.1 * epsilon`` against the exact DFT, and jax-nufft is held to
+``2 * epsilon`` there (``tests/test_against_dft.py``), so the gap between the
+two implementations is dominated by jax-nufft's own error and a factor of
+three is all the headroom the contract needs. The previous ``20 * epsilon``
+threshold was chosen when the w-kernel width rule under-provisioned by up to
+three cells and would not have caught it.
 
 Image sizes / row counts are reduced from the spec values so that the test
 matrix runs in single-digit seconds locally; the algorithmic regime (FoV,
@@ -23,6 +29,9 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from tests.conftest import Telescope, synthetic_uvw
+
+# ducc0 parity contract (issue #9). See the module docstring.
+DUCC_TOL_FACTOR = 3.0
 
 
 @pytest.mark.parametrize("w_strategy", ["dense_scan", "windowed_scan"])
@@ -53,10 +62,10 @@ def test_forward_parity(
     )
 
     err = np.linalg.norm(vis_jax - vis_ducc) / np.linalg.norm(vis_ducc)
-    # Loosen the tolerance slightly: ducc and our wgridder both target
-    # `epsilon` independently, so the gap between them is bounded by ~2*eps
-    # in the best case and ~10*eps in practice.
-    assert err < 20 * eps, (
+    # ducc and our wgridder both target `epsilon` independently, so the gap
+    # between them is bounded by the sum of their individual errors: ducc is
+    # ~0.1*eps and we are contracted to 2*eps, hence 3*eps.
+    assert err < DUCC_TOL_FACTOR * eps, (
         f"{tel.name} zen={zen_deg} eps={eps:g} {w_strategy}: relative error {err:.3e}"
     )
 
@@ -93,7 +102,7 @@ def test_adjoint_parity(
     )
 
     err = np.linalg.norm(dirty_jax - dirty_ducc) / np.linalg.norm(dirty_ducc)
-    assert err < 20 * eps, (
+    assert err < DUCC_TOL_FACTOR * eps, (
         f"{tel.name} zen={zen_deg} eps={eps:g} {w_strategy}: relative error {err:.3e}"
     )
 
@@ -132,7 +141,7 @@ def test_forward_parity_with_weights(
     )
 
     err = np.linalg.norm(dirty_jax - dirty_ducc) / np.linalg.norm(dirty_ducc)
-    assert err < 20 * eps
+    assert err < DUCC_TOL_FACTOR * eps
 
 
 @pytest.mark.parametrize("eps", [1e-6])
@@ -159,7 +168,7 @@ def test_forward_parity_long(long_telescope_pointing: tuple[Telescope, float], e
         nthreads=1,
     )
     err = np.linalg.norm(vis_jax - vis_ducc) / np.linalg.norm(vis_ducc)
-    assert err < 20 * eps
+    assert err < DUCC_TOL_FACTOR * eps
 
 
 @pytest.mark.parametrize(
@@ -168,7 +177,7 @@ def test_forward_parity_long(long_telescope_pointing: tuple[Telescope, float], e
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
 def test_constant_w_ducc_parity(op: str, w_strategy: str) -> None:
     """v0.1.2 fast path: coplanar (w == 0 everywhere) data must match ducc
-    within ``20 * eps`` for every w_strategy. ``plan.n_w == 1`` confirms the
+    within ``DUCC_TOL_FACTOR * eps`` for every w_strategy. ``plan.n_w == 1`` confirms the
     specialisation engaged."""
     eps = 1e-6
     tel = Telescope(
@@ -228,9 +237,9 @@ def test_constant_w_ducc_parity(op: str, w_strategy: str) -> None:
         )
         err = np.linalg.norm(dirty_jax - dirty_ducc) / np.linalg.norm(dirty_ducc)
 
-    assert err < 20 * eps, (
+    assert err < DUCC_TOL_FACTOR * eps, (
         f"constant-w fast path n_w={plan.n_w} {op} {w_strategy}: "
-        f"relative error {err:.3e} exceeds {20 * eps:.3e}"
+        f"relative error {err:.3e} exceeds {DUCC_TOL_FACTOR * eps:.3e}"
     )
 
 
@@ -268,4 +277,4 @@ def test_multichannel_forward_parity(eps: float) -> None:
     )
 
     err = np.linalg.norm(vis_jax - vis_ducc) / np.linalg.norm(vis_ducc)
-    assert err < 20 * eps
+    assert err < DUCC_TOL_FACTOR * eps

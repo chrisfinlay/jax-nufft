@@ -1,4 +1,15 @@
-"""Adjoint operator: DFT comparison, dot-product test, weights pass-through."""
+"""Adjoint operator: DFT comparison, dot-product test, weights pass-through.
+
+The DFT-parity bounds here are the same accuracy contract as
+``tests/test_against_dft.py``: the exact DFT is the definition of the answer,
+so the adjoint must land within ``2 * eps`` of it too. Issue #9 tightened these
+from ``10 * eps``, which was loose enough to hide a ``w_kernel_width`` that was
+up to three cells short of the requested epsilon.
+
+The ``100 * eps`` bounds on the dot-product identities below are a different
+quantity -- a reduction-order comparison between two operators, not a
+comparison against truth -- and are left alone here on purpose.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +22,10 @@ from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
 
 jax.config.update("jax_enable_x64", True)
+
+# Accuracy contract against the exact DFT (issue #9); mirrors
+# ``tests/test_against_dft.py::DFT_TOL_FACTOR``.
+DFT_TOL_FACTOR = 2.0
 
 
 def _reference_adjoint(
@@ -76,7 +91,9 @@ def test_adjoint_matches_dft_zenith(eps: float, w_strategy: str) -> None:
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
-    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10 * eps:.3e}"
+    assert err < DFT_TOL_FACTOR * eps, (
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+    )
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
@@ -100,7 +117,9 @@ def test_adjoint_matches_dft_off_zenith(eps: float) -> None:
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
-    assert err < 10 * eps, f"relative error {err:.3e} exceeds 10*eps={10 * eps:.3e}"
+    assert err < DFT_TOL_FACTOR * eps, (
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+    )
 
 
 @pytest.mark.parametrize("eps", [1e-6])
@@ -201,7 +220,7 @@ def test_adjoint_weights_match_dft(eps: float) -> None:
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize, weights=weights)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
-    assert err < 10 * eps
+    assert err < DFT_TOL_FACTOR * eps
 
 
 def test_adjoint_validates_shapes() -> None:

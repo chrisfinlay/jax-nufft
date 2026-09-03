@@ -21,11 +21,13 @@ import pytest
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 
 _EPS = 1e-6
-# Relative-norm tolerance: each path has wgridder error ~10*eps relative to
-# truth, so the worst-case fast-vs-generic diff is ~20*eps. Keep the
-# headroom modest but in line with tests/test_against_dft.py's per-strategy
-# 10*eps bound for the dense path itself.
-_TOL = 20 * _EPS
+# Relative-norm tolerance: each path is contracted to ~1*eps against the exact
+# DFT (tests/test_against_dft.py's 2*eps bound is the ceiling, not the typical
+# value), so the worst-case fast-vs-generic diff is the sum of the two, and
+# 3*eps is the same headroom the ducc0 parity tests use. Issue #9 tightened
+# this from 20*eps, which was loose enough to hide a w-kernel width that was
+# up to three cells short of the requested epsilon.
+_TOL = 3 * _EPS
 
 
 def _coplanar_uvw(n_rows: int = 96, seed: int = 1, w_const_m: float = 0.0) -> np.ndarray:
@@ -83,7 +85,7 @@ def test_force_generic_builds_generic_shape_plan(w_const_m: float) -> None:
 @pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
 def test_constant_w_fast_vs_generic_dirty2vis(w_const_m: float, w_strategy: str) -> None:
     """Forward operator agrees between fast and generic plans on the same
-    coplanar uvw input within ``10 * eps``."""
+    coplanar uvw input within ``_TOL``."""
     uvw = _coplanar_uvw(w_const_m=w_const_m)
     plan_fast, plan_generic = _build_pair(uvw)
 
@@ -103,7 +105,7 @@ def test_constant_w_fast_vs_generic_dirty2vis(w_const_m: float, w_strategy: str)
 @pytest.mark.parametrize("w_strategy", ["dense_scan", "dense_vmap"])
 def test_constant_w_fast_vs_generic_vis2dirty(w_const_m: float, w_strategy: str) -> None:
     """Adjoint operator agrees between fast and generic plans on the same
-    coplanar uvw input within ``10 * eps``."""
+    coplanar uvw input within ``_TOL``."""
     uvw = _coplanar_uvw(w_const_m=w_const_m)
     plan_fast, plan_generic = _build_pair(uvw)
 

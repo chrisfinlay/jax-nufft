@@ -22,9 +22,11 @@ public operators:
 
 Both are fully traceable through `jax.jit`, `jax.vmap`, `jax.grad`. The
 reference baseline for correctness is `ducc0.wgridder`. Headline
-target is DFT parity within `10 * epsilon`; ducc parity, windowed
+target is DFT parity within `2 * epsilon`; ducc parity, windowed
 vs. dense, and adjoint reduction-order tolerances are looser — see
-§6 for the full table.
+§6 for the full table. These contracts are for the default float64 plan
+with `jax_enable_x64` enabled; `float32` / `complex64` inputs are
+accuracy-limited and do not meet them — see issues #11 and #13.
 
 The strategic value-add over ducc is **differentiability and the GPU
 port via cuFINUFFT**, not raw CPU speed (ducc is consistently faster
@@ -106,9 +108,13 @@ NUFFTs indexed by `w`-plane by approximating the `exp(2πi w (n-1))`
 phase with a kernel-interpolation scheme.
 
 The plan-time work picks the number of w-planes `n_w`, the kernel
-half-width `W`, the kernel shape `beta`, the w-plane centres
-`w_centers`, and a per-image correction `phi_hat_n` that compensates
-for the kernel's image-domain footprint. The call-time work, for each
+half-width `W` (`ceil(-log10(eps/10))`, so `n_w = n_w_inner + W` grows
+by one plane per requested digit), the kernel shape `beta`, the
+w-plane centres `w_centers`, and a per-image correction `phi_hat_n`
+that compensates for the kernel's image-domain footprint. The
+caller's `epsilon` is a budget shared by two error sources, so the
+(u,v) NUFFT is asked for `epsilon / 10` (`_nufft_epsilon` in
+`wgridder.py`) and the w-kernel carries the rest. The call-time work, for each
 w-plane `k`, multiplies the image by the w-correction
 `exp(2πi w_k (n-1)) / phi_hat_n`, runs a 2D NUFFT to land at the
 visibilities, and weights each visibility by `phi((w-w_k) / scale)`.
@@ -213,6 +219,7 @@ default without a GPU benchmark.
 ```sh
 pixi run -e test pytest                # fast unit tests, ~5 s
 pixi run -e test pytest --runslow      # adds MWA_extended/MeerKAT parity
+pixi run -e test pytest --runsweep -s tests/test_accuracy_sweep.py  # exact-DFT accuracy sweep
 pixi run -e test pytest --runbench     # opt-in benchmarks (~2 min for one pointing)
 pixi run -e dev lint                   # ruff check
 pixi run -e dev format                 # ruff format (apply)
@@ -222,14 +229,30 @@ pixi run -e dev typecheck              # mypy (best-effort)
 * `pyproject.toml` sets `filterwarnings = ["error"]` &mdash; any
   unexpected warning fails the test. If you intentionally emit a
   `DeprecationWarning`, test it with `pytest.warns(DeprecationWarning, …)`.
-* Parity tolerances: `err < 10 * eps` for DFT parity and dense-vs-windowed
-  forward; `err < 20 * eps` for ducc parity (ducc and jax both target
-  `eps` independently so the gap is bounded by `~2*eps` to `~10*eps`).
-  `err < 100 * eps` for dense-vs-windowed adjoint (different reduction
-  order across NUFFT batches).
+* Parity tolerances (tightened in #9): `err < 2 * eps` against the
+  exact DFT. That one is the accuracy *contract*, not a comparison --
+  the DFT is the definition of the answer, whereas ducc is a second
+  implementation with its own error budget. `err < 3 * eps` for ducc
+  parity and for the constant-w fast-vs-generic comparison (ducc lands
+  at `~0.1 * eps`, so the gap is dominated by our own `2 * eps`).
+  `err < 100 * eps` still applies to dense-vs-windowed adjoint
+  (different reduction order across NUFFT batches). The former
+  `10 * eps` / `20 * eps` allowances predated the FINUFFT w-kernel
+  width rule and were loose enough to hide a `W` that was up to three
+  cells short of the requested epsilon. All of the above are for the
+  default float64 plan with `jax_enable_x64` enabled -- `float32` /
+  `complex64` inputs are accuracy-limited and do not meet these bounds
+  (issues #11, #13).
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.
+* `tests/test_accuracy_sweep.py` is the reusable accuracy harness: the
+  seven review fixtures x eight epsilon values x forward/adjoint,
+  measured against the exact DFT and asserted at `<= 2 * eps`. It is
+  gated behind `--runsweep` and skipped without `jax_enable_x64`.
+  Whenever an issue says "re-run the accuracy sweep" it means
+  `pytest --runsweep -s tests/test_accuracy_sweep.py`; the printed
+  table is what goes into the PR description.
 
 When adding a feature, the right test files to update are:
 - algorithmic correctness &rarr; `test_against_dft.py` (small problems)
@@ -476,11 +499,33 @@ These are seeds for later releases, not v0.1.2 candidates:
 ## 11. Don'ts
 
 * Don't change `phi_hat_oversample`'s default behaviour without
-  re-running the phi_hat-conditioning tests in `tests/test_kernel.py`
-  and confirming `min(phi_hat) > safety_floor` across `W in {4, 6, 8, 10}`.
-  v0.1.1 picks the oversample as a function of `W` precisely because
-  v0.1's constant-32 default broke conditioning at the wider eta
-  range. (`safety_floor` is defined in `src/jax_nufft/kernel.py`.)
+  re-running the phi_hat tests in `tests/test_kernel.py`:
+  `test_phi_hat_oversample_schedule_is_pinned` (the full returned
+  schedule, `W` from 4 through 15, pinned to concrete integers -- cheap,
+  and the only test that covers `W = 15` at all);
+  `test_phi_hat_conditioning_at_v011_eta_max` (`min(phi_hat) >
+  safety_floor` across `W in {4, 6, 8, 10, 11, 13}`); and
+  `test_phi_hat_interpolation_error_off_node` / its `--runslow`
+  counterpart `test_phi_hat_interpolation_error_off_node_slow`
+  (`< eps/10` off the table nodes; `W in {4, 8, 10}` run by default,
+  `W in {11, 12, 13, 14}` gated behind `--runslow` because their
+  4x-oversample reference tables get big -- see
+  `phi_hat_oversample_for_w`'s docstring for the memory accounting;
+  `W = 15` is skipped even there, its reference alone pushing the
+  `--runslow` leg from ~1.2 GB to ~5.5 GB peak memory footprint, so the
+  schedule pin above is its only regression guard). v0.1.1 picks the
+  oversample as a function of `W` because v0.1's
+  constant-32 default broke conditioning at the wider eta range; #9
+  added the doublings above `W = 8` because `phi_hat_n` is divided
+  into the image, so a 5.9e-11 table error at `W = 13` showed up as
+  14x epsilon in the operator output. A later review found the
+  original doubling-every-digit schedule one doubling too generous
+  throughout (doubling every *second* digit is enough); the current
+  rule in `phi_hat_oversample_for_w` roughly halves the table (and
+  its build-time peak host memory) at each width above `W = 8`.
+  Node-aligned
+  sampling hides that, which is why the off-node test exists.
+  (`safety_floor` is defined in `src/jax_nufft/kernel.py`.)
 * Don't bypass `_canonicalise_w_strategy` by hard-coding the v0.1
   names in new code. They are user-input aliases only; the internal
   dispatch uses the canonical names.

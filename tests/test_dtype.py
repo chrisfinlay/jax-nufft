@@ -561,6 +561,62 @@ def test_malformed_uvw_beats_the_float32_epsilon_warning() -> None:
         )
 
 
+@requires_x64
+def test_unreachable_epsilon_beats_the_float32_epsilon_warning() -> None:
+    """``kernel_params``'s own rejection must also beat the accuracy warning.
+
+    Same class of ordering bug as the malformed-``uvw`` case above, surfaced
+    by the rebase onto issue #11: ``epsilon=1e-15`` is both below
+    ``FLOAT32_EPSILON_FLOOR`` (so ``_warn_if_below_float32_floor`` would fire)
+    and below the 1e-14 floor ``kernel_params`` refuses outright. With
+    ``filterwarnings = ["error"]`` the warning would raise first if it ran
+    first, and its own text ("the plan will build") would be false -- the
+    plan cannot build at this epsilon at all, in any dtype. ``make_plan``
+    must raise the ``ValueError`` naming the unreachable epsilon, not a
+    ``UserWarning`` about accuracy.
+    """
+    uvw, freq, _image, _vis, pixsize = _fixture_arrays()
+    with pytest.raises(ValueError, match=r"1e-14"):
+        make_plan(
+            uvw,
+            freq,
+            (EDA2.n_pix, EDA2.n_pix),
+            pixsize,
+            pixsize,
+            1e-15,
+            dtype=jnp.float32,
+        )
+
+
+@requires_x64
+def test_malformed_phi_hat_oversample_beats_the_float32_epsilon_warning() -> None:
+    """The two phi_hat-table overrides must also beat the accuracy warning.
+
+    Same class of ordering bug as the two cases above, this time for
+    ``phi_hat_oversample`` / ``phi_hat_n_fine``: they are validated inside
+    ``compute_phi_hat_table`` (kernel.py), but that function is only called
+    much later in ``make_plan``, well after ``_warn_if_below_float32_floor``.
+    ``epsilon=1e-6`` alone is below ``FLOAT32_EPSILON_FLOOR`` (so the
+    accuracy warning would fire), and ``phi_hat_oversample=0`` is invalid.
+    With ``filterwarnings = ["error"]`` the warning would raise first if it
+    ran first, again with its false "the plan will build" claim.
+    ``make_plan`` must raise the ``ValueError`` naming the invalid
+    oversample, not a ``UserWarning`` about accuracy.
+    """
+    uvw, freq, _image, _vis, pixsize = _fixture_arrays()
+    with pytest.raises(ValueError, match=r"phi_hat_oversample"):
+        make_plan(
+            uvw,
+            freq,
+            (EDA2.n_pix, EDA2.n_pix),
+            pixsize,
+            pixsize,
+            1e-6,
+            dtype=jnp.float32,
+            phi_hat_oversample=0,
+        )
+
+
 _MIXED_CASES = (
     "float64_plan_float32_image",
     "float64_plan_complex64_vis",

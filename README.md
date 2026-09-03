@@ -26,8 +26,10 @@ self-cal, or amortised inference networks. Concretely:
 - Multi-channel visibilities (`Nrow x Nchan`) with shared per-row `uvw` and
   per-channel frequency.
 - Optional per-visibility weights of shape `(Nrow, Nchan)`.
-- Output that matches `ducc0.wgridder` to within ~10x the requested accuracy
-  `epsilon` for both `dirty2vis` and `vis2dirty`.
+- Output within `2 * epsilon` of the exact DFT, and within `3 * epsilon` of
+  `ducc0.wgridder`, for both `dirty2vis` and `vis2dirty`, on the default
+  float64 plan with `jax_enable_x64` enabled; single precision is
+  accuracy-limited (see "Accuracy expectation" below and issues #11, #13).
 
 Polarisation handling is **out of scope for v1**.
 
@@ -149,9 +151,15 @@ For each channel `c`:
   2. `u_finufft, v_finufft = 2*pi * uvw_lambda[:, 0:2] * pixsize`
   3. For each w-plane `k`:
      - `image_k = B[c] * exp(+2 pi i w_k (n - 1)) / phi_hat_n`
-     - `vis_k = NUFFT2(image_k, u_finufft, v_finufft, iflag = -1, eps = epsilon)`
+     - `vis_k = NUFFT2(image_k, u_finufft, v_finufft, iflag = -1, eps = max(epsilon / 10, 1e-14))`
      - `vis_k = vis_k * phi((w_lambda - w_k) / w_kernel_scale)`
   4. `vis[:, c] = sum over k of vis_k`
+
+The `(u, v)` NUFFT is asked for `max(epsilon / 10, 1e-14)`, not `epsilon`
+itself (`_nufft_epsilon` in `wgridder.py`): the caller's budget is shared
+between the w-kernel and the `(u, v)` NUFFT, and FINUFFT's `eps` is a target
+rather than a bound, so the NUFFT gets one extra digit of headroom (issue
+#9). The same call appears in the adjoint operator below.
 
 w-plane traversal has four strategies (`dense_scan` default, `dense_vmap`,
 `windowed_scan`, `windowed_vmap`). The dense variants evaluate every
@@ -174,7 +182,7 @@ For each channel `c`:
   2. `vis_w = vis[:, c] * weights[:, c]` if weights are provided.
   3. For each w-plane `k`:
      - `vis_k = vis_w * phi((w_lambda - w_k) / w_kernel_scale)`
-     - `H_k = NUFFT1((u_finufft, v_finufft), vis_k, image_shape, iflag = +1, eps = epsilon)`
+     - `H_k = NUFFT1((u_finufft, v_finufft), vis_k, image_shape, iflag = +1, eps = max(epsilon / 10, 1e-14))`
      - `I_k = H_k * exp(-2 pi i w_k (n - 1)) / phi_hat_n`
   4. `dirty[c] = (sum over k of I_k).real / n`,
      where the `1/n` factor matches ducc's `divide_by_n=True` convention.
@@ -193,15 +201,31 @@ phi(z; beta) = exp(beta * (sqrt(1 - z^2) - 1))   for |z| <= 1
 
 Parameters as a function of `epsilon`:
 
-  - kernel half-width `W = ceil(-log10(epsilon) * 2 / pi) + 2`;
-  - shape parameter `beta = 2.30 * W` (matches the FINUFFT default for
+  - kernel half-width `W = ceil(-log10(epsilon / 10))`, i.e. one cell per
+    requested digit plus one. This is the practical rule of eq. 10 in the
+    FINUFFT paper &mdash; "`W` is one more than the desired number of digits"
+    &mdash; and is what FINUFFT itself implements in
+    `src/spreadinterp.cpp::setup_spreader` at upsampling factor sigma = 2. The
+    paper's Theorem 7 is what makes it one *per digit*: the kernel's aliasing
+    error decays like `exp(-pi * W * gamma * sqrt(1 - 1/sigma))`, about
+    `exp(-2.2 * W)` at sigma = 2. `epsilon` below `1e-14` is rejected (the rule
+    would ask for `W > 15`).
+  - shape parameter `beta = 2.30 * W` (the same equation's value for
     upsampling factor sigma = 2).
+
+The plane count follows the width directly: `n_w = n_w_inner + W`, so one extra
+plane per unit of `W`. The (u,v) NUFFT is asked for one digit more than the
+caller's `epsilon`, so that the error the caller sees is dominated by the
+w-kernel rather than by FINUFFT's own tolerance (which is a target, not a
+bound, and runs 1-3x above `epsilon` on small transforms).
 
 `phi_hat`, the continuous Fourier transform of `phi`, has no closed form. We
 compute it once at planning time on a regular grid via a zero-padded FFT, and
 evaluate it at arbitrary `eta` values using 4-point Lagrange (cubic)
 interpolation. The resulting per-pixel correction `phi_hat_n` is bundled into
-the plan and treated as a JIT-time constant.
+the plan and treated as a JIT-time constant. Since `phi_hat_n` is *divided*
+into the image, the table's interpolation error lands one-for-one in the
+output, so the grid is refined as `W` grows (see `phi_hat_oversample_for_w`).
 
 ### Plan-then-call API
 
@@ -233,8 +257,9 @@ it, and the operators accept and return the matching real / complex dtypes.
 See [Precision](#precision) below.
 
 `phi_hat_oversample=None` (the default) picks a width-dependent oversample
-suitable for the kernel chosen by `epsilon` (32 / 64 / 128 for `W <= 4`,
-`<= 8`, `> 8`); pass an explicit integer to override.
+suitable for the kernel chosen by `epsilon` (32 for `W <= 4`, 64 for `W <= 8`,
+128 for `W in {9, 10}`, then one doubling per digit up to a cap of 4096); pass
+an explicit integer to override.
 
 The returned plan also exposes `max_window_size` and
 `window_padding_overhead` for callers that want to inspect whether the
@@ -313,10 +338,28 @@ strategy is within 15% of the best measured strategy for every
 
 ### Accuracy expectation
 
-`dirty2vis` and `vis2dirty` match `ducc0.wgridder` (with matched
-`divide_by_n` flags) to within ~10x the requested `epsilon`. For tighter
-`epsilon`, you may need to bump `phi_hat_oversample` to keep the
-phi_hat-table interpolation error below the wgridder accuracy floor.
+`dirty2vis` and `vis2dirty` land within **`2 * epsilon`** of the exact DFT
+&mdash; relative L2, in the sign convention above &mdash; for every
+`epsilon` from `1e-3` to `1e-12`, forward and adjoint, on the seven telescope
+fixtures of `tests/test_accuracy_sweep.py`. The measured worst cell across
+that 112-cell matrix is `0.67 * epsilon`. Against `ducc0.wgridder` (with
+matched `divide_by_n` flags) the bound is `3 * epsilon`, the sum of the two
+implementations' budgets.
+
+Both contracts are for the **default float64 plan with `jax_enable_x64`
+enabled**. `float32` / `complex64` inputs are accuracy-limited and do not
+meet either bound. See issue #11 for the `make_plan` guard (refusing a
+float64 plan when `jax_enable_x64` is off, and warning on a float32 plan
+below `epsilon = 1e-5`) and issue #13 for the underlying precision-vs-epsilon
+tradeoff.
+
+The contract holds with the default `phi_hat_oversample=None`, which
+automatically sizes the phi_hat table to the width `kernel_params(epsilon)`
+picks (see `phi_hat_oversample_for_w`). There is no public API to override
+the kernel width itself -- it is derived from `epsilon` alone -- so ordinary
+callers never need to pass `phi_hat_oversample` explicitly; it exists as an
+escape hatch for testing the phi_hat table at a size other than the
+schedule's default.
 
 ### Precision
 
@@ -399,14 +442,16 @@ coplanar array, snapshot data at fixed pointing, or any case where
 `plan.w_extent == 0` after planning &mdash; `make_plan` collapses the
 w-plane loop to a single plane at the constant w-value. Expected speedup
 is roughly `w_kernel_width + 1` (one NUFFT instead of `W+1`), which is
-about 7&times; for the default `epsilon = 1e-6` (`W = 6`).
+about 8&times; for the default `epsilon = 1e-6` (`W = 7`).
 
 The user-visible signal that the specialisation engaged is
 `plan.n_w == 1` (and `plan.is_constant_w == True`). All four
 `w_strategy` choices reduce to the same single-plane work in this
 regime, so picking one vs another has no effect on output. Both
 operators stay bit-identical across strategies in this case and match
-ducc within `20 * epsilon`.
+ducc within `3 * epsilon` (issue #9 tightened this from `20 * epsilon`,
+the same DFT-width-rule fix behind the headline accuracy contract
+above).
 
 ### CPU benchmarks vs ducc0
 

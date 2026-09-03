@@ -56,6 +56,37 @@ ChannelStrategy = Literal["scan", "vmap"]
 _CANONICAL_W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
 _W_STRATEGY_ALIASES: dict[str, WStrategy] = {"scan": "dense_scan", "vmap": "dense_vmap"}
 
+# Smallest epsilon FINUFFT can honour in double precision; asking for less
+# makes it warn and clamp, and ``filterwarnings = ["error"]`` turns that into a
+# hard failure.
+_MIN_NUFFT_EPSILON = 1e-14
+
+
+def _nufft_epsilon(epsilon: float) -> float:
+    """Accuracy asked of the (u,v) NUFFT for a plan targeting ``epsilon``.
+
+    The error a caller sees is the sum of two independent contributions: the
+    w-direction kernel (sized by :func:`jax_nufft.kernel.kernel_params`) and
+    the (u,v) NUFFT. Handing the caller's whole budget to *each* of them means
+    the total can only be a multiple of it, so the NUFFT gets one extra digit,
+    which is exactly one more cell of FINUFFT's own width rule
+    ``W = ceil(-log10(eps/10))`` in each of u and v.
+
+    That is not a paper margin. FINUFFT's epsilon is a target, not a bound, and
+    on small transforms the achieved error runs above it: measured directly
+    against an exact 2D DFT on the 16x16 / 24-point problem in
+    ``tests/test_against_dft.py``, ``nufft2`` returns 1.9x eps at eps = 1e-4
+    and 2.9x at 1e-6. With the whole budget spent there the library could not
+    honour its own ``2 * eps`` contract against the exact DFT no matter how
+    wide the w-kernel got (issue #9); with the extra digit the (u,v) term drops
+    to ~0.3x eps and the w-kernel is the leading term again, as it should be.
+
+    Cost: FINUFFT spreads with a kernel one cell wider in each direction, so
+    the spreading work grows like ``((W+1)/W)^2`` (~30% at W = 7) with the
+    upsampled grid and the FFTs unchanged.
+    """
+    return max(epsilon / 10.0, _MIN_NUFFT_EPSILON)
+
 
 def _canonicalise_w_strategy(
     name: str,
@@ -346,7 +377,9 @@ def _channel_forward(
         phase = (two_pi * w_k) * plan.n_minus_1  # (n_l, n_m), real
         shift = jnp.exp((1j * phase).astype(cdtype))
         image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
-        vis_k = nufft2(image_k, u_ft_c, v_ft_c, iflag=-1, eps=plan.epsilon, opts=opts)
+        vis_k = nufft2(
+            image_k, u_ft_c, v_ft_c, iflag=-1, eps=_nufft_epsilon(plan.epsilon), opts=opts
+        )
         # w-direction kernel applied at the visibility output
         z = (w_lambda_c - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
@@ -429,7 +462,7 @@ def _channel_forward_windowed(
         shift = jnp.exp((1j * phase).astype(cdtype))
         image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
 
-        contrib = nufft2(image_k, u_k, v_k, iflag=-1, eps=plan.epsilon, opts=opts)
+        contrib = nufft2(image_k, u_k, v_k, iflag=-1, eps=_nufft_epsilon(plan.epsilon), opts=opts)
 
         z = (w_k_lambda - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
@@ -487,7 +520,13 @@ def _channel_adjoint(
         # Adjoint of the type-2 NUFFT is type 1 with iflag = +1 (the conjugate
         # of iflag=-1 used in the forward).
         h_k = nufft1(
-            (plan.n_l, plan.n_m), vis_k, u_ft_c, v_ft_c, iflag=+1, eps=plan.epsilon, opts=opts
+            (plan.n_l, plan.n_m),
+            vis_k,
+            u_ft_c,
+            v_ft_c,
+            iflag=+1,
+            eps=_nufft_epsilon(plan.epsilon),
+            opts=opts,
         )
         # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1)) is its conjugate.
         phase = (two_pi * w_k) * plan.n_minus_1
@@ -682,7 +721,15 @@ def _channel_adjoint_windowed(
         kernel_w = phi(z, plan.beta).astype(cdtype)
         vis_k = vis_k * kernel_w
 
-        h_k = nufft1((plan.n_l, plan.n_m), vis_k, u_k, v_k, iflag=+1, eps=plan.epsilon, opts=opts)
+        h_k = nufft1(
+            (plan.n_l, plan.n_m),
+            vis_k,
+            u_k,
+            v_k,
+            iflag=+1,
+            eps=_nufft_epsilon(plan.epsilon),
+            opts=opts,
+        )
         phase = (two_pi * w_k) * plan.n_minus_1
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
