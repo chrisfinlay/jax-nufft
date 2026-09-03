@@ -280,18 +280,34 @@ def _validate_vis(vis: Array, plan: WGridderPlan) -> Array:
 
 
 def _validate_weights(weights: Array | None, plan: WGridderPlan) -> Array | None:
-    """Check the weight shape and cast the weights to the plan's real dtype.
+    """Check the weight shape and dtype and cast the weights to the plan's real dtype.
 
-    Same rule as the image and visibilities: narrower is cast up, wider is a
-    ``TypeError``. ``weights`` are real (they multiply the visibilities before
-    gridding, matching ducc's ``wgt``), so the reference is
-    ``plan.real_dtype``.
+    ``weights`` are **real** by contract (they multiply the visibilities
+    before gridding, matching ducc's ``wgt``), so unlike the image and the
+    visibilities they get a kind check before the width check: a complex
+    ``weights`` array has no correct interpretation here. Casting it to
+    ``plan.real_dtype`` would drop the imaginary part silently, and routing it
+    through the usual "wider dtype" path would be worse still — the advice
+    would be to narrow complex128 to complex64, which loses data without
+    fixing anything. Reject it outright instead.
+
+    Once known real, the usual rule applies: narrower is cast up to
+    ``plan.real_dtype``, wider is a ``TypeError``.
     """
     if weights is None:
         return None
     if weights.shape != (plan.n_rows, plan.n_chan):
         raise ValueError(
             f"weights shape {weights.shape} does not match plan ({plan.n_rows}, {plan.n_chan})"
+        )
+    # Kind check, not a width check: real (or integer / boolean mask) weights
+    # are all meaningful, complex ones are not.
+    if jnp.issubdtype(weights.dtype, jnp.complexfloating):
+        raise TypeError(
+            f"weights must be a real array; got dtype {np.dtype(weights.dtype)}. They are "
+            "multiplied into the visibilities before gridding (ducc's `wgt`), so a "
+            "complex weight has no defined meaning — pass the real weights as "
+            f"{plan.real_dtype} instead."
         )
     return _cast_to_plan_dtype(weights, plan, name="weights", target=plan.real_dtype)
 
@@ -789,7 +805,9 @@ def vis2dirty(
     weights:
         Optional real array of shape ``(n_rows, n_chan)``, multiplied into the
         visibilities before gridding (matches ducc's ``wgt`` argument). Cast
-        to ``plan.real_dtype`` under the same rule.
+        to ``plan.real_dtype`` under the same rule; a complex ``weights``
+        array is rejected with ``TypeError`` rather than silently losing its
+        imaginary part.
     w_strategy:
         ``"dense_scan"`` (default), ``"dense_vmap"``, ``"windowed_scan"``,
         ``"windowed_vmap"``, or ``"auto"``; same semantics as in

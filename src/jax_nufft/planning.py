@@ -251,17 +251,19 @@ def _coerce_uvw_freq_dtype(
     return uvw_arr.astype(real_dtype), freq_arr.astype(real_dtype)
 
 
-def _resolve_plan_dtypes(dtype: DTypeLike, epsilon: float) -> tuple[np.dtype[Any], np.dtype[Any]]:
+def _resolve_plan_dtypes(dtype: DTypeLike) -> tuple[np.dtype[Any], np.dtype[Any]]:
     """Turn the requested ``dtype`` into the plan's ``(real, complex)`` pair.
 
-    Also enforces the two precision guards of issue #11:
+    Also enforces the x64 guard of issue #11: float64 is only meaningful with
+    ``jax.config.jax_enable_x64`` on. With x64 off (JAX's default) every array
+    handed to ``jnp.asarray`` is truncated to float32 *silently*, so a
+    "float64" plan would quietly be a float32 one whose error floors near
+    3.4e-5. Refuse rather than degrade.
 
-    * float64 is only meaningful with ``jax.config.jax_enable_x64`` on. With
-      x64 off (JAX's default) every array handed to ``jnp.asarray`` is
-      truncated to float32 *silently*, so a "float64" plan would quietly be a
-      float32 one whose error floors near 3.4e-5. Refuse rather than degrade.
-    * float32 cannot deliver ``epsilon < FLOAT32_EPSILON_FLOOR``; warn so the
-      caller knows the requested accuracy will be missed.
+    This runs before any array is built or validated, because the guard has
+    to fire before ``jnp.asarray`` gets a chance to truncate anything. The
+    float32 accuracy *warning* deliberately does not live here — see
+    :func:`_warn_if_below_float32_floor`.
     """
     real_dtype: np.dtype[Any] = np.dtype(dtype)
     complex_dtype: np.dtype[Any]
@@ -290,6 +292,20 @@ def _resolve_plan_dtypes(dtype: DTypeLike, epsilon: float) -> tuple[np.dtype[Any
             "(achievable epsilon ~ 1e-5)."
         )
 
+    return real_dtype, complex_dtype
+
+
+def _warn_if_below_float32_floor(real_dtype: np.dtype[Any], epsilon: float) -> None:
+    """Warn when a float32 plan is asked for an ``epsilon`` it cannot reach.
+
+    Called *after* ``uvw`` / ``freq`` have been validated, and deliberately
+    so: the suite (and many downstream users) run with
+    ``filterwarnings = ["error"]``, which turns this into a raised
+    ``UserWarning``. Emitting it earlier would mean a caller who passes a
+    malformed ``uvw`` at a tight epsilon gets an accuracy complaint instead of
+    the shape error that actually describes their bug. Only a plan that is
+    otherwise buildable gets to hear about its accuracy.
+    """
     if real_dtype == np.dtype(np.float32) and epsilon < FLOAT32_EPSILON_FLOOR:
         warnings.warn(
             f"epsilon={epsilon:g} is below the accuracy a float32 plan can deliver "
@@ -300,8 +316,6 @@ def _resolve_plan_dtypes(dtype: DTypeLike, epsilon: float) -> tuple[np.dtype[Any
             UserWarning,
             stacklevel=3,
         )
-
-    return real_dtype, complex_dtype
 
 
 def make_plan(
@@ -346,11 +360,12 @@ def make_plan(
         raise ValueError(f"pixsize_l and pixsize_m must be > 0; got ({pixsize_l}, {pixsize_m})")
 
     # Resolve precision before touching any array: the x64 guard has to fire
-    # before ``jnp.asarray`` gets a chance to truncate anything, and the
-    # float32 epsilon warning should not be emitted for a call that is going
-    # to be rejected for an unrelated reason anyway.
-    real_dtype, complex_dtype = _resolve_plan_dtypes(dtype, epsilon)
+    # before ``jnp.asarray`` gets a chance to truncate anything.
+    real_dtype, complex_dtype = _resolve_plan_dtypes(dtype)
     uvw_arr, freq_arr = _coerce_uvw_freq_dtype(uvw, freq, real_dtype)
+    # Only now, with every argument known good, complain about accuracy the
+    # requested precision cannot deliver (see _warn_if_below_float32_floor).
+    _warn_if_below_float32_floor(real_dtype, epsilon)
     n_rows = uvw_arr.shape[0]
     n_chan = freq_arr.shape[0]
 

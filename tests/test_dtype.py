@@ -45,6 +45,7 @@ from tests.conftest import EDA2, requires_x64, synthetic_uvw, tol
 _SEED = 0
 _IMAGE_SEED = 7
 _VIS_SEED = 11
+_WEIGHT_SEED = 13
 
 
 def _fixture_arrays() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
@@ -55,6 +56,12 @@ def _fixture_arrays() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, f
     rng = np.random.default_rng(_VIS_SEED)
     vis = rng.standard_normal((EDA2.n_rows, 1)) + 1j * rng.standard_normal((EDA2.n_rows, 1))
     return uvw, freq, image, vis, EDA2.pixsize
+
+
+def _weights() -> np.ndarray:
+    """Strictly positive per-visibility weights, ``(n_rows, 1)`` real."""
+    rng = np.random.default_rng(_WEIGHT_SEED)
+    return rng.uniform(0.5, 2.0, size=(EDA2.n_rows, 1))
 
 
 def _rel_err(a: np.ndarray, b: np.ndarray) -> float:
@@ -105,16 +112,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax_nufft import dirty2vis, make_plan
+from jax_nufft import dirty2vis, make_plan, vis2dirty
 
 data = np.load(sys.argv[1])
 uvw = data["uvw"]
 freq = data["freq"]
 image = data["image"]
+vis = data["vis"]
+weights = data["weights"]
 pixsize = float(data["pixsize"])
 n_pix = int(image.shape[0])
 
-out = {"x64": bool(jax.config.jax_enable_x64), "float32_error": None, "warn_probe_error": None}
+out = {
+    "x64": bool(jax.config.jax_enable_x64),
+    "float32_error": None,
+    "adjoint_error": None,
+    "warn_probe_error": None,
+}
 
 
 def record(caught):
@@ -163,6 +177,39 @@ try:
 except Exception as exc:
     out["float32_error"] = describe(exc)
 
+# (b2) The adjoint has to work in float32 too, weights included -- otherwise
+#      the x64-off CI leg would stay green with vis2dirty completely broken.
+#      Same plan, same epsilon, same 3*eps bound against the double oracle.
+try:
+    plan = make_plan(uvw, freq, (n_pix, n_pix), pixsize, pixsize, 1e-4, dtype=jnp.float32)
+    dirty_jax = np.asarray(
+        vis2dirty(
+            plan,
+            jnp.asarray(vis, dtype=jnp.complex64),
+            weights=jnp.asarray(weights, dtype=jnp.float32),
+        )
+    )[0]
+    out["dirty_dtype"] = str(dirty_jax.dtype)
+    dirty_ducc = ducc0.wgridder.vis2dirty(
+        uvw=uvw,
+        freq=freq,
+        vis=vis,
+        wgt=weights,
+        npix_x=n_pix,
+        npix_y=n_pix,
+        pixsize_x=pixsize,
+        pixsize_y=pixsize,
+        epsilon=1e-4,
+        do_wgridding=True,
+        divide_by_n=True,
+        nthreads=1,
+    )
+    out["adjoint_rel_err_1e_4"] = float(
+        np.linalg.norm(dirty_jax - dirty_ducc) / np.linalg.norm(dirty_ducc)
+    )
+except Exception as exc:
+    out["adjoint_error"] = describe(exc)
+
 # (c) Asking float32 for eps=1e-6 is below the achievable floor: warn.
 try:
     with warnings.catch_warnings(record=True) as caught:
@@ -182,9 +229,17 @@ _JSON_MARKER = "<<<JSON>>>"
 def x64_off_report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     """Run ``_CHILD_SCRIPT`` once with ``JAX_ENABLE_X64=0`` and parse its JSON."""
     tmp: Path = tmp_path_factory.mktemp("x64_off")
-    uvw, freq, image, _vis, pixsize = _fixture_arrays()
+    uvw, freq, image, vis, pixsize = _fixture_arrays()
     npz = tmp / "fixture.npz"
-    np.savez(npz, uvw=uvw, freq=freq, image=image, pixsize=np.asarray(pixsize))
+    np.savez(
+        npz,
+        uvw=uvw,
+        freq=freq,
+        image=image,
+        vis=vis,
+        weights=_weights(),
+        pixsize=np.asarray(pixsize),
+    )
     script = tmp / "x64_off_child.py"
     script.write_text(_CHILD_SCRIPT)
 
@@ -239,6 +294,21 @@ def test_x64_off_float32_plan_matches_ducc(x64_off_report: dict[str, Any]) -> No
     assert x64_off_report["vis_dtype"] == "complex64"
     rel = x64_off_report["rel_err_1e_4"]
     assert rel < 3 * 1e-4, f"float32 plan vs ducc0 at eps=1e-4: relative error {rel:.3e}"
+
+
+def test_x64_off_float32_adjoint_matches_ducc(x64_off_report: dict[str, Any]) -> None:
+    """The x64-off leg must exercise ``vis2dirty`` too, weights included.
+
+    Everything else under ``JAX_ENABLE_X64=0`` is skipped by ``collect_ignore``
+    in ``tests/conftest.py``, so without this the single-precision CI job would
+    stay green with the adjoint completely broken.
+    """
+    assert x64_off_report["adjoint_error"] is None, (
+        f"the float32 adjoint probe failed in the child: {x64_off_report['adjoint_error']}"
+    )
+    assert x64_off_report["dirty_dtype"] == "float32"
+    rel = x64_off_report["adjoint_rel_err_1e_4"]
+    assert rel < 3 * 1e-4, f"float32 adjoint vs ducc0 at eps=1e-4: relative error {rel:.3e}"
 
 
 def test_x64_off_float32_plan_warns_below_the_floor(x64_off_report: dict[str, Any]) -> None:
@@ -398,6 +468,63 @@ def test_float32_plan_rejects_a_complex128_vis() -> None:
     message = str(excinfo.value)
     assert "complex128" in message, message
     assert "complex64" in message, message
+
+
+@requires_x64
+@pytest.mark.parametrize("plan_dtype", [jnp.float64, jnp.float32])
+def test_complex_weights_are_rejected(plan_dtype: Any) -> None:
+    """``weights`` are real by contract (ducc's ``wgt``): refuse a complex array.
+
+    Casting to the plan's real dtype would silently drop the imaginary part,
+    and treating it as a merely "too wide" dtype would advise narrowing to a
+    complex dtype, which loses the same data. Neither is acceptable, so the
+    kind check comes first and names the offending dtype.
+    """
+    _uvw, _freq, _image, vis, _pixsize = _fixture_arrays()
+    plan = _plan(plan_dtype)
+    complex_weights = jnp.ones((EDA2.n_rows, 1), dtype=jnp.complex64)
+    with pytest.raises(TypeError) as excinfo:
+        vis2dirty(plan, jnp.asarray(vis, dtype=plan.complex_dtype), weights=complex_weights)
+    message = str(excinfo.value)
+    assert "complex64" in message, message
+    assert "real" in message, message
+
+
+@requires_x64
+def test_narrower_real_weights_are_cast_up() -> None:
+    """The complex rejection must not break the narrower-is-cast-up contract."""
+    _uvw, _freq, _image, vis, _pixsize = _fixture_arrays()
+    plan = _plan(jnp.float64)
+    weights = _weights()
+    dirty_ref = np.asarray(vis2dirty(plan, jnp.asarray(vis), weights=jnp.asarray(weights)))
+    dirty_cast = vis2dirty(
+        plan,
+        jnp.asarray(vis),
+        weights=jnp.asarray(weights, dtype=jnp.float32),
+    )
+    assert dirty_cast.dtype == jnp.float64, "the plan's precision governs the output"
+    err = _rel_err(np.asarray(dirty_cast), dirty_ref)
+    assert err < 1e-6, f"float32 weights into a float64 plan: relative error {err:.3e}"
+
+
+@requires_x64
+def test_malformed_uvw_beats_the_float32_epsilon_warning() -> None:
+    """Argument validation must run before the accuracy warning.
+
+    With ``filterwarnings = ["error"]`` an eagerly-emitted ``UserWarning``
+    would mask the shape error that actually describes the caller's bug.
+    """
+    uvw, freq, _image, _vis, pixsize = _fixture_arrays()
+    with pytest.raises(ValueError, match=r"uvw must have shape"):
+        make_plan(
+            uvw[:, :2],
+            freq,
+            (EDA2.n_pix, EDA2.n_pix),
+            pixsize,
+            pixsize,
+            1e-6,
+            dtype=jnp.float32,
+        )
 
 
 _MIXED_CASES = (
