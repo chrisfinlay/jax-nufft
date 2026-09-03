@@ -24,7 +24,9 @@ Both are fully traceable through `jax.jit`, `jax.vmap`, `jax.grad`. The
 reference baseline for correctness is `ducc0.wgridder`. Headline
 target is DFT parity within `2 * epsilon`; ducc parity, windowed
 vs. dense, and adjoint reduction-order tolerances are looser — see
-§6 for the full table.
+§6 for the full table. These contracts are for the default float64 plan
+with `jax_enable_x64` enabled; `float32` / `complex64` inputs are
+accuracy-limited and do not meet them — see issues #11 and #13.
 
 The strategic value-add over ducc is **differentiability and the GPU
 port via cuFINUFFT**, not raw CPU speed (ducc is consistently faster
@@ -237,7 +239,10 @@ pixi run -e dev typecheck              # mypy (best-effort)
   (different reduction order across NUFFT batches). The former
   `10 * eps` / `20 * eps` allowances predated the FINUFFT w-kernel
   width rule and were loose enough to hide a `W` that was up to three
-  cells short of the requested epsilon.
+  cells short of the requested epsilon. All of the above are for the
+  default float64 plan with `jax_enable_x64` enabled -- `float32` /
+  `complex64` inputs are accuracy-limited and do not meet these bounds
+  (issues #11, #13).
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.
@@ -497,12 +502,22 @@ These are seeds for later releases, not v0.1.2 candidates:
   re-running the phi_hat tests in `tests/test_kernel.py`: both
   `test_phi_hat_conditioning_at_v011_eta_max` (`min(phi_hat) >
   safety_floor` across `W in {4, 6, 8, 10, 11, 13}`) and
-  `test_phi_hat_interpolation_error_off_node` (`< eps/10` off the
-  table nodes). v0.1.1 picks the oversample as a function of `W`
-  because v0.1's constant-32 default broke conditioning at the wider
-  eta range; #9 added the doublings above `W = 8` because `phi_hat_n`
-  is divided into the image, so a 5.9e-11 table error at `W = 13`
-  showed up as 14x epsilon in the operator output. Node-aligned
+  `test_phi_hat_interpolation_error_off_node` / its `--runslow`
+  counterpart `test_phi_hat_interpolation_error_off_node_slow`
+  (`< eps/10` off the table nodes; `W in {4, 8, 10}` run by default,
+  `W in {11, 12, 13}` gated behind `--runslow` because their
+  4x-oversample reference tables get big -- see
+  `phi_hat_oversample_for_w`'s docstring for the memory accounting).
+  v0.1.1 picks the oversample as a function of `W` because v0.1's
+  constant-32 default broke conditioning at the wider eta range; #9
+  added the doublings above `W = 8` because `phi_hat_n` is divided
+  into the image, so a 5.9e-11 table error at `W = 13` showed up as
+  14x epsilon in the operator output. A later review found the
+  original doubling-every-digit schedule one doubling too generous
+  throughout (doubling every *second* digit is enough); the current
+  rule in `phi_hat_oversample_for_w` roughly halves the table (and
+  its build-time peak host memory) at each width above `W = 8`.
+  Node-aligned
   sampling hides that, which is why the off-node test exists.
   (`safety_floor` is defined in `src/jax_nufft/kernel.py`.)
 * Don't bypass `_canonicalise_w_strategy` by hard-coding the v0.1

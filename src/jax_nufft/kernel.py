@@ -47,25 +47,45 @@ def phi_hat_oversample_for_w(w_kernel_width: int) -> int:
     into the image: whatever relative error the table carries lands
     one-for-one in the output. The requested accuracy for a width is
     ``eps = 10**-(W - 1)`` (:func:`kernel_params` inverted), so the table has
-    to be good to roughly ``eps / 10``, and off-grid interpolation error
-    measured against a 64x finer table is
+    to be good to roughly ``eps / 10``. Off-node interpolation error (the
+    thing that actually lands in the output -- see
+    ``test_phi_hat_interpolation_error_off_node``), measured against a
+    common reference table many times finer than any row below (so the
+    reference's own error is negligible), against that requirement:
 
-        W      = 4        8        10       11       12       13
-        os=32    4.9e-08  2.8e-08  2.3e-08  2.0e-08  1.8e-08  1.5e-08
-        os=64    3.1e-09  1.7e-09  1.4e-09  1.3e-09  1.1e-09  9.4e-10
-        os=128   1.9e-10  1.1e-10  8.8e-11  7.8e-11  6.8e-11  5.9e-11
-        os=512   7.5e-13  4.1e-13  3.5e-13  3.1e-13  2.7e-13  2.3e-13
+        W          9         10        11        12        13
+        eps/10     1e-9      1e-10     1e-11     1e-12     1e-13
+        os=128     9.8e-11   8.8e-11   7.8e-11*  6.8e-11*  5.9e-11*
+        os=256     6.2e-12   5.6e-12   4.9e-12   4.3e-12*  3.6e-12*
+        os=512     3.9e-13   3.5e-13   3.1e-13   2.7e-13   2.3e-13*
+        os=1024    2.4e-14   2.2e-14   1.9e-14   1.7e-14   1.4e-14
 
-    i.e. a factor 16 per doubling (``eta_step**4`` with
-    ``eta_step = 1 / (2 * oversample)``) against a requirement that tightens
-    by 10 per digit -- so the oversample doubles once per digit above W = 9
-    and keeps a growing margin. Issue #9 added the steps above 128: at
-    eps = 1e-12 (W = 13) the old flat 128 left a 5.9e-11 table error, which
-    showed up end-to-end as 1.4e-11 relative -- 14x the requested epsilon,
-    with the w-kernel itself already well inside its budget. The cap at 2048
-    is where the table's own float64 noise (~1e-16 relative) takes over;
-    building it costs about 190 ms and 270 MB of transient host memory at
-    plan time, and only for eps <= 1e-12 requests.
+    (``*`` marks a row/column combination that fails ``eps/10`` at that
+    width). Each doubling buys a consistent ~16x (``eta_step**4`` with
+    ``eta_step = 1 / (2 * oversample)``), so the smallest sufficient
+    oversample per width, reading the first non-``*`` entry in each column,
+    is 128 at W = 9-10, 256 at W = 11, 512 at W = 12, 1024 at W = 13 --
+    doubling once every *second* digit above W = 8, not every digit. Issue
+    #9 originally doubled every digit starting at W = 9
+    (``min(2048, 128 * 2 ** (w_kernel_width - 9))``): at each width from
+    W = 10 up that is exactly the oversample this schedule uses one width
+    higher, i.e. one doubling too generous throughout. At W = 13 the old
+    flat-2048 table reached ~0.96 GB of process RSS (~0.82 GB above the
+    import baseline, measured with ``psutil``/``ru_maxrss``); this
+    schedule's 1024 measures ~0.56 GB (~0.41 GB above baseline).
+
+    Above W = 13 the margin keeps shrinking and the schedule cannot stay
+    flat at 1024: measured the same way, W = 14 (eps = 1e-13) needs at least
+    os=2048 (os=1024 measures 1.25e-14 against a 1e-14 requirement -- over)
+    and W = 15 (eps = 1e-14, the tightest width :func:`kernel_params`
+    allows) needs os=4096 (os=1024 and os=2048 measure ~1.1e-14 and
+    ~1.1e-15 against a 1e-15 requirement -- both over, the second only
+    marginally but still over). So the schedule keeps doubling per digit
+    through W = 15 rather than capping at 1024; the cap only bites above the
+    widths ``kernel_params`` can ever produce. 4096 is also close to where
+    the table's own float64 noise (~6e-16 relative, measured against an even
+    finer reference) starts to dominate the interpolation error, so pushing
+    the cap higher would not buy more accuracy anyway.
 
     Note this is *not* measured by ``test_phi_hat_conditioning_at_v011_eta_max``
     in the test suite: that test's check points land exactly on table nodes,
@@ -75,8 +95,9 @@ def phi_hat_oversample_for_w(w_kernel_width: int) -> int:
         return 32
     if w_kernel_width <= 8:
         return 64
-    # W >= 9: one doubling per requested digit, capped where float64 noise wins.
-    return min(2048, 128 * 2 ** (w_kernel_width - 9))
+    # W >= 9: one doubling per requested digit above the flat-128 floor at
+    # W = 9-10, capped where float64 noise wins (see docstring above).
+    return min(4096, 128 * 2 ** max(0, w_kernel_width - 10))
 
 
 def kernel_params(epsilon: float) -> tuple[int, float]:
@@ -259,7 +280,16 @@ def compute_phi_hat_table(
     phi_hat_complex = np.fft.fftshift(fft_out) * dz
 
     # phi(z) is real and symmetric, so phi_hat is real to within FFT rounding.
-    phi_hat = phi_hat_complex.real
+    # ``.real`` on a complex array is a *view*: it shares the interleaved
+    # real/imag buffer via ``.base``, at 2x the nominal size of the real
+    # array. ``PhiHatTable`` is not stored on ``WGridderPlan`` (it is a
+    # planning-time intermediate, consumed by ``.evaluate()`` and then
+    # discarded), but it is still held for the rest of that ``make_plan``
+    # call -- which goes on to build the sorted/windowed arrays -- so
+    # without ``ascontiguousarray`` the (unused) imaginary half of this
+    # array would sit resident for that whole window. Copy out just the
+    # real part so ``phi_hat_complex`` can be collected right away.
+    phi_hat = np.ascontiguousarray(phi_hat_complex.real)
 
     eta_step = 1.0 / (n_fft * dz)
     eta_max_table = (n_fft // 2) * eta_step

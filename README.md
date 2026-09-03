@@ -27,7 +27,9 @@ self-cal, or amortised inference networks. Concretely:
   per-channel frequency.
 - Optional per-visibility weights of shape `(Nrow, Nchan)`.
 - Output within `2 * epsilon` of the exact DFT, and within `3 * epsilon` of
-  `ducc0.wgridder`, for both `dirty2vis` and `vis2dirty`.
+  `ducc0.wgridder`, for both `dirty2vis` and `vis2dirty`, on the default
+  float64 plan with `jax_enable_x64` enabled; single precision is
+  accuracy-limited (see "Accuracy expectation" below and issues #11, #13).
 
 Polarisation handling is **out of scope for v1**.
 
@@ -250,8 +252,8 @@ See [Precision](#precision) below.
 
 `phi_hat_oversample=None` (the default) picks a width-dependent oversample
 suitable for the kernel chosen by `epsilon` (32 for `W <= 4`, 64 for `W <= 8`,
-then one doubling per digit from 128 at `W = 9` up to a cap of 2048); pass an
-explicit integer to override.
+128 for `W in {9, 10}`, then one doubling per digit up to a cap of 4096); pass
+an explicit integer to override.
 
 The returned plan also exposes `max_window_size` and
 `window_padding_overhead` for callers that want to inspect whether the
@@ -337,6 +339,13 @@ fixtures of `tests/test_accuracy_sweep.py`. The measured worst cell across
 that 112-cell matrix is `0.67 * epsilon`. Against `ducc0.wgridder` (with
 matched `divide_by_n` flags) the bound is `3 * epsilon`, the sum of the two
 implementations' budgets.
+
+Both contracts are for the **default float64 plan with `jax_enable_x64`
+enabled**. `float32` / `complex64` inputs are accuracy-limited and do not
+meet either bound. See issue #11 for the `make_plan` guard (refusing a
+float64 plan when `jax_enable_x64` is off, and warning on a float32 plan
+below `epsilon = 1e-5`) and issue #13 for the underlying precision-vs-epsilon
+tradeoff.
 
 The contract holds with the default `phi_hat_oversample=None`, which sizes the
 phi_hat table for the width `epsilon` asks for; you only need to pass an

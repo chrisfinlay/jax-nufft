@@ -239,9 +239,8 @@ def test_phi_hat_conditioning_at_v011_eta_max(w: int) -> None:
     assert rel_err < 1e-7, f"W={w}: phi_hat interp rel_err = {rel_err:.3e}"
 
 
-@pytest.mark.parametrize("w", [4, 8, 10, 11, 12, 13])
-def test_phi_hat_interpolation_error_off_node(w: int) -> None:
-    """Off-node interpolation must be worth the epsilon the width promises.
+def _phi_hat_interpolation_error_off_node(w: int) -> None:
+    """Shared body for the fast and ``--runslow`` off-node interpolation checks.
 
     ``test_phi_hat_conditioning_at_v011_eta_max`` above samples
     ``linspace(-eta_max, eta_max, 17)``, and with ``eta_max = x0 * W / 2`` and
@@ -276,6 +275,38 @@ def test_phi_hat_interpolation_error_off_node(w: int) -> None:
         f"W={w} (eps={eps:.0e}, oversample={oversample}): phi_hat interpolation "
         f"error {rel_err:.3e} exceeds eps/10={eps / 10.0:.3e}"
     )
+
+
+@pytest.mark.parametrize("w", [4, 8, 10])
+def test_phi_hat_interpolation_error_off_node(w: int) -> None:
+    """Default-suite leg: widths up to 10, where both tables stay small.
+
+    At W = 10 the 4x-oversample reference is ``phi_hat_oversample_for_w(10) *
+    4 = 512``, an ``n_fft = n_fine * 512 ~= 2.1M``-element table (tens of MB).
+    W in {11, 12, 13} moved to :func:`test_phi_hat_interpolation_error_off_node_slow`
+    below: at W = 13 the reference alone is oversample 4096 (``n_fft ~= 16.8M``),
+    and building it alongside the table under test previously reached
+    multiple GB of transient host memory -- in the *default* suite, on every
+    pull request. See that test and ``phi_hat_oversample_for_w`` for the
+    memory accounting (issue #9 follow-up).
+    """
+    _phi_hat_interpolation_error_off_node(w)
+
+
+@pytest.mark.parametrize("w", [11, 12, 13])
+def test_phi_hat_interpolation_error_off_node_slow(w: int, pytestconfig: pytest.Config) -> None:
+    """``--runslow`` leg: widths where the 4x-oversample reference gets big.
+
+    Gated on the same ``--runslow`` flag as the long-telescope parity tests
+    (rather than the fixture-based gating in ``conftest.py``, which only
+    covers ``long_telescope_pointing``) so an ordinary CI runner doing
+    ``pytest -q`` never has to hold the W = 13 pair (table + oversample-4096
+    reference) in memory at once. Skipped, not xfailed, without the flag --
+    this is a cost gate, not a correctness gate.
+    """
+    if not pytestconfig.getoption("--runslow"):
+        pytest.skip("needs --runslow")
+    _phi_hat_interpolation_error_off_node(w)
 
 
 def test_phi_hat_table_is_picklable_via_dataclass() -> None:

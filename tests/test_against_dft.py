@@ -18,6 +18,8 @@ under-provisioned kernel.
 
 from __future__ import annotations
 
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -25,6 +27,7 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
+from jax_nufft.kernel import kernel_params
 from tests.conftest import MWA_COMPACT, synthetic_uvw
 from tests.test_adjoint import _reference_adjoint
 
@@ -139,7 +142,13 @@ def test_forward_matches_dft_off_zenith(eps: float) -> None:
     )
 
 
-_TRACKING_EPS = [1e-3, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12]
+# Every decade from 1e-3 to 1e-12, not just a subsample: the old rule
+# ``ceil(-log10(eps)*2/pi) + 2`` collapsed the adjacent pairs 1e-5/1e-6,
+# 1e-9/1e-10 and 1e-11/1e-12 onto the same ``W`` (see kernel.py, kernel_params
+# docstring), and a list that skips one member of each pair (as the previous
+# ``[1e-3, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12]`` did) can't exercise the exact
+# regression it exists to catch.
+_TRACKING_EPS = [10.0**-k for k in range(3, 13)]
 
 
 def test_accuracy_tracks_epsilon() -> None:
@@ -149,8 +158,22 @@ def test_accuracy_tracks_epsilon() -> None:
     assertion is *across* epsilon values: with the old width rule
     ``W = ceil(-log10(eps) * 2/pi) + 2``, eps=1e-5 and eps=1e-6 both mapped to
     W=6 and produced the *same* error, so asking for a tighter epsilon bought
-    nothing. The monotonicity check below is the regression guard for that; the
-    per-epsilon bound is the same ``2 * eps`` contract as the rest of the file.
+    nothing. ``_TRACKING_EPS`` covers every decade from 1e-3 to 1e-12 so this
+    exercises the exact adjacent pairs that used to collapse (1e-5/1e-6,
+    1e-9/1e-10, 1e-11/1e-12), not just a subsample that happens to include one
+    member of each. The per-epsilon bound is the same ``2 * eps`` contract as
+    the rest of the file.
+
+    The real plateau guard is the width check at the end: ``kernel_params``
+    must hand back a strictly wider kernel for every adjacent decade, since
+    that -- not the measured error -- is what the old rule actually violated.
+    A *measured*-error monotonicity assertion was tried first and dropped: a
+    tighter kernel is not guaranteed to measure a smaller error on every
+    fixture (a tighter approximation can reorder floating-point cancellation
+    and land marginally worse), so asserting it risks becoming exactly the
+    kind of assertion this repo's rules say not to weaken to make green.
+    Asserting the width step directly tests the thing that must not
+    regress and nothing else.
 
     MWA_compact off30 (128 px, 600 rows) is the smallest review fixture with
     real w-content, and the row-loop DFT reference over 128^2 pixels costs a
@@ -171,16 +194,12 @@ def test_accuracy_tracks_epsilon() -> None:
     vis_ref = _reference_forward(image.astype(np.complex128), uvw, freq, pix, pix)
     dirty_ref = _reference_adjoint(vis, uvw, freq, shape, pix, pix)
 
-    fwd_err: list[float] = []
-    adj_err: list[float] = []
     for eps in _TRACKING_EPS:
         plan = make_plan(uvw, freq, shape, pix, pix, eps)
         vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image)))
         dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis)))
         e_f = float(np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref))
         e_a = float(np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref))
-        fwd_err.append(e_f)
-        adj_err.append(e_a)
         assert e_f < DFT_TOL_FACTOR * eps, (
             f"forward eps={eps:g}: relative error {e_f:.3e} is {e_f / eps:.2f}x eps "
             f"(W={plan.w_kernel_width}, n_w={plan.n_w})"
@@ -190,15 +209,17 @@ def test_accuracy_tracks_epsilon() -> None:
             f"(W={plan.w_kernel_width}, n_w={plan.n_w})"
         )
 
-    # Strict monotonicity: every tightening of epsilon must actually buy
-    # accuracy. Equal consecutive errors mean two epsilon values collapsed onto
-    # the same kernel width.
-    for name, errs in (("forward", fwd_err), ("adjoint", adj_err)):
-        for k in range(1, len(_TRACKING_EPS)):
-            assert errs[k] < errs[k - 1], (
-                f"{name}: error did not improve going from eps={_TRACKING_EPS[k - 1]:g} "
-                f"({errs[k - 1]:.3e}) to eps={_TRACKING_EPS[k]:g} ({errs[k]:.3e})"
-            )
+    # The actual plateau guard: kernel_params()[0] (the width W) must step up
+    # by exactly one for every adjacent decade in _TRACKING_EPS. This is what
+    # the old rule violated (three collapsed pairs across eps=1e-3..1e-12);
+    # it is cheap (no plan / no NUFFT call) and, unlike a measured-error
+    # comparison, deterministic.
+    widths = [kernel_params(eps)[0] for eps in _TRACKING_EPS]
+    width_deltas = [b - a for a, b in itertools.pairwise(widths)]
+    assert width_deltas == [1] * len(width_deltas), (
+        f"kernel width must increase by exactly one per decade from "
+        f"eps={_TRACKING_EPS[0]:g} to eps={_TRACKING_EPS[-1]:g}; got widths={widths}"
+    )
 
 
 def test_forward_real_image_promotes_to_complex() -> None:
