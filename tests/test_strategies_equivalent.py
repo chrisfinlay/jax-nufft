@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+from typing import cast
 
 import jax.numpy as jnp
 import numpy as np
@@ -84,6 +85,15 @@ N_CHAN = 3
 # See the "Bound" section of the module docstring for the measurements
 # behind these two constants.
 STRATEGY_TOL = tol(1e-11, 1.3e-6)
+
+# Issue #46 made ``w_strategy="auto"`` the shipped default on both operators,
+# so "what a caller who passes no w_strategy gets" is now its own path through
+# the wrapper, distinct from any of the four explicit names. It belongs in the
+# same equivalence net rather than in a net of its own: the bound this module
+# owns (STRATEGY_TOL) is exactly the bound the issue promises the default
+# change does not move. This label is the dict key the default call's results
+# are filed under; it is not a value ``w_strategy`` ever takes.
+DEFAULT_KEY = cast(WStrategy, "<default>")
 
 
 def _per_channel_freq(tel: Telescope) -> np.ndarray:
@@ -216,6 +226,12 @@ def test_strategies_agree_pairwise(
     combination is evaluated against *that same input*, so any discrepancy
     is attributable to the strategy implementation, not to random input
     variation.
+
+    Since issue #46 the call that passes *no* ``w_strategy`` at all (the
+    ``"auto"`` default) is entered as a ninth and tenth participant, one per
+    channel strategy. That is what pins the issue's backward-compatibility
+    promise: the default change may alter which reduction order runs, but not
+    the answer beyond the bound this module already owns.
     """
     tel, zen_deg = short_telescope_pointing
     plan, image, vis = _build_problem(tel, zen_deg, eps, real_dtype, complex_dtype)
@@ -228,6 +244,17 @@ def test_strategies_agree_pairwise(
         )
         adjoint[(w_strategy, channel_strategy)] = np.asarray(
             vis2dirty(plan, vis, w_strategy=w_strategy, channel_strategy=channel_strategy)
+        )
+
+    # The default (issue #46: ``w_strategy="auto"``) as its own entrant --
+    # deliberately called with the argument omitted, not with ``"auto"``
+    # spelled out, so it is the shipped default path that is under test.
+    for channel_strategy in CHANNEL_STRATEGIES:
+        forward[(DEFAULT_KEY, channel_strategy)] = np.asarray(
+            dirty2vis(plan, image, channel_strategy=channel_strategy)
+        )
+        adjoint[(DEFAULT_KEY, channel_strategy)] = np.asarray(
+            vis2dirty(plan, vis, channel_strategy=channel_strategy)
         )
 
     case_id = f"{tel.name} zen={zen_deg:g} eps={eps:g}"
