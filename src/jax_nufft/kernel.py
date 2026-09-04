@@ -281,11 +281,17 @@ def compute_phi_hat_table(
     # margin the largest transient in ``make_plan``: ``n_fft = n_fine *
     # oversample`` is 262144 at eps=1e-6 (2.1 MB real, 4.2 MB complex) and
     # 4194304 at eps=1e-12 (33.5 MB / 67 MB), against a whole float64 plan of
-    # 2.4 MB for a 16-channel, 10k-row job. issue #23 put a host-RSS budget on
-    # ``make_plan`` as a whole, so the naive spelling -- a separate
-    # pre-shift name, then the complex FFT output, its shifted copy and the
-    # scaled copy all live together -- is worth avoiding even though none of
-    # these arrays is a plan leaf.
+    # 2.4 MB for a 16-channel, 10k-row job.
+    #
+    # This is here as part of issue #23 -- a plan-*storage* change -- and that
+    # is not drift: #23 gates ``make_plan``'s host peak, and once the
+    # per-(channel, row) copies it removed were gone, this FFT was the only
+    # transient of any size left in the call. The rewrite is
+    # allocation-shaped only; the table values are bit-identical (verified
+    # against the pre-change output at eps = 1e-3, 1e-6, 1e-8 and 1e-12), so
+    # nothing downstream of ``phi_hat_n`` moves. The naive spelling -- a
+    # separate pre-shift name, then the complex FFT output, its shifted copy
+    # and the scaled copy all live together -- costs 2x the peak for nothing.
     #
     # Rebinding rather than naming the shifted copy separately is what drops
     # the reference to the pre-shift array.

@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import threading
+import pathlib
+import subprocess
+import sys
 from collections.abc import Callable
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import psutil
 import pytest
 from jax import Array
 
@@ -997,95 +998,183 @@ def test_plan_footprint() -> None:
     )
 
 
-def _peak_rss_delta_during(fn: Callable[[], None], poll_interval: float = 0.002) -> int:
-    """Sample this process's RSS (``psutil``) throughout a call to ``fn``,
-    returning peak-minus-baseline.
+# ---------------------------------------------------------------------------
+# issue #23: make_plan's *host* cost must scale with n_rows + n_chan, not with
+# n_chan * n_rows
+# ---------------------------------------------------------------------------
+#
+# ``test_plan_footprint`` above gates the plan's device leaves. This gates the
+# host side: before issue #23 ``make_plan`` built ``uvw_lambda``,
+# ``uvw_lambda_sorted``, ``u_finufft`` and ``v_finufft`` as transient numpy
+# arrays -- 64 B per (channel, row) -- on top of the leaves it stored.
+#
+# The instrument is a *difference*, not an absolute peak, because an absolute
+# peak cannot gate this property. ``make_plan``'s largest single allocation is
+# the zero-padded FFT inside ``compute_phi_hat_table``, and its size depends
+# only on ``epsilon``: at eps=1e-6 the table is n_fft = 4096 * 64 = 262144
+# points, so the FFT input is 2.1 MB and its complex output 4.2 MB, and the
+# call peaks near 14.7 MB of traced allocation -- identically so for a 32x32,
+# 200-row, 2-channel plan whose leaves total 50 KB. Any absolute bound tight
+# enough to catch a per-(channel, row) array is therefore already blown by the
+# kernel table, and any bound loose enough to admit the table gates nothing.
+#
+# So build two plans that differ in *nothing but* ``n_chan`` -- same epsilon
+# (hence the same kernel table and the same n_w), same image shape, same rows,
+# same frequency endpoints -- and measure the gap. The table, the image-sized
+# arrays, the uvw input and the interpreter baseline are identical in both and
+# subtract out; what is left is exactly the quantity this issue changed.
+#
+# Two deliberate choices about *how* it is measured:
+#
+#   * ``tracemalloc``, not process RSS. RSS answers "did the allocator ask the
+#     OS for new pages", which depends on whether previously freed pages of the
+#     right size happen to still be held -- so the same code measures 0.03 MB
+#     or 22 MB on consecutive calls in one process, and a gate built on it goes
+#     intermittently red on a runner with different allocator behaviour.
+#     ``tracemalloc`` counts bytes *requested*, including numpy's data
+#     allocations (numpy registers them with tracemalloc), and reproduces to
+#     within about 1 KB run to run.
+#   * one plan per fresh interpreter. Both probes then pay identical one-time
+#     costs (JAX import, numpy's FFT twiddle cache for this n_fft), which is
+#     what lets them cancel; measuring both in one process would charge those
+#     to whichever ran first.
+#
+# Measured with this probe (float64, eps=1e-6, 100k rows, 256^2, n_w=528):
+#
+#     n_chan            2          32        delta
+#     pre-#23     29.57 MB   240.72 MB   211.15 MB
+#     post-#23    14.66 MB    14.66 MB      ~900 B
+#
+# i.e. the pre-#23 gap is the 64 B per (channel, row) this issue removed, and
+# the post-#23 gap is a few hundred bytes of per-channel scalars.
 
-    ``psutil`` has no cross-platform "peak RSS since a point in time"
-    accessor (``Process.memory_info().rss`` is a snapshot), so this polls it
-    from a background thread at ``poll_interval`` granularity while ``fn``
-    runs. Coarse, but more than sufficient to catch multi-MB transient
-    allocations held for longer than a few milliseconds -- exactly the shape
-    of the cost this issue targets (Python-level numpy copies that outlive
-    their use within a single ``make_plan`` call).
+_HOST_ALLOC_PROBE = """
+import sys
+import tracemalloc
+
+n_chan, n_rows, n_pix = (int(a) for a in sys.argv[1:4])
+pixsize = float(sys.argv[4])
+epsilon = float(sys.argv[5])
+
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import numpy as np
+
+from jax_nufft.planning import make_plan
+
+# The same fixture as _footprint_fixture_uvw (seed 0, max_baseline 5000 m),
+# written out here rather than imported: this runs in a bare interpreter, and
+# importing the test module would drag pytest and this whole file into it.
+max_baseline = 5000.0
+rng = np.random.default_rng(0)
+uvw = rng.normal(scale=max_baseline / 3, size=(n_rows, 3))
+uvw = uvw / np.maximum(np.linalg.norm(uvw, axis=1, keepdims=True) / max_baseline, 1.0)
+freq = np.linspace(140e6, 160e6, n_chan)
+
+# Start tracing *after* the inputs exist: uvw and freq are the caller's data,
+# not make_plan's cost, and uvw is n_chan-independent anyway.
+tracemalloc.start()
+plan = make_plan(uvw, freq, (n_pix, n_pix), pixsize, pixsize, epsilon)
+peak = tracemalloc.get_traced_memory()[1]
+tracemalloc.stop()
+
+print(peak, plan.n_w)
+"""
+
+
+def _peak_host_alloc_bytes(
+    n_chan: int, n_rows: int, n_pix: int, pixsize: float, epsilon: float
+) -> tuple[int, int]:
+    """Run one ``make_plan`` in a fresh interpreter; return ``(peak_bytes, n_w)``.
+
+    ``cwd`` is the repository root (this file's parent's parent) so the probe
+    imports the same ``jax_nufft`` the suite is testing, editable install or
+    not.
     """
-    process = psutil.Process()
-    baseline = process.memory_info().rss
-    peak = baseline
-    stop = threading.Event()
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _HOST_ALLOC_PROBE,
+            str(n_chan),
+            str(n_rows),
+            str(n_pix),
+            repr(pixsize),
+            repr(epsilon),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"host-allocation probe failed for n_chan={n_chan}:\n{completed.stdout}\n{completed.stderr}"
+    )
+    peak_str, n_w_str = completed.stdout.split()[-2:]
+    return int(peak_str), int(n_w_str)
 
-    def _poll() -> None:
-        nonlocal peak
-        while not stop.is_set():
-            rss = process.memory_info().rss
-            if rss > peak:
-                peak = rss
-            stop.wait(poll_interval)
 
-    sampler = threading.Thread(target=_poll, daemon=True)
-    sampler.start()
-    try:
-        fn()
-    finally:
-        stop.set()
-        sampler.join()
-    return max(peak - baseline, 0)
+def test_make_plan_host_cost_is_independent_of_n_chan_times_n_rows(
+    pytestconfig: pytest.Config,
+) -> None:
+    """issue #23: doubling the channel count must not cost ``n_rows`` of host
+    memory per added channel.
 
+    The two plans differ only in ``n_chan`` (2 vs 32), so the bound is written
+    in terms of what may *legitimately* scale with the channel count after this
+    issue: the ``(n_chan, n_w)`` int32 window tables (``window_start``, its
+    plan-time ``window_size`` twin, and any staging copy of either), plus a few
+    scalars per channel. Nothing proportional to ``n_chan * n_rows`` is
+    allowed, which is the whole point -- the pre-#23 code exceeds this bound by
+    two orders of magnitude (see the table above).
 
-def test_make_plan_peak_host_rss_bounded_slow(pytestconfig: pytest.Config) -> None:
-    """issue #23: ``make_plan`` currently materialises the per-channel uvw
-    arrays (``uvw_lambda``, ``uvw_lambda_sorted``, ``u_finufft``,
-    ``v_finufft``) as transient host numpy arrays *in addition to* the ones
-    it stores, and loops over channels in Python for ``searchsorted``. This
-    pins the host-side (as opposed to ``test_plan_footprint``'s device-leaf)
-    cost of that at a stated multiple of the issue's target footprint bound
-    -- 3x, from the issue body's own gate ("make_plan peak host RSS delta <
-    3x that (psutil, marked slow)", where "that" is the footprint bound
-    computed the sentence before it, not whatever a given plan happens to
-    measure).
-
-    Marked slow (needs ``--runslow``): RSS sampling is coarser and noisier
-    than a value assertion, and this fixture is bigger than the rest of the
-    default suite.
+    Marked slow (needs ``--runslow``): it spawns two interpreters and builds a
+    100k-row plan in each.
     """
     if not pytestconfig.getoption("--runslow"):
         pytest.skip("needs --runslow")
 
-    n_rows = 10_000
-    n_chan = 16
-    uvw = _footprint_fixture_uvw(n_rows, max_baseline=5000.0, seed=0)
-    freq = np.linspace(140e6, 160e6, n_chan)
+    n_rows = 100_000
+    n_pix = 256
+    epsilon = 1e-6
+    n_chan_lo, n_chan_hi = 2, 32
 
-    def _build() -> None:
-        make_plan(
-            uvw=uvw,
-            freq=freq,
-            image_shape=(256, 256),
-            pixsize_l=MWA_EXTENDED.pixsize,
-            pixsize_m=MWA_EXTENDED.pixsize,
-            epsilon=1e-6,
-        )
-
-    # One warm-up call outside the timed/sampled region (AGENTS.md sec 7's
-    # timing protocol): the first JAX call in a process pays one-time
-    # backend-init cost that has nothing to do with make_plan's own
-    # transient host allocation, and would otherwise pollute the sample.
-    # It also gives us plan.n_w for the bound formula.
-    warmup_plan = make_plan(
-        uvw=uvw,
-        freq=freq,
-        image_shape=(256, 256),
-        pixsize_l=MWA_EXTENDED.pixsize,
-        pixsize_m=MWA_EXTENDED.pixsize,
-        epsilon=1e-6,
+    lo_peak, lo_n_w = _peak_host_alloc_bytes(
+        n_chan_lo, n_rows, n_pix, MWA_EXTENDED.pixsize, epsilon
     )
-    bound = 3 * _footprint_bound_bytes(
-        warmup_plan.n_chan, warmup_plan.n_rows, warmup_plan.n_w, warmup_plan.n_l, warmup_plan.n_m
+    hi_peak, hi_n_w = _peak_host_alloc_bytes(
+        n_chan_hi, n_rows, n_pix, MWA_EXTENDED.pixsize, epsilon
+    )
+    # Same epsilon and the same frequency endpoints (np.linspace keeps 140 and
+    # 160 MHz whatever the count), so the w-extent, the plane spacing and n_w
+    # are identical. If they are not, the two plans differ in more than n_chan
+    # and the difference below is not measuring what it claims to.
+    assert lo_n_w == hi_n_w, (
+        f"the two probe plans must differ only in n_chan, but n_w is {lo_n_w} at "
+        f"n_chan={n_chan_lo} and {hi_n_w} at n_chan={n_chan_hi}"
     )
 
-    peak_delta = _peak_rss_delta_during(_build)
-    assert peak_delta <= bound, (
-        f"make_plan peak host RSS delta {peak_delta} B ({peak_delta / 1e6:.2f} MB) exceeds 3x "
-        f"the issue #23 footprint target ({bound} B / {bound / 1e6:.2f} MB) -- make_plan is "
-        "materialising more transient host copies than the issue #23 budget allows"
+    delta_chan = n_chan_hi - n_chan_lo
+    # Per added channel: four (n_chan, n_w) int32 tables' worth of headroom
+    # (twice what make_plan actually builds) plus 64 B of scalars.
+    per_channel_bound = 16 * hi_n_w + 64
+    # x4 on top of that, plus a flat 512 KB, to absorb interpreter-level noise
+    # -- still ~140x below the pre-#23 gap.
+    bound = 4 * delta_chan * per_channel_bound + 512 * 1024
+    # What n_chan * n_rows scaling costs: 8 float64 per (channel, row), the
+    # uvw_lambda / uvw_lambda_sorted / u_finufft / v_finufft set issue #23
+    # removed.
+    naive = 64 * n_rows * delta_chan
+
+    delta = hi_peak - lo_peak
+    assert delta <= bound, (
+        f"make_plan's peak host allocation grew by {delta} B ({delta / 1e6:.2f} MB) going from "
+        f"n_chan={n_chan_lo} to n_chan={n_chan_hi} at n_rows={n_rows}, above the "
+        f"{bound} B ({bound / 1e6:.2f} MB) allowed for per-channel bookkeeping. Something in "
+        f"make_plan is again allocating per (channel, row): n_chan * n_rows scaling would cost "
+        f"about {naive / 1e6:.0f} MB here, and the measured growth is "
+        f"{100.0 * delta / naive:.1f}% of that"
     )
