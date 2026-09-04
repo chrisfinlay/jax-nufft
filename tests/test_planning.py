@@ -176,8 +176,13 @@ def test_channel_ft_coords_match_independent_reference() -> None:
 
     Three properties of the fixture make those bugs visible, and none is
     incidental: ``pixsize_l != pixsize_m`` (so swapping the u and v scalings
-    shows up), two widely separated channels (so reading ``inv_lambda[0]`` for
-    every channel shows up), and a large constant w offset, giving
+    shows up), two widely separated channels (so a scaling that only looks
+    right at one frequency shows up -- but *not* a wrong-channel read: this
+    test hands the helper ``plan.inv_lambda[c]`` itself and the helper does no
+    channel indexing, so the channel wiring in ``_dirty2vis_jit`` /
+    ``_vis2dirty_jit`` is gated by
+    ``test_multi_channel_matches_dft_forward_and_adjoint``, not here), and a
+    large constant w offset, giving
     ``|w0| ~ 1.1e4`` wavelengths -- about 5x the relative-w spread, and some
     14 orders of magnitude above the tolerance the relative w is checked to,
     so returning the absolute w instead of ``w - w0`` is a gross failure
@@ -845,18 +850,32 @@ def _independent_window_bounds(
     return window_start, window_size
 
 
-def test_window_builder_matches_independent_reference() -> None:
+@pytest.mark.parametrize(
+    "freq",
+    [
+        pytest.param(np.array([1.4e9]), id="single_channel"),
+        # Widely split, descending freq, so the widest window is in channel 1
+        # and channel 0 is strictly narrower (241 vs 250 rows on this fixture).
+        # ``max_window_size`` sizes every windowed ``dynamic_slice``, so a
+        # builder that maxed over channel 0 alone would undersize the slice and
+        # silently drop rows from the other channels' windows -- a real-value
+        # error, not a diagnostic one. The split has to be this wide: on
+        # narrower pairs every window saturates at n_rows in both channels, so
+        # the bug survives. Verified by mutating ``window_size_np.max()`` to
+        # ``window_size_np[0].max()``, which this case catches and the
+        # single-channel one does not.
+        pytest.param(np.array([2.0e9, 0.5e9]), id="max_in_channel_1"),
+    ],
+)
+def test_window_builder_matches_independent_reference(freq: np.ndarray) -> None:
     """``plan.window_start`` must match an independently-computed reference
-    exactly, and the reference's window sizes (not a plan leaf any more,
-    issue #23) recover the same aggregate property the old
-    ``test_window_builder_sum_matches_expected`` pinned: each row lies in
-    ``W`` consecutive plane-windows (interior case), so ``sum_k
-    window_size[c, k]`` is close to ``n_rows * W``.
+    exactly, and ``plan.max_window_size`` must be the max over *every*
+    (channel, plane) window -- the window sizes themselves stopped being a plan
+    leaf under issue #23.
     """
     rng = np.random.default_rng(1)
     n_rows = 250
     uvw = rng.normal(scale=120.0, size=(n_rows, 3))
-    freq = np.array([1.4e9])
 
     plan = make_plan(uvw, freq, (128, 128), 5e-4, 5e-4, epsilon=1e-6)
     expected_start, expected_size = _independent_window_bounds(uvw, freq, plan)
@@ -864,14 +883,17 @@ def test_window_builder_matches_independent_reference() -> None:
     np.testing.assert_array_equal(np.asarray(plan.window_start), expected_start)
     assert plan.max_window_size == int(expected_size.max())
 
-    W = plan.w_kernel_width
-    total = int(expected_size.sum())
-    # See the removed test's comment for the slack derivation: searchsorted's
-    # half-open [side="left", side="right") interval includes rows exactly on
-    # a window edge, so each of the n_chan * n_w windows can pick up at most
-    # one extra row at each end.
-    assert total <= plan.n_rows * W + 2 * plan.n_chan * plan.n_w
-    assert total >= plan.n_rows * (W - 1)
+    # The predecessor test bounded ``window_size.sum()`` above and below by
+    # ``n_rows * W``. Those bounds are not reproduced here: ``expected_size`` is
+    # this file's own reference array, so asserting on its sum would check the
+    # reference against itself, and ``_independent_window_bounds`` transcribes
+    # the same searchsorted logic -- a builder that systematically widened its
+    # windows would widen the reference with it and stay green. Anchor the
+    # aggregate on something make_plan computes instead.
+    nonzero = expected_size[expected_size > 0]
+    assert plan.window_padding_overhead == pytest.approx(
+        int(expected_size.max()) / float(nonzero.mean())
+    )
 
 
 # Pixel size for test_window_builder_clumped_distribution. The bare 2e-3 this

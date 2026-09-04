@@ -224,11 +224,13 @@ The windowed strategies rely on a contract between
   for the rows inside `[w_centers[k] - W/2 * dw, w_centers[k] + W/2 * dw]`.
   The builder places those boundaries in the *relative* coordinate
   (`w - w0`) and forms the per-channel w in the plan's `real_dtype`
-  before widening, so they agree bit-for-bit with what
-  `_channel_ft_coords` computes at call time. Building them any other
-  way lets a row within an ulp of an edge be kept by one path and
-  dropped by the other, a `phi(z = ±1) = exp(-beta)` (~1e-7 at W=7)
-  windowed-vs-dense mismatch.
+  before widening, so they agree with what `_channel_ft_coords`
+  computes at call time to within one rounding of the absolute w
+  (~`ulp(w0)`) — not bit-for-bit, since XLA may contract the
+  operator's multiply-then-subtract into an FMA. Building them any
+  other way lets a row within an ulp of an edge be kept by one path
+  and dropped by the other, a `phi(z = ±1) = exp(-beta)` (~1e-7 at
+  W=7) windowed-vs-dense mismatch.
 * `plan.max_window_size` is a static int used as the
   `dynamic_slice` size — must be `>=` every window's length. The
   per-window lengths themselves are plan-time locals, not a leaf

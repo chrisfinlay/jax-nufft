@@ -216,10 +216,11 @@ class WGridderPlan:
     # resolution at 1e-10 no matter how exact the subtraction is, and a 1e-10
     # error in a plane centre is a ~6e-10 phase error -- 300x the eps=1e-12
     # contract. Computed small, they carry full relative precision.
-    # This is the array the plane loop iterates over; the absolute
-    # ``w_centers`` the window builder and the w-coverage tests read is the
-    # property below (issue #23: ``w0`` is static, so storing both was storing
-    # the same numbers twice).
+    # This is the array the plane loop iterates over, and the coordinate the
+    # window builder places its boundaries in (see ``w_centers64`` below). The
+    # absolute ``w_centers`` -- read by the w-coverage tests, by nothing under
+    # ``src/`` -- is the property below (issue #23: ``w0`` is static, so
+    # storing both was storing the same numbers twice).
     w_centers_rel: Array = field()  # (n_w,)
     # issue #16: ``n_minus_1 + nshift``. This is the grid the per-plane phase
     # ``exp(2πi w_k (n-1+nshift))`` and the ``phi_hat`` argument
@@ -944,14 +945,23 @@ def make_plan(
             # at O(n_chan * n_w * log n_rows).
             #
             # The product is formed in the plan's *real* dtype before widening
-            # to float64, not directly in float64. That is what makes these
-            # boundaries agree bit-for-bit with the numbers the operators
-            # compute at call time: they derive w the same way, from the same
-            # two leaves, in ``real_dtype``. Skipping the narrowing would place
-            # a float32 plan's window edges against values the operator never
-            # sees, and a row landing between the two would be dropped by the
-            # windowed path while the dense path gives it
-            # ``phi(z = +/-1) = exp(-beta)``.
+            # to float64, not directly in float64, so that these boundaries sit
+            # against the numbers the operators actually compute at call time:
+            # they derive w the same way, from the same two leaves, in
+            # ``real_dtype``. Skipping the narrowing would place a float32
+            # plan's window edges against values the operator never sees, and a
+            # row landing between the two would be dropped by the windowed path
+            # while the dense path gives it ``phi(z = +/-1) = exp(-beta)``.
+            #
+            # Not bit-for-bit, though: the operator computes this as a single
+            # multiply-then-subtract (``_w_relative``), which XLA is free to
+            # contract into an FMA -- one rounding where the two numpy steps
+            # here round twice. The two therefore agree to within one rounding
+            # of the *absolute* w, i.e. ~ulp(w0). Measured at |w0| ~ 1.1e6
+            # lambda in float32, about 80% of rows differ, by at most 1.2e-10
+            # lambda -- 5e-15 of ``w_kernel_scale``, so a row has to fall that
+            # close to an edge for the two paths to disagree at all, and the
+            # disagreement is then one row at ``phi(z = +/-1)``.
             w_lambda_c = (w_m_sorted * inv_lambda_np[c]).astype(np.float64) - w0
             # ``side="left"``  for lower bound, ``side="right"`` for upper bound
             # gives a half-open interval [lo, hi) of strictly-inside rows. Rows
