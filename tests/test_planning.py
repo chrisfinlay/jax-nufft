@@ -23,9 +23,9 @@ from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
 from jax_nufft.planning import (
     W_OVERSAMPLE_X0,
-    WINDOW_BOUNDARY_MARGIN_EPS,
     WGridderPlan,
     make_plan,
+    window_boundary_margin,
 )
 from jax_nufft.wgridder import _channel_ft_coords
 from tests.conftest import (
@@ -857,10 +857,11 @@ def _independent_window_bounds(
     # to pin -- an implementation that dropped the widening would be a silent
     # parity regression, so this must not quietly accept one.
     w_abs = np.outer(np.asarray(freq, dtype=np.float64) / SPEED_OF_LIGHT, uvw[:, 2])
-    margin = (
-        WINDOW_BOUNDARY_MARGIN_EPS
-        * float(np.finfo(plan.real_dtype).eps)
-        * max(abs(float(w_abs.min())), abs(float(w_abs.max())), plan.w_extent)
+    # The production helper, not a transcription of it: this reference exists to
+    # pin window_start exactly, so it has to widen by the same number make_plan
+    # widened by, whatever that number is.
+    margin = window_boundary_margin(
+        plan.real_dtype, float(w_abs.min()), float(w_abs.max()), plan.w_extent
     )
     window_start = np.zeros((n_chan, n_w), dtype=np.int64)
     window_size = np.zeros((n_chan, n_w), dtype=np.int64)
@@ -1368,9 +1369,10 @@ def test_no_operator_path_materialises_per_channel_row_coordinates(
     The rule has two clauses, because two different things have to be caught.
     Dimension membership catches every array that wears the shape -- ``(5, 257)``,
     ``(257, 5)``, ``(257, 5, 3)``. Element count catches the ones that do not:
-    the natural flat carrier ``(n_chan * n_rows,)``, which is what a future
-    single-FINUFFT-call-over-all-channels rewrite would build, and which a
-    membership test cannot see at all. Both clauses are checked on the *squeezed*
+    the flat carrier ``(n_chan * n_rows,)`` and the flat cube
+    ``(n_chan * n_rows, 3)``, which is what a single-FINUFFT-call-over-all-
+    channels rewrite builds and which contains neither ``n_chan`` nor
+    ``n_rows`` as a dimension at all. Both clauses are checked on the *squeezed*
     shape so a broadcast axis cannot disguise either.
 
     Restricted to *real* element types, and that restriction is load-bearing
@@ -1387,8 +1389,10 @@ def test_no_operator_path_materialises_per_channel_row_coordinates(
     baselines or the per-channel scaling, and ``n_chan`` cannot be confused with
     the length-3 coordinate axis.
 
-    ``channel_strategy="vmap"`` is held to the coordinate-*cube* form only, and
-    that is not a hole being papered over. ``jax.vmap`` over the channel axis
+    ``channel_strategy="vmap"`` is held to the dimension-membership clause only
+    -- the element-count clause is scan-only -- and that is a real, stated
+    weakening: a *flattened* carrier is not caught under vmap. It is not a hole
+    being papered over, though. ``jax.vmap`` over the channel axis
     *is* the request to batch the per-channel work, so it lifts
     ``_channel_ft_coords``'s three ``(n_rows,)`` outputs to ``(n_chan, n_rows)``
     by construction; pairing it with a ``*_vmap`` w-strategy lifts the kernel
@@ -1396,8 +1400,9 @@ def test_no_operator_path_materialises_per_channel_row_coordinates(
     of those strategies can avoid either, and AGENTS.md sec 5 already prices
     them as "allocates n_chan x per-channel transient memory". What no strategy
     ever needs is the array that *also* carries the length-3 baseline axis, so
-    that stays banned in all eight. The default ``"scan"`` path -- the one the
-    memory argument in issue #23 is about -- is held to the full rule.
+    the shaped cube stays banned in all eight; its flattened form is caught
+    under ``"scan"`` only. The default ``"scan"`` path -- the one the memory
+    argument in issue #23 is about -- is held to the full rule.
     """
     n_chan = _UVW_LAMBDA_PROBE_N_CHAN
     n_rows = _UVW_LAMBDA_PROBE_N_ROWS
@@ -1434,14 +1439,26 @@ def test_no_operator_path_materialises_per_channel_row_coordinates(
             # broadcast axis.
             squeezed = [d for d in dims if d != 1]
             # Element count, not just dimension membership. A carrier that never
-            # takes the (n_chan, n_rows) *shape* -- the flat (n_chan * n_rows,)
-            # form a future "concatenate every channel's points into one FINUFFT
-            # call" would use, built by gather so no rank-2 intermediate ever
-            # exists -- costs exactly the same memory and walks straight through
-            # a membership test. Measured on such a mutant: the ban passed 8/8
-            # and the whole fast suite stayed green while the lowered temp size
-            # went from 6.14 MB to 13.27 MB, +116%.
-            if channel_strategy == "scan" and math.prod(squeezed) == n_chan * n_rows:
+            # takes the (n_chan, n_rows) *shape* -- what a future "concatenate
+            # every channel's points into one FINUFFT call" rewrite builds, by
+            # gather, so no rank-2 intermediate ever exists -- costs exactly the
+            # same memory and walks straight through a membership test.
+            #
+            # A multiple, not equality, because the flattened *cube* is
+            # ``(n_chan * n_rows, 3)``: three times the element count, and
+            # ``(1285, 3)`` contains neither 5 nor 257, so both the earlier
+            # clauses miss it. Measured on that mutant: all eight
+            # parametrisations passed while ``temp_size_in_bytes`` went from
+            # 6.437 MB to 20.546 MB, +219%, on a 16-channel 20k-row fixture. A
+            # quotient cap of 3 covers the flat form, the two-array u/v split
+            # and the cube, and stops short of anything large enough to be a
+            # legitimately per-plane or per-pixel array.
+            elements = math.prod(squeezed)
+            if (
+                channel_strategy == "scan"
+                and elements % (n_chan * n_rows) == 0
+                and elements // (n_chan * n_rows) <= 3
+            ):
                 return True
             if not (n_chan in squeezed and n_rows in squeezed):
                 return False

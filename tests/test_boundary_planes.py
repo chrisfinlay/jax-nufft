@@ -20,7 +20,7 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
-from jax_nufft.planning import WINDOW_BOUNDARY_MARGIN_EPS
+from jax_nufft.planning import window_boundary_margin
 
 jax.config.update("jax_enable_x64", True)
 
@@ -303,7 +303,9 @@ def _find_invariant_breaking_w(
     sharing the same straddling ``w`` exhaust the one-row slack, and the margin
     has to carry it.
 
-    Returns ``(w_metres, spliced_uvw)`` or ``None`` when no candidate qualifies
+    Returns ``(overhang, spliced_uvw)`` -- the amount by which the selected
+    row's host w falls outside the bare boundary, and the fixture -- or ``None``
+    when no candidate qualifies
     -- e.g. on a platform whose compiler does not contract the multiply-subtract,
     where host and device agree exactly and the invariant is trivially safe.
     """
@@ -338,8 +340,17 @@ def _find_invariant_breaking_w(
         )[2]
     )
 
+    # Take the *largest* straddle, not the first. Straddling only requires the
+    # overhang to exceed zero, and the first candidate encountered exercised
+    # 8.3% of the margin -- so the fixture was gating a fraction of what it
+    # could. Ordering by |bound - host| costs nothing: the qualifying test
+    # below is unchanged, it just runs on the most demanding candidates first.
+    overhangs = np.abs(np.asarray([b for _, b in edges]) - host)
+    order_by_overhang = np.argsort(-overhangs)
+
     order = np.argsort(uvw[:, 2])
-    for i, (side, bound) in enumerate(edges):
+    for i in order_by_overhang:
+        side, bound = edges[i]
         # "lo": searchsorted(..., "left") drops rows below the bound, but the
         # dense path keeps any row the device puts at or above it. "hi" mirrors.
         straddles = host[i] < bound <= device[i] if side == "lo" else host[i] > bound >= device[i]
@@ -360,7 +371,7 @@ def _find_invariant_breaking_w(
                 if candidate_plan.w0 != plan.w0 or candidate_plan.n_w != plan.n_w:  # type: ignore[attr-defined]
                     continue
                 if _unwidened_builder_drops(candidate_plan, spliced, freq):
-                    return float(cand[i]), spliced
+                    return float(overhangs[i]), spliced
     return None
 
 
@@ -436,7 +447,21 @@ def test_windowed_dense_parity_at_window_edge() -> None:
             "derivation does not come from FMA contraction at all. That half is "
             "gated by test_window_boundary_margin_covers_host_device_gap"
         )
-    _, uvw_adv = found
+    selected_overhang, uvw_adv = found
+    # The fixture has to exercise a real fraction of the margin, not merely a
+    # non-zero one: a straddle needs only overhang > 0, and the first candidate
+    # the search used to return exercised 8.3% of it. The scale to compare
+    # against is an ulp of the absolute w, which is what the host/device
+    # disagreement is bounded by in the first place.
+    ulp_w_abs = float(
+        np.spacing(abs(base.w0) + 0.5 * base.w_extent)  # type: ignore[arg-type]
+    )
+    assert selected_overhang >= 0.25 * ulp_w_abs, (
+        f"the selected row overhangs its window edge by {selected_overhang:.3e} "
+        f"wavelengths, under a quarter of ulp(|w|) = {ulp_w_abs:.3e}. The search is "
+        "settling for a marginal straddle, so the fixture exercises far less of "
+        "boundary_margin than it could"
+    )
     # Never let the fixture silently degrade. Two conditions, because they fail
     # differently: a zero-row splice would run every assertion below against the
     # plain base plan, and a *one*-row splice is rescued unconditionally by the
@@ -494,20 +519,80 @@ def test_windowed_dense_parity_at_window_edge() -> None:
 # a large offset raises the absolute-w scale, and hence the host/device gap,
 # without exploding the plane count.
 _MARGIN_CASES = [
-    ("float64 |w0| ~ 0", np.float64, 0.0, np.array([1.4e9]), 1e-8),
-    ("float64 |w0| large", np.float64, 5.0e7, np.array([1.4e9]), 1e-6),
-    ("float64 3 channels", np.float64, 1.0e6, np.array([1.2e9, 1.4e9, 1.6e9]), 1e-6),
-    ("float32 |w0| ~ 0", np.float32, 0.0, np.array([1.4e9]), 1e-3),
-    ("float32 |w0| large", np.float32, 5.0e7, np.array([1.4e9]), 1e-3),
+    # (tag, dtype, w offset in metres, w spread in metres, freq, epsilon)
+    ("float64 edge-test geometry", np.float64, 5.0e4, 2.0e3, np.array([1.0e9]), 1e-6),
+    ("float64 |w0| ~ 0", np.float64, 0.0, 8.0e3, np.array([1.4e9]), 1e-8),
+    ("float64 |w0| 5e5 m", np.float64, 5.0e5, 2.0e3, np.array([1.0e9]), 1e-6),
+    ("float64 3 channels", np.float64, 0.0, 8.0e3, np.array([1.2e9, 1.4e9, 1.6e9]), 1e-6),
+    ("float32 |w0| ~ 0", np.float32, 0.0, 8.0e3, np.array([1.4e9]), 1e-3),
+    ("float32 |w0| 5e7 m", np.float32, 5.0e7, 8.0e3, np.array([1.4e9]), 1e-3),
 ]
 
 # Minimum acceptable ratio of ``boundary_margin`` to the largest overhang any
-# in-support row actually needs. Measured worst over these cases is 0.120 of
-# the margin, i.e. 8.3x headroom, and the round-2 review sweep over ~130 plans
-# measured 0.157, i.e. 6.4x. Tripping below 3x therefore leaves roughly a
-# factor of two of slack against the worst thing anyone has measured, while
-# still failing outright if the coefficient is cut to a quarter or an eighth.
+# in-support row actually needs. Measured worst over these cases is 0.130 of
+# the margin, i.e. 7.7x headroom (float32, |w0| 5e7 m); the worst float64 case
+# is 0.110, i.e. 9.1x. Tripping below 3x leaves a factor of ~2.5 of slack while
+# still failing outright if the coefficient is cut to a half, a quarter or an
+# eighth of its shipped value.
 _MIN_MARGIN_HEADROOM = 3.0
+
+
+def _edge_probe_w_metres(
+    plan: object,
+    inv_lambda_c: float,
+    w_lo: float,
+    w_hi: float,
+    n_step: int = 20,
+    max_planes: int = 40,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(w_metres, plane_index)`` hugging every interior window edge.
+
+    The requirement this file measures is a property of the *arithmetic*, not of
+    any particular row set, and in float64 waiting for random rows to land in
+    the host/device disagreement band does not work: the band is ~1e-16
+    relative, so 120 rows essentially never fall in it. Measured, every one of
+    the 120 strict-subset float64 plans in a 311-plan sweep reports a
+    requirement of exactly zero -- which is why cutting the margin coefficient
+    8x *for float64 only* left the entire suite green.
+
+    So walk to the edges instead of waiting for them, exactly as
+    :func:`_find_invariant_breaking_w` does. The walk is in the plan's own
+    dtype, because that is the grid ``plan.uvw_m`` lives on and a float64 walk
+    would collapse onto a handful of distinct float32 values.
+
+    Restricted to ``(w_lo, w_hi)``: an edge outside the data range belongs to a
+    plane whose window is empty, so a row there cannot exist and counting it
+    would make the gate conservative for no reason.
+    """
+    dtype = plan.real_dtype  # type: ignore[attr-defined]
+    centres = np.asarray(plan.w_centers_rel, dtype=np.float64)  # type: ignore[attr-defined]
+    scale = plan.w_kernel_scale  # type: ignore[attr-defined]
+    out: list[float] = []
+    planes: list[int] = []
+    # A subsample of the interior planes, evenly spaced. The quantity being
+    # measured is a property of the arithmetic at *an* edge, not of any
+    # particular plane, so probing all ~600 planes of a wide-w plan costs
+    # 25x the time for no more coverage (and one XLA compile per distinct
+    # probe count).
+    interior = np.arange(1, max(centres.shape[0] - 1, 2))
+    if interior.size > max_planes:
+        interior = interior[np.linspace(0, interior.size - 1, max_planes).astype(int)]
+    for k in interior:
+        k = int(k)
+        for bound in (centres[k] - scale, centres[k] + scale):
+            x = np.asarray((bound + plan.w0) / inv_lambda_c, dtype=dtype)  # type: ignore[attr-defined]
+            for _ in range(n_step // 2):
+                x = np.nextafter(x, np.asarray(-np.inf, dtype=dtype))
+            for _ in range(n_step):
+                if w_lo < float(x) < w_hi:
+                    out.append(float(x))
+                    # Each probe is only ever interesting against the plane whose
+                    # edge produced it. Pairing every probe with every plane is a
+                    # (30k, 600) matrix per channel and runs the process out of
+                    # memory for nothing.
+                    planes.append(k)
+                x = np.nextafter(x, np.asarray(np.inf, dtype=dtype))
+    return np.asarray(out, dtype=dtype), np.asarray(planes, dtype=np.intp)
 
 
 def _margin_requirement(uvw: np.ndarray, freq: np.ndarray, dtype: type, eps: float) -> tuple:
@@ -518,42 +603,74 @@ def _margin_requirement(uvw: np.ndarray, freq: np.ndarray, dtype: type, eps: flo
     outside the *unwidened* host boundary ``[w_k - S, w_k + S]``. That is
     exactly what ``boundary_margin`` has to cover: any such row would be dropped
     by a builder that searched at the bare boundary.
+
+    Both sides are computed the way production computes them, which took two
+    corrections to get right and is the whole reliability of this gate:
+
+      * the **host** side forms the product in the plan's ``real_dtype`` before
+        widening, as ``make_plan`` does. A float64 host value reports zero
+        overhang on every float32 fixture.
+      * the **device** side is fed ``plan.uvw_m`` -- already cast to
+        ``real_dtype`` -- not the caller's raw float64 ``uvw``. Feeding the raw
+        array measures a float32 host against a float64 device, a gap that never
+        occurs at runtime, and inflates the answer about 2x.
+
+    The margin comes from ``window_boundary_margin``, the same call
+    ``make_plan`` makes, so this measures the number actually applied rather
+    than a restatement of the formula.
     """
     from jax_nufft.wgridder import _channel_ft_coords
 
     plan = make_plan(uvw, freq, (32, 32), 0.004, 0.004, eps, dtype=dtype)
     perm = np.asarray(plan.sort_perm)
-    # In the plan's dtype, not float64: make_plan forms this product in
-    # ``real_dtype`` and only then widens, so a float64 host value here would be
-    # a different number from the one the builder's boundaries are placed
-    # against -- and, measured, would report no overhang at all on every float32
-    # fixture, quietly making this whole test vacuous.
-    w_m_sorted = uvw[perm, 2].astype(plan.real_dtype)
     centres = np.asarray(plan.w_centers_rel, dtype=np.float64)
     scale = plan.w_kernel_scale
     inv_lambda = np.asarray(plan.inv_lambda)
+    uvw_m = np.asarray(plan.uvw_m)
 
-    w_abs = np.outer(np.asarray(inv_lambda, dtype=np.float64), uvw[:, 2])
-    w_abs_scale = max(abs(float(w_abs.min())), abs(float(w_abs.max())), plan.w_extent)
-    margin = WINDOW_BOUNDARY_MARGIN_EPS * float(np.finfo(dtype).eps) * w_abs_scale
+    w_abs = np.outer(inv_lambda.astype(np.float64), uvw[:, 2])
+    margin = window_boundary_margin(
+        plan.real_dtype, float(w_abs.min()), float(w_abs.max()), plan.w_extent
+    )
+    w_lo, w_hi = float(uvw_m[:, 2].min()), float(uvw_m[:, 2].max())
 
-    sorted_uvw = jnp.asarray(uvw[perm])
+    def overhang_of(host: np.ndarray, centre: np.ndarray) -> np.ndarray:
+        """How far outside the bare ``[centre - S, centre + S]`` the host sits."""
+        return np.maximum(np.maximum(centre - scale - host, host - centre - scale), 0.0)
+
     requirement = 0.0
     for chan in range(plan.n_chan):
-        host = (w_m_sorted * inv_lambda[chan]).astype(np.float64) - plan.w0
+        probes, probe_plane = _edge_probe_w_metres(plan, float(inv_lambda[chan]), w_lo, w_hi)
+        rows_m = np.concatenate([uvw_m[perm, 2], probes])
+        block = np.zeros((rows_m.size, 3), dtype=plan.real_dtype)
+        block[:, 2] = rows_m
+        host = (rows_m * inv_lambda[chan]).astype(np.float64) - plan.w0
+        # Under ``jax.jit``, not eagerly. Op-by-op execution does not contract
+        # the multiply-subtract into an FMA at all, so an eager call measures a
+        # device value that agrees with the host bit-for-bit and reports a
+        # requirement of exactly zero -- i.e. it silently measures the wrong
+        # thing on the very dtype this gate exists for.
         device = np.asarray(
-            _channel_ft_coords(sorted_uvw, plan.inv_lambda[chan], plan)[2], dtype=np.float64
+            jax.jit(_channel_ft_coords)(jnp.asarray(block), plan.inv_lambda[chan], plan)[2],
+            dtype=np.float64,
         )
-        in_support = np.abs((device[:, None] - centres[None, :]) / scale) <= 1.0
-        overhang = np.maximum(
-            np.maximum(
-                centres[None, :] - scale - host[:, None],
-                host[:, None] - centres[None, :] - scale,
-            ),
-            0.0,
-        )
+        n_fixture = perm.size
+
+        # Fixture rows: every plane, but only 120 of them.
+        host_rows, dev_rows = host[:n_fixture], device[:n_fixture]
+        in_support = np.abs((dev_rows[:, None] - centres[None, :]) / scale) <= 1.0
         if in_support.any():
-            requirement = max(requirement, float(overhang[in_support].max()))
+            over = overhang_of(host_rows[:, None], centres[None, :])
+            requirement = max(requirement, float(over[in_support].max()))
+
+        # Edge probes: each against its own plane only.
+        if probes.size:
+            host_p, dev_p = host[n_fixture:], device[n_fixture:]
+            centre_p = centres[probe_plane]
+            hit = np.abs((dev_p - centre_p) / scale) <= 1.0
+            if hit.any():
+                over_p = overhang_of(host_p, centre_p)
+                requirement = max(requirement, float(over_p[hit].max()))
     return requirement, margin, plan
 
 
@@ -581,13 +698,13 @@ def test_window_boundary_margin_covers_host_device_gap() -> None:
     instead of silently spending it.
     """
     ratios = []
-    for tag, dtype, offset_m, freq, eps in _MARGIN_CASES:
-        rng = np.random.default_rng(11)
+    for tag, dtype, offset_m, spread_m, freq, eps in _MARGIN_CASES:
+        rng = np.random.default_rng(0)
         n_rows = 120
         uvw = np.zeros((n_rows, 3))
-        uvw[:, 0] = rng.uniform(-100.0, 100.0, size=n_rows)
-        uvw[:, 1] = rng.uniform(-100.0, 100.0, size=n_rows)
-        uvw[:, 2] = offset_m + rng.uniform(-8000.0, 8000.0, size=n_rows)
+        uvw[:, 0] = rng.uniform(-120.0, 120.0, size=n_rows)
+        uvw[:, 1] = rng.uniform(-120.0, 120.0, size=n_rows)
+        uvw[:, 2] = offset_m + rng.uniform(-spread_m, spread_m, size=n_rows)
 
         requirement, margin, plan = _margin_requirement(uvw, freq, dtype, eps)
         assert plan.max_window_size < plan.n_rows, (
@@ -595,15 +712,24 @@ def test_window_boundary_margin_covers_host_device_gap() -> None:
             "this case gates nothing -- pick a fixture with more planes"
         )
         assert margin > 0.0, f"{tag}: boundary_margin is zero"
-        ratios.append((requirement / margin, tag, requirement, margin))
+        ratios.append((requirement / margin, tag, requirement, margin, dtype))
 
-    worst_ratio, worst_tag, worst_req, worst_margin = max(ratios)
-    # At least one case must actually exercise the margin, or the assertion
-    # below is satisfied by arithmetic rather than by the code being right.
-    assert worst_ratio > 0.0, (
-        "no fixture here needs any widening at all, so this test would pass with "
-        "boundary_margin set to zero -- it has stopped gating the margin"
-    )
+    # Per *dtype*, not just overall. float64 is the dtype the whole tolerance
+    # contract is written in, and it is the one where a requirement of zero is
+    # easy to measure by accident: the disagreement band is ~1e-16 relative, so
+    # random rows never land in it and only the edge probes reach it. With the
+    # float64 cases reporting zero, cutting the coefficient 8x for float64 alone
+    # left the entire suite green -- so "some case is non-zero" is not enough.
+    for want in (np.float64, np.float32):
+        best = max(r[0] for r in ratios if r[4] is want)
+        assert best > 0.0, (
+            f"every {np.dtype(want).name} case measures a requirement of exactly zero, so "
+            f"this gate would pass with boundary_margin set to zero for {np.dtype(want).name}. "
+            "The edge probes are not reaching the host/device disagreement band -- check "
+            "_edge_probe_w_metres, and that the device side runs under jax.jit"
+        )
+
+    worst_ratio, worst_tag, worst_req, worst_margin, _ = max(ratios)
     assert worst_ratio <= 1.0 / _MIN_MARGIN_HEADROOM, (
         f"boundary_margin has only {1.0 / worst_ratio:.2f}x headroom on {worst_tag} "
         f"(rows need {worst_req:.3e} wavelengths of widening, margin is {worst_margin:.3e}), "

@@ -504,14 +504,24 @@ def _channel_ft_coords(
 
     Note the ordering: the two scalars are multiplied together *first* and the
     row vector last, so the per-row cost stays at a single multiply rather than
-    two. That reassociates ``(2π · pixsize) · (inv_lambda · uvw)`` --  what
-    v0.1.2 stored -- by a ulp or so, which is a rounding-level change to a
-    FINUFFT input coordinate and does not move the accuracy sweep. ``w`` is a
-    single multiply either way, so it is bit-identical to the removed
-    ``uvw_lambda[..., 2]``.
+    two. That reassociates ``(2π · pixsize) · (inv_lambda · uvw)`` -- what
+    v0.1.2 stored -- by a ulp or so, a rounding-level change to a FINUFFT input
+    coordinate.
 
     The w that comes back is already relative to ``plan.w0``
-    (:func:`_w_relative`); the plane loop uses no other form.
+    (:func:`_w_relative`); the plane loop uses no other form. The *product*
+    ``inv_lambda[c] * uvw_m[:, 2]`` is bit-identical to the removed
+    ``uvw_lambda[..., 2]`` -- same two operands, same single multiply -- but
+    do not read that as "the w the operator uses is unchanged". It is not:
+    XLA contracts this multiply with :func:`_w_relative`'s subtract into a
+    single FMA, so the ``w`` reaching the plane loop differs in the last bits
+    from the pre-issue-#23 ``stored product, then subtract``, on 18-22% of
+    rows. That is the whole reason ``make_plan`` has to widen its window
+    boundaries (see ``planning.window_boundary_margin``), and it is why the
+    branch's operator output is not bit-identical to v0.1.2's: measured
+    1.0e-12 forward and 9.1e-12 adjoint in relative L2, four orders above an
+    ulp, ~1e-3 of the 1e-9-scale eps the contract is written against, and just
+    under the 1e-11 strategy-equivalence bound.
     """
     two_pi = 2.0 * jnp.pi
     u_ft = (two_pi * plan.pixsize_l * inv_lambda_c) * uvw_m[:, 0]

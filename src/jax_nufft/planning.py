@@ -568,6 +568,98 @@ def _warn_if_below_float32_floor(real_dtype: np.dtype[Any], epsilon: float) -> N
         )
 
 
+def window_boundary_margin(
+    real_dtype: DTypeLike,
+    w_min_all: float,
+    w_max_all: float,
+    w_extent: float,
+) -> float:
+    """The window builder's boundary widening, in wavelengths.
+
+    **The single definition of this quantity.** ``make_plan`` calls it, and so do
+    the tests that gate it (``tests/test_boundary_planes.py``'s
+    ``_margin_requirement`` and ``tests/test_planning.py``'s
+    ``_independent_window_bounds``). That is not tidiness: while the formula was
+    restated at each of those three sites, only the ``WINDOW_BOUNDARY_MARGIN_EPS``
+    coefficient was pinned and the *scale* was pinned nowhere. Replacing
+    ``w_abs_scale`` with ``w_extent`` alone -- dropping exactly the terms that
+    (a) below scales with -- left the whole fast suite green while dropping rows
+    at 1e-8 relative on a large-|w0| fixture.
+
+    The contract (AGENTS.md sec 4) is that a window contains EVERY row the
+    dense path gives a non-zero kernel weight, i.e. every row whose w --
+    as the *operator* computes it on the device -- satisfies |z| <= 1.
+
+    Host and device do not compute that w identically, and cannot be made
+    to. The operator evaluates ``inv_lambda[c] * uvw_m[:, 2] - w0`` as a
+    multiply immediately followed by a subtract, which XLA is free to
+    contract into a single FMA: one rounding where the builder's two
+    numpy steps round twice. (Before issue #23 the device subtracted ``w0`` from
+    a *stored, already-rounded* product, so the two agreed bit for bit by
+    construction. They no longer do: measured, they differ on ~23% of
+    (channel, row) pairs on MWA_extended and ~18% on MeerKAT.)
+
+    Chasing bit-equality is therefore the wrong fix; the right one is to
+    make the disagreement unable to matter. The asymmetry that lets us do
+    that: over-inclusion is free -- a row inside the slice but outside
+    kernel support gets ``phi(|z| > 1) = 0`` and contributes exactly
+    nothing -- while under-inclusion is a value error. So widen.
+
+    ``boundary_margin`` is ``8u`` of the absolute-w scale, and what it has
+    to dominate is a sum of two terms, not one:
+
+      (a) |device w - host w|. The device may skip the product's rounding
+          (<= u * |w_absolute|) and the two sides round their own
+          subtraction (<= u * |w_relative| each): about 3u of the larger
+          scale, i.e. 3u * w_abs_scale.
+      (b) 2u * S, where S is ``w_kernel_scale``. The operator does not
+          compare w against the edge; it forms z = fl(fl(w - w_k) / S) and
+          tests |z| <= 1, so a row can be *in* support with an exact
+          |w - w_k| as large as S(1 + 2u). This term is about S, not about
+          w_abs_scale, so it does not shrink with the margin and must be
+          carried explicitly. (An earlier version of this comment claimed
+          "3u covers it" and omitted (b) entirely; measured, ``4 * eps`` is
+          up to 3.1x too small at the value level once (b) is counted.)
+
+    What rescues it is that (b) can only matter where nothing can be
+    dropped. A window spans 2S = W * dw and the data span
+    n_w_inner * dw, so ``max_window_size == n_rows`` -- every window holds
+    every row -- unless ``n_w_inner > W``. Whenever any window *is* a
+    strict subset, and only then is a drop possible at all,
+
+        S = (W / 2) * w_extent / n_w_inner < w_extent / 2 <= w_abs_scale / 2,
+
+    so (b) < u * w_abs_scale and (a) + (b) <= 4u * w_abs_scale, half the
+    margin. Put the other way round, which is the more intuitive
+    statement: (b) only bites when ``ulp(w_rel)`` is comparable to
+    ``2u * S``, i.e. when S approaches the whole relative-w range -- and a
+    kernel that wide is one whose windows already span every row, so there
+    is nothing left to drop. Swept over 48 plans (float64 and float32, eps 1e-3 to 1e-14,
+    w from 3e1 to 1e7 wavelengths, narrow and wide spreads): the worst
+    safety factor over the 30 strict-subset plans is 5.40, while the worst
+    over all 48 is 1.61 and occurs on a plan whose windows cover every row.
+
+    If ``w_kernel_scale`` or the plane count is ever redefined, that
+    inequality is what has to be re-derived -- the margin does not
+    self-adjust.
+
+    The extra row ``make_plan`` takes at each end is *not* a second line of defence
+    against (b); it is insurance against this derivation being wrong, and
+    it is deliberately not load-bearing. It cannot be: a single row that
+    straddles an edge is rescued by ``lo - 1`` on its own, which is why
+    ``test_windowed_dense_parity_at_window_edge`` splices the straddling w
+    into *two* adjacent rows -- that fixture fails with the margin removed
+    and the extra row kept, and passes with the margin kept and the extra
+    row removed.
+
+    In practice neither widens anything: the margin is ~1e-11 wavelengths
+    against a ``w_kernel_scale`` of order 1e2-1e4, so a window only grows
+    when a row really does sit that close to an edge.
+    """
+    w_abs_scale = max(abs(w_min_all), abs(w_max_all), w_extent)
+    return WINDOW_BOUNDARY_MARGIN_EPS * float(np.finfo(np.dtype(real_dtype)).eps) * w_abs_scale
+
+
 def _n_minus_1_grid(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> np.ndarray:
     """The ``n - 1`` image grid, ``(n_l, n_m)``, always in full float64.
 
@@ -966,79 +1058,9 @@ def make_plan(
         window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
         half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
 
-        # --- the windowed-vs-dense invariant, and why it holds by construction ---
-        #
-        # The contract (AGENTS.md sec 4) is that a window contains EVERY row the
-        # dense path gives a non-zero kernel weight, i.e. every row whose w --
-        # as the *operator* computes it on the device -- satisfies |z| <= 1.
-        #
-        # Host and device do not compute that w identically, and cannot be made
-        # to. The operator evaluates ``inv_lambda[c] * uvw_m[:, 2] - w0`` as a
-        # multiply immediately followed by a subtract, which XLA is free to
-        # contract into a single FMA: one rounding where the two numpy steps
-        # below round twice. (Before issue #23 the device subtracted ``w0`` from
-        # a *stored, already-rounded* product, so the two agreed bit for bit by
-        # construction. They no longer do: measured, they differ on ~23% of
-        # (channel, row) pairs on MWA_extended and ~18% on MeerKAT.)
-        #
-        # Chasing bit-equality is therefore the wrong fix; the right one is to
-        # make the disagreement unable to matter. The asymmetry that lets us do
-        # that: over-inclusion is free -- a row inside the slice but outside
-        # kernel support gets ``phi(|z| > 1) = 0`` and contributes exactly
-        # nothing -- while under-inclusion is a value error. So widen.
-        #
-        # ``boundary_margin`` is ``8u`` of the absolute-w scale, and what it has
-        # to dominate is a sum of two terms, not one:
-        #
-        #   (a) |device w - host w|. The device may skip the product's rounding
-        #       (<= u * |w_absolute|) and the two sides round their own
-        #       subtraction (<= u * |w_relative| each): about 3u of the larger
-        #       scale, i.e. 3u * w_abs_scale.
-        #   (b) 2u * S, where S is ``w_kernel_scale``. The operator does not
-        #       compare w against the edge; it forms z = fl(fl(w - w_k) / S) and
-        #       tests |z| <= 1, so a row can be *in* support with an exact
-        #       |w - w_k| as large as S(1 + 2u). This term is about S, not about
-        #       w_abs_scale, so it does not shrink with the margin and must be
-        #       carried explicitly. (An earlier version of this comment claimed
-        #       "3u covers it" and omitted (b) entirely; measured, ``4 * eps`` is
-        #       up to 3.1x too small at the value level once (b) is counted.)
-        #
-        # What rescues it is that (b) can only matter where nothing can be
-        # dropped. A window spans 2S = W * dw and the data span
-        # n_w_inner * dw, so ``max_window_size == n_rows`` -- every window holds
-        # every row -- unless ``n_w_inner > W``. Whenever any window *is* a
-        # strict subset, and only then is a drop possible at all,
-        #
-        #     S = (W / 2) * w_extent / n_w_inner < w_extent / 2 <= w_abs_scale / 2,
-        #
-        # so (b) < u * w_abs_scale and (a) + (b) <= 4u * w_abs_scale, half the
-        # margin. Put the other way round, which is the more intuitive
-        # statement: (b) only bites when ``ulp(w_rel)`` is comparable to
-        # ``2u * S``, i.e. when S approaches the whole relative-w range -- and a
-        # kernel that wide is one whose windows already span every row, so there
-        # is nothing left to drop. Swept over 48 plans (float64 and float32, eps 1e-3 to 1e-14,
-        # w from 3e1 to 1e7 wavelengths, narrow and wide spreads): the worst
-        # safety factor over the 30 strict-subset plans is 5.40, while the worst
-        # over all 48 is 1.61 and occurs on a plan whose windows cover every row.
-        #
-        # If ``w_kernel_scale`` or the plane count is ever redefined, that
-        # inequality is what has to be re-derived -- the margin does not
-        # self-adjust.
-        #
-        # The extra row at each end (below) is *not* a second line of defence
-        # against (b); it is insurance against this derivation being wrong, and
-        # it is deliberately not load-bearing. It cannot be: a single row that
-        # straddles an edge is rescued by ``lo - 1`` on its own, which is why
-        # ``test_windowed_dense_parity_at_window_edge`` splices the straddling w
-        # into *two* adjacent rows -- that fixture fails with the margin removed
-        # and the extra row kept, and passes with the margin kept and the extra
-        # row removed.
-        #
-        # In practice neither widens anything: the margin is ~1e-11 wavelengths
-        # against a ``w_kernel_scale`` of order 1e2-1e4, so a window only grows
-        # when a row really does sit that close to an edge.
-        w_abs_scale = max(abs(w_min_all), abs(w_max_all), w_extent)
-        boundary_margin = WINDOW_BOUNDARY_MARGIN_EPS * float(np.finfo(real_dtype).eps) * w_abs_scale
+        # The widening that makes the windowed-vs-dense invariant hold by
+        # construction; the derivation lives in ``window_boundary_margin``.
+        boundary_margin = window_boundary_margin(real_dtype, w_min_all, w_max_all, w_extent)
 
         # issue #16 follow-up: compute the boundaries in the SAME coordinate the
         # operators use for ``z``, i.e. relative to ``w0``, not in absolute
@@ -1154,4 +1176,4 @@ def make_plan(
     )
 
 
-__all__ = ["WGridderPlan", "make_plan"]
+__all__ = ["WGridderPlan", "make_plan", "window_boundary_margin"]
