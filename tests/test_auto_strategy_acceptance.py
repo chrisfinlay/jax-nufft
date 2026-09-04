@@ -52,7 +52,26 @@ def _cells() -> list[tuple[str, str, list[dict]]]:
 
 
 def _plan_stub_from_row(row: dict) -> SimpleNamespace:
-    """Reconstruct the heuristic's plan-input view from a baseline row."""
+    """Reconstruct the heuristic's plan-input view from a baseline row.
+
+    ``window_padding_overhead`` in this JSON is on the pre-v0.1.3 scale: the
+    sweep predates both the current definition (mean over all planes, not
+    only nonzero ones) and the current plan geometry (`W = 6` and no
+    ``nshift``, against 7 and centred today). The stored values are therefore
+    lower than the same fixtures measure now, and cannot be recomputed from
+    the JSON -- the per-plane ``window_size`` array is not recorded.
+
+    That does not weaken the replay, because the GPU padding gate cannot
+    bind on any cell where the two scales disagree. It is reached only after
+    ``n_w > w_kernel_width + 2``, and it decides anything only on plans with
+    ``n_rows >= _GPU_LARGE_N_ROWS``; the sole such fixture here is
+    GH200_large, which has no empty planes at any epsilon, so old and new
+    definitions agree on it to within a few percent (1.23-1.75 at zenith,
+    2.65-2.76 off-zenith -- both well clear of the 3.0 cutoff). Every other
+    fixture in the sweep is 400-600 rows and resolves to ``dense_vmap`` on
+    the row-count gate whatever the padding number says. ``_GPU_PADDING_CUTOFF``
+    is unchanged for exactly this reason; see its comment in ``wgridder.py``.
+    """
     return SimpleNamespace(
         n_w=row["n_w"],
         w_kernel_width=row["w_kernel_width"],

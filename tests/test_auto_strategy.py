@@ -30,6 +30,7 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft.wgridder import (
+    _CPU_PADDING_CUTOFF,
     _auto_w_strategy,
     _auto_w_strategy_cpu,
     _auto_w_strategy_gpu,
@@ -97,10 +98,11 @@ def test_cpu_constant_w_fast_path_picks_dense_scan(is_adjoint: bool) -> None:
 
 @pytest.mark.parametrize("is_adjoint", [False, True])
 def test_cpu_high_padding_overhead_forces_dense_scan(is_adjoint: bool) -> None:
-    """If the windowed plane builder paid >5x average overhead per plane,
-    the windowed savings disappear -- dense_scan even for the adjoint
-    at large n_w."""
-    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=7.5)
+    """Above ``_CPU_PADDING_CUTOFF`` the windowed savings are assumed gone
+    -- dense_scan even for the adjoint at large n_w."""
+    plan = _stub_plan(
+        n_w=200, w_kernel_width=8, window_padding_overhead=_CPU_PADDING_CUTOFF + 2.5
+    )
     assert _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint) == "dense_scan"
 
 
@@ -134,13 +136,31 @@ def test_cpu_adjoint_just_above_ratio_boundary_picks_windowed_scan() -> None:
 
 
 def test_cpu_padding_overhead_boundary_is_strict() -> None:
-    """The padding cutoff is strict ``>``: at exactly 5.0 we still take
-    the next branch and (because is_adjoint with large n_w) pick
+    """The padding cutoff is strict ``>``: exactly at the cutoff we still
+    take the next branch and (because is_adjoint with large n_w) pick
     windowed_scan."""
-    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=5.0)
+    plan = _stub_plan(
+        n_w=200, w_kernel_width=8, window_padding_overhead=_CPU_PADDING_CUTOFF
+    )
     assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "windowed_scan"
-    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=5.001)
+    plan = _stub_plan(
+        n_w=200, w_kernel_width=8, window_padding_overhead=_CPU_PADDING_CUTOFF + 1e-3
+    )
     assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "dense_scan"
+
+
+def test_cpu_padding_cutoff_clears_every_review_fixture() -> None:
+    """The cutoff is a guard, not a boundary real plans sit near.
+
+    5.578 is the largest ``window_padding_overhead`` over the calibration
+    grid swept in ``tests/test_padding_overhead.py`` (five fixtures, two
+    pointings, epsilon 1e-3 to 1e-12) -- MWA_extended off-zenith, which is
+    also the one fixture where the windowed adjoint is the measured CPU
+    win, so it has to stay on the windowed side.
+    """
+    assert _CPU_PADDING_CUTOFF > 5.578
+    plan = _stub_plan(n_w=251, w_kernel_width=7, window_padding_overhead=5.578)
+    assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "windowed_scan"
 
 
 # -- Part 6.3: GPU heuristic ------------------------------------------------

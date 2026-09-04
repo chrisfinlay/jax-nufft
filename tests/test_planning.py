@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import math
 
 import jax
 import jax.numpy as jnp
@@ -491,53 +490,136 @@ def test_window_builder_sum_matches_expected() -> None:
     assert total >= plan.n_rows * (W - 1)
 
 
-# Pixel size for test_window_builder_clumped_distribution. The bare 2e-3 this
-# test used before issue #16 is scaled by sqrt(2) so that the *plan geometry*
-# it measures is bit-for-bit the geometry it was written against.
+# --- w-clumping and the padding diagnostic ----------------------------------
 #
-# Why: nshift halves ``max|n-1|`` -> ``dw = x0 / max|n-1|`` doubles -> the
-# w-window count halves and each window widens. On a 64x64 image
-# ``max|n-1|`` is ``1024 * pixsize^2`` before the shift and ``512 * pixsize^2``
-# after, so ``pixsize * sqrt(2)`` restores the pre-#16 value exactly, giving
-# back the same ``n_w`` (12 clumped / 17 uniform), the same ``window_size``
-# rows, and therefore the same two padding-overhead numbers (1.7137 / 1.6757).
-# Only the sampling resolution is retuned -- the clumped-vs-uniform w geometry
-# that is actually under test is untouched, and the assertion is unchanged.
+# Two tight w-clumps 60 m apart, against a uniform w-distribution of the same
+# row count. The property under test is that
+# ``plan.window_padding_overhead`` -- the factor by which a windowed
+# traversal's row-work exceeds the irreducible work; see
+# ``tests/test_padding_overhead.py`` for the definition -- reports the
+# clumped geometry as the more expensive one.
 #
-# Left at 2e-3 the fixture drops to 3 inner planes with a kernel half-width
-# (344) wider than the whole w extent (295), i.e. every plane sees every row
-# and the clumped/uniform contrast the assertion is about no longer exists.
-# That contrast is in any case not monotone in resolution (measured on this
-# fixture: it holds at inner = 5/10 and at 182/347, but not at 10/19 or
-# 40/76, because ``window_padding_overhead`` excludes empty windows and a
-# well-resolved clumped distribution is all-or-nothing windows with overhead
-# ~1.0). Making this a robust invariant rather than a fixture-specific
-# heuristic is out of scope here; see the note in the issue #16 PR.
-_CLUMPED_PIXSIZE = 2e-3 * math.sqrt(2.0)
+# That is only true once the plane grid resolves the clumps, and the
+# crossover is exact rather than a matter of taste. Write ``f`` for the
+# fraction of rows in the largest clump and ``W`` for the kernel width. Once
+# the kernel support is narrower than the clump separation, the widest window
+# holds one whole clump, ``f * n_rows``, while the mean over all ``n_w``
+# planes is ``n_rows * W / n_w`` (every row lands in ``W`` planes), so
+#
+#     overhead_clumped  ~=  f * n_w / W.
+#
+# A uniform distribution has near-equal windows apart from the ``W``-plane
+# ramp at each end, giving ``overhead_uniform ~= n_w / (n_w - W)``, which
+# decays to 1 as the grid refines. With ``f = 1/2`` the two cross at exactly
+# ``n_w = 3W``. Below that the *clumped* plan is the flatter of the two --
+# every plane sees both clumps, so its windows are uniformly full -- and the
+# assertion legitimately fails. That is a property of the geometry, not a
+# defect in the diagnostic, so the sweep below starts above the crossover
+# (at ``n_w >= 4W``, asserted per case) and the assertion holds at every
+# resolution from there up.
+#
+# Measured on this fixture (epsilon 1e-6, W = 7):
+#
+#     pixsize   n_w    clumped   f*n_w/W    uniform
+#     6e-3       29      2.071     2.071      1.312
+#     8e-3       47      3.356     3.357      1.393
+#     1.2e-2    101      7.212     7.214      1.603
+#     1.6e-2    189     13.428    13.500      1.770
+#
+# The old nonzero-window mean produced 1.142 / 1.214 / 1.571 / 2.131 for the
+# same four plans: it understates the true waste by up to 6x, and it puts
+# the clumped plan *below* the uniform one at three of the four. That is
+# what issue #16 ran into, and why it reached for a fixture tweak (a pixsize
+# scaled by sqrt(2), restoring the pre-nshift plane count so the two
+# hard-coded numbers came back) rather than an invariant. The tweak is gone;
+# this sweep replaces it.
+_CLUMP_PIXSIZES = (6e-3, 8e-3, 1.2e-2, 1.6e-2)
+_CLUMP_ROWS = 400
+_CLUMP_OFFSET_M = 30.0
+_CLUMP_SIGMA_M = 0.5
+_CLUMP_PEAK_FRACTION = 0.5  # two equal clumps
+_CLUMP_FREQ = np.array([1.4e9])
 
 
-def test_window_builder_clumped_distribution() -> None:
-    """A clumped w-distribution should produce a high padding overhead."""
+def _clumped_and_uniform_uvw() -> tuple[np.ndarray, np.ndarray]:
+    """``(clumped, uniform)`` uvw arrays sharing a draw order with the seed."""
     rng = np.random.default_rng(2)
-    n_rows = 400
-    # Two tight clumps in w: padding overhead should be large because most
-    # planes have ~0 rows while the two clump-overlapping planes hold many.
-    uvw = np.zeros((n_rows, 3))
-    uvw[:, 0] = rng.uniform(-100, 100, n_rows)
-    uvw[:, 1] = rng.uniform(-100, 100, n_rows)
+    n_rows = _CLUMP_ROWS
+    clumped = np.zeros((n_rows, 3))
+    clumped[:, 0] = rng.uniform(-100, 100, n_rows)
+    clumped[:, 1] = rng.uniform(-100, 100, n_rows)
     half = n_rows // 2
-    uvw[:half, 2] = rng.normal(loc=-30.0, scale=0.5, size=half)
-    uvw[half:, 2] = rng.normal(loc=+30.0, scale=0.5, size=n_rows - half)
-    freq = np.array([1.4e9])
-    plan_clumped = make_plan(uvw, freq, (64, 64), _CLUMPED_PIXSIZE, _CLUMPED_PIXSIZE, epsilon=1e-6)
+    clumped[:half, 2] = rng.normal(-_CLUMP_OFFSET_M, _CLUMP_SIGMA_M, half)
+    clumped[half:, 2] = rng.normal(+_CLUMP_OFFSET_M, _CLUMP_SIGMA_M, n_rows - half)
+    uniform = rng.uniform(-2.0 * _CLUMP_OFFSET_M, 2.0 * _CLUMP_OFFSET_M, size=(n_rows, 3))
+    return clumped, uniform
 
-    uvw_uniform = rng.uniform(-60.0, 60.0, size=(n_rows, 3))
-    plan_uniform = make_plan(
-        uvw_uniform, freq, (64, 64), _CLUMPED_PIXSIZE, _CLUMPED_PIXSIZE, epsilon=1e-6
+
+def _clump_plan(uvw: np.ndarray, pixsize: float) -> WGridderPlan:
+    return make_plan(uvw, _CLUMP_FREQ, (64, 64), pixsize, pixsize, epsilon=1e-6)
+
+
+@pytest.mark.parametrize("pixsize", _CLUMP_PIXSIZES)
+def test_window_builder_clumped_distribution(pixsize: float) -> None:
+    """A clumped w-distribution pays more windowed padding than a uniform one."""
+    clumped_uvw, uniform_uvw = _clumped_and_uniform_uvw()
+    plan_clumped = _clump_plan(clumped_uvw, pixsize)
+    plan_uniform = _clump_plan(uniform_uvw, pixsize)
+
+    # Preconditions, asserted rather than skipped: if a planning change moves
+    # this fixture below the crossover the sweep stops testing what it claims
+    # to, and that should be a failure, not a silently vacuous pass.
+    width = plan_clumped.w_kernel_width
+    assert plan_clumped.n_w >= 4 * width
+    # Kernel support narrower than the clump separation, so no single plane
+    # can see both clumps -- the condition behind ``f * n_w / W``.
+    lam = _CLUMP_FREQ[0] / SPEED_OF_LIGHT
+    assert plan_clumped.w_kernel_scale < _CLUMP_OFFSET_M * lam
+
+    assert plan_clumped.window_padding_overhead > plan_uniform.window_padding_overhead
+
+    # ... and it is high for the reason claimed: one clump fills the widest
+    # window while the empty planes between them drag the mean down.
+    predicted = _CLUMP_PEAK_FRACTION * plan_clumped.n_w / width
+    assert plan_clumped.window_padding_overhead == pytest.approx(predicted, rel=0.02)
+    assert plan_clumped.max_window_size == pytest.approx(
+        _CLUMP_PEAK_FRACTION * _CLUMP_ROWS, rel=0.05
     )
 
-    # Padding overhead should be noticeably higher for the clumped case.
-    assert plan_clumped.window_padding_overhead > plan_uniform.window_padding_overhead
+    # The uniform plan stays O(1): its windows differ only by the end ramp.
+    assert plan_uniform.window_padding_overhead < 2.0
+
+
+def test_window_padding_overhead_grows_as_clumps_resolve() -> None:
+    """Past the crossover, refining the grid raises the clumped overhead.
+
+    Once each clump sits inside its own windows, further refinement only
+    inserts empty planes between them: ``n_w`` grows, ``max_window_size``
+    stays pinned to one clump, and a windowed traversal really does pay more
+    per useful row. The diagnostic has to say so and keep separating from
+    the uniform plan, which stays O(1) throughout. The old nonzero-window
+    mean rose too, but so slowly (1.14 -> 2.13 across this sweep) that it
+    stayed below the uniform plan for most of it.
+
+    Below the crossover the overhead can legitimately fall -- a plane that
+    stops straddling both clumps halves ``max_window_size`` -- so the sweep
+    stays in the resolved regime.
+    """
+    clumped_uvw, uniform_uvw = _clumped_and_uniform_uvw()
+    clumped = [
+        _clump_plan(clumped_uvw, px).window_padding_overhead for px in _CLUMP_PIXSIZES
+    ]
+    uniform = [
+        _clump_plan(uniform_uvw, px).window_padding_overhead for px in _CLUMP_PIXSIZES
+    ]
+
+    assert clumped == sorted(clumped)
+    assert clumped[0] > 1.0
+    # Roughly a doubling per resolution step here, so an order of magnitude
+    # over the sweep; the uniform plan meanwhile stays within a factor of 2
+    # of no padding at all.
+    assert clumped[-1] > 5.0 * clumped[0]
+    assert all(1.0 <= value < 2.0 for value in uniform)
 
 
 def test_plan_sample_consistency() -> None:

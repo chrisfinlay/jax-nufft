@@ -413,6 +413,16 @@ the sorted array that falls inside the kernel support. New strategies
 fields `sort_perm`, `uvw_lambda_sorted`, `window_start`, `window_size`,
 `max_window_size`, `window_padding_overhead` support this. No explicit
 mask: the kernel weight `phi(z)` is zero outside the support.
+`window_padding_overhead` is `max_window_size / window_size.mean()` with
+the mean over **every** `(channel, plane)` pair, empty planes included:
+the per-plane slice shape is static, so it is exactly the factor by which
+windowed row-work exceeds the irreducible `window_size.sum()`. It is `>=
+1`, rises monotonically as the plane grid resolves a peaked
+`w`-distribution, and converges to `w_extent * max_w_density`. Through
+v0.1.2 the mean skipped empty windows, which understated the cost and was
+non-monotone in resolution; `_CPU_PADDING_CUTOFF` in `wgridder.py` (5.0 ->
+8.0) is restated on the new scale, and benchmark JSON from v0.1.2 or
+earlier records the old one.
 
 **Measured wins** (Mac M-series CPU, eps=1e-6):
 * Part 1: 1.05–1.62x across telescopes/pointings (forward + adjoint).

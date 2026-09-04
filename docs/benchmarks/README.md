@@ -66,7 +66,7 @@ metadata. Stable keys (the merge script in v0.1.3+ keys joins by these):
 | `n_pix`            | `int`   | Image side                                                        |
 | `n_w`              | `int`   | From `plan.n_w`                                                   |
 | `w_kernel_width`   | `int`   | From `plan.w_kernel_width` (the spreading-kernel half-width, set by `epsilon`). Added in Part 6.1 so the auto-strategy heuristic can be validated against the JSON without re-deriving plan-internal quantities. |
-| `window_padding_overhead` | `float` | From `plan.window_padding_overhead` (= `max_window_size / mean_window_size`). Added in Part 6.1; gates the windowed-vs-dense choice in the heuristic. |
+| `window_padding_overhead` | `float` | From `plan.window_padding_overhead` (= `max_window_size / window_size.mean()`, the mean over all `(channel, plane)` pairs). Added in Part 6.1; gates the windowed-vs-dense choice in the heuristic. **Scale change:** through v0.1.2 the mean skipped empty windows, so values recorded in `v0.1.2-baseline-gpu.json` are on the old scale and read lower than the same plan would today. Compare across files only within one scale. |
 | `is_constant_w`    | `bool`  | From `plan.is_constant_w`                                         |
 | `median_s`         | `float` | Time-harness median seconds                                       |
 | `min_s`            | `float` | Time-harness min seconds                                          |

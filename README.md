@@ -190,8 +190,8 @@ w-plane traversal has four strategies (`dense_scan` default, `dense_vmap`,
 visibility on every w-plane and rely on the kernel zeroing out non-
 contributing rows; the windowed variants take a contiguous slice of
 visibilities (after sorting by `w`) per plane, cutting the spread cost
-to roughly `p * n_rows * W^3` where `p ~ 1.5-3` is the window padding
-overhead. See *Strategy options* below for the trade-offs. Channel
+to roughly `p * n_rows * W^3` where `p ~ 1.1-5.6` on the review fixtures
+is the window padding overhead. See *Strategy options* below for the trade-offs. Channel
 traversal independently supports `scan` (default) or `vmap`.
 
 ### Adjoint operator (`vis2dirty`)
@@ -356,9 +356,31 @@ names are kept as deprecated aliases:
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
 
 For the windowed strategies, the plan exposes
-`plan.window_padding_overhead = max_window_size / mean_window_size` as a
-diagnostic. Pathological `w`-distributions can drive this above ~3, at
-which point dense strategies usually win on absolute time.
+
+```
+plan.window_padding_overhead = max_window_size / window_size.mean()
+```
+
+as a diagnostic, with the mean over **every** `(channel, w-plane)` pair,
+empty planes included. Each plane slices a fixed `max_window_size` rows
+(the shape must be static for `scan` / `vmap`), so this is exactly the
+factor by which a windowed traversal's row-work
+`n_chan * n_w * max_window_size` exceeds the `window_size.sum()` rows that
+carry a nonzero kernel weight: `1.0` means no waste, `p` means `p` times
+the necessary work. It is `>= 1` by construction, and for a fine plane
+grid it converges to `w_extent * max_w_density` -- a resolution-free
+measure of how peaked the `w`-distribution is, `~1` for a uniform one.
+
+Peaked (clumped) `w`-distributions drive it up without bound: the two-clump
+fixture in `tests/test_planning.py` reaches 13x. On the five review
+fixtures it spans 1.08-5.58 across pointings and `epsilon` from 1e-3 to
+1e-12, the top of that range being `MWA_extended` off-zenith.
+
+> Changed in v0.1.3: the mean previously skipped empty windows. That
+> understated the cost (empty planes are still sliced) and was
+> non-monotone in resolution -- on a clumped distribution it *fell* back
+> towards 1.0 as the padding waste grew. Recorded values in benchmark JSON
+> from v0.1.2 and earlier are on the old scale and are not comparable.
 
 #### `w_strategy="auto"` (v0.1.2+, opt-in)
 
@@ -373,7 +395,10 @@ on the same plan. The heuristic is **platform-aware**
 - **CPU.** Conservative: never picks a windowed forward (no measured
   win on the v0.1.1 algorithm), and only picks `windowed_scan` on the
   adjoint when `n_w / w_kernel_width > 2` and the windowed padding
-  overhead is below 5x. Otherwise `dense_scan`.
+  overhead is below 8x. Otherwise `dense_scan`. (The cutoff was 5x
+  against the pre-v0.1.3 definition of the overhead; restating it on the
+  new scale leaves every strategy choice on the review fixtures
+  unchanged.)
 - **GPU** (tuned on the GH200 baseline sweep). Never picks a `_scan`
   variant (5-30x slower than `_vmap` there). Picks `windowed_vmap` only
   on large-row plans (`n_rows >= 10000`) with padding overhead below 3x
@@ -842,8 +867,13 @@ jax-nufft value proposition is differentiability and the GPU port
 - **`dense_vmap`** allocates `O(n_w * image_size)` but is usually the
   fastest of the four on CPU at the tested scales.
 - **`windowed_scan`** matches `dense_scan` memory and helps on the
-  adjoint when `n_w >> W` and the `w`-distribution is reasonably
-  uniform (`plan.window_padding_overhead < ~3`).
+  adjoint when `n_w >> W` and the `w`-distribution is not sharply
+  peaked. A high `plan.window_padding_overhead` is a warning sign, but
+  read it against `n_w / w_kernel_width`: what decides the win is
+  `max_window_size / n_rows`, so a plan with a large `n_w` can carry a
+  high overhead and still be a clear windowed win (`MWA_extended`
+  off-zenith: overhead 5.1, but each plane touches 14% of the rows a
+  dense plane does).
 - **`windowed_vmap`** is the high-memory variant of the windowed path;
   marginal wins on most cases, kept primarily for GPU parity.
 

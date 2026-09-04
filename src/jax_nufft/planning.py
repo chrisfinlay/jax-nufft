@@ -97,8 +97,16 @@ class WGridderPlan:
     nshift: float
     # v0.1.1 windowed-scan fields:
     # ``max_window_size`` is the worst-case live-window length across all
-    # (channel, plane) pairs; ``window_padding_overhead`` is
-    # ``max_window_size / mean_window_size`` and is purely diagnostic.
+    # (channel, plane) pairs. ``window_padding_overhead`` is
+    # ``max_window_size / window_size.mean()`` with the mean taken over
+    # *every* (channel, plane) pair, empty planes included: it is exactly
+    # the factor by which a windowed strategy's row-work
+    # (``n_chan * n_w * max_window_size``, since the per-plane slice shape
+    # is static) exceeds the irreducible ``window_size.sum()``. 1.0 means
+    # every plane's window is the same length and the windowed traversal
+    # wastes nothing; ``p`` means it does ``p`` times the necessary work.
+    # Read by ``wgridder._auto_w_strategy``; also reported by the benchmark
+    # harness.
     max_window_size: int
     window_padding_overhead: float
     # v0.1.2 w-degeneracy metadata:
@@ -554,6 +562,7 @@ def make_plan(
         window_start_np = np.zeros((n_chan, 1), dtype=np.int32)
         window_size_np = np.full((n_chan, 1), n_rows, dtype=np.int32)
         max_window_size = max(n_rows, 1)
+        # One plane, one window covering every row: no padding at all.
         window_padding_overhead = 1.0
     else:
         # --- number of w-planes ---
@@ -654,13 +663,40 @@ def make_plan(
             window_size_np[c] = (hi - lo).astype(np.int32)
 
         max_window_size = int(window_size_np.max(initial=0))
-        # mean_window_size: ignore empty windows (entirely outside data range)
-        # so that the diagnostic isn't dominated by edge planes.
-        nonzero_windows = window_size_np[window_size_np > 0]
-        if nonzero_windows.size:
-            mean_window_size = float(nonzero_windows.mean())
-            window_padding_overhead = max_window_size / mean_window_size
+        # --- padding overhead: what the windowed strategies actually pay ---
+        # Every (channel, plane) step slices a *static* ``max_window_size``
+        # rows out of the sorted array, so a windowed traversal touches
+        # ``n_chan * n_w * max_window_size`` rows against an irreducible
+        # ``window_size.sum()``. The ratio of the two is
+        # ``max_window_size / window_size.mean()`` with the mean over ALL
+        # planes -- empty ones included, because a plane with no live rows
+        # still costs a full-width slice.
+        #
+        # Up to v0.1.2 the mean excluded empty windows, on the reasoning
+        # that edge planes shouldn't dominate a diagnostic. But refining
+        # ``dw`` on a clumped w-distribution turns partially-filled windows
+        # into all-or-nothing ones, so the nonzero mean climbs towards the
+        # peak and the ratio stays near 1.0 exactly as the padding waste
+        # grows. Measured on the two-clump fixture in
+        # ``tests/test_planning.py``, over a resolution sweep from 29 to 189
+        # planes: the old ratio reads 1.14 -> 2.13 where the true
+        # windowed/irreducible work ratio is 2.07 -> 13.43, and at three of
+        # those four resolutions it puts the clumped plan *below* a uniform
+        # one (1.31 -> 1.77) -- the inversion that made the old assertion in
+        # that test hold or fail depending on the plane count.
+        #
+        # Including empty planes both matches the cost model and gives the
+        # diagnostic a limit: for fine ``dw`` it converges to
+        # ``w_extent * max_w_density``, a resolution-free measure of how
+        # peaked the w-distribution is (1.0 for a uniform one).
+        total_live_rows = int(window_size_np.sum())
+        if total_live_rows > 0:
+            window_padding_overhead = (
+                max_window_size * window_size_np.size / total_live_rows
+            )
         else:
+            # No live rows anywhere (unreachable for real data: every row
+            # falls inside at least one plane's support by construction).
             window_padding_overhead = 1.0
         # Clamp max_window_size to at least 1 so the static dynamic_slice
         # shape is well-defined (e.g. n_rows >= 1 always).

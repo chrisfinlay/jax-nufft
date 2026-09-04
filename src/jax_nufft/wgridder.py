@@ -231,6 +231,44 @@ def _resolve_nthreads(
     return 0
 
 
+# Padding-overhead cutoff for the CPU heuristic: above this, windowed
+# traversal is assumed to waste more on padded plane rows than it saves by
+# shortening them, so ``auto`` stays on ``dense_scan``.
+#
+# This was 5.0 while ``window_padding_overhead`` averaged over *nonzero*
+# windows only. Averaging over all planes (the cost the windowed strategies
+# actually pay) raises the number on any plan with empty planes, so the
+# cutoff is restated on the new scale. Measured over the five review
+# fixtures x two pointings x epsilon in {1e-3, 1e-6, 1e-9, 1e-12} (40 plans;
+# `tests/test_padding_overhead.py` pins the summary):
+#
+#   * 38 of the 40 sit at or below 3.2 on either definition.
+#   * The two exceptions are both MWA_extended off30, the one fixture where
+#     the windowed adjoint is the measured CPU win (AGENTS.md section 9):
+#     3.62-4.47 on the old scale, 5.11-5.58 on the new one. Leaving the
+#     cutoff at 5.0 would have flipped exactly that cell to ``dense_scan``.
+#
+# 8.0 is ~1.43x above the largest measured value, matching the margin the
+# old 5.0 had over the old scale's 4.47 -- i.e. still a guard against
+# pathological w-distributions rather than a boundary any real fixture
+# approaches. Nothing in this repository's calibration set reaches it, and
+# the ``auto`` choice on all 40 plans is identical to the pre-redefinition
+# one.
+#
+# Shape, not just scale, is the weaker part of this gate: what decides
+# windowed-vs-dense is the *work ratio* ``max_window_size / n_rows``, which
+# on the new definition is ``window_padding_overhead * w_kernel_width / n_w``
+# up to edge effects -- so a plan with a high overhead and a very large
+# ``n_w / w_kernel_width`` (MWA_extended off30: overhead 5.1, ratio 36,
+# windowed touching 14% of dense's rows) is a windowed win despite the high
+# overhead. Replacing the absolute cutoff with that ratio reproduces all 40
+# calibration decisions, but puts three of them (MWA_compact off30, MeerKAT
+# off30, GH200_large zenith) within 5% of the boundary, where a heuristic
+# should not be. Left as an absolute cutoff until there are CPU
+# measurements on the far side of it.
+_CPU_PADDING_CUTOFF = 8.0
+
+
 def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     """CPU-tuned heuristic from ``docs/v0.1.2-plan.md`` Part 4.
 
@@ -242,15 +280,15 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
         algorithm, so we never auto-pick a windowed forward.
 
     A high ``window_padding_overhead`` means windowed traversal would
-    waste enough cycles on padded plane rows that dense wins -- the 5x
-    cutoff is conservative.
+    waste enough cycles on padded plane rows that dense wins; see
+    :data:`_CPU_PADDING_CUTOFF` for where the cutoff sits and why.
 
     The constant-w fast path collapses ``n_w`` to one, so the
     small-``n_w`` branch always picks ``dense_scan`` there.
     """
     if plan.n_w <= plan.w_kernel_width + 2:
         return "dense_scan"
-    if plan.window_padding_overhead > 5.0:
+    if plan.window_padding_overhead > _CPU_PADDING_CUTOFF:
         return "dense_scan"
     if is_adjoint and plan.n_w / plan.w_kernel_width > 2.0:
         return "windowed_scan"
@@ -263,6 +301,12 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 # work); the windowed_vmap wins only on the GH200_large (50k-row)
 # fixture where dense_vmap's per-plane n_rows*W^2 starts to bite.
 _GPU_LARGE_N_ROWS = 10_000
+# Unlike the CPU cutoff above, this one is unchanged by the padding-overhead
+# redefinition: the gate can only bind on plans with ``n_rows >= 10_000``,
+# which on this calibration set means GH200_large alone, and that fixture has
+# no empty planes at any epsilon (0% at 1e-3/1e-9/1e-12, 10% at 1e-6 on the
+# zenith pointing) -- old and new definitions give 2.65-2.76 off-zenith and
+# 1.23-1.75 at zenith, the same side of 3.0 either way.
 _GPU_PADDING_CUTOFF = 3.0
 _GPU_FORWARD_RATIO_CUTOFF = 3.0
 
