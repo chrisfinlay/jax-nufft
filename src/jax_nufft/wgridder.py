@@ -303,10 +303,11 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 _GPU_LARGE_N_ROWS = 10_000
 # Unlike the CPU cutoff above, this one is unchanged by the padding-overhead
 # redefinition: the gate can only bind on plans with ``n_rows >= 10_000``,
-# which on this calibration set means GH200_large alone, and that fixture has
-# no empty planes at any epsilon (0% at 1e-3/1e-9/1e-12, 10% at 1e-6 on the
-# zenith pointing) -- old and new definitions give 2.65-2.76 off-zenith and
-# 1.23-1.75 at zenith, the same side of 3.0 either way.
+# which on this calibration set means GH200_large alone. Seven of its eight
+# pointing/epsilon cells have no empty planes, so the definitions agree
+# exactly; the zenith, epsilon=1e-9 cell is 7.7% empty and moves from 1.20 to
+# 1.30. All eight remain well below the 3.0 cutoff (the off-zenith cells are
+# 2.65-2.76), so the redefinition cannot change the selected strategy.
 _GPU_PADDING_CUTOFF = 3.0
 _GPU_FORWARD_RATIO_CUTOFF = 3.0
 

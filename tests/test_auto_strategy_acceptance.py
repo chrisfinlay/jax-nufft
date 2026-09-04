@@ -65,12 +65,13 @@ def _plan_stub_from_row(row: dict) -> SimpleNamespace:
     bind on any cell where the two scales disagree. It is reached only after
     ``n_w > w_kernel_width + 2``, and it decides anything only on plans with
     ``n_rows >= _GPU_LARGE_N_ROWS``; the sole such fixture here is
-    GH200_large, which has no empty planes at any epsilon, so old and new
-    definitions agree on it to within a few percent (1.23-1.75 at zenith,
-    2.65-2.76 off-zenith -- both well clear of the 3.0 cutoff). Every other
-    fixture in the sweep is 400-600 rows and resolves to ``dense_vmap`` on
-    the row-count gate whatever the padding number says. ``_GPU_PADDING_CUTOFF``
-    is unchanged for exactly this reason; see its comment in ``wgridder.py``.
+    GH200_large. Seven of its eight cells have no empty planes; the remaining
+    zenith cell moves only from 1.20 to 1.30 under the new definition. All are
+    well clear of the 3.0 cutoff (the off-zenith cells are 2.65-2.76). Every
+    other fixture in the sweep is 400-600 rows and resolves to ``dense_vmap``
+    on the row-count gate whatever the padding number says.
+    ``_GPU_PADDING_CUTOFF`` is unchanged for exactly this reason; see its
+    comment in ``wgridder.py``.
     """
     return SimpleNamespace(
         n_w=row["n_w"],

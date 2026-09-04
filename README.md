@@ -390,8 +390,8 @@ empty planes included. Each plane slices a fixed `max_window_size` rows
 factor by which a windowed traversal's row-work
 `n_chan * n_w * max_window_size` exceeds the `window_size.sum()` rows that
 carry a nonzero kernel weight: `1.0` means no waste, `p` means `p` times
-the necessary work. It is `>= 1` by construction, and for a fine plane
-grid it converges to `w_extent * max_w_density` -- a resolution-free
+the necessary work. For samples from a continuous density and a fine plane
+grid, it converges to `w_extent * max_w_density` -- a resolution-free
 measure of how peaked the `w`-distribution is, `~1` for a uniform one.
 
 Peaked (clumped) `w`-distributions drive it up without bound: the two-clump

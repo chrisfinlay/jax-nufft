@@ -852,9 +852,10 @@ def make_plan(
         # that test hold or fail depending on the plane count.
         #
         # Including empty planes both matches the cost model and gives the
-        # diagnostic a limit: for fine ``dw`` it converges to
-        # ``w_extent * max_w_density``, a resolution-free measure of how
-        # peaked the w-distribution is (1.0 for a uniform one).
+        # diagnostic a limit for samples from a continuous density: for fine
+        # ``dw`` it converges to ``w_extent * max_w_density``, a
+        # resolution-free measure of how peaked that density is (1.0 for a
+        # uniform one). Discrete clumps instead keep growing as they resolve.
         total_live_rows = int(window_size_np.sum())
         if total_live_rows > 0:
             window_padding_overhead = (

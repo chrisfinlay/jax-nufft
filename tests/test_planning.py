@@ -642,9 +642,9 @@ def test_window_builder_sum_matches_expected() -> None:
 #
 #     pixsize   n_w    clumped   f*n_w/W    uniform
 #     6e-3       29      2.071     2.071      1.312
-#     8e-3       47      3.356     3.357      1.393
-#     1.2e-2    101      7.212     7.214      1.603
-#     1.6e-2    189     13.428    13.500      1.770
+#     8e-3       47      3.357     3.357      1.393
+#     1.2e-2    101      7.212     7.214      1.602
+#     1.6e-2    189     13.428    13.500      1.769
 #
 # The old nonzero-window mean produced 1.142 / 1.214 / 1.571 / 2.131 for the
 # same four plans: it understates the true waste by up to 6x, and it puts

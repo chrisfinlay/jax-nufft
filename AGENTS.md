@@ -448,8 +448,9 @@ mask: the kernel weight `phi(z)` is zero outside the support.
 the mean over **every** `(channel, plane)` pair, empty planes included:
 the per-plane slice shape is static, so it is exactly the factor by which
 windowed row-work exceeds the irreducible `window_size.sum()`. It is `>=
-1`, rises monotonically as the plane grid resolves a peaked
-`w`-distribution, and converges to `w_extent * max_w_density`. Through
+1`, tends to rise as the plane grid resolves a peaked `w`-distribution,
+and converges to `w_extent * max_w_density` for a continuous density.
+Small non-monotonic steps are possible as window boundaries move. Through
 v0.1.2 the mean skipped empty windows, which understated the cost and was
 non-monotone in resolution; `_CPU_PADDING_CUTOFF` in `wgridder.py` (5.0 ->
 8.0) is restated on the new scale, and benchmark JSON from v0.1.2 or

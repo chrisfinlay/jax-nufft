@@ -19,9 +19,9 @@ Two things follow, and they are what the rest of this module pins:
 
 * it is bounded below by 1.0, with equality iff every plane's window has
   the same length; and
-* on a peaked w-distribution it keeps rising as the plane grid refines --
-  each new plane between the peaks is empty, and the widest window does
-  not shrink.
+* on a peaked w-distribution it tends to rise as the plane grid refines --
+  new planes between the peaks are empty while the widest window stays near
+  a clump size. Small dips remain possible when window boundaries move.
 
 The second point is why the definition changed in v0.1.3. Averaging over
 nonzero windows only -- the pre-v0.1.3 convention -- systematically
@@ -106,6 +106,14 @@ def test_padding_overhead_is_the_windowed_work_ratio(zenith_angle_deg: float) ->
     """
     plan = _plan_for(MWA_EXTENDED, zenith_angle_deg, 1e-3)
     window_size = np.asarray(plan.window_size)
+
+    # The off-zenith case is specifically a regression fixture for including
+    # empty windows in the mean. Keep that precondition explicit so fixture
+    # drift cannot make the new and old definitions coincide and leave the
+    # test vacuous. (At zenith, float64 has one empty edge window but float32
+    # rounding makes it nonempty, so that is not a precision-stable guard.)
+    if zenith_angle_deg == 30.0:
+        assert np.any(window_size == 0)
 
     windowed_row_work = plan.n_chan * plan.n_w * plan.max_window_size
     irreducible_row_work = int(window_size.sum())
