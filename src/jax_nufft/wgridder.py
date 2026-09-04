@@ -465,16 +465,59 @@ def _w_relative(w_absolute: Array, plan: WGridderPlan) -> Array:
     the *absolute* w. The constant part that is factored out this way is
     ``plan.w0_screen`` (see ``planning.make_plan``).
 
-    Kept as a subtraction at the JIT boundary rather than as extra pre-shifted
-    plan leaves for two reasons: ``plan.w_centers`` and ``plan.uvw_lambda``
-    keep their documented absolute-wavelength semantics (the window builder and
-    the w-coverage tests read them), and in float64 the subtraction is exact --
+    Kept as a subtraction here rather than as an extra pre-shifted plan leaf
+    for two reasons: the plan's stored baselines keep their documented
+    absolute semantics (``uvw_m`` in metres, scaled by ``inv_lambda`` -- see
+    :func:`_channel_ft_coords`), and in float64 the subtraction is exact --
     the operands are within one w-extent of each other, which is Sterbenz's
     condition -- so deferring it costs no accuracy. A float32 plan does lose
     resolution here, but only the resolution its absolute w already lacked
     (issue #13).
     """
     return w_absolute - plan.w0
+
+
+def _channel_ft_coords(
+    uvw_m: Array,
+    inv_lambda_c: Array,
+    plan: WGridderPlan,
+) -> tuple[Array, Array, Array]:
+    """Derive one channel's ``(u_ft, v_ft, w_rel)`` from the stored leaves.
+
+    issue #23: the plan stores the baselines exactly once, in metres and in
+    whatever row order the caller hands this function (``plan.uvw_m``, or its
+    ``sort_perm`` gather for the windowed helpers), plus one scalar per
+    channel, ``inv_lambda[c] = freq[c] / c``. The three per-channel arrays the
+    operators actually consume are rebuilt here instead of being stored:
+
+        u_ft  = (2π · pixsize_l · inv_lambda[c]) · uvw_m[:, 0]
+        v_ft  = (2π · pixsize_m · inv_lambda[c]) · uvw_m[:, 1]
+        w     =  inv_lambda[c] · uvw_m[:, 2]
+
+    ``pixsize_l`` / ``pixsize_m`` are static plan fields, so ``2π · pixsize_*``
+    is folded at trace time and each line is one scalar-times-vector multiply:
+    three multiplies per row per channel, invisible next to the ``n_w`` NUFFTs
+    that follow. What it replaces is four ``(n_chan, n_rows)``-or-larger plan
+    leaves -- ``uvw_lambda``, ``uvw_lambda_sorted``, ``u_finufft``,
+    ``v_finufft`` -- i.e. 8 float64 per (channel, row) of which only these
+    4 were ever read.
+
+    Note the ordering: the two scalars are multiplied together *first* and the
+    row vector last, so the per-row cost stays at a single multiply rather than
+    two. That reassociates ``(2π · pixsize) · (inv_lambda · uvw)`` --  what
+    v0.1.2 stored -- by a ulp or so, which is a rounding-level change to a
+    FINUFFT input coordinate and does not move the accuracy sweep. ``w`` is a
+    single multiply either way, so it is bit-identical to the removed
+    ``uvw_lambda[..., 2]``.
+
+    The w that comes back is already relative to ``plan.w0``
+    (:func:`_w_relative`); the plane loop uses no other form.
+    """
+    two_pi = 2.0 * jnp.pi
+    u_ft = (two_pi * plan.pixsize_l * inv_lambda_c) * uvw_m[:, 0]
+    v_ft = (two_pi * plan.pixsize_m * inv_lambda_c) * uvw_m[:, 1]
+    w_rel = _w_relative(inv_lambda_c * uvw_m[:, 2], plan)
+    return u_ft, v_ft, w_rel
 
 
 def _apply_nshift_compensation(
@@ -530,24 +573,24 @@ def _apply_nshift_compensation(
 
 def _channel_forward(
     image_c: Array,
-    u_ft_c: Array,
-    v_ft_c: Array,
-    w_rel_c: Array,
+    uvw_m: Array,
+    inv_lambda_c: Array,
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
 ) -> Array:
     """Forward operator for a single channel: image (n_l, n_m) -> vis (n_rows,).
 
-    ``u_ft_c`` / ``v_ft_c`` are the precomputed FINUFFT input coordinates for
-    this channel (``2π · pixsize_* · uvw_lambda[c, :, 0|1]``); ``w_rel_c`` is
-    the per-channel w-component in wavelengths *relative to ``plan.w0``*
-    (see :func:`_w_relative`), used for the kernel z, the plane phase and the
-    nshift compensation. The absolute part of w is carried by
-    ``plan.w0_screen`` and never enters this function.
+    ``uvw_m`` is the plan's baselines in metres, in input row order, shared by
+    every channel; ``inv_lambda_c`` is this channel's ``freq / c``. The FINUFFT
+    input coordinates and the w-component in wavelengths *relative to
+    ``plan.w0``* are derived from the pair by :func:`_channel_ft_coords`. The
+    absolute part of w is carried by ``plan.w0_screen`` and never enters this
+    function.
     """
     two_pi = 2.0 * jnp.pi
     cdtype = image_c.dtype
+    u_ft_c, v_ft_c, w_rel_c = _channel_ft_coords(uvw_m, inv_lambda_c, plan)
     n_rows = u_ft_c.shape[0]
 
     def w_plane_contribution(w_k: Array) -> Array:
@@ -585,9 +628,8 @@ def _channel_forward(
 
 def _channel_forward_windowed(
     image_c: Array,
-    u_finufft_c: Array,
-    v_finufft_c: Array,
-    w_rel_sorted_c: Array,
+    uvw_m_sorted: Array,
+    inv_lambda_c: Array,
     window_start_c: Array,
     plan: WGridderPlan,
     opts: Opts,
@@ -601,23 +643,20 @@ def _channel_forward_windowed(
     inside the slice but outside the kernel's natural support pick up
     ``phi(z) = 0`` automatically, so no explicit mask is needed.
 
-    ``u_finufft_c`` / ``v_finufft_c`` are the precomputed FINUFFT coords
-    for this channel in **input** row order; ``w_rel_sorted_c`` is the
-    w-component in wavelengths relative to ``plan.w0``
-    (see :func:`_w_relative`), already in sorted-row order
-    (``plan.uvw_lambda_sorted[c, :, 2] - plan.w0``).
+    ``uvw_m_sorted`` is ``plan.uvw_m[plan.sort_perm]`` -- the baselines in
+    metres, in **sorted** row order. The sort is by w in metres, so that
+    permutation is channel-independent and the caller gathers it once for the
+    whole call rather than once per channel (issue #23; v0.1.2 already did the
+    same for the u/v coordinates, one channel at a time). This channel's
+    coordinates come from :func:`_channel_ft_coords` on that sorted array, so
+    they land in sorted-row order too.
 
     ``w_strategy`` selects scan-over-planes (``windowed_scan``, low memory)
     or vmap-over-planes (``windowed_vmap``, higher memory, possibly faster
     on GPU).
     """
     two_pi = 2.0 * jnp.pi
-    # v0.1.2 Part 3.3 (plan option (b)): sorted u/v FINUFFT coords aren't
-    # stored on the plan to save (n_chan, n_rows) * 2 floats; gather them
-    # once per channel from the unsorted plan.u_finufft / plan.v_finufft.
-    u_sorted = u_finufft_c[plan.sort_perm]
-    v_sorted = v_finufft_c[plan.sort_perm]
-    w_rel_sorted = w_rel_sorted_c
+    u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)
 
     cdtype = image_c.dtype
     n_rows = plan.n_rows
@@ -633,7 +672,7 @@ def _channel_forward_windowed(
         Returns ``(lo, contrib)`` where ``lo`` is the clamped sorted-row
         start of the window and ``contrib`` is the ``(max_window_size,)``
         complex contribution in sorted-row order (i.e. aligned with
-        ``plan.uvw_lambda_sorted[c, lo:lo+max_window_size]``).
+        ``uvw_m_sorted[lo:lo+max_window_size]``).
         """
         lo = jnp.clip(lo_raw, 0, lo_max)
 
@@ -698,9 +737,8 @@ def _channel_forward_windowed(
 
 def _channel_adjoint(
     vis_c: Array,
-    u_ft_c: Array,
-    v_ft_c: Array,
-    w_rel_c: Array,
+    uvw_m: Array,
+    inv_lambda_c: Array,
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
@@ -711,6 +749,7 @@ def _channel_adjoint(
     """
     two_pi = 2.0 * jnp.pi
     cdtype = vis_c.dtype
+    u_ft_c, v_ft_c, w_rel_c = _channel_ft_coords(uvw_m, inv_lambda_c, plan)
 
     # issue #16: the adjoint of the forward's per-visibility output scaling by
     # exp(-2πi w nshift) is the conjugate scaling on the *input*, applied once
@@ -776,63 +815,53 @@ def _dirty2vis_jit(
     image = image * plan.w0_screen
 
     if w_strategy in ("windowed_scan", "windowed_vmap"):
-        # Windowed path: per-channel function takes precomputed FINUFFT
-        # coords (input row order, gathered via sort_perm inside the helper)
-        # plus the pre-permuted w-component and the per-channel window-start
-        # table from the plan.
-        w_rel_sorted = _w_relative(plan.uvw_lambda_sorted[..., 2], plan)  # (n_chan, n_rows)
+        # Windowed path: the per-channel helper takes the *sorted* baselines in
+        # metres plus this channel's inv_lambda and the per-channel
+        # window-start table. issue #23: the sort key is w in metres, so the
+        # gather is channel-independent and belongs here, outside the channel
+        # loop -- one (n_rows, 3) gather per call, where the removed
+        # ``uvw_lambda_sorted`` leaf paid (n_chan, n_rows, 3) of storage and
+        # v0.1.2's u/v gathers paid two (n_rows,) gathers per channel.
+        uvw_m_sorted = plan.uvw_m[plan.sort_perm]  # (n_rows, 3)
         if channel_strategy == "vmap":
             vis_per_chan = jax.vmap(
-                lambda im_c, u_c, v_c, w_s_c, ws_c: _channel_forward_windowed(
-                    im_c, u_c, v_c, w_s_c, ws_c, plan, opts, w_strategy
+                lambda im_c, il_c, ws_c: _channel_forward_windowed(
+                    im_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
                 )
-            )(
-                image,
-                plan.u_finufft,
-                plan.v_finufft,
-                w_rel_sorted,
-                plan.window_start,
-            )
+            )(image, plan.inv_lambda, plan.window_start)
         elif channel_strategy == "scan":
 
             def step_w(
                 _: None,
-                args: tuple[Array, Array, Array, Array, Array],
+                args: tuple[Array, Array, Array],
             ) -> tuple[None, Array]:
-                im_c, u_c, v_c, w_s_c, ws_c = args
+                im_c, il_c, ws_c = args
                 return None, _channel_forward_windowed(
-                    im_c, u_c, v_c, w_s_c, ws_c, plan, opts, w_strategy
+                    im_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
                 )
 
             _, vis_per_chan = jax.lax.scan(
                 step_w,
                 None,
-                (
-                    image,
-                    plan.u_finufft,
-                    plan.v_finufft,
-                    w_rel_sorted,
-                    plan.window_start,
-                ),
+                (image, plan.inv_lambda, plan.window_start),
             )
         else:
             raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
         return vis_per_chan.T  # (n_rows, n_chan)
 
-    w_rel = _w_relative(plan.uvw_lambda[..., 2], plan)  # (n_chan, n_rows)
+    # Dense path: ``plan.uvw_m`` is closed over rather than scanned/mapped --
+    # it is one array for every channel, not one per channel (issue #23).
     if channel_strategy == "vmap":
         vis_per_chan = jax.vmap(
-            lambda im_c, u_c, v_c, w_c: _channel_forward(
-                im_c, u_c, v_c, w_c, plan, opts, w_strategy
-            )
-        )(image, plan.u_finufft, plan.v_finufft, w_rel)
+            lambda im_c, il_c: _channel_forward(im_c, plan.uvw_m, il_c, plan, opts, w_strategy)
+        )(image, plan.inv_lambda)
     elif channel_strategy == "scan":
 
-        def step(_: None, args: tuple[Array, Array, Array, Array]) -> tuple[None, Array]:
-            im_c, u_c, v_c, w_c = args
-            return None, _channel_forward(im_c, u_c, v_c, w_c, plan, opts, w_strategy)
+        def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
+            im_c, il_c = args
+            return None, _channel_forward(im_c, plan.uvw_m, il_c, plan, opts, w_strategy)
 
-        _, vis_per_chan = jax.lax.scan(step, None, (image, plan.u_finufft, plan.v_finufft, w_rel))
+        _, vis_per_chan = jax.lax.scan(step, None, (image, plan.inv_lambda))
     else:
         raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
 
@@ -906,9 +935,8 @@ def dirty2vis(
 
 def _channel_adjoint_windowed(
     vis_sorted_c: Array,
-    u_finufft_c: Array,
-    v_finufft_c: Array,
-    w_rel_sorted_c: Array,
+    uvw_m_sorted: Array,
+    inv_lambda_c: Array,
     window_start_c: Array,
     plan: WGridderPlan,
     opts: Opts,
@@ -926,9 +954,7 @@ def _channel_adjoint_windowed(
     See :func:`_channel_forward_windowed` for the coord-arg convention.
     """
     two_pi = 2.0 * jnp.pi
-    u_sorted = u_finufft_c[plan.sort_perm]
-    v_sorted = v_finufft_c[plan.sort_perm]
-    w_rel_sorted = w_rel_sorted_c
+    u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)
 
     cdtype = vis_sorted_c.dtype
     max_window_size = plan.max_window_size
@@ -1004,62 +1030,46 @@ def _vis2dirty_jit(
 
     if w_strategy in ("windowed_scan", "windowed_vmap"):
         # Apply sort_perm once per channel so windowed slices line up with
-        # plan.window_start.
+        # plan.window_start; the baselines get the same permutation once for
+        # the whole call (see _dirty2vis_jit's note -- the sort key is w in
+        # metres, so it is channel-independent).
         vis_sorted_per_chan = vis_per_chan[:, plan.sort_perm]
-        w_rel_sorted = _w_relative(plan.uvw_lambda_sorted[..., 2], plan)
+        uvw_m_sorted = plan.uvw_m[plan.sort_perm]  # (n_rows, 3)
         if channel_strategy == "vmap":
             dirty_per_chan = jax.vmap(
-                lambda v_s_c, u_c, vv_c, w_s_c, ws_c: _channel_adjoint_windowed(
-                    v_s_c, u_c, vv_c, w_s_c, ws_c, plan, opts, w_strategy
+                lambda v_s_c, il_c, ws_c: _channel_adjoint_windowed(
+                    v_s_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
                 )
-            )(
-                vis_sorted_per_chan,
-                plan.u_finufft,
-                plan.v_finufft,
-                w_rel_sorted,
-                plan.window_start,
-            )
+            )(vis_sorted_per_chan, plan.inv_lambda, plan.window_start)
         elif channel_strategy == "scan":
 
             def step_w(
                 _: None,
-                args: tuple[Array, Array, Array, Array, Array],
+                args: tuple[Array, Array, Array],
             ) -> tuple[None, Array]:
-                v_s_c, u_c, vv_c, w_s_c, ws_c = args
+                v_s_c, il_c, ws_c = args
                 return None, _channel_adjoint_windowed(
-                    v_s_c, u_c, vv_c, w_s_c, ws_c, plan, opts, w_strategy
+                    v_s_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
                 )
 
             _, dirty_per_chan = jax.lax.scan(
                 step_w,
                 None,
-                (
-                    vis_sorted_per_chan,
-                    plan.u_finufft,
-                    plan.v_finufft,
-                    w_rel_sorted,
-                    plan.window_start,
-                ),
+                (vis_sorted_per_chan, plan.inv_lambda, plan.window_start),
             )
         else:
             raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
     elif channel_strategy == "vmap":
-        w_rel = _w_relative(plan.uvw_lambda[..., 2], plan)
         dirty_per_chan = jax.vmap(
-            lambda v_c, u_c, vv_c, w_c: _channel_adjoint(
-                v_c, u_c, vv_c, w_c, plan, opts, w_strategy
-            )
-        )(vis_per_chan, plan.u_finufft, plan.v_finufft, w_rel)
+            lambda v_c, il_c: _channel_adjoint(v_c, plan.uvw_m, il_c, plan, opts, w_strategy)
+        )(vis_per_chan, plan.inv_lambda)
     elif channel_strategy == "scan":
-        w_rel = _w_relative(plan.uvw_lambda[..., 2], plan)
 
-        def step(_: None, args: tuple[Array, Array, Array, Array]) -> tuple[None, Array]:
-            v_c, u_c, vv_c, w_c = args
-            return None, _channel_adjoint(v_c, u_c, vv_c, w_c, plan, opts, w_strategy)
+        def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
+            v_c, il_c = args
+            return None, _channel_adjoint(v_c, plan.uvw_m, il_c, plan, opts, w_strategy)
 
-        _, dirty_per_chan = jax.lax.scan(
-            step, None, (vis_per_chan, plan.u_finufft, plan.v_finufft, w_rel)
-        )
+        _, dirty_per_chan = jax.lax.scan(step, None, (vis_per_chan, plan.inv_lambda))
     else:
         raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
 
@@ -1092,6 +1102,13 @@ def _vis2dirty_jit(
     # percent that no parity test's epsilon budget would absorb -- but it
     # would leave the plane count halved and every structural nshift test
     # green, which is exactly why it gets its own comment.
+    #
+    # issue #23: ``plan.n_minus_1`` is now a property (``n_minus_1_shifted -
+    # nshift``, both traced-leaf and static) rather than a leaf of its own, so
+    # this is one image-sized subtract added to the graph -- once per call, not
+    # once per plane. It is also the one place in either operator that reads a
+    # derived accessor, and deliberately so: this factor is exactly what the
+    # unshifted grid exists for.
     n_grid = (plan.n_minus_1 + 1.0).astype(dirty_per_chan.real.dtype)
     safe_n = jnp.where(n_grid > 0.0, n_grid, 1.0)
     return jnp.where(n_grid > 0.0, dirty_per_chan.real / safe_n, 0.0)

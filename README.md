@@ -190,12 +190,13 @@ across channels), the forward operator computes `vis` of shape
 
 For each channel `c`:
 
-  1. `uvw_lambda = uvw * freq[c] / c`
-  2. `u_finufft, v_finufft = 2*pi * uvw_lambda[:, 0:2] * pixsize`
+  1. `w_lambda = inv_lambda[c] * uvw_m[:, 2]`, where `uvw_m` is the plan's
+     baselines in metres and `inv_lambda[c] = freq[c] / c`.
+  2. `u_ft, v_ft = (2*pi * pixsize * inv_lambda[c]) * uvw_m[:, 0:2]`
   3. `B_c = B[c] * w0_screen`, `d_lambda = w_lambda - w0`.
   4. For each w-plane `k` (with `d_k = w_centers_rel[k]`):
      - `image_k = B_c * exp(+2 pi i d_k (n - 1 + nshift)) / phi_hat_n`
-     - `vis_k = NUFFT2(image_k, u_finufft, v_finufft, iflag = -1, eps = max(epsilon / 10, 1e-14))`
+     - `vis_k = NUFFT2(image_k, u_ft, v_ft, iflag = -1, eps = max(epsilon / 10, 1e-14))`
      - `vis_k = vis_k * phi((d_lambda - d_k) / w_kernel_scale)`
   5. `vis[:, c] = (sum over k of vis_k) * exp(-2 pi i d_lambda * nshift)`
 
@@ -222,13 +223,13 @@ shape `(n_chan, n_l, n_m)`:
 
 For each channel `c`:
 
-  1. `uvw_lambda`, `u_finufft`, `v_finufft` as for the forward operator.
+  1. `w_lambda`, `u_ft`, `v_ft` as for the forward operator.
   2. `vis_w = vis[:, c] * weights[:, c]` if weights are provided, then
      `vis_w = vis_w * exp(+2 pi i d_lambda * nshift)` &mdash; the conjugate of
      the forward's step 5, applied to the input rather than the output.
   3. For each w-plane `k` (with `d_k = w_centers_rel[k]`):
      - `vis_k = vis_w * phi((d_lambda - d_k) / w_kernel_scale)`
-     - `H_k = NUFFT1((u_finufft, v_finufft), vis_k, image_shape, iflag = +1, eps = max(epsilon / 10, 1e-14))`
+     - `H_k = NUFFT1((u_ft, v_ft), vis_k, image_shape, iflag = +1, eps = max(epsilon / 10, 1e-14))`
      - `I_k = H_k * exp(-2 pi i d_k (n - 1 + nshift)) / phi_hat_n`
   4. `dirty[c] = ((sum over k of I_k) * conj(w0_screen)).real / n`,
      where the `1/n` factor matches ducc's `divide_by_n=True` convention. The
@@ -315,6 +316,17 @@ an explicit integer to override.
 The returned plan also exposes `max_window_size` and
 `window_padding_overhead` for callers that want to inspect whether the
 windowed strategies will be efficient on a given uvw distribution.
+
+**Plan memory.** The plan stores nothing per `(channel, row)`: the baselines
+are kept once in metres (`plan.uvw_m`, `(n_rows, 3)`) next to one scalar per
+channel (`plan.inv_lambda = freq / c`), and the per-channel `(u, v)` FINUFFT
+coordinates and `w` in wavelengths are derived inside the JIT. A float64 plan
+is therefore about `28 * n_rows + 8 * n_chan + 32 * n_l * n_m` bytes plus the
+small `n_w`-sized arrays &mdash; 2.4 MB for 16 channels &times; 10k rows at
+256&sup2;, 31 MB for 64 channels &times; 1M rows. `plan.uvw_lambda`,
+`plan.n_minus_1` and `plan.w_centers` remain readable as derived properties;
+reading `plan.uvw_lambda` materialises the full `(n_chan, n_rows, 3)` array,
+so it is for introspection, not for hot loops.
 
 ### `dirty2vis(plan, image, *, w_strategy="dense_scan", channel_strategy="scan", nthreads=None) -> Array`
 
@@ -532,7 +544,7 @@ baselines produce more w-planes &mdash; expected wgridder behaviour.
 
 ### Constant-w fast path (v0.1.2+)
 
-When every `uvw_lambda[:, :, 2]` entry is identical &mdash; e.g. a perfectly
+When every visibility shares the same `w` in wavelengths &mdash; e.g. a perfectly
 coplanar array, snapshot data at fixed pointing, or any case where
 `plan.w_extent == 0` after planning &mdash; `make_plan` collapses the
 w-plane loop to a single plane at the constant w-value. Expected speedup

@@ -4,18 +4,26 @@ Planning is a one-shot, *non-traced* preprocessing step that turns
 ``(uvw, freq, image_shape, pixsize, epsilon)`` into:
 
   * static integers (``n_w``, ``w_kernel_width``, image dimensions, ...);
-  * the ``n_minus_1`` grid evaluated on the image, plus its ``nshift``-centred
-    counterpart ``n_minus_1_shifted`` (issue #16);
+  * the ``nshift``-centred ``n_minus_1_shifted`` grid (issue #16);
   * the ``phi_hat_n`` correction (precomputed via :class:`PhiHatTable`);
-  * the w-plane centres in wavelengths;
-  * ``uvw_lambda`` for each channel.
+  * the w-plane centres, relative to the w-range midpoint ``w0``;
+  * the baselines in metres (``uvw_m``) and the per-channel inverse
+    wavelength ``inv_lambda = freq / c``.
 
 These quantities are bundled into :class:`WGridderPlan`, which is a frozen
-dataclass registered as a JAX pytree. The numerical fields (``uvw_lambda``,
-``w_centers``, ``n_minus_1``, ``phi_hat_n``) become pytree leaves and are
-traced normally by ``jax.jit``; the static fields (shape ints and Python
-floats) live in the pytree aux_data, so they are part of the JIT cache key
-without being treated as traced inputs.
+dataclass registered as a JAX pytree. The numerical fields (``uvw_m``,
+``inv_lambda``, ``w_centers_rel``, ``n_minus_1_shifted``, ``phi_hat_n``, ...)
+become pytree leaves and are traced normally by ``jax.jit``; the static fields
+(shape ints and Python floats) live in the pytree aux_data, so they are part
+of the JIT cache key without being treated as traced inputs.
+
+issue #23: nothing per ``(channel, row)`` is stored. The plan keeps the
+baselines once, in metres and in input row order, alongside one scalar per
+channel; the per-channel ``(u, v)`` FINUFFT coordinates and w in wavelengths
+are derived inside the JIT, one channel at a time (see
+``jax_nufft.wgridder._channel_ft_coords``). ``uvw_lambda``, ``n_minus_1`` and
+``w_centers`` remain readable as :class:`WGridderPlan` properties, but are no
+longer leaves.
 """
 
 from __future__ import annotations
@@ -183,9 +191,24 @@ class WGridderPlan:
     complex_dtype: np.dtype[Any]
 
     # ---- traced arrays (pytree leaves) ----
-    uvw_lambda: Array = field()  # (n_chan, n_rows, 3) — input row order
-    w_centers: Array = field()  # (n_w,)
-    # issue #16 follow-up: the same plane centres measured from ``w0``, i.e.
+    # issue #23: the baselines are stored ONCE, in metres and in input row
+    # order, next to one scalar per channel. Everything the operators consume
+    # per (channel, row) -- the two FINUFFT coordinates and w in wavelengths --
+    # is derived from this pair inside the JIT
+    # (``jax_nufft.wgridder._channel_ft_coords``), three multiplies per row per
+    # channel, instead of being pre-materialised on the host. The four leaves
+    # that did the pre-materialising (``uvw_lambda`` and ``uvw_lambda_sorted``
+    # at ``(n_chan, n_rows, 3)``, ``u_finufft`` and ``v_finufft`` at
+    # ``(n_chan, n_rows)``) held 8 float64 per (channel, row) of which only 4
+    # were ever read; they are gone. Measured on a 16-channel, 10k-row plan at
+    # 256 pixels that is 12.98 MB of leaves down to 2.42 MB; at 64 channels x
+    # 1M rows it is 3.9 GB down to 31 MB, against 23 MB of inputs.
+    uvw_m: Array = field()  # (n_rows, 3) — metres, input row order
+    # ``freq / c``, i.e. one over the wavelength: the per-channel factor that
+    # turns metres into wavelengths. Stored rather than ``freq`` so the divide
+    # never happens at call time and the operators need only multiplies.
+    inv_lambda: Array = field()  # (n_chan,)
+    # issue #16 follow-up: the plane centres measured from ``w0``, i.e.
     # ``w_centers - w0`` -- but built at small magnitude on the host rather than
     # by subtracting two ~|w0| numbers at call time. That distinction is the
     # whole point: ``w_centers`` is quantised to the float64 grid *at* |w0|
@@ -193,15 +216,19 @@ class WGridderPlan:
     # resolution at 1e-10 no matter how exact the subtraction is, and a 1e-10
     # error in a plane centre is a ~6e-10 phase error -- 300x the eps=1e-12
     # contract. Computed small, they carry full relative precision.
-    # This is the array the plane loop iterates over; ``w_centers`` stays
-    # absolute because the window builder and the w-coverage tests read it.
+    # This is the array the plane loop iterates over; the absolute
+    # ``w_centers`` the window builder and the w-coverage tests read is the
+    # property below (issue #23: ``w0`` is static, so storing both was storing
+    # the same numbers twice).
     w_centers_rel: Array = field()  # (n_w,)
-    n_minus_1: Array = field()  # (n_l, n_m)
     # issue #16: ``n_minus_1 + nshift``. This is the grid the per-plane phase
     # ``exp(2πi w_k (n-1+nshift))`` and the ``phi_hat`` argument
-    # ``eta = (n-1+nshift) * w_kernel_scale`` are evaluated on. ``n_minus_1``
-    # itself stays, and is the *only* thing the adjoint's ``1/n`` output factor
-    # may use -- ``n = n_minus_1 + 1``, not ``n_minus_1_shifted + 1``.
+    # ``eta = (n-1+nshift) * w_kernel_scale`` are evaluated on. It is the
+    # member of the pair that survives issue #23 (the plane loop reads it every
+    # plane in both operators, while ``n_minus_1`` is read once, for the
+    # adjoint's ``1/n``); ``n_minus_1`` is the property below, and is still the
+    # *only* thing that output factor may use -- ``n = n_minus_1 + 1``, not
+    # ``n_minus_1_shifted + 1``.
     n_minus_1_shifted: Array = field()  # (n_l, n_m)
     # issue #16 follow-up: ``exp(2πi * w0 * (n - 1))``, complex, the image-domain
     # phase screen carrying the w-range midpoint that the plane loop no longer
@@ -212,21 +239,66 @@ class WGridderPlan:
     # adjoint multiplies its output image by the conjugate.
     w0_screen: Array = field()  # (n_l, n_m), complex_dtype
     phi_hat_n: Array = field()  # (n_l, n_m)
-    # v0.1.1 windowed-scan support:
+    # v0.1.1 windowed-scan support. No *sorted* coordinate array is stored: the
+    # sort is by w in metres, so the permutation is channel-independent and the
+    # windowed helpers gather ``uvw_m[sort_perm]`` once per call (issue #23;
+    # v0.1.2 already did this for ``u_finufft`` / ``v_finufft``).
     sort_perm: Array = field()  # (n_rows,) int — argsort(uvw[:, 2]) ascending
-    uvw_lambda_sorted: Array = field()  # (n_chan, n_rows, 3) — uvw_lambda[:, sort_perm, :]
     window_start: Array = field()  # (n_chan, n_w) int — start idx in sorted array
-    window_size: Array = field()  # (n_chan, n_w) int — live window length per plane
-    # v0.1.2 precomputed FINUFFT coordinates (option (b) from the v0.1.2 plan):
-    # ``u_finufft[c, r] = 2π · pixsize_l · uvw_lambda[c, r, 0]`` and likewise
-    # for ``v_finufft``. Sorted variants are NOT stored — the windowed helpers
-    # gather via ``plan.sort_perm`` + ``dynamic_slice`` at scan time.
-    u_finufft: Array = field()  # (n_chan, n_rows) — input row order
-    v_finufft: Array = field()  # (n_chan, n_rows) — input row order
 
     @property
     def image_shape(self) -> tuple[int, int]:
         return (self.n_l, self.n_m)
+
+    # ---- backward-compatible accessors (issue #23) ----
+    # These three were pytree leaves before issue #23. Two of them are an exact
+    # affine image of a surviving leaf plus a *static* field, and the third is
+    # the per-channel broadcast this issue exists to delete. They stay readable
+    # -- they are documented plan fields that tests and downstream code
+    # introspect (``tests/test_adjoint.py``, ``tests/test_dtype.py``,
+    # ``tests/test_nshift.py``) -- but as computed properties, so they are not
+    # flattened, not shipped to the device with the plan, and not part of the
+    # JIT cache key.
+
+    @property
+    def n_minus_1(self) -> Array:
+        """``n - 1`` on the image grid: the *unshifted* grid.
+
+        Recovered from the stored ``n_minus_1_shifted`` by removing the static
+        ``nshift``, inverting issue #16's exact identity ``n_minus_1_shifted =
+        n_minus_1 + nshift``. This is the grid -- and the only grid -- the
+        adjoint's ``1/n`` output factor may use (see ``wgridder._vis2dirty_jit``
+        for why using the shifted one there is a silent, test-passing gain
+        error).
+        """
+        return self.n_minus_1_shifted - self.nshift
+
+    @property
+    def w_centers(self) -> Array:
+        """w-plane centres in *absolute* wavelengths, ``w0 + w_centers_rel``.
+
+        The operators work purely in the relative coordinate -- that is the
+        point of issue #16's follow-up -- so nothing under ``src/`` reads this;
+        it is the form the window-builder contract in AGENTS.md sec 4 and the
+        w-coverage tests are written against.
+        """
+        return self.w0 + self.w_centers_rel
+
+    @property
+    def uvw_lambda(self) -> Array:
+        """``(n_chan, n_rows, 3)`` baselines in wavelengths, per channel.
+
+        **Compatibility accessor -- not for internal use.** Reading it
+        materialises precisely the ``n_chan x n_rows x 3`` array issue #23
+        exists to delete (3.9 GB at 64 channels x 1M rows, against 23 MB of
+        inputs), so no operator path may touch it: ``_dirty2vis_jit`` /
+        ``_vis2dirty_jit`` and every ``_channel_*`` helper read ``uvw_m`` and
+        ``inv_lambda`` and derive the three per-channel coordinates they
+        actually use, one channel at a time, inside the JIT. Using this
+        property there would undo the whole change while every test still
+        passed.
+        """
+        return self.uvw_m[None, :, :] * self.inv_lambda[:, None, None]
 
 
 def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
@@ -276,19 +348,14 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         complex_dtype,
     ) = aux
     (
-        uvw_lambda,
-        w_centers,
+        uvw_m,
+        inv_lambda,
         w_centers_rel,
-        n_minus_1,
         n_minus_1_shifted,
         w0_screen,
         phi_hat_n,
         sort_perm,
-        uvw_lambda_sorted,
         window_start,
-        window_size,
-        u_finufft,
-        v_finufft,
     ) = children
     return WGridderPlan(
         n_l=n_l,
@@ -310,19 +377,14 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         is_constant_w=is_constant_w,
         real_dtype=real_dtype,
         complex_dtype=complex_dtype,
-        uvw_lambda=uvw_lambda,
-        w_centers=w_centers,
+        uvw_m=uvw_m,
+        inv_lambda=inv_lambda,
         w_centers_rel=w_centers_rel,
-        n_minus_1=n_minus_1,
         n_minus_1_shifted=n_minus_1_shifted,
         w0_screen=w0_screen,
         phi_hat_n=phi_hat_n,
         sort_perm=sort_perm,
-        uvw_lambda_sorted=uvw_lambda_sorted,
         window_start=window_start,
-        window_size=window_size,
-        u_finufft=u_finufft,
-        v_finufft=v_finufft,
     )
 
 
@@ -330,19 +392,14 @@ jax.tree_util.register_pytree_node(
     WGridderPlan,
     flatten_func=lambda p: (
         (
-            p.uvw_lambda,
-            p.w_centers,
+            p.uvw_m,
+            p.inv_lambda,
             p.w_centers_rel,
-            p.n_minus_1,
             p.n_minus_1_shifted,
             p.w0_screen,
             p.phi_hat_n,
             p.sort_perm,
-            p.uvw_lambda_sorted,
             p.window_start,
-            p.window_size,
-            p.u_finufft,
-            p.v_finufft,
         ),
         _plan_aux(p),
     ),
@@ -454,6 +511,37 @@ def _warn_if_below_float32_floor(real_dtype: np.dtype[Any], epsilon: float) -> N
         )
 
 
+def _n_minus_1_grid(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> np.ndarray:
+    """The ``n - 1`` image grid, ``(n_l, n_m)``, always in full float64.
+
+    For pixels inside the unit disc (``l² + m² <= 1``) this is the usual
+    ``n - 1 = sqrt(1 - l² - m²) - 1``, with values in ``[-1, 0]``. For pixels
+    outside it we use ducc's analytic extension
+    ``n - 1 = -sqrt(l² + m² - 1) - 1`` (values ``< -1``), so that full-sky
+    imaging matches ducc's wgridder pixel-by-pixel.
+
+    Always float64 whatever the plan dtype, for two reasons: ``w0_screen``'s
+    range reduction (:func:`_phase_turns_reduced`) is only worth doing on a
+    full-precision input, and the plan's own (possibly float32) leaf is a
+    single narrowing cast away.
+
+    It is its own function so the half-dozen ``(n_l, n_m)`` intermediates it
+    needs -- the ``l² + m²`` grid, the disc mask, and the two branch values --
+    are released the moment it returns instead of staying live for the rest of
+    ``make_plan``. issue #23's host-RSS budget is a peak measured across the
+    whole call, and at 2048² those intermediates are ~100 MB.
+    """
+    i = np.arange(n_l) - n_l // 2
+    j = np.arange(n_m) - n_m // 2
+    ll = (i * pixsize_l)[:, None]
+    mm = (j * pixsize_m)[None, :]
+    eps_lm = ll * ll + mm * mm
+    inside_disc = eps_lm <= 1.0
+    inside_val = np.sqrt(np.where(inside_disc, 1.0 - eps_lm, 0.0)) - 1.0
+    outside_val = -np.sqrt(np.where(inside_disc, 0.0, eps_lm - 1.0)) - 1.0
+    return np.where(inside_disc, inside_val, outside_val)
+
+
 def make_plan(
     uvw: np.ndarray,
     freq: np.ndarray,
@@ -530,20 +618,17 @@ def make_plan(
     _warn_if_below_float32_floor(real_dtype, epsilon)
 
     # --- n - 1 grid (numpy, host-side) ---
-    # For pixels inside the unit disc (l^2 + m^2 <= 1) this is the usual
-    # n - 1 = sqrt(1 - l^2 - m^2) - 1 with values in [-1, 0]. For pixels
-    # outside the disc we use ducc's analytic extension
-    # n - 1 = -sqrt(l^2 + m^2 - 1) - 1 (values < -1), so that full-sky
-    # imaging matches ducc's wgridder pixel-by-pixel.
-    i = np.arange(n_l) - n_l // 2
-    j = np.arange(n_m) - n_m // 2
-    ll = (i * pixsize_l)[:, None]
-    mm = (j * pixsize_m)[None, :]
-    eps_lm = ll * ll + mm * mm
-    inside_disc = eps_lm <= 1.0
-    inside_val = np.sqrt(np.where(inside_disc, 1.0 - eps_lm, 0.0)) - 1.0
-    outside_val = -np.sqrt(np.where(inside_disc, 0.0, eps_lm - 1.0)) - 1.0
-    n_minus_1_np = np.where(inside_disc, inside_val, outside_val).astype(real_dtype)
+    # Built once in float64 (see :func:`_n_minus_1_grid`); ``n_minus_1_f64`` is
+    # what ``w0_screen``'s range reduction needs at the end of this function,
+    # and ``n_minus_1_np`` is the same grid at the plan's precision. For a
+    # float64 plan ``np.asarray`` returns the input unchanged rather than
+    # copying, so the pair costs one array, not two.
+    #
+    # issue #23: neither is a plan leaf any more -- ``n_minus_1_shifted`` is,
+    # and ``plan.n_minus_1`` recovers this grid from it by subtracting the
+    # static ``nshift``.
+    n_minus_1_f64 = _n_minus_1_grid(n_l, n_m, pixsize_l, pixsize_m)
+    n_minus_1_np = np.asarray(n_minus_1_f64, dtype=real_dtype)
 
     # --- issue #16: centre the n-1 range (ducc's ``allow_nshift`` device) ---
     # The w-phase factor obeys the *exact* identity
@@ -580,7 +665,11 @@ def make_plan(
     nm1_max = float(np.max(n_minus_1_np))
     nm1_min = float(np.min(n_minus_1_np))
     nshift = -(nm1_max + nm1_min) / 2.0
-    n_minus_1_shifted_np = (n_minus_1_np + nshift).astype(real_dtype)
+    # ``np.asarray(..., dtype=)`` rather than ``.astype()``: the sum is already
+    # in ``real_dtype`` for a float64 plan, and ``astype`` would copy it anyway.
+    # Same reasoning below for ``phi_hat_n`` and ``w0_screen`` -- image-sized
+    # arrays, and issue #23's host-RSS gate is a peak over the whole call.
+    n_minus_1_shifted_np = np.asarray(n_minus_1_np + nshift, dtype=real_dtype)
     # Read the plane-spacing denominator off the two extremes rather than
     # recomputing ``max(abs(n_minus_1_shifted_np))``: it is by construction the
     # quantity ``nshift`` was chosen to minimise, and taking it from the same
@@ -592,14 +681,27 @@ def make_plan(
         # ratios are well-defined.
         max_abs_nm1 = 1e-12
 
-    # --- per-channel uvw in wavelengths ---
-    uvw_lambda_np = (uvw_arr[None, :, :] * (freq_arr / SPEED_OF_LIGHT)[:, None, None]).astype(
-        real_dtype
-    )
-    # Worst-case w over all channels.
-    w_lambda_all = uvw_lambda_np[..., 2]  # (Nchan, Nrow)
-    w_min_all = float(np.min(w_lambda_all))
-    w_max_all = float(np.max(w_lambda_all))
+    # --- per-channel scaling: metres -> wavelengths ---
+    # issue #23: this is the ONLY per-channel array the plan keeps. The
+    # ``(n_chan, n_rows, 3)`` product it used to be built into is derived one
+    # channel at a time inside the JIT instead.
+    inv_lambda_np = (freq_arr / SPEED_OF_LIGHT).astype(real_dtype)
+
+    # Worst-case w over all channels, from the two *row* extremes of the w in
+    # metres scaled by each channel -- O(n_chan) work, no ``(n_chan, n_rows)``
+    # array anywhere. This is exact rather than an approximation: IEEE
+    # round-to-nearest multiplication is monotonic, so for any fixed scale
+    # ``s > 0``, ``fl(w_min · s) <= fl(w_r · s) <= fl(w_max · s)`` for every row
+    # ``r``, and the extremes of the full product are attained at exactly these
+    # two rows. The ``minimum`` / ``maximum`` pair covers the order flip a
+    # non-physical zero or negative ``freq`` would produce, so the guard below
+    # still fires on genuinely bad input rather than on our own bookkeeping.
+    w_m_min = float(np.min(uvw_arr[:, 2]))
+    w_m_max = float(np.max(uvw_arr[:, 2]))
+    w_ends_lo = inv_lambda_np * w_m_min  # (n_chan,)
+    w_ends_hi = inv_lambda_np * w_m_max  # (n_chan,)
+    w_min_all = float(np.min(np.minimum(w_ends_lo, w_ends_hi)))
+    w_max_all = float(np.max(np.maximum(w_ends_lo, w_ends_hi)))
     w_extent = w_max_all - w_min_all
     if w_extent < 0:
         # Should be unreachable with a real telescope; guard anyway.
@@ -688,21 +790,23 @@ def make_plan(
         # accuracy gain for constant-w data at large |w|.
         nshift = 0.0
         n_minus_1_shifted_np = n_minus_1_np
-        w_constant = w_min_all  # = w_max_all by construction
         n_w = 1
         # Any nonzero ``w_kernel_scale`` makes ``z = (w_lambda - w_k)/scale``
         # well-defined; with z=0 the kernel weight phi(0, beta) = 1 by
         # construction so the value doesn't affect output.
         w_kernel_scale = 1.0
-        w_centers_np = np.array([w_constant], dtype=real_dtype)
-        # w0 == w_constant here, so the one plane sits exactly at the origin.
+        # ``w0 == w_min_all == w_max_all`` is the constant w here, so the one
+        # plane sits exactly at the origin of the relative coordinate and
+        # ``plan.w_centers`` (= ``w0 + w_centers_rel``) recovers that constant
+        # exactly.
         w_centers_rel_np = np.zeros(1, dtype=real_dtype)
         phi_hat_n_np = np.ones((n_l, n_m), dtype=real_dtype)
-        # Single-window builder: one window per channel, covering all rows.
+        # Single-window builder: one window per channel, starting at row 0 and
+        # covering all rows (that length is ``max_window_size``, a static
+        # field; issue #23 dropped the ``window_size`` leaf, which no operator
+        # path ever read).
         sort_perm_np = np.arange(n_rows, dtype=np.int32)
-        uvw_lambda_sorted_np = uvw_lambda_np
         window_start_np = np.zeros((n_chan, 1), dtype=np.int32)
-        window_size_np = np.full((n_chan, 1), n_rows, dtype=np.int32)
         max_window_size = max(n_rows, 1)
         window_padding_overhead = 1.0
     else:
@@ -739,15 +843,13 @@ def make_plan(
             dw = w_extent / n_w_inner
         w_kernel_scale = dw * w_kernel_width / 2.0
         k = np.arange(n_w)
-        # Build the centres *relative to w0* first, at small magnitude, then add
-        # w0 back for the public absolute field. Doing it the other way round
-        # (absolute first, subtract later) rounds each centre onto the float64
-        # grid at |w0| and loses the low bits of the offset for good -- see the
-        # ``w_centers_rel`` field comment. ``w_min_all - w0`` is exact
-        # (Sterbenz), so the relative centres are as accurate as ``dw``.
-        w_centers_rel_np = (w_min_all - w0) + (k - w_kernel_width / 2.0) * dw
-        w_centers_np = (w0 + w_centers_rel_np).astype(real_dtype)
-        w_centers_rel_np = w_centers_rel_np.astype(real_dtype)
+        # Build the centres *relative to w0*, at small magnitude. Doing it the
+        # other way round (absolute first, subtract later) rounds each centre
+        # onto the float64 grid at |w0| and loses the low bits of the offset
+        # for good -- see the ``w_centers_rel`` field comment. ``w_min_all -
+        # w0`` is exact (Sterbenz), so the relative centres are as accurate as
+        # ``dw``. The absolute ``plan.w_centers`` adds ``w0`` back on demand.
+        w_centers_rel_np = ((w_min_all - w0) + (k - w_kernel_width / 2.0) * dw).astype(real_dtype)
 
         # --- phi_hat_n (precomputed on the n-1 grid) ---
         # Argument to phi_hat is eta = (n - 1) * scale, where scale is the kernel
@@ -775,7 +877,7 @@ def make_plan(
         # discrete sum picks up a (scale/dw) = W/2 multiplier relative to the
         # continuous-FT-based correction phi_hat(scale * (n-1)).
         phi_hat_dim = phi_hat_table.evaluate(eta_n)
-        phi_hat_n_np = ((w_kernel_width / 2.0) * phi_hat_dim).astype(real_dtype)
+        phi_hat_n_np = np.asarray((w_kernel_width / 2.0) * phi_hat_dim, dtype=real_dtype)
         if not np.all(phi_hat_n_np > 0):
             raise ValueError(
                 "phi_hat_n contains non-positive values; planning would produce "
@@ -788,13 +890,22 @@ def make_plan(
         # permutation serves every channel because scaling by ``freq[c]/c`` is
         # strictly positive and so monotonic.
         sort_perm_np = np.argsort(uvw_arr[:, 2], kind="stable").astype(np.int32)
-        uvw_lambda_sorted_np = uvw_lambda_np[:, sort_perm_np, :]
+        # The sorted w in *metres*: one ``(n_rows,)`` array serving every
+        # channel, exactly as ``sort_perm`` itself does. issue #23 removed the
+        # ``(n_chan, n_rows, 3)`` ``uvw_lambda_sorted`` this used to slice out
+        # of; the windowed operator helpers gather ``uvw_m[sort_perm]``
+        # themselves at call time.
+        w_m_sorted = uvw_arr[sort_perm_np, 2]
 
         # For each (channel, plane), the contributing rows are those with
         # ``|w_lambda - w_k| < W/2 * dw = w_kernel_scale`` (the kernel support
         # cutoff, where ``phi(z) = 0`` outside). After sorting, this is a
         # contiguous slice; ``searchsorted`` finds the boundaries.
         window_start_np = np.zeros((n_chan, n_w), dtype=np.int32)
+        # ``window_size`` is plan-time bookkeeping only -- it feeds
+        # ``max_window_size`` and ``window_padding_overhead``, both static, and
+        # no operator path ever read it -- so since issue #23 it is a local,
+        # not a leaf.
         window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
         half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
         # issue #16 follow-up: compute the boundaries in the SAME coordinate the
@@ -808,7 +919,22 @@ def make_plan(
         # test_boundary_planes.py measures at a 1e-12 tolerance.
         w_centers64 = w_centers_rel_np.astype(np.float64)
         for c in range(n_chan):
-            w_lambda_c = uvw_lambda_sorted_np[c, :, 2].astype(np.float64) - w0
+            # issue #23: scale the shared sorted-w-in-metres into this
+            # channel's wavelengths, one transient ``(n_rows,)`` array reused
+            # each iteration -- never an ``(n_chan, n_rows)`` materialisation,
+            # and the two ``searchsorted`` calls below keep the whole builder
+            # at O(n_chan * n_w * log n_rows).
+            #
+            # The product is formed in the plan's *real* dtype before widening
+            # to float64, not directly in float64. That is what makes these
+            # boundaries agree bit-for-bit with the numbers the operators
+            # compute at call time: they derive w the same way, from the same
+            # two leaves, in ``real_dtype``. Skipping the narrowing would place
+            # a float32 plan's window edges against values the operator never
+            # sees, and a row landing between the two would be dropped by the
+            # windowed path while the dense path gives it
+            # ``phi(z = +/-1) = exp(-beta)``.
+            w_lambda_c = (w_m_sorted * inv_lambda_np[c]).astype(np.float64) - w0
             # ``side="left"``  for lower bound, ``side="right"`` for upper bound
             # gives a half-open interval [lo, hi) of strictly-inside rows. Rows
             # exactly at ``w_k +/- half_W_dw`` have phi(z=+/-1) = exp(-beta),
@@ -832,18 +958,13 @@ def make_plan(
         # shape is well-defined (e.g. n_rows >= 1 always).
         max_window_size = max(max_window_size, 1)
 
-    # v0.1.2 Part 3: precompute the per-call (2π * pixsize) scaling on u, v
-    # so the channel helpers can read them directly from the plan instead of
-    # re-deriving them on every JIT invocation. Sorted variants are NOT
-    # stored (option (b) in the v0.1.2 plan); the windowed helpers gather
-    # via plan.sort_perm at scan time.
-    # The explicit ``astype`` is not redundant: ``pixsize_*`` are Python
-    # floats, and value-based promotion rules differ across numpy versions,
-    # so pin the result to the plan's dtype rather than trusting the scalar
-    # to stay weak.
-    two_pi = 2.0 * np.pi
-    u_finufft_np = ((two_pi * pixsize_l) * uvw_lambda_np[..., 0]).astype(real_dtype)
-    v_finufft_np = ((two_pi * pixsize_m) * uvw_lambda_np[..., 1]).astype(real_dtype)
+    # issue #23: v0.1.2's precomputed ``u_finufft`` / ``v_finufft`` leaves
+    # (``2π · pixsize_* · uvw_lambda[..., axis]``, ``(n_chan, n_rows)`` each)
+    # are gone. ``2π · pixsize_*`` is a compile-time constant -- both pixsizes
+    # are static plan fields -- so folding it into the per-channel scalar
+    # ``inv_lambda[c]`` inside the JIT costs nothing and saves storing the
+    # scaled coordinates per channel. See
+    # ``jax_nufft.wgridder._channel_ft_coords``.
 
     # --- issue #16 follow-up: the w0 image-domain phase screen ---
     # ``exp(2πi w0 (n-1))``. This is the one place a large phase argument
@@ -853,13 +974,12 @@ def make_plan(
     # matter how large ``w0`` is. Doing this on the host is free -- it happens
     # once per plan, not once per call, and never inside the plane loop.
     #
-    # Deliberately computed from the float64 ``n_minus_1`` grid rather than the
-    # (possibly float32) plan leaf: the reduction is only worth doing if its
-    # input carries full precision, and the result is cast to the plan's
-    # complex dtype at the end.
-    n_minus_1_f64 = np.where(inside_disc, inside_val, outside_val)
-    w0_screen_np = np.exp(2j * np.pi * _phase_turns_reduced(w0, n_minus_1_f64)).astype(
-        complex_dtype
+    # Deliberately computed from the float64 ``n_minus_1`` grid rather than
+    # from the (possibly float32) narrowed copy: the reduction is only worth
+    # doing if its input carries full precision, and the result is cast to the
+    # plan's complex dtype at the end.
+    w0_screen_np = np.asarray(
+        np.exp(2j * np.pi * _phase_turns_reduced(w0, n_minus_1_f64)), dtype=complex_dtype
     )
 
     return WGridderPlan(
@@ -886,19 +1006,14 @@ def make_plan(
         is_constant_w=use_fast_path,
         real_dtype=real_dtype,
         complex_dtype=complex_dtype,
-        uvw_lambda=jnp.asarray(uvw_lambda_np),
-        w_centers=jnp.asarray(w_centers_np),
+        uvw_m=jnp.asarray(uvw_arr),
+        inv_lambda=jnp.asarray(inv_lambda_np),
         w_centers_rel=jnp.asarray(w_centers_rel_np),
-        n_minus_1=jnp.asarray(n_minus_1_np),
         n_minus_1_shifted=jnp.asarray(n_minus_1_shifted_np),
         w0_screen=jnp.asarray(w0_screen_np),
         phi_hat_n=jnp.asarray(phi_hat_n_np),
         sort_perm=jnp.asarray(sort_perm_np),
-        uvw_lambda_sorted=jnp.asarray(uvw_lambda_sorted_np),
         window_start=jnp.asarray(window_start_np),
-        window_size=jnp.asarray(window_size_np),
-        u_finufft=jnp.asarray(u_finufft_np),
-        v_finufft=jnp.asarray(v_finufft_np),
     )
 
 
