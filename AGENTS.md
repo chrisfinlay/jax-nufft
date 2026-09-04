@@ -316,10 +316,41 @@ If you touch any of these, run `tests/test_planning.py` and
 
 | `w_strategy`      | Per-plane work          | Peak transient memory       | Notes                                          |
 |-------------------|-------------------------|-----------------------------|------------------------------------------------|
-| `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | Default. v0.1 `"scan"` is a deprecated alias.  |
+| `auto`            | resolves to one below   | matches the resolved choice | **Default since v0.1.3** (issue #46). Platform-aware heuristic. |
+| `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
 | `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
 | `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
+
+`auto` is resolved by `_auto_w_strategy` in the public wrapper, *before*
+the JIT boundary, so the static arg reaching `_dirty2vis_jit` /
+`_vis2dirty_jit` is always one of the four canonical names and an `auto`
+caller shares a JIT cache entry with the explicit equivalent. An explicit
+`w_strategy` is passed through untouched and overrides the heuristic.
+
+It became the default in v0.1.3 because until then it was unreachable
+unless asked for by name, which left the GPU default on the worst of the
+four choices: on one GH200, against ducc0 on the 72 Grace cores of the
+same node, `dense_scan` runs 1.4-5.6x slower than ducc0 where what the
+heuristic picks runs 1.4-6.3x faster (issue #46's table, `epsilon = 1e-6`,
+float64). On CPU the forward is unchanged — the heuristic never picks a
+windowed forward, so it resolves to `dense_scan` on every fixture here —
+while the off-zenith adjoint moves to `windowed_scan`. Timed on the review
+machine (10-core Apple M-series, repository timing protocol, five
+interleaved rounds against explicit `dense_scan`), that is 1.14-1.24x
+faster on MWA_extended off30 and within a ±4% noise floor on MWA_compact
+off30 and MeerKAT off30, whose `n_w` is under 20; the zenith fixtures keep
+`dense_scan` in float64 and cross over in float32, where the narrower
+`W = 5` kernel raises `n_w / w_kernel_width` past the cutoff. Nothing
+measured slower. Two consequences to keep in mind when changing anything
+here: retuning the heuristic now moves the *shipped* default, so
+`tests/test_default_w_strategy.py` pins the resolved pick for every CPU
+fixture as a literal table that a retune has to edit deliberately; and
+because the strategies differ in w-plane accumulation order, they agree
+only to the 1e-11 strategy-equivalence bound
+(`tests/test_strategies_equivalent.py`), so this change does not preserve
+bit-identical output across the version boundary. `w_strategy="dense_scan"`
+restores the pre-v0.1.3 behaviour.
 
 The v0.1 names `"scan"` / `"vmap"` are accepted as deprecated aliases
 that emit `DeprecationWarning` and resolve to their `dense_*`

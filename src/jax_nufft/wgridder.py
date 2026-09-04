@@ -939,7 +939,7 @@ def dirty2vis(
     plan: WGridderPlan,
     image: Array,
     *,
-    w_strategy: WStrategy = "dense_scan",
+    w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int | None = None,
 ) -> Array:
@@ -956,13 +956,30 @@ def dirty2vis(
         ``plan.complex_dtype`` is cast up to it, a wider one raises
         ``TypeError`` (issue #11).
     w_strategy:
-        ``"dense_scan"`` (default, low memory) or ``"dense_vmap"`` (potentially
-        faster on GPU but allocates ``n_w * image_size`` peak memory).
-        ``"windowed_scan"`` / ``"windowed_vmap"`` use the per-plane windowed
-        path. ``"auto"`` resolves to a canonical name before the JIT boundary
-        via :func:`_auto_w_strategy` (so cache sharing is preserved); see that
-        helper's docstring for the heuristic. The bare names ``"scan"`` /
-        ``"vmap"`` are accepted as deprecated aliases.
+        ``"auto"`` (the default since v0.1.3, issue #46) resolves to one of
+        the four canonical names before the JIT boundary via
+        :func:`_auto_w_strategy` -- so cache sharing is preserved, and see
+        that helper's docstring for the heuristic itself. The canonical
+        names, all of which override the heuristic when passed explicitly,
+        are ``"dense_scan"`` (low memory), ``"dense_vmap"`` (potentially
+        faster on GPU but allocates ``n_w * image_size`` peak memory) and
+        ``"windowed_scan"`` / ``"windowed_vmap"``, which use the per-plane
+        windowed path. The bare names ``"scan"`` / ``"vmap"`` are accepted
+        as deprecated aliases.
+
+        The default was ``"dense_scan"`` through v0.1.2, which left the
+        heuristic unreachable and, on GPU, made the shipped default the
+        worst of the four choices: measured on one GH200 against ducc0 on
+        72 Grace cores of the same node (eps 1e-6, float64, single
+        channel), ``dense_scan`` runs 1.4-5.6x *slower* than ducc0 on the
+        fixtures of issue #46, where what ``"auto"`` picks there runs
+        1.4-6.3x faster. Passing ``w_strategy="dense_scan"`` restores the
+        pre-v0.1.3 behaviour. Note that the strategies agree to the
+        strategy-equivalence bound (1e-11 in float64,
+        ``tests/test_strategies_equivalent.py``) and not bit-for-bit --
+        they accumulate the w-planes in a different order -- so output
+        that is exactly reproducible across this version boundary needs an
+        explicit ``w_strategy``.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"`` for the channel loop.
     nthreads:
@@ -1186,7 +1203,7 @@ def vis2dirty(
     vis: Array,
     *,
     weights: Array | None = None,
-    w_strategy: WStrategy = "dense_scan",
+    w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int | None = None,
 ) -> Array:
@@ -1208,10 +1225,24 @@ def vis2dirty(
         array is rejected with ``TypeError`` rather than silently losing its
         imaginary part.
     w_strategy:
-        ``"dense_scan"`` (default), ``"dense_vmap"``, ``"windowed_scan"``,
-        ``"windowed_vmap"``, or ``"auto"``; same semantics as in
-        :func:`dirty2vis`. The bare names ``"scan"`` / ``"vmap"`` are accepted
-        as deprecated aliases.
+        ``"auto"`` (the default since v0.1.3, issue #46), ``"dense_scan"``,
+        ``"dense_vmap"``, ``"windowed_scan"`` or ``"windowed_vmap"``; same
+        semantics as in :func:`dirty2vis`, including that an explicit name
+        overrides the heuristic, that ``"dense_scan"`` restores the
+        pre-v0.1.3 default, and that the strategies agree to 1e-11 in
+        float64 rather than bit-for-bit. The bare names ``"scan"`` /
+        ``"vmap"`` are accepted as deprecated aliases.
+
+        The adjoint is where the new default also changes what a *CPU*
+        caller gets: on the repository's off-zenith fixtures the CPU
+        heuristic picks ``"windowed_scan"`` here where the old default was
+        ``"dense_scan"``. Measured on a 10-core Apple M-series (eps 1e-6,
+        float64, single channel, plan and warm-up outside the timer,
+        median of 9 calls, five interleaved rounds) that is 1.14-1.24x
+        faster on MWA_extended off30 (n_w=251) and indistinguishable
+        (within a +-4% noise floor) on MWA_compact off30 and MeerKAT
+        off30, whose n_w is under 20. The forward is unaffected: the CPU
+        heuristic never picks a windowed forward.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"``.
     nthreads:
