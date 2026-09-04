@@ -535,9 +535,10 @@ benchmark is at least as consistent with run-to-run variance as with any
 code change, and there is no same-node A/B of the two revisions on this
 branch to separate the two explanations — so the honest statement is that
 the gap is wider on this run, not that some particular change widened it.
-What does not depend on that cell: in all six of the re-run's cells the
-default beats `dense_scan` by 3x or more, and the smallest margin (3.0x,
-the GH200_large adjoint) is one the shifted cell has no part in.
+What does not depend on that cell: the default beats `dense_scan` in all
+six of the re-run's cells, and the smallest margin — 2.96x on the
+GH200_large adjoint, which the table rounds to 3.0x — is one the shifted
+cell has no part in.
 
 On CPU the change is much smaller, and it is not nothing. The forward is
 untouched — the CPU heuristic never picks a windowed forward, so it
@@ -600,10 +601,17 @@ bound `tests/test_strategies_equivalent.py` pins — `1e-11` relative in
 float64 — rather than to the last bit. In practice the gap is far
 smaller: on the three GH200 fixtures above, the default and `dense_scan`
 agree to `5e-16` relative, i.e. to float64 rounding. The `1e-11` is what
-is *guaranteed*, not what is typical. Code that needs bit-identical
-output from one run to the next on one build should name its
-`w_strategy`; code that needs it across releases needs the release
-pinned, not the strategy.
+is *guaranteed*, not what is typical.
+
+Naming `w_strategy` explicitly is worth doing, but not for bitwise
+determinism: `"auto"` is already deterministic for an unchanged plan on an
+unchanged platform, and FINUFFT's own reduction order can vary underneath
+either choice, so pinning the strategy neither adds nor guarantees
+run-to-run bit identity. What it buys is insulation from the *heuristic*
+and the *platform* — a retune (issue #34) or the same code running on GPU
+instead of CPU changes what `"auto"` selects, and an explicit name does
+not move. Reproducing an older release's numbers needs that release
+pinned; neither choice of `w_strategy` substitutes for it.
 
 ### Accuracy expectation
 

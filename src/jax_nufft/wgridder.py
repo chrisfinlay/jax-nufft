@@ -201,7 +201,11 @@ def _resolve_nthreads(
       * otherwise ``w_strategy`` is canonicalised via
         :func:`_canonicalise_w_strategy` (resolving ``"auto"`` and the
         deprecated ``"scan"`` / ``"vmap"`` aliases the same way the
-        strategy dispatch itself does), and:
+        strategy dispatch itself does) *unless it is already one of the
+        four canonical names*, in which case it is used as-is and the
+        canonicalisation is skipped entirely -- see the note below on why
+        that skip is a correctness guarantee rather than an optimisation.
+        Then:
           - if ``n_rows < _NTHREADS_SMALL_N_ROWS``, the plane loop is short
             enough that spinning up a thread pool per call isn't worth it
             regardless of strategy -> ``1`` (this overrides the strategy
@@ -220,10 +224,38 @@ def _resolve_nthreads(
     is the opposite story -- it benefits from threads -- so a flat default of
     ``1`` would regress it; hence the strategy-family split rather than a
     single number.
+
+    One canonicalisation (issue #46)
+    --------------------------------
+    Since ``w_strategy`` also defaults to ``"auto"``, the common path is
+    *both* defaults at once, and :func:`dirty2vis` / :func:`vis2dirty`
+    resolve the strategy in the wrapper and hand the resolved name down to
+    this function. Issue #46 asks for exactly one canonicalisation on that
+    path, so the already-canonical branch below short-circuits rather than
+    calling :func:`_canonicalise_w_strategy` a second time.
+
+    That is a guarantee, not a micro-optimisation. Re-canonicalising a
+    canonical name happens to be a no-op *today* -- the function is a fixed
+    point on those four strings -- but relying on that makes an invariant
+    of what is really an implementation detail of another function: any
+    future change that gave ``_canonicalise_w_strategy`` a plan-dependent
+    branch, or made it re-consult the heuristic, would silently start
+    resolving twice and could disagree with the strategy the wrapper
+    already committed to at the JIT boundary. Skipping the call removes
+    that coupling instead of documenting it.
+
+    Direct callers passing a raw name still work unchanged: ``"auto"`` and
+    the deprecated aliases fall through to the full canonicalisation below,
+    including its ``ValueError`` when ``"auto"`` arrives without ``plan`` /
+    ``is_adjoint`` context.
     """
     if nthreads is not None:
         return nthreads
-    canonical = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=is_adjoint)
+    if w_strategy in _CANONICAL_W_STRATEGIES:
+        # Already resolved (the operators' path): use it as-is.
+        canonical: WStrategy = cast(WStrategy, w_strategy)
+    else:
+        canonical = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=is_adjoint)
     if n_rows < _NTHREADS_SMALL_N_ROWS:
         return 1
     if canonical in ("dense_scan", "windowed_scan"):
@@ -1246,11 +1278,12 @@ def vis2dirty(
         heuristic picks ``"windowed_scan"`` here where the old default was
         ``"dense_scan"``. Measured on a 10-core Apple M-series (eps 1e-6,
         float64, single channel, plan and warm-up outside the timer,
-        median of 9 calls, five interleaved rounds) that is 1.14-1.24x
-        faster on MWA_extended off30 (n_w=251) and indistinguishable
-        (within a +-4% noise floor) on MWA_compact off30 and MeerKAT
-        off30, whose n_w is under 20. The forward is unaffected: the CPU
-        heuristic never picks a windowed forward.
+        median of 9 calls) that is 1.14-1.24x faster on MWA_extended off30
+        (n_w=251) -- a range across two passes, 1.24x over five interleaved
+        rounds and 1.14x over a nine-round paired re-measurement -- and
+        indistinguishable, within a +-4% noise floor, on MWA_compact off30
+        and MeerKAT off30, whose n_w is under 20. The forward is
+        unaffected: the CPU heuristic never picks a windowed forward.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"``.
     nthreads:

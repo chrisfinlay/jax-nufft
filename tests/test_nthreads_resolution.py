@@ -13,10 +13,16 @@ helper in ``jax_nufft.wgridder``:
   * an explicit ``nthreads`` (any int, including 0) always passes straight
     through -- resolution never runs, and ``w_strategy="auto"`` never needs
     ``plan`` / ``is_adjoint`` in that case;
-  * otherwise ``w_strategy`` is canonicalised first (via the existing
-    ``_canonicalise_w_strategy``, so ``"auto"`` and the deprecated
-    ``"scan"``/``"vmap"`` aliases resolve the same way they already do for
-    the strategy dispatch itself);
+  * otherwise the strategy family decides, from a canonical name: one of
+    the four canonical names is used as-is, and anything else -- ``"auto"``
+    and the deprecated ``"scan"``/``"vmap"`` aliases -- is put through
+    ``_canonicalise_w_strategy`` and so resolves the same way it does for
+    the strategy dispatch itself. (The already-canonical short-circuit is
+    issue #46: with ``w_strategy`` also defaulting to ``"auto"``, the
+    operators resolve in the wrapper and pass the result down, and
+    resolving it a second time here would be a silent dependency on
+    canonicalisation staying a fixed point. See
+    ``tests/test_default_w_strategy.py::test_defaulted_call_canonicalises_exactly_once``.)
   * if ``n_rows`` is below the tunable ``_NTHREADS_SMALL_N_ROWS`` cutoff,
     the plane loop is short enough that spinning up a thread pool per call
     isn't worth it regardless of strategy -> ``1``;

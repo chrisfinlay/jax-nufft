@@ -331,24 +331,25 @@ caller shares a JIT cache entry with the explicit equivalent. An explicit
 It became the default (issue #46; unreleased — the version the package
 reports is still the v0.1.2 line) because until then it was unreachable
 unless asked for by name, which left the GPU default on the worst of the
-four choices: on one GH200, against ducc0 on the 72 Grace cores of the
-same node, `dense_scan` runs 1.4-5.6x slower than ducc0 where what the
-heuristic picks runs 1.4-6.3x faster (issue #46's table, `epsilon = 1e-6`,
-float64). On CPU the forward is unchanged — the heuristic never picks a
-windowed forward, so it resolves to `dense_scan` on every fixture here —
-while the off-zenith adjoint moves to `windowed_scan`. Timed on the review
-machine (10-core Apple M-series, repository timing protocol, five
-interleaved rounds against explicit `dense_scan`), that is 1.14-1.24x
-faster on MWA_extended off30 and within a ±4% noise floor on MWA_compact
-off30 and MeerKAT off30, whose `n_w` is under 20; the zenith fixtures keep
-`dense_scan` in float64 and cross over in float32, where the narrower
-`W = 5` kernel raises `n_w / w_kernel_width` past the cutoff. Nothing
-measured slower outside that noise floor — the worst cell is the MeerKAT
-off30 adjoint at 0.99x, which is a strategy-changing cell rather than a
-control, so it is a real 1% too small for this machine to resolve rather
-than a demonstrated tie. Note also that the 1.05-1.53x range in section 9
-does not reproduce: its endpoints are MWA_compact off30 and MeerKAT off30,
-the two cells now measured flat.
+four choices: on one GH200, against ducc0 on the 72 Grace cores of the same
+node, `dense_scan` runs 1.4-5.6x slower than ducc0 where what the heuristic
+picks runs 1.4-6.3x faster (issue #46's table, `epsilon = 1e-6`, float64).
+On CPU the forward is unchanged — the heuristic never picks a windowed
+forward, so it resolves to `dense_scan` on every fixture here — while the
+off-zenith adjoint moves to `windowed_scan`. Timed on the review machine
+(10-core Apple M-series, repository timing protocol, against explicit
+`dense_scan`), that is 1.14-1.24x faster on MWA_extended off30 — a range
+across two passes, 1.24x over five interleaved rounds and 1.14x over a
+nine-round paired re-measurement — and within a ±4% noise floor on
+MWA_compact off30 and MeerKAT off30, whose `n_w` is under 20; the zenith
+fixtures keep `dense_scan` in float64 and cross over in float32, where the
+narrower `W = 5` kernel raises `n_w / w_kernel_width` past the cutoff.
+Nothing measured slower outside that noise floor — the worst cell is the
+MeerKAT off30 adjoint at 0.99x, which is a strategy-changing cell rather
+than a control, so it is a real 1% too small for this machine to resolve
+rather than a demonstrated tie. Note also that the 1.05-1.53x range in
+section 9 does not reproduce: its endpoints are MWA_compact off30 and
+MeerKAT off30, the two cells now measured flat.
 
 Two consequences to keep in mind when changing anything here. Retuning the
 heuristic now moves the *shipped* default, so

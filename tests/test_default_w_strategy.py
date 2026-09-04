@@ -17,23 +17,29 @@ What this module pins
   time (checked at the JIT boundary, with the platform pinned so the
   resolved name is one the old default could never produce);
 * an explicit ``w_strategy`` is still forwarded untouched -- including
-  ``"dense_scan"``, which issue #46 promises restores the old behaviour;
+  ``"dense_scan"``, which issue #46 promises restores the old *code path*
+  (not the old numbers -- other changes in the same release moved those);
 * what ``"auto"`` resolves to on every repository CPU fixture, forward and
   adjoint, as a literal table: a later change to the heuristic must break a
   test rather than silently move the shipped default;
 * the ``nthreads`` interaction from issue #24: ``_resolve_nthreads`` derives
   its default from the *resolved* strategy and is never handed the literal
-  ``"auto"`` by the operators, canonicalisation is idempotent (so the
-  double resolution that both-defaults implies cannot change the answer),
-  and both-defaults gives the same ``nthreads`` as passing the resolved
-  strategy explicitly;
+  ``"auto"`` by the operators, a defaulted call canonicalises exactly *once*
+  (issue #46's checkbox -- ``_resolve_nthreads`` short-circuits on an
+  already-canonical name rather than resolving a second time), and
+  both-defaults gives the same ``nthreads`` as passing the resolved strategy
+  explicitly;
 * JIT cache sharing: the default call and the explicit resolved call hit the
   same compiled executable, not merely equal numbers.
 
 Numerical equivalence of the new default against the four explicit
-strategies is *not* here: ``tests/test_strategies_equivalent.py`` already
-owns the 1e-11 strategy-equivalence bound and was extended (issue #46) with
-a default-call entrant rather than duplicating that net here.
+strategies is *not* here: ``tests/test_strategies_equivalent.py`` owns the
+1e-11 strategy-equivalence bound. It has no default-call entrant, and
+deliberately so -- ``"auto"`` resolves before the JIT boundary, so such an
+entrant is bit-identical to the explicit strategy it resolves to and gates
+nothing; see the comment on ``STRATEGY_TOL`` there. What makes that
+reasoning sound is pinned below, by
+``test_default_shares_the_compiled_executable_with_the_explicit_resolved``.
 
 Platform pinning
 ----------------
@@ -84,6 +90,7 @@ from jax_nufft.wgridder import (
 )
 from tests.conftest import (
     EDA2,
+    GH200_LARGE,
     MEERKAT,
     MWA_COMPACT,
     MWA_EXTENDED,
@@ -335,7 +342,10 @@ def test_explicit_strategy_is_not_overridden(
 ) -> None:
     """Every member of ``WStrategy``, passed explicitly, reaches the JIT
     boundary unchanged -- ``"dense_scan"`` included, which is the promise
-    that an explicit ``dense_scan`` restores the pre-#46 behaviour exactly.
+    that an explicit ``dense_scan`` restores the pre-#46 *code path*. (Not
+    the pre-#46 numbers: #16, #23 and #43 land in the same release and #16
+    moved the numbers on its own, so pinning the strategy removes the
+    strategy change from a cross-version comparison and nothing else.)
 
     The platform is pinned to ``"gpu"``, where ``"auto"`` resolves to
     ``dense_vmap`` for this plan, so an implementation that resolved
@@ -391,10 +401,19 @@ def test_explicit_auto_matches_the_default(
 #   float32/1e-4: same fixtures at W=5, n_w 12/6/15/12/249/6/17.
 # The pattern in both legs: the forward never leaves ``dense_scan`` (the CPU
 # heuristic has no forward windowed win to claim -- v0.1.1 Part 2 measured
-# "~flat on forward"), and the adjoint switches to ``windowed_scan`` exactly
-# where the w-extent is large enough for the windowed slice to pay
-# (n_w / w_kernel_width > 2), which is the 1.05-1.53x off-zenith adjoint win
-# recorded in AGENTS.md section 9.
+# "~flat on forward"), and the adjoint switches to ``windowed_scan`` where the
+# w-extent is large enough for the windowed slice to pay
+# (n_w / w_kernel_width > 2).
+#
+# What that switch is worth on current code is *smaller* than the 1.05-1.53x
+# AGENTS.md section 9 records for v0.1.1 Part 2, and that range should not be
+# quoted here: its endpoints are MWA_compact off30 (1.53x) and MeerKAT off30
+# (1.05x), and both now time flat (1.01x and 0.99x, inside a +-4% noise
+# floor). Only MWA_extended off30 still shows a win, 1.14-1.24x. See the
+# README's `w_strategy="auto"` section for the measurement. None of that
+# changes what this table asserts -- which strategy is picked, not what it
+# earns -- but a reader should not take the pick as evidence of the old
+# range.
 _CPU_FIXTURES: list[tuple[Telescope, float]] = [
     (EDA2, 0.0),
     (MWA_COMPACT, 0.0),
@@ -475,50 +494,118 @@ def test_cpu_default_resolves_to_expected_strategy(
 
 
 # -- 4. the GPU case, behind the repository's GPU gate ----------------------
+#
+# Literal expectations, exactly as for the CPU table above: "a vmap-family
+# strategy" is not enough. The GPU heuristic has two vmap answers and the
+# choice between them is the whole content of three of its four gates, so an
+# ``in ("dense_vmap", "windowed_vmap")`` assertion passes under a heuristic
+# mutated to return the wrong one of the two -- which is how the earlier
+# revision of this test failed to gate the branch it was written for.
+#
+# Measured on a real GH200 (issue #46's hardware) and reproduced here from
+# the plan alone, which is host-side and therefore checkable off-GPU:
+#
+#   MWA_extended off30  n_w=251  fwd dense_vmap  adj dense_vmap
+#   MeerKAT off30       n_w=19   fwd dense_vmap  adj dense_vmap
+#   GH200_large off30   n_w=43   fwd dense_vmap  adj windowed_vmap
+#
+# GH200_large is the interesting row and the reason it is worth its size: it
+# is the only fixture where the two directions *disagree*, so it is what pins
+# the ``is_adjoint and n_rows >= _GPU_LARGE_N_ROWS -> windowed_vmap`` gate.
+# Without it nothing in the suite reaches that branch on real hardware.
+#
+# The picks are the same on both precision legs (float64/eps 1e-6 and
+# float32/eps 1e-4), so unlike the CPU table this one is not precision-keyed.
+# The cell closest to a boundary is MeerKAT off30 in float32, whose padding
+# overhead reads 2.992 against a 3.0 cutoff; crossing it would send the
+# adjoint to ``dense_vmap``, which is what this table already expects, so
+# even that crossing would not silently change an answer here.
+_EXPECTED_GPU_AUTO: list[tuple[Telescope, str, str]] = [
+    # telescope (all at 30 deg off-zenith) -> (forward pick, adjoint pick)
+    (MWA_EXTENDED, "dense_vmap", "dense_vmap"),
+    (MEERKAT, "dense_vmap", "dense_vmap"),
+    (GH200_LARGE, "dense_vmap", "windowed_vmap"),
+]
+
+
+def _gpu_plan(tel: Telescope, real_dtype: DTypeLike):
+    """Plan for ``tel`` at 30 deg off-zenith. Host-side numpy only."""
+    return make_plan(
+        uvw=synthetic_uvw(tel, 30.0, seed=0),
+        freq=np.array([tel.freq_hz]),
+        image_shape=(tel.n_pix, tel.n_pix),
+        pixsize_l=tel.pixsize,
+        pixsize_m=tel.pixsize,
+        epsilon=EPSILON,
+        dtype=real_dtype,
+    )
 
 
 @pytest.mark.runbench_gpu
-def test_gpu_default_resolves_to_a_vmap_strategy(
+@pytest.mark.parametrize(
+    ("telescope", "expected_forward", "expected_adjoint"),
+    _EXPECTED_GPU_AUTO,
+    ids=[t.name for t, _, _ in _EXPECTED_GPU_AUTO],
+)
+def test_gpu_default_resolves_to_the_expected_strategy(
+    telescope: Telescope,
+    expected_forward: str,
+    expected_adjoint: str,
     real_dtype: DTypeLike,
-    complex_dtype: DTypeLike,
 ) -> None:
-    """On a real GPU backend the default must land on the fast path.
+    """On a real GPU backend the default resolves to the *named* strategy.
 
     Issue #46's measurements: on a GH200, ``dense_scan`` (the old default)
     is 1.4-5.6x *slower* than ducc0 on 72 Grace cores, while the strategy
     ``"auto"`` picks is 1.4-6.3x faster; the GH200 sweep behind
     ``docs/benchmarks/v0.1.2-baseline-gpu.json`` has the scan variants
-    5-30x off the vmap ones. So a scan-family pick here is the regression
-    this test exists to catch.
+    5-30x off the vmap ones. A scan-family pick is the headline regression
+    this catches, but the exact-name assertion also catches picking the
+    wrong member of the vmap family -- see the table comment above.
 
-    Uses the repository ``MWA_extended`` off-zenith fixture -- the headline
-    row of the issue's table (n_w=251) -- and, unlike the CPU tests above,
-    does *not* patch the platform: the point is what a user on real GPU
-    hardware gets. Gated by ``@pytest.mark.runbench_gpu``, the repository's
-    only GPU gate (``--runbench-gpu`` plus ``jax.default_backend() ==
-    "gpu"``, enforced in ``tests/conftest.py``), so it skips cleanly on CPU.
+    Unlike the CPU tests, this does *not* patch the platform: the point is
+    what a user on real GPU hardware gets. Gated by
+    ``@pytest.mark.runbench_gpu``, the repository's only GPU gate
+    (``--runbench-gpu`` plus ``jax.default_backend() == "gpu"``, enforced in
+    ``tests/conftest.py``), so it skips cleanly on CPU.
+
+    Cost: this builds a plan and runs the heuristic, and runs no transform.
+    That matters for the ``GH200_large`` parametrisation -- 2048^2 with 50k
+    rows -- whose plan is a few hundred MB of host arrays but whose gridding
+    would be seconds of GPU time per call. The strategy resolution is
+    host-side and needs neither, so it is not paid here. The end-to-end
+    check below deliberately uses only the small fixture.
     """
     assert jax.default_backend() == "gpu", "the runbench_gpu gate should guarantee this"
-    uvw = synthetic_uvw(MWA_EXTENDED, 30.0, seed=0)
-    plan = make_plan(
-        uvw=uvw,
-        freq=np.array([MWA_EXTENDED.freq_hz]),
-        image_shape=(MWA_EXTENDED.n_pix, MWA_EXTENDED.n_pix),
-        pixsize_l=MWA_EXTENDED.pixsize,
-        pixsize_m=MWA_EXTENDED.pixsize,
-        epsilon=EPSILON,
-        dtype=real_dtype,
-    )
-    for is_adjoint in (False, True):
+    plan = _gpu_plan(telescope, real_dtype)
+    for is_adjoint, expected in ((False, expected_forward), (True, expected_adjoint)):
         resolved = _canonicalise_w_strategy("auto", plan=plan, is_adjoint=is_adjoint)
-        assert resolved in ("dense_vmap", "windowed_vmap"), (
-            f"MWA_extended off30 {'adjoint' if is_adjoint else 'forward'} "
-            f"(n_w={plan.n_w}): the GPU default resolved to {resolved!r}; the "
-            "scan family is 5-30x slower than the vmap family on this hardware"
+        assert resolved == expected, (
+            f"{telescope.name} off30 {'adjoint' if is_adjoint else 'forward'} "
+            f"(n_w={plan.n_w}, W={plan.w_kernel_width}, n_rows={plan.n_rows}, "
+            f"padding_overhead={plan.window_padding_overhead:.4f}): the GPU default "
+            f"resolved to {resolved!r}, but this table says {expected!r}. A scan-family "
+            "answer is 5-30x slower on this hardware; the other vmap answer is a "
+            "bounded loss but still not what was measured. If the heuristic was "
+            "retuned on purpose (issue #34), update the table with the measurement."
         )
 
-    # ...and the operators actually forward it. Run the real transform so this
-    # is an end-to-end statement about the GPU path, not just the heuristic.
+
+@pytest.mark.runbench_gpu
+def test_gpu_default_matches_the_explicit_resolved_end_to_end(
+    real_dtype: DTypeLike,
+    complex_dtype: DTypeLike,
+) -> None:
+    """...and the operators actually forward the resolved strategy on GPU.
+
+    The resolution test above is host-side; this runs the real transform so
+    there is one end-to-end statement about the GPU path rather than only a
+    statement about the heuristic. Uses ``MWA_extended`` off30 alone -- the
+    headline row of the issue's table (n_w=251) at 256^2 and 600 rows, so
+    four transforms here are cheap; ``GH200_large`` is deliberately excluded.
+    """
+    assert jax.default_backend() == "gpu", "the runbench_gpu gate should guarantee this"
+    plan = _gpu_plan(MWA_EXTENDED, real_dtype)
     rng = np.random.default_rng(0)
     image = jnp.asarray(
         rng.standard_normal((MWA_EXTENDED.n_pix, MWA_EXTENDED.n_pix)), dtype=real_dtype
@@ -594,6 +681,99 @@ def test_resolve_nthreads_is_never_handed_the_literal_auto(
 
 
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_defaulted_call_canonicalises_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    op: str,
+    real_dtype: DTypeLike,
+    complex_dtype: DTypeLike,
+) -> None:
+    """Issue #46's "one canonicalisation" checkbox, gated rather than argued.
+
+    With ``w_strategy`` and ``nthreads`` both defaulting, the resolution is
+    reachable from two places: the operator's own wrapper, and
+    ``_resolve_nthreads``, which canonicalises whatever name it is handed.
+    Before issue #46 closed this, the pair ran it twice per defaulted call --
+    the second pass on an already-canonical name.
+
+    Two passes are *harmless today* only because canonicalisation is a fixed
+    point on the four canonical names, which
+    ``test_canonicalisation_is_idempotent`` pins separately. That makes the
+    second pass a correctness dependency on another function's internals: a
+    future ``_canonicalise_w_strategy`` with a plan-dependent branch, or one
+    that re-consulted the heuristic, would resolve twice and could hand
+    ``_resolve_nthreads`` a different strategy from the one the wrapper had
+    already committed to at the JIT boundary. So the count itself is the
+    contract, not just the answer.
+
+    ``_resolve_nthreads`` reaches ``_canonicalise_w_strategy`` through the
+    module global, so patching the module attribute observes both call sites
+    from one spy.
+    """
+    _patch_platform(monkeypatch, "gpu")
+    plan, image, vis = _offzenith_problem(real_dtype, complex_dtype)
+    _, jit_name, is_adjoint = _OPERATORS[op]
+    expected = _auto_w_strategy(plan, is_adjoint=is_adjoint)
+
+    seen: list[tuple[str, Any]] = []
+    real_canonicalise = wgridder._canonicalise_w_strategy
+
+    def spy(name, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append((name, kwargs.get("is_adjoint")))
+        return real_canonicalise(name, **kwargs)
+
+    monkeypatch.setattr(wgridder, "_canonicalise_w_strategy", spy)
+    _spy_jit(monkeypatch, jit_name)
+    _call(op, plan, image, vis)  # both defaults
+
+    assert len(seen) == 1, (
+        f"{op} at both defaults canonicalised {len(seen)} times ({seen}), expected once. "
+        "The wrapper resolves 'auto'; _resolve_nthreads must use that resolved name "
+        "as-is rather than canonicalising it again."
+    )
+    name, seen_is_adjoint = seen[0]
+    assert name == "auto", f"the single canonicalisation should be of 'auto', got {name!r}"
+    assert seen_is_adjoint is is_adjoint, (
+        f"{op} resolved 'auto' with is_adjoint={seen_is_adjoint!r}, expected {is_adjoint!r}"
+    )
+    # ...and the one resolution still produces the right answer, so this cannot
+    # pass by skipping the resolution altogether.
+    assert real_canonicalise("auto", plan=plan, is_adjoint=is_adjoint) == expected
+
+
+@pytest.mark.parametrize("w_strategy", CANONICAL)
+def test_resolve_nthreads_needs_no_plan_context_for_canonical_names(
+    w_strategy: WStrategy,
+) -> None:
+    """The short-circuit above must not have made the canonical path depend on
+    ``plan`` / ``is_adjoint``: a canonical name resolves with neither."""
+    assert _resolve_nthreads(None, w_strategy, 500_000) in (0, 1)
+
+
+@pytest.mark.parametrize(("alias", "canonical"), [("scan", "dense_scan"), ("vmap", "dense_vmap")])
+def test_resolve_nthreads_still_resolves_deprecated_aliases(alias: str, canonical: str) -> None:
+    """The raw-name path is still live for direct callers.
+
+    Skipping canonicalisation for already-canonical names must not skip it
+    for the v0.1 aliases: they still resolve (and still warn) here, and reach
+    the same thread default their ``dense_*`` counterparts do. Run above
+    ``_NTHREADS_SMALL_N_ROWS`` so the two families give different answers and
+    the assertion is not satisfied by the small-``n_rows`` override.
+    """
+    n_rows = wgridder._NTHREADS_SMALL_N_ROWS + 1
+    with pytest.warns(DeprecationWarning):
+        got = _resolve_nthreads(None, alias, n_rows)
+    assert got == _resolve_nthreads(None, canonical, n_rows)
+
+
+def test_resolve_nthreads_still_rejects_auto_without_context() -> None:
+    """The other half of the raw-name path: ``"auto"`` with no ``plan`` /
+    ``is_adjoint`` must still raise rather than fall through the
+    already-canonical short-circuit."""
+    with pytest.raises(ValueError, match="must be resolved with plan"):
+        _resolve_nthreads(None, "auto", 500_000)
+
+
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
 def test_both_defaults_give_the_same_nthreads_as_the_explicit_resolved_strategy(
     monkeypatch: pytest.MonkeyPatch,
     op: str,
@@ -640,11 +820,16 @@ def test_canonicalisation_is_idempotent(
 ) -> None:
     """Resolving twice cannot change the answer.
 
-    With both ``w_strategy`` and ``nthreads`` defaulting, the resolution is
-    reachable more than once (the operators canonicalise, and
-    ``_resolve_nthreads`` canonicalises again for anyone who calls it with a
-    raw name), so idempotence is what makes "how many times it happens" a
-    performance question rather than a correctness one.
+    Since issue #46 a defaulted operator call resolves exactly once -- the
+    wrapper canonicalises and ``_resolve_nthreads`` short-circuits on the
+    already-canonical name, which
+    ``test_defaulted_call_canonicalises_exactly_once`` gates. Idempotence is
+    therefore no longer load-bearing on that path, and this test is not a
+    substitute for that one. It stays because the property is still relied
+    on wherever a canonical name is re-offered to the resolver -- direct
+    callers, and any future refactor that moves the canonicalisation -- and
+    because it is what makes the short-circuit safe to add rather than a
+    behaviour change.
 
     Note this also catches a heuristic that returns a *deprecated alias*
     (``"scan"`` / ``"vmap"``) instead of a canonical name: the second
