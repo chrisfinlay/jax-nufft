@@ -25,7 +25,9 @@ plan.
 `padding_overhead` is `plan.window_padding_overhead`, whose **definition
 changed in v0.1.3** (issue #43): the denominator moved from the mean of the
 padded per-plane window lengths to `plan.live_row_count`, the incidences
-inside the unpadded kernel support. Every JSON file in this directory was
+inside the unpadded *nominal* kernel support (a host-side count — see the
+`live_row_count` field comment in `planning.py` for how far it can sit from
+what the compiled operators weight, and why that does not matter here). Every JSON file in this directory was
 recorded through v0.1.2 and so carries the old scale, which reads 0 – 17%
 lower on the same plan. The two are not convertible after the fact — the
 conversion needs the per-`(channel, plane)` window lengths, which are

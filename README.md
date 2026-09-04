@@ -325,11 +325,15 @@ long tail of empty planes is the signature of a clumped `w`-distribution, and
 the reason the windowed strategies stop paying on one.
 
 `live_row_count` is a nominal-support count, not a census of the weights the
-operators apply: the device tests `|z| <= 1` on a `w` that may differ from the
-host's by an FMA contraction, so the two disagree on a handful of incidences
-per plan (measured over the review fixtures: at most 3, and at most 0.083%).
-It is the denominator of a work ratio rather than a kernel-weight audit, and a
-disagreement of that size does not reach the precision the ratio is read at.
+operators apply. The operators derive their own `w` inside the JIT — where the
+multiply and the `- w0` may contract into one FMA, and where a float32 plan
+runs the whole chain in single precision — then test `|z| <= 1`. Measured
+against that compiled expression over the review fixtures, the two counts
+differ on 20 of 40 cells in float64 and 7 of 10 in float32, never by more than
+3 incidences and never by more than 0.19%. `window_padding_overhead` is a work
+ratio rather than a kernel-weight audit, so a disagreement of that size sits
+well below the precision it is read at; an exact census would have to be taken
+against a compiled executable, which does not exist at plan time.
 
 **Plan memory.** The plan stores nothing per `(channel, row)`: the baselines
 are kept once in metres (`plan.uvw_m`, `(n_rows, 3)`) next to one scalar per
@@ -414,7 +418,8 @@ as a diagnostic: the factor by which a windowed traversal's row-work exceeds
 the irreducible minimum. The numerator is what the traversal actually touches
 — each `(channel, plane)` step slices a *static* `max_window_size` rows, since
 the shape has to be static for `lax.scan` / `vmap` — and the denominator counts
-only the rows the `w`-kernel weights. It is bounded below by 1.0, attaining it
+only the rows inside a plane's nominal `w`-kernel support. It is bounded below
+by 1.0, attaining it
 on the constant-`w` fast path where the single plane holds every row and none
 of the slice is padding; pathological `w`-distributions can drive it above ~3,
 at which point dense strategies usually win on absolute time.

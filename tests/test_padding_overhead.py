@@ -11,15 +11,23 @@ a plane's kernel support, and issue #43 is about which ones:
 
 ``live_row_count`` counts the ``(channel, plane, row)`` incidences with
 ``|w_lambda - w_k| <= w_kernel_scale``, measured on the *unpadded* window and
-on the host's own w. That is the *nominal* support, which is close to but not
-identical with "the incidences ``kernel.phi`` weights": the operators form
-``z = fl(fl(w - w_k) / S)`` and test ``|z| <= 1``, and the division rounds --
-:func:`_kernel_weighted_incidence_count` below counts it that way, and the two
-disagree on at most three incidences over the whole calibration grid, which
-:func:`test_padding_overhead_is_windowed_work_over_live_work` pins at four.
-The nominal count is what the denominator of a work ratio wants; an exact
-weight census would cost an ``(n_w, n_rows)`` ``phi`` evaluation per channel
-at plan time to move a diagnostic's fourth decimal place.
+on the host's own w. That is the **nominal support**, and the name ``live`` is
+shorthand for it -- not for "the incidences ``kernel.phi`` weights", which is a
+close but genuinely different set. The operators derive their own w inside the
+JIT (``wgridder._channel_ft_coords``, where XLA may contract the multiply and
+the ``- w0`` into one FMA, and where a float32 plan runs the whole chain in
+single precision), form ``z = fl(fl(w - w_k) / S)``, and test ``|z| <= 1``.
+Measured against that compiled expression over the calibration grid, the two
+counts differ on 20 of the 40 cells in float64 and 7 of the 10 in float32,
+never by more than 3 incidences and never by more than 0.19%.
+
+The nominal count is what the denominator of a work ratio wants. Three
+incidences in several thousand is far below the resolution the ratio is read
+at, an exact census would cost an ``(n_w, n_rows)`` ``phi`` evaluation per
+channel at plan time, and it would in any case be a property of a compiled
+executable rather than of the plan. Nothing in this module claims otherwise:
+:func:`_kernel_weighted_incidence_count` is a *host-side* cross-check on the
+nominal count, and says so.
 
 The builder then widens each window by ``window_boundary_margin`` and by one
 further row at each end (``lo - 1`` / ``hi + 1``, clamped into range). Those
@@ -38,8 +46,10 @@ and none on the other twenty-eight, so the live-vs-padded gap is essentially
 the two clamp rows per (channel, plane) -- on MWA_extended off30 at eps 1e-3,
 the fixture the regression test below uses, it is exactly that and the margin
 catches nothing. Both are excluded on principle regardless of how many rows
-they happen to move: a padded row is one the *device* might place inside
-support under FMA contraction, not one the kernel gives weight. That the gap
+they happen to move: a padded row is outside nominal support, which is the
+predicate being counted, and a margin row is one the *device* might well place
+inside support under FMA contraction -- that possibility being the margin's
+reason to exist. That the gap
 is mostly the clamp is also why it matters most where the windows are
 narrowest.
 
@@ -166,9 +176,12 @@ def _independent_live_sizes(plan: WGridderPlan) -> np.ndarray:
     the ``lo - 1`` / ``hi + 1`` clamp, which is the whole point: those rows
     must not reach the denominator.
 
-    The interval is closed at both ends, matching ``side="left"`` /
-    ``side="right"`` and matching ``kernel.phi``, which returns a nonzero
-    ``exp(-beta)`` at ``|z| == 1`` exactly.
+    The interval is closed at both ends, matching the builder's
+    ``side="left"`` / ``side="right"`` pair. Closed is the right choice
+    because ``kernel.phi`` returns a nonzero ``exp(-beta)`` at an *exactly*
+    computed ``|z| == 1``; it does not follow that the operators weight every
+    row this counts, since they form ``z`` by a division that rounds -- see
+    the module docstring for the measured size of that gap.
     """
     centres = np.asarray(plan.w_centers_rel, dtype=np.float64)
     scale = plan.w_kernel_scale
@@ -183,16 +196,28 @@ def _independent_live_sizes(plan: WGridderPlan) -> np.ndarray:
 
 
 def _kernel_weighted_incidence_count(plan: WGridderPlan) -> int:
-    """``(channel, plane, row)`` incidences whose w-kernel weight is nonzero.
+    """Host-side ``phi_numpy`` cross-check on the nominal-support count.
 
-    This is the *semantic* definition of the denominator -- the work a
-    windowed traversal cannot avoid -- expressed through the same
-    ``kernel.phi`` the operators call, rather than through any interval
-    arithmetic. It is a slightly different float computation from
-    :func:`_independent_live_sizes` (it forms ``z = (w - w_k) / scale`` and
-    lets the division round) so the two can disagree by a row or two on
-    fixtures that place a row exactly on ``|z| == 1``; the callers below only
-    use it where that does not happen, and say so.
+    Restates the denominator through ``kernel.phi_numpy`` instead of through
+    interval arithmetic: it forms ``z = (w - w_k) / scale`` in numpy and lets
+    the division round, where :func:`_independent_live_sizes` compares against
+    the interval endpoints directly. Two ways of asking the same host-side
+    question, so a systematic error in one shows up as a disagreement.
+
+    **It is not a proxy for what the operators weight, and must not be read as
+    one.** The device derives its own w (``wgridder._channel_ft_coords``, FMA
+    contraction, single precision throughout on a float32 plan); this runs
+    numpy on the plan's leaves. Measured over the calibration grid against the
+    JIT-compiled operator expression, this helper differs from it on 10 of the
+    40 float64 cells and 7 of the 10 float32 ones -- for instance MeerKAT off30
+    at eps 1e-3, where the nominal count is 2401, this helper gives 2399 and
+    the compiled expression gives 2400. On the float32 leg it reproduces
+    :func:`_independent_live_sizes` exactly on every cell and so carries no
+    information about the device at all.
+
+    The residual host-side disagreement with the interval count -- at most
+    three incidences over the grid, from rows sitting within a rounding of
+    ``|z| == 1`` -- is what the tolerance at the one call site allows for.
     """
     centres = np.asarray(plan.w_centers_rel, dtype=np.float64)
     total = 0
@@ -360,14 +385,15 @@ def test_padding_overhead_is_windowed_work_over_live_work(zenith_angle_deg: floa
     # has to visit, so this is a real overhead factor.
     assert plan.window_padding_overhead >= 1.0
 
-    # The same denominator expressed through the kernel the operators
-    # actually apply: a row is live iff ``phi`` gives it a nonzero weight.
-    # The tolerance is for rows sitting exactly on ``|z| == 1``, where forming
-    # ``z`` by division rounds to the other side of the support edge; the
-    # measured worst case over the whole forty-cell grid below, in both
-    # precision legs, is three rows. Against the ~490-row gap between the live
-    # and padded denominators on this fixture that is not slack the defect
-    # could hide in.
+    # The same denominator restated through ``phi_numpy`` rather than through
+    # interval endpoints -- a second host-side route to the same number, not a
+    # statement about what the operators weight (see the helper's docstring).
+    # The tolerance is for rows sitting within a rounding of ``|z| == 1``,
+    # where forming ``z`` by division puts them on the other side of the
+    # support edge; the measured worst case over the whole forty-cell grid
+    # below, in both precision legs, is three rows. Against the ~490-row gap
+    # between the live and padded denominators on this fixture that is not
+    # slack the defect could hide in.
     assert abs(_kernel_weighted_incidence_count(plan) - plan.live_row_count) <= 4
 
     # The padded windows are strictly bigger. How much bigger is the whole
@@ -676,8 +702,13 @@ def test_margin_rows_are_excluded_from_the_denominator(real_dtype: DTypeLike) ->
         f"planted row sits at {offset - scale:.3e} past the edge, outside the "
         f"margin band (0, {margin:.3e}]"
     )
-    # Said through the kernel the operators actually apply: |z| > 1, so phi
-    # weights this row at exactly zero. It is unambiguously padding.
+    # Said through the kernel rather than through the interval: at this |z|,
+    # computed on the host, ``phi`` returns exactly zero. That is a host-side
+    # statement -- the device forms its own ``z`` and this is a row the margin
+    # exists to catch, so it is precisely the case where the device may
+    # disagree. Which is the point: the row is excluded from the denominator
+    # because it is outside *nominal* support, not because the kernel can be
+    # shown to ignore it.
     assert float(phi_numpy(np.array([offset / scale]), plan.beta)[0]) == 0.0
 
     live_sizes = _independent_live_sizes(plan)

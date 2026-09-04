@@ -198,24 +198,38 @@ class WGridderPlan:
     # insurance clamp hides.
     #
     # ``live_row_count`` is the number of ``(channel, plane, row)`` incidences
-    # with ``|w_lambda - w_k| <= w_kernel_scale``: the *nominal* support,
-    # measured on the host, on the unpadded interval. It is deliberately not
-    # an audit of which incidences the operators end up weighting. The device
-    # forms ``z = fl(fl(w - w_k) / S)`` and tests ``|z| <= 1``, from a w that
-    # may differ from the host's by an FMA contraction, so the two counts
-    # disagree a little. Measured over the forty-cell calibration grid: 15 of
-    # the 40 cells disagree at all, never by more than 3 incidences (worst,
-    # MWA_extended off30 at eps 1e-6: 4201 nominal against 4198 that ``phi``
-    # weights) or 0.083% relative, and the float32 leg's ten cells agree
-    # exactly.
+    # inside the plane's NOMINAL SUPPORT: ``|w_lambda - w_k| <=
+    # w_kernel_scale``, with ``w`` as *this function* computes it, on the
+    # unpadded interval. That, and not "the incidences the kernel weights",
+    # is the whole of what the field means -- the two are close but not the
+    # same thing, and the difference is worth stating rather than glossing.
+    #
+    # The operators never evaluate that predicate. They derive their own ``w``
+    # (``wgridder._channel_ft_coords``, where XLA may contract the multiply
+    # and the ``- w0`` into one FMA, and where a float32 plan runs the whole
+    # chain in single precision), form ``z = fl(fl(w - w_k) / S)``, and test
+    # ``|z| <= 1``. Measured against exactly that expression, JIT-compiled,
+    # over the calibration grid: the counts differ on 20 of the 40 cells in
+    # float64 and 7 of the 10 in float32, never by more than 3 incidences,
+    # worst 0.19% relative (EDA2 zenith at eps 1e-3 in float32, 3 of 1598).
+    # ``kernel.phi`` and ``kernel.phi_numpy`` are the same expression line for
+    # line, so all of that gap is in how ``z`` is formed, none of it in the
+    # kernel.
     #
     # The nominal count is the right quantity here, not a tolerable
     # approximation of a better one. This is the denominator of a *work*
     # ratio -- what fraction of a windowed traversal is padding -- so three
     # incidences in several thousand is far below the resolution at which the
-    # number is read, while an exact kernel-weight audit would cost an
+    # number is read, while an exact device census would cost an
     # ``(n_w, n_rows)`` evaluation of ``phi`` per channel at plan time to move
-    # a diagnostic's fourth decimal place.
+    # a diagnostic's fourth decimal place. It would also be the wrong
+    # quantity: which rows the device weights is a property of a compiled
+    # executable, and the plan is built before one exists.
+    #
+    # The name ``live`` is shorthand for that nominal-support membership. It
+    # is a slightly stronger-sounding word than the measurement supports; this
+    # comment is where that difference is recorded, since the name cannot
+    # carry it.
     #
     # The builder then widens every window by ``window_boundary_margin`` and
     # by one further row at each end. Those rows are real work for a windowed
@@ -1186,8 +1200,10 @@ def make_plan(
             lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw - boundary_margin, "left")
             hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw + boundary_margin, "right")
             # issue #43: the same two boundaries WITHOUT the margin, taken
-            # before the clamp below widens them -- the rows that actually
-            # carry a nonzero ``phi``. Two more binary searches per channel,
+            # before the clamp below widens them -- the rows inside nominal
+            # support, which is what ``live_row_count`` means (see its field
+            # comment: not the same as the rows the *device* weights, and the
+            # gap is measured there). Two more binary searches per channel,
             # so the builder stays O(n_chan * n_w * log n_rows) and still
             # never materialises anything of shape (n_chan, n_rows).
             #
@@ -1198,9 +1214,11 @@ def make_plan(
             # twenty-eight -- on MWA_extended off30 at eps 1e-3, the worst
             # fixture, the whole 487-row live-vs-padded gap is the clamp
             # (2 * n_w = 496, less end-clipping). The margin is excluded on
-            # principle all the same: a margin row is one the *device* might
-            # place inside support under FMA contraction, not one the kernel
-            # gives weight.
+            # principle all the same: it is outside nominal support, which is
+            # the predicate being counted. Note that this is the one exclusion
+            # that cannot also be justified by appeal to the kernel -- a
+            # margin row is precisely one the *device* might place inside
+            # support under FMA contraction, which is why the margin exists.
             live_lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw, "left")
             live_hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw, "right")
             live_sizes_c = live_hi - live_lo
@@ -1222,7 +1240,8 @@ def make_plan(
         # rows out of the w-sorted array -- the shape has to be static for
         # ``lax.scan`` / ``vmap`` -- so a windowed traversal touches
         # ``n_chan * n_w * max_window_size`` rows however narrow the individual
-        # windows are. ``live_row_count`` is how many of those carry weight.
+        # windows are. ``live_row_count`` is how many of those are inside
+        # nominal support.
         #
         # Through v0.1.2 this was ``max_window_size`` over the mean of the
         # nonzero ``window_size``, which measured the widest window against the
@@ -1236,8 +1255,8 @@ def make_plan(
             # Defensive, and unreachable through ``make_plan``: the plane grid
             # spans the whole w-range with a support half-width of ``W/2``
             # planes, so every one of the ``n_rows >= 1`` rows that
-            # ``_coerce_uvw_freq_dtype`` guarantees is live in at least one
-            # plane. Kept as a division guard rather than an expected case --
+            # ``_coerce_uvw_freq_dtype`` guarantees is inside at least one
+            # plane's nominal support. Kept as a division guard rather than an expected case --
             # a future change to the plane spacing or to ``w_kernel_scale``
             # would land here rather than on a ZeroDivisionError.
             window_padding_overhead = 1.0

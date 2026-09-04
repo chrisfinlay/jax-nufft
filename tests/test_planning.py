@@ -958,7 +958,7 @@ def test_window_builder_matches_independent_reference(freq: np.ndarray) -> None:
     # aggregate on something make_plan computes instead.
     #
     # issue #43: the denominator is ``live_row_count``, the incidences inside
-    # the *unpadded* support, so ``expected_size`` (which carries the margin
+    # the *unpadded* nominal support, so ``expected_size`` (which carries the margin
     # and the +/-1 clamp) is the wrong array to divide by and is strictly
     # larger. ``tests/test_padding_overhead.py`` is where the live count is
     # pinned against a reference that does not go through ``searchsorted`` at

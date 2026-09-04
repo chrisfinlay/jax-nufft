@@ -283,10 +283,16 @@ The windowed strategies rely on a contract between
   margin exists because the device might place such a row inside
   support. Both are excluded regardless, the denominator being what the
   host can establish is irreducible. Note also that `live_row_count` is
-  a host-side nominal count, not a census of applied weights: over the
-  calibration grid it differs from a `phi`-weighted count on 15 of 40
-  cells, by at most 3 incidences (0.083%), which is far below the
-  resolution a work ratio is read at. Through v0.1.2 the denominator
+  a host-side **nominal-support** count, not a census of applied
+  weights — the name is shorthand, and slightly stronger-sounding than
+  the measurement supports. The operators derive their own `w` in the
+  JIT (FMA contraction; single precision throughout on a float32 plan)
+  and test `|z| <= 1`; measured against that compiled expression over
+  the calibration grid the two counts differ on 20 of 40 cells in
+  float64 and 7 of 10 in float32, never by more than 3 incidences or
+  0.19%. That is far below the resolution a work ratio is read at, and
+  an exact census would have to be taken against a compiled executable,
+  which does not exist at plan time. Through v0.1.2 the denominator
   was the mean of the *padded* window lengths and counted the widening
   as irreducible, understating the waste by up to 17% on the review
   fixtures. In practice it is the `±1` clamp that the
