@@ -20,6 +20,7 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
+from jax_nufft.planning import WINDOW_BOUNDARY_MARGIN_EPS
 
 jax.config.update("jax_enable_x64", True)
 
@@ -385,9 +386,8 @@ def test_windowed_dense_parity_at_window_edge() -> None:
     file uses throughout and ``origin/main``'s 1.5e-17 / 2.4e-15 on identical
     inputs.
 
-    If the search finds nothing -- a compiler that does not contract the
-    multiply-subtract -- the parity assertions still run on the base fixture.
-    The test is sharper where the platform allows and never vacuous.
+    If the search finds nothing the test does not quietly fall back to the base
+    fixture -- it fails or skips, explicitly. See the ``found is None`` branch.
     """
     n_rows = 60
     freq = np.array([1.0e9])
@@ -411,21 +411,42 @@ def test_windowed_dense_parity_at_window_edge() -> None:
         "cannot show up in the first place"
     )
 
+    # The premise of the whole fixture, measured rather than assumed: does this
+    # compiler's w disagree with the builder's at all? On every fixture in this
+    # repository it disagrees on 18-22% of rows.
+    perm = np.asarray(base.sort_perm)
+    host_w = (uvw[perm, 2] * float(np.asarray(base.inv_lambda)[0])).astype(np.float64) - base.w0
+    disagreement = float(np.max(np.abs(_device_w_sorted(base, uvw) - host_w)))
+
     found = _find_invariant_breaking_w(base, uvw, freq, plan_kwargs)
-    if found is None:  # pragma: no cover - platform-dependent
-        pytest.skip(
-            "no w value in this plan's window-edge neighbourhoods is placed on opposite "
-            "sides by the host builder and the device operator, so this compiler is not "
-            "contracting the multiply-subtract into an FMA and the invariant is trivially "
-            "safe here. Nothing to gate -- but note that this test then checks nothing, "
-            "rather than quietly checking the non-adversarial base fixture"
+    if found is None:
+        # Two very different situations, and conflating them is how a test like
+        # this rots into a permanent skip.
+        assert disagreement == 0.0, (
+            f"host and device disagree by up to {disagreement:.3e} wavelengths on this "
+            "fixture, so a straddling value should exist, but the search found none. "
+            "The search has gone stale (plane geometry, candidate window, or splice "
+            "positions), not the platform -- this test is no longer gating anything"
+        )
+        pytest.skip(  # pragma: no cover - platform-dependent
+            "host and device compute w bit-for-bit identically on every row of this "
+            "fixture, so there is no straddling value to build the adversarial case "
+            "from and this test gates nothing on this platform. Note this does NOT "
+            "mean the invariant is safe here: the 2u*S term in boundary_margin's "
+            "derivation does not come from FMA contraction at all. That half is "
+            "gated by test_window_boundary_margin_covers_host_device_gap"
         )
     _, uvw_adv = found
-    # Never let the fixture silently degrade into the base one: every assertion
-    # below is written against a spliced row, and would be decorative without it.
-    assert not np.array_equal(uvw_adv[:, 2], uvw[:, 2]), (
-        "the adversarial splice did not change the fixture, so the assertions below "
-        "would be running against the plain base plan and gating nothing"
+    # Never let the fixture silently degrade. Two conditions, because they fail
+    # differently: a zero-row splice would run every assertion below against the
+    # plain base plan, and a *one*-row splice is rescued unconditionally by the
+    # builder's ``lo - 1`` and so gates ``boundary_margin`` not at all (measured:
+    # one row with the margin off gives dropped=0 and this test passes).
+    n_spliced = int(np.sum(uvw_adv[:, 2] != uvw[:, 2]))
+    assert n_spliced >= 2, (
+        f"the search returned a {n_spliced}-row splice; at least 2 adjacent rows must "
+        "share the straddling w or the +/-1-row half of the widening rescues the "
+        "fixture on its own and boundary_margin goes ungated"
     )
 
     plan = make_plan(uvw_adv, freq, **plan_kwargs)
@@ -461,3 +482,133 @@ def test_windowed_dense_parity_at_window_edge() -> None:
     # Strictly stronger than the parity assertions above: a dropped row whose
     # kernel weight happens to underflow the norms would slip past those.
     assert dropped == 0, why
+
+
+# ---------------------------------------------------------------------------
+# The *magnitude* of boundary_margin (issue #23)
+# ---------------------------------------------------------------------------
+
+# Fixtures chosen to be strict-subset (some window holds fewer than every row,
+# which is the only regime where a row can be dropped) and cheap. The w spread
+# is fixed in *metres* while the offset varies, which decouples |w0| from n_w:
+# a large offset raises the absolute-w scale, and hence the host/device gap,
+# without exploding the plane count.
+_MARGIN_CASES = [
+    ("float64 |w0| ~ 0", np.float64, 0.0, np.array([1.4e9]), 1e-8),
+    ("float64 |w0| large", np.float64, 5.0e7, np.array([1.4e9]), 1e-6),
+    ("float64 3 channels", np.float64, 1.0e6, np.array([1.2e9, 1.4e9, 1.6e9]), 1e-6),
+    ("float32 |w0| ~ 0", np.float32, 0.0, np.array([1.4e9]), 1e-3),
+    ("float32 |w0| large", np.float32, 5.0e7, np.array([1.4e9]), 1e-3),
+]
+
+# Minimum acceptable ratio of ``boundary_margin`` to the largest overhang any
+# in-support row actually needs. Measured worst over these cases is 0.120 of
+# the margin, i.e. 8.3x headroom, and the round-2 review sweep over ~130 plans
+# measured 0.157, i.e. 6.4x. Tripping below 3x therefore leaves roughly a
+# factor of two of slack against the worst thing anyone has measured, while
+# still failing outright if the coefficient is cut to a quarter or an eighth.
+_MIN_MARGIN_HEADROOM = 3.0
+
+
+def _margin_requirement(uvw: np.ndarray, freq: np.ndarray, dtype: type, eps: float) -> tuple:
+    """``(requirement, margin, plan)`` for one fixture.
+
+    The requirement is the largest distance by which a row that the *production*
+    ``_channel_ft_coords`` places inside kernel support (``|z| <= 1``) falls
+    outside the *unwidened* host boundary ``[w_k - S, w_k + S]``. That is
+    exactly what ``boundary_margin`` has to cover: any such row would be dropped
+    by a builder that searched at the bare boundary.
+    """
+    from jax_nufft.wgridder import _channel_ft_coords
+
+    plan = make_plan(uvw, freq, (32, 32), 0.004, 0.004, eps, dtype=dtype)
+    perm = np.asarray(plan.sort_perm)
+    # In the plan's dtype, not float64: make_plan forms this product in
+    # ``real_dtype`` and only then widens, so a float64 host value here would be
+    # a different number from the one the builder's boundaries are placed
+    # against -- and, measured, would report no overhang at all on every float32
+    # fixture, quietly making this whole test vacuous.
+    w_m_sorted = uvw[perm, 2].astype(plan.real_dtype)
+    centres = np.asarray(plan.w_centers_rel, dtype=np.float64)
+    scale = plan.w_kernel_scale
+    inv_lambda = np.asarray(plan.inv_lambda)
+
+    w_abs = np.outer(np.asarray(inv_lambda, dtype=np.float64), uvw[:, 2])
+    w_abs_scale = max(abs(float(w_abs.min())), abs(float(w_abs.max())), plan.w_extent)
+    margin = WINDOW_BOUNDARY_MARGIN_EPS * float(np.finfo(dtype).eps) * w_abs_scale
+
+    sorted_uvw = jnp.asarray(uvw[perm])
+    requirement = 0.0
+    for chan in range(plan.n_chan):
+        host = (w_m_sorted * inv_lambda[chan]).astype(np.float64) - plan.w0
+        device = np.asarray(
+            _channel_ft_coords(sorted_uvw, plan.inv_lambda[chan], plan)[2], dtype=np.float64
+        )
+        in_support = np.abs((device[:, None] - centres[None, :]) / scale) <= 1.0
+        overhang = np.maximum(
+            np.maximum(
+                centres[None, :] - scale - host[:, None],
+                host[:, None] - centres[None, :] - scale,
+            ),
+            0.0,
+        )
+        if in_support.any():
+            requirement = max(requirement, float(overhang[in_support].max()))
+    return requirement, margin, plan
+
+
+def test_window_boundary_margin_covers_host_device_gap() -> None:
+    """``boundary_margin`` must exceed what the rows actually need, with headroom.
+
+    ``test_windowed_dense_parity_at_window_edge`` gates that the margin is
+    non-zero -- it fails with the margin deleted -- but nothing gated its
+    *magnitude*, which is the substance of the derivation in ``planning.py``.
+    Measured: with the coefficient at 0.5, 1.0 or 1.5 instead of 4.0, that test
+    and the entire fast suite stayed green. A fixture cannot close that gap,
+    because on any fixture whose rows are not adversarially placed the margin
+    sits orders of magnitude below the row spacing and a smaller one changes no
+    window at all.
+
+    So measure the requirement directly rather than provoking it: for each
+    strict-subset plan, the largest amount by which a row the operator puts
+    inside kernel support falls outside the bare ``[w_k - S, w_k + S]``
+    boundary. That is the quantity the margin exists to cover, it is
+    well-defined on every plan, and it scales with the same ``u * w_abs_scale``
+    the derivation is written in.
+
+    The assertion is on the ratio, not just the sign, so that a future change to
+    ``w_kernel_scale`` or the plane count which erodes the headroom fails loudly
+    instead of silently spending it.
+    """
+    ratios = []
+    for tag, dtype, offset_m, freq, eps in _MARGIN_CASES:
+        rng = np.random.default_rng(11)
+        n_rows = 120
+        uvw = np.zeros((n_rows, 3))
+        uvw[:, 0] = rng.uniform(-100.0, 100.0, size=n_rows)
+        uvw[:, 1] = rng.uniform(-100.0, 100.0, size=n_rows)
+        uvw[:, 2] = offset_m + rng.uniform(-8000.0, 8000.0, size=n_rows)
+
+        requirement, margin, plan = _margin_requirement(uvw, freq, dtype, eps)
+        assert plan.max_window_size < plan.n_rows, (
+            f"{tag}: every window already spans every row, so no row can be dropped and "
+            "this case gates nothing -- pick a fixture with more planes"
+        )
+        assert margin > 0.0, f"{tag}: boundary_margin is zero"
+        ratios.append((requirement / margin, tag, requirement, margin))
+
+    worst_ratio, worst_tag, worst_req, worst_margin = max(ratios)
+    # At least one case must actually exercise the margin, or the assertion
+    # below is satisfied by arithmetic rather than by the code being right.
+    assert worst_ratio > 0.0, (
+        "no fixture here needs any widening at all, so this test would pass with "
+        "boundary_margin set to zero -- it has stopped gating the margin"
+    )
+    assert worst_ratio <= 1.0 / _MIN_MARGIN_HEADROOM, (
+        f"boundary_margin has only {1.0 / worst_ratio:.2f}x headroom on {worst_tag} "
+        f"(rows need {worst_req:.3e} wavelengths of widening, margin is {worst_margin:.3e}), "
+        f"below the {_MIN_MARGIN_HEADROOM:g}x this gate requires. Either "
+        "WINDOW_BOUNDARY_MARGIN_EPS has been cut, or a change to w_kernel_scale / the "
+        "plane count has invalidated the derivation at its use site in planning.py -- "
+        "re-derive it rather than raising this bound"
+    )

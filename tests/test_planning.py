@@ -21,7 +21,12 @@ import jax_nufft
 from jax_nufft import dirty2vis, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
-from jax_nufft.planning import W_OVERSAMPLE_X0, WGridderPlan, make_plan
+from jax_nufft.planning import (
+    W_OVERSAMPLE_X0,
+    WINDOW_BOUNDARY_MARGIN_EPS,
+    WGridderPlan,
+    make_plan,
+)
 from jax_nufft.wgridder import _channel_ft_coords
 from tests.conftest import (
     EDA2,
@@ -853,7 +858,7 @@ def _independent_window_bounds(
     # parity regression, so this must not quietly accept one.
     w_abs = np.outer(np.asarray(freq, dtype=np.float64) / SPEED_OF_LIGHT, uvw[:, 2])
     margin = (
-        4.0
+        WINDOW_BOUNDARY_MARGIN_EPS
         * float(np.finfo(plan.real_dtype).eps)
         * max(abs(float(w_abs.min())), abs(float(w_abs.max())), plan.w_extent)
     )
@@ -1360,6 +1365,14 @@ def test_no_operator_path_materialises_per_channel_row_coordinates(
     whose dimensions include both ``n_chan`` and ``n_rows`` catches ``(5, 257)``,
     ``(257, 5)``, ``(257, 5, 3)`` and the rank-3 form alike.
 
+    The rule has two clauses, because two different things have to be caught.
+    Dimension membership catches every array that wears the shape -- ``(5, 257)``,
+    ``(257, 5)``, ``(257, 5, 3)``. Element count catches the ones that do not:
+    the natural flat carrier ``(n_chan * n_rows,)``, which is what a future
+    single-FINUFFT-call-over-all-channels rewrite would build, and which a
+    membership test cannot see at all. Both clauses are checked on the *squeezed*
+    shape so a broadcast axis cannot disguise either.
+
     Restricted to *real* element types, and that restriction is load-bearing
     rather than incidental: the visibility cube genuinely is ``n_chan * n_rows``
     and legitimately appears as ``(257, 5)`` and ``(5, 257)`` complex tensors in
@@ -1420,6 +1433,16 @@ def test_no_operator_path_materialises_per_channel_row_coordinates(
             # ``(n_chan, 1, n_rows)``, which is the rank-2 form wearing a
             # broadcast axis.
             squeezed = [d for d in dims if d != 1]
+            # Element count, not just dimension membership. A carrier that never
+            # takes the (n_chan, n_rows) *shape* -- the flat (n_chan * n_rows,)
+            # form a future "concatenate every channel's points into one FINUFFT
+            # call" would use, built by gather so no rank-2 intermediate ever
+            # exists -- costs exactly the same memory and walks straight through
+            # a membership test. Measured on such a mutant: the ban passed 8/8
+            # and the whole fast suite stayed green while the lowered temp size
+            # went from 6.14 MB to 13.27 MB, +116%.
+            if channel_strategy == "scan" and math.prod(squeezed) == n_chan * n_rows:
+                return True
             if not (n_chan in squeezed and n_rows in squeezed):
                 return False
             if channel_strategy == "scan":

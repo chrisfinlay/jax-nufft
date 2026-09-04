@@ -58,6 +58,20 @@ from jax_nufft.kernel import compute_phi_hat_table, kernel_params, phi_hat_overs
 # :func:`jax_nufft.kernel.phi_hat_oversample_for_w`).
 W_OVERSAMPLE_X0 = 0.25
 
+# Width of the window-builder's boundary widening, in units of the plan dtype's
+# ``eps`` (= 2u) times the absolute-w scale. See the derivation at its use site
+# in ``make_plan``: it has to dominate the host/device disagreement in the
+# relative w (~3u of that scale) plus the ``2u * w_kernel_scale`` slack the
+# operator's own ``z = fl(fl(w - w_k) / S)`` rounding allows.
+#
+# Named, module-level and imported by the tests rather than written inline,
+# because its *magnitude* is the substance of that derivation and has to be
+# gated: with the constant buried in an expression, every test still passed at
+# 1.5, 1.0 and 0.5, and only a value of exactly 0.0 was detectable.
+# ``tests/test_boundary_planes.py::test_window_boundary_margin_covers_host_device_gap``
+# measures the requirement directly and fails if the headroom drops below 3x.
+WINDOW_BOUNDARY_MARGIN_EPS = 4.0
+
 # Smallest ``epsilon`` a float32 plan can plausibly deliver. Measured in the
 # 2026-09 review: with every plan array in single precision the relative L2
 # error against a float64 reference floors at ~3.4e-5 across the review
@@ -998,7 +1012,11 @@ def make_plan(
         #     S = (W / 2) * w_extent / n_w_inner < w_extent / 2 <= w_abs_scale / 2,
         #
         # so (b) < u * w_abs_scale and (a) + (b) <= 4u * w_abs_scale, half the
-        # margin. Swept over 48 plans (float64 and float32, eps 1e-3 to 1e-14,
+        # margin. Put the other way round, which is the more intuitive
+        # statement: (b) only bites when ``ulp(w_rel)`` is comparable to
+        # ``2u * S``, i.e. when S approaches the whole relative-w range -- and a
+        # kernel that wide is one whose windows already span every row, so there
+        # is nothing left to drop. Swept over 48 plans (float64 and float32, eps 1e-3 to 1e-14,
         # w from 3e1 to 1e7 wavelengths, narrow and wide spreads): the worst
         # safety factor over the 30 strict-subset plans is 5.40, while the worst
         # over all 48 is 1.61 and occurs on a plan whose windows cover every row.
@@ -1020,7 +1038,7 @@ def make_plan(
         # against a ``w_kernel_scale`` of order 1e2-1e4, so a window only grows
         # when a row really does sit that close to an edge.
         w_abs_scale = max(abs(w_min_all), abs(w_max_all), w_extent)
-        boundary_margin = 4.0 * float(np.finfo(real_dtype).eps) * w_abs_scale
+        boundary_margin = WINDOW_BOUNDARY_MARGIN_EPS * float(np.finfo(real_dtype).eps) * w_abs_scale
 
         # issue #16 follow-up: compute the boundaries in the SAME coordinate the
         # operators use for ``z``, i.e. relative to ``w0``, not in absolute
