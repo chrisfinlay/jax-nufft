@@ -131,21 +131,24 @@ channel, which is prohibitive. The **wgridder** factorises it into a stack of
 2D non-uniform FFTs, one per w-plane:
 
 1. Discretise the `w` axis into `n_w` planes with centres `w_0, ..., w_{n_w-1}`.
-2. For each plane k, perform a 2D NUFFT in `(u, v)` of the image multiplied by
-   the image-domain w-shift `exp(+2 pi i w_k (n - 1 + nshift))` and divided by
-   the image-domain kernel correction `phi_hat(scale * (n - 1 + nshift))`.
-3. Multiply each per-plane visibility by the w-direction gridding kernel
-   `phi((w_lambda - w_k) / scale)`.
-4. Sum over w-planes.
-5. Multiply each visibility by the compensating phase
-   `exp(-2 pi i w_lambda * nshift)`.
+2. Multiply the image by the `w0` phase screen `exp(+2 pi i w0 (n - 1))`,
+   where `w0` is the midpoint of the w range.
+3. For each plane k, perform a 2D NUFFT in `(u, v)` of the image multiplied by
+   the image-domain w-shift `exp(+2 pi i d_k (n - 1 + nshift))` and divided by
+   the image-domain kernel correction `phi_hat(scale * (n - 1 + nshift))`,
+   where `d_k = w_k - w0`.
+4. Multiply each per-plane visibility by the w-direction gridding kernel
+   `phi((d_lambda - d_k) / scale)`, `d_lambda = w_lambda - w0`.
+5. Sum over w-planes.
+6. Multiply each visibility by the compensating phase
+   `exp(-2 pi i d_lambda * nshift)`.
 
-Steps 2-3 implement a discrete approximation of the continuous w-direction
-convolution; step 4 is the inverse NUFFT in w. The kernel `phi` and its
+Steps 3-4 implement a discrete approximation of the continuous w-direction
+convolution; step 5 is the inverse NUFFT in w. The kernel `phi` and its
 Fourier transform `phi_hat` are chosen as a matched pair so that the gridding
 correction in image space cancels the kernel apodisation in w-space.
 
-Steps 2 and 5 together are the **`nshift` centring** (ducc's `allow_nshift`).
+Steps 3 and 6 together are the **`nshift` centring** (ducc's `allow_nshift`).
 The w-phase obeys the exact identity
 
 ```
@@ -163,6 +166,22 @@ adjoint applies the conjugate factor to its *input* visibilities instead. Note
 the adjoint's `1/n` output factor still uses the physical, *unshifted*
 `n = sqrt(1 - l^2 - m^2)`.
 
+Step 2 is the matching **`w` centring**, and it is what keeps the two phases in
+step 3 and step 6 from cancelling catastrophically. Both are proportional to
+`w`, so with an absolute `w` they grow without bound while their sum stays
+small — at the phase centre (`n - 1 = 0`) they cancel *exactly*, so the result
+is a small number reconstructed from two large ones and only the rounding error
+survives. Splitting `w = w0 + d` the same way, via
+`exp(2 pi i w (n-1)) = exp(2 pi i w0 (n-1)) * exp(2 pi i d (n-1))`, leaves the
+loop working in `d`, bounded by the w-extent, while the constant `w0` part
+becomes a per-pixel image-domain screen applied once per call. The screen's own
+argument *is* large, so it is evaluated at plan time on the host with exact
+range reduction (`w0 * (n-1)` reduced mod 1 in double-double arithmetic). The
+adjoint multiplies its output image by the screen's conjugate. Measured on a
+delta image at the phase centre with `w_lambda = 1e6 + [-10, 10]` and
+`epsilon = 1e-12`, this takes the relative L2 error from 1335x epsilon to
+0.57x, and makes it independent of the absolute `w`.
+
 ### Forward operator (`dirty2vis`)
 
 Given an image `B` of shape `(n_chan, n_l, n_m)` (or `(n_l, n_m)` broadcast
@@ -173,11 +192,12 @@ For each channel `c`:
 
   1. `uvw_lambda = uvw * freq[c] / c`
   2. `u_finufft, v_finufft = 2*pi * uvw_lambda[:, 0:2] * pixsize`
-  3. For each w-plane `k`:
-     - `image_k = B[c] * exp(+2 pi i w_k (n - 1 + nshift)) / phi_hat_n`
+  3. `B_c = B[c] * w0_screen`, `d_lambda = w_lambda - w0`.
+  4. For each w-plane `k` (with `d_k = w_centers_rel[k]`):
+     - `image_k = B_c * exp(+2 pi i d_k (n - 1 + nshift)) / phi_hat_n`
      - `vis_k = NUFFT2(image_k, u_finufft, v_finufft, iflag = -1, eps = max(epsilon / 10, 1e-14))`
-     - `vis_k = vis_k * phi((w_lambda - w_k) / w_kernel_scale)`
-  4. `vis[:, c] = (sum over k of vis_k) * exp(-2 pi i w_lambda * nshift)`
+     - `vis_k = vis_k * phi((d_lambda - d_k) / w_kernel_scale)`
+  5. `vis[:, c] = (sum over k of vis_k) * exp(-2 pi i d_lambda * nshift)`
 
 The `(u, v)` NUFFT is asked for `max(epsilon / 10, 1e-14)`, not `epsilon`
 itself (`_nufft_epsilon` in `wgridder.py`): the caller's budget is shared
@@ -204,14 +224,16 @@ For each channel `c`:
 
   1. `uvw_lambda`, `u_finufft`, `v_finufft` as for the forward operator.
   2. `vis_w = vis[:, c] * weights[:, c]` if weights are provided, then
-     `vis_w = vis_w * exp(+2 pi i w_lambda * nshift)` &mdash; the conjugate of
-     the forward's step 4, applied to the input rather than the output.
-  3. For each w-plane `k`:
-     - `vis_k = vis_w * phi((w_lambda - w_k) / w_kernel_scale)`
+     `vis_w = vis_w * exp(+2 pi i d_lambda * nshift)` &mdash; the conjugate of
+     the forward's step 5, applied to the input rather than the output.
+  3. For each w-plane `k` (with `d_k = w_centers_rel[k]`):
+     - `vis_k = vis_w * phi((d_lambda - d_k) / w_kernel_scale)`
      - `H_k = NUFFT1((u_finufft, v_finufft), vis_k, image_shape, iflag = +1, eps = max(epsilon / 10, 1e-14))`
-     - `I_k = H_k * exp(-2 pi i w_k (n - 1 + nshift)) / phi_hat_n`
-  4. `dirty[c] = (sum over k of I_k).real / n`,
-     where the `1/n` factor matches ducc's `divide_by_n=True` convention.
+     - `I_k = H_k * exp(-2 pi i d_k (n - 1 + nshift)) / phi_hat_n`
+  4. `dirty[c] = ((sum over k of I_k) * conj(w0_screen)).real / n`,
+     where the `1/n` factor matches ducc's `divide_by_n=True` convention. The
+     conjugate screen is the adjoint of the forward's step 3 and must be
+     applied before taking the real part.
 
 Pixels with `n <= 0` (i.e. outside the unit disc) are returned as exactly 0.
 
@@ -259,7 +281,8 @@ output, so the grid is refined as `W` grows (see `phi_hat_oversample_for_w`).
 The wgridder requires several quantities that depend on `(uvw, freq,
 image_shape, pixsize, epsilon)` but not on the image or visibility values: the
 n-1 grid (shifted and unshifted), the kernel correction, the number of
-w-planes, the w-plane centres.
+w-planes, the w-plane centres (absolute and relative to the w-range
+midpoint), and the `w0` phase screen.
 `make_plan` precomputes those once and returns a `WGridderPlan` &mdash; a frozen
 dataclass registered as a JAX pytree. The actual operators are then JIT-friendly
 functions of `(plan, image)` or `(plan, vis)`:

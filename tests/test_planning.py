@@ -355,7 +355,7 @@ def test_plan_is_a_jax_pytree() -> None:
     # plane phase and the phi_hat argument; n_minus_1 itself is kept for the
     # 1/n output factor -- see AGENTS.md sec 4).
     # The issue #11 dtype metadata is *static*, so it must not show up here.
-    assert len(leaves) == 11
+    assert len(leaves) == 13
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
     # Static fields preserved exactly.
@@ -487,7 +487,22 @@ def test_window_builder_sum_matches_expected() -> None:
     # the end of the data range, so the sum is bounded above by n_rows * W
     # and below by n_rows * (W - 1) for our test geometry.
     total = int(window_size.sum())
-    assert total <= plan.n_rows * W
+    # The upper bound carries the builder's own documented slack: it uses
+    # ``searchsorted(..., "left")`` / ``"right"``, which *includes* a row lying
+    # exactly on a window edge, so each of the ``n_chan * n_w`` windows can pick
+    # up at most one extra row at each end. That inclusion is not a wart to be
+    # tolerated -- it is required for windowed/dense parity, because the dense
+    # path gives such a row ``phi(z = +/-1) = exp(-beta)`` (~1e-7 at W=7, i.e.
+    # far above tests/test_boundary_planes.py's 1e-12 tolerance) and a windowed
+    # path that dropped it would disagree by exactly that much.
+    #
+    # Exact edge hits used to be vanishingly unlikely because the boundaries
+    # were computed in absolute wavelengths; since issue #16's follow-up they
+    # are computed relative to ``w0`` (so that they agree with the operators'
+    # own ``z``), where the arithmetic is "rounder" and ties do occur -- this
+    # fixture has exactly one. The bound below is still tight enough to catch a
+    # builder that widened its windows systematically (the slack is 1.6% here).
+    assert total <= plan.n_rows * W + 2 * plan.n_chan * plan.n_w
     assert total >= plan.n_rows * (W - 1)
 
 
