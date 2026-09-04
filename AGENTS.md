@@ -143,7 +143,7 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
 * `make_plan` is host-side (numpy) and returns a `WGridderPlan` — a
   frozen dataclass that's also a registered JAX pytree.
 * Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
-  w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale,
+  w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale, nshift, w0,
   max_window_size, window_padding_overhead, w_extent,
   is_constant_w, real_dtype, complex_dtype`) live in the pytree
   aux_data and become part of the JIT cache key. This list must
@@ -152,10 +152,16 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   `real_dtype` / `complex_dtype` (issue #11) are `np.dtype` objects
   recording the precision requested via `make_plan(dtype=...)`;
   being aux data is what keeps a float32 and a float64 plan on
-  separate JIT cache entries.
-* Plan **traced fields** (`uvw_lambda, w_centers, n_minus_1,
-  phi_hat_n, sort_perm, uvw_lambda_sorted, window_start,
-  window_size, u_finufft, v_finufft`) are JAX device arrays.
+  separate JIT cache entries. `nshift` (issue #16) is the `n-1`
+  centring offset `-(nm1_max + nm1_min) / 2`; it is `0.0` on the
+  constant-w fast path, which cannot benefit from it. `w0` (issue #16
+  follow-up) is the w-range midpoint: the plane loop works in
+  `delta = w - w0` so no phase it exponentiates scales with the
+  absolute w, and the constant part leaves as the `w0_screen` leaf.
+* Plan **traced fields** (`uvw_lambda, w_centers, w_centers_rel,
+  n_minus_1, n_minus_1_shifted, w0_screen, phi_hat_n, sort_perm,
+  uvw_lambda_sorted, window_start, window_size, u_finufft,
+  v_finufft` — 13 leaves) are JAX device arrays.
   `u_finufft` / `v_finufft` are `(n_chan, n_rows)` precomputed
   FINUFFT-input coordinates (`2π · pixsize_* · uvw_lambda[..., axis]`,
   v0.1.2+). They add roughly `2 · n_chan · n_rows · sizeof(real)` to the
@@ -163,6 +169,17 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   arrays since each is now-half the shape). Sorted variants are not
   stored; the windowed helpers gather them via `plan.sort_perm` at
   scan time, trading half the memory for one gather per channel iter.
+  `n_minus_1_shifted` (issue #16) is `n_minus_1 + nshift` and is the
+  grid the per-plane phase and the `phi_hat` argument are evaluated
+  on; `n_minus_1` itself stays, and the adjoint's `1/n` output factor
+  must keep using it (`n = n_minus_1 + 1`) — using the shifted grid
+  there is a silent, test-passing gain error.
+  `w_centers_rel` and `w0_screen` (issue #16 follow-up) are the
+  plane centres measured from `w0` and the image-domain screen
+  `exp(2πi·w0·(n-1))`. Both are built at plan time *at small
+  magnitude* / with exact range reduction; deriving either from its
+  absolute counterpart at call time reintroduces the large-|w|
+  cancellation they exist to remove.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and
@@ -236,7 +253,7 @@ pixi run -e dev typecheck              # mypy (best-effort)
 
   | Comparison                                   | Bound          | Measured (this repo, 2026-09 review)       |
   |-----------------------------------------------|----------------|---------------------------------------------|
-  | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; comfortably under `2 * eps` after it |
+  | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; `0.67x eps` worst cell after it; `1.47x eps` worst cell after #16's nshift centring (MWA_extended off30, eps=1e-12, adjoint) -- still inside the contract, but the headroom is now ~1.4x, not ~3x |
   | vs. ducc0 (forward + adjoint, constant-w fast path) | `err < 3 * eps`  | ducc0 lands at `~0.1 * eps` against the DFT; the `3 * eps` gap is dominated by our own `2 * eps` budget |
   | Strategy equivalence (`w_strategy` x `channel_strategy`, `tests/test_strategies_equivalent.py`) | `err < 1e-11` (float64), `err < 1.3e-6` (float32) | worst pairwise difference between any two of the eight combinations, 3 short fixtures x eps in {1e-4,1e-6,1e-8}: float64 2.0e-13 (MWA_compact off30, eps=1e-6); float32 1.21e-7 (MWA_compact off30, eps=1e-8) -- float32 bound is ~10x that measurement, see the module docstring |
   | Adjointness (dot-product identity, dense-vs-windowed adjoint) | `err < 1e-11`  | dot-product residual 1e-16 .. 7e-13 (ducc0 itself: 1e-14 .. 8e-11, for comparison only) |
@@ -258,6 +275,28 @@ pixi run -e dev typecheck              # mypy (best-effort)
   FINUFFT bins differently from macOS arm64), the fix is to measure the
   worst case there and set the bound at 10x it, not higher -- record the
   measurement in a comment, don't just loosen it to whatever passes.
+* **Adjointness is necessary but not sufficient &mdash; it cannot
+  replace DFT parity.** The dot-product identity
+  `<A x, y> == <x, A^H y>` constrains the forward and the adjoint
+  relative to *each other*, not either of them relative to the truth.
+  Any error the two share &mdash; a common-mode error &mdash; cancels out
+  of the identity and passes it cleanly while both operators are badly
+  wrong. Issue #16's follow-up is the worked example: with a large common
+  `w` offset the plane phase and the `nshift` compensating phase were
+  cancelling catastrophically, the forward's relative L2 error against the
+  exact DFT was `1335 * eps`, and the dot-product identity passed at
+  **every** offset, because the adjoint made the identical rounding error
+  in the identical place. Both sign-mutation checks on that branch tell
+  the same story from the other side: mutations that break the *pairing*
+  (flip one operator's compensation) are caught by adjointness
+  immediately, while a mutation that moves both together is not.
+  So: adjointness catches pairing bugs, DFT parity catches shared-mode
+  bugs, and a change to the shared phase machinery needs both. When you
+  add a new phase factor, add a DFT-parity test for it &mdash; see
+  `tests/test_nshift.py::test_large_common_w_offset_stays_in_contract`,
+  which uses a delta image at the phase centre (exact answer: 1 for every
+  visibility, analytically) so that the residual *is* the phase error,
+  with no reference implementation in the loop.
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.

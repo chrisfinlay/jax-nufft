@@ -456,11 +456,83 @@ def _validate_weights(weights: Array | None, plan: WGridderPlan) -> Array | None
     return _cast_to_plan_dtype(weights, plan, name="weights", target=plan.real_dtype)
 
 
+def _w_relative(w_absolute: Array, plan: WGridderPlan) -> Array:
+    """Re-express w (wavelengths) relative to the plan's w-range midpoint.
+
+    Everything inside the w-plane loop -- plane centres, per-row w, the kernel
+    argument z, and the nshift compensating phase -- works in this ``delta =
+    w - w0`` coordinate, so no phase the loop exponentiates ever scales with
+    the *absolute* w. The constant part that is factored out this way is
+    ``plan.w0_screen`` (see ``planning.make_plan``).
+
+    Kept as a subtraction at the JIT boundary rather than as extra pre-shifted
+    plan leaves for two reasons: ``plan.w_centers`` and ``plan.uvw_lambda``
+    keep their documented absolute-wavelength semantics (the window builder and
+    the w-coverage tests read them), and in float64 the subtraction is exact --
+    the operands are within one w-extent of each other, which is Sterbenz's
+    condition -- so deferring it costs no accuracy. A float32 plan does lose
+    resolution here, but only the resolution its absolute w already lacked
+    (issue #13).
+    """
+    return w_absolute - plan.w0
+
+
+def _apply_nshift_compensation(
+    vis: Array,
+    w_rel: Array,
+    plan: WGridderPlan,
+    *,
+    conjugate: bool,
+) -> Array:
+    """Apply issue #16's per-visibility ``nshift`` compensating phase.
+
+    The w-plane loop evaluates its image-domain phase on
+    ``plan.n_minus_1_shifted = n - 1 + nshift`` rather than on ``n - 1``, which
+    is what halves the plane count (see ``planning.make_plan``). The exact
+    identity that licenses the substitution is
+
+        exp(2πi d (n-1)) = exp(2πi d (n-1+nshift)) · exp(-2πi d nshift),
+
+    so what the plane loop computes is the true answer *times*
+    ``exp(+2πi d nshift)``; multiplying by ``exp(-2πi d nshift)`` restores it.
+    That factor depends only on the visibility (through ``d``), never on the
+    pixel or the plane, so it is applied once per visibility per call rather
+    than once per plane: the whole point of the optimisation.
+
+    ``d`` here is ``w_rel = w - plan.w0``, not the absolute w: the w-centring
+    follow-up moved the absolute part into ``plan.w0_screen`` precisely so that
+    this phase and the plane phase it cancels against are both small. Passing
+    an absolute w here would reintroduce the cancellation bug.
+
+    ``conjugate=False`` is the forward form ``exp(-2πi d nshift)``, applied to
+    the summed **output** visibilities. ``conjugate=True`` is the adjoint form
+    ``exp(+2πi d nshift)``, applied to the **input** visibilities before the
+    plane loop -- the adjoint of a diagonal scaling on the forward's output is
+    the conjugate diagonal on the adjoint's input, which is exactly what keeps
+    ``<A x, y> == <x, A^H y>`` (``tests/test_adjoint.py`` and
+    ``tests/test_nshift.py::test_dot_product_identity_survives_nshift``).
+
+    ``vis`` and ``w_rel`` must be in the *same* row order; the windowed
+    helpers therefore call this on their w-sorted arrays, before/after the
+    sort_perm round trip rather than across it.
+
+    ``plan.nshift`` is static, so the ``== 0.0`` early-out is a trace-time
+    Python branch: the constant-w fast path (``nshift == 0.0`` by choice, see
+    ``planning.make_plan``) emits no multiply at all.
+    """
+    if plan.nshift == 0.0:
+        return vis
+    two_pi = 2.0 * jnp.pi
+    phase = (two_pi * plan.nshift) * w_rel
+    sign = 1.0 if conjugate else -1.0
+    return vis * jnp.exp((sign * 1j * phase).astype(vis.dtype))
+
+
 def _channel_forward(
     image_c: Array,
     u_ft_c: Array,
     v_ft_c: Array,
-    w_lambda_c: Array,
+    w_rel_c: Array,
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
@@ -468,47 +540,54 @@ def _channel_forward(
     """Forward operator for a single channel: image (n_l, n_m) -> vis (n_rows,).
 
     ``u_ft_c`` / ``v_ft_c`` are the precomputed FINUFFT input coordinates for
-    this channel (``2π · pixsize_* · uvw_lambda[c, :, 0|1]``); ``w_lambda_c``
-    is the per-channel w-component in wavelengths used for the kernel z and
-    image-domain shift.
+    this channel (``2π · pixsize_* · uvw_lambda[c, :, 0|1]``); ``w_rel_c`` is
+    the per-channel w-component in wavelengths *relative to ``plan.w0``*
+    (see :func:`_w_relative`), used for the kernel z, the plane phase and the
+    nshift compensation. The absolute part of w is carried by
+    ``plan.w0_screen`` and never enters this function.
     """
     two_pi = 2.0 * jnp.pi
     cdtype = image_c.dtype
     n_rows = u_ft_c.shape[0]
 
     def w_plane_contribution(w_k: Array) -> Array:
-        phase = (two_pi * w_k) * plan.n_minus_1  # (n_l, n_m), real
+        # issue #16: the shifted grid, not plan.n_minus_1. The resulting
+        # exp(+2πi w nshift) excess is removed from the *summed* output below.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted  # (n_l, n_m), real
         shift = jnp.exp((1j * phase).astype(cdtype))
         image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
         vis_k = nufft2(
             image_k, u_ft_c, v_ft_c, iflag=-1, eps=_nufft_epsilon(plan.epsilon), opts=opts
         )
         # w-direction kernel applied at the visibility output
-        z = (w_lambda_c - w_k) / plan.w_kernel_scale
+        z = (w_rel_c - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
         return vis_k * kernel_w
 
     if w_strategy == "dense_vmap":
-        contributions = jax.vmap(w_plane_contribution)(plan.w_centers)
-        return jnp.sum(contributions, axis=0)
-
-    if w_strategy == "dense_scan":
+        contributions = jax.vmap(w_plane_contribution)(plan.w_centers_rel)
+        vis_c = jnp.sum(contributions, axis=0)
+    elif w_strategy == "dense_scan":
 
         def step(acc: Array, w_k: Array) -> tuple[Array, None]:
             return acc + w_plane_contribution(w_k), None
 
         init = jnp.zeros((n_rows,), dtype=cdtype)
-        result, _ = jax.lax.scan(step, init, plan.w_centers)
-        return result
+        vis_c, _ = jax.lax.scan(step, init, plan.w_centers_rel)
+    else:
+        raise ValueError(f"unknown w_strategy: {w_strategy!r}")
 
-    raise ValueError(f"unknown w_strategy: {w_strategy!r}")
+    # issue #16: once per visibility, *after* the plane loop -- the factor is
+    # common to every plane, so pulling it out of the sum is both cheaper and
+    # exact (the sum is linear in it).
+    return _apply_nshift_compensation(vis_c, w_rel_c, plan, conjugate=False)
 
 
 def _channel_forward_windowed(
     image_c: Array,
     u_finufft_c: Array,
     v_finufft_c: Array,
-    w_lambda_sorted_c: Array,
+    w_rel_sorted_c: Array,
     window_start_c: Array,
     plan: WGridderPlan,
     opts: Opts,
@@ -523,9 +602,10 @@ def _channel_forward_windowed(
     ``phi(z) = 0`` automatically, so no explicit mask is needed.
 
     ``u_finufft_c`` / ``v_finufft_c`` are the precomputed FINUFFT coords
-    for this channel in **input** row order; ``w_lambda_sorted_c`` is the
-    w-component in wavelengths, already in sorted-row order
-    (``plan.uvw_lambda_sorted[c, :, 2]``).
+    for this channel in **input** row order; ``w_rel_sorted_c`` is the
+    w-component in wavelengths relative to ``plan.w0``
+    (see :func:`_w_relative`), already in sorted-row order
+    (``plan.uvw_lambda_sorted[c, :, 2] - plan.w0``).
 
     ``w_strategy`` selects scan-over-planes (``windowed_scan``, low memory)
     or vmap-over-planes (``windowed_vmap``, higher memory, possibly faster
@@ -537,7 +617,7 @@ def _channel_forward_windowed(
     # once per channel from the unsorted plan.u_finufft / plan.v_finufft.
     u_sorted = u_finufft_c[plan.sort_perm]
     v_sorted = v_finufft_c[plan.sort_perm]
-    w_lambda_sorted = w_lambda_sorted_c
+    w_rel_sorted = w_rel_sorted_c
 
     cdtype = image_c.dtype
     n_rows = plan.n_rows
@@ -559,15 +639,16 @@ def _channel_forward_windowed(
 
         u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (max_window_size,))
         v_k = jax.lax.dynamic_slice(v_sorted, (lo,), (max_window_size,))
-        w_k_lambda = jax.lax.dynamic_slice(w_lambda_sorted, (lo,), (max_window_size,))
+        w_rel_window = jax.lax.dynamic_slice(w_rel_sorted, (lo,), (max_window_size,))
 
-        phase = (two_pi * w_k) * plan.n_minus_1
+        # issue #16: shifted grid; compensated once per visibility below.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted
         shift = jnp.exp((1j * phase).astype(cdtype))
         image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
 
         contrib = nufft2(image_k, u_k, v_k, iflag=-1, eps=_nufft_epsilon(plan.epsilon), opts=opts)
 
-        z = (w_k_lambda - w_k) / plan.w_kernel_scale
+        z = (w_rel_window - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
         return lo, contrib * kernel_w
 
@@ -580,8 +661,19 @@ def _channel_forward_windowed(
             rows_k = jax.lax.dynamic_slice(plan.sort_perm, (lo,), (max_window_size,))
             return jnp.zeros((n_rows,), dtype=cdtype).at[rows_k].add(contrib)
 
-        contributions = jax.vmap(plane_to_full_rows)(window_start_c, plan.w_centers)
-        return jnp.sum(contributions, axis=0)
+        contributions = jax.vmap(plane_to_full_rows)(window_start_c, plan.w_centers_rel)
+        # issue #16: ``plane_to_full_rows`` has already scattered back to
+        # *input* row order, so the compensating phase has to be built from
+        # the input-order w -- the phase and the visibility it multiplies must
+        # share a row order. Recover it from the sorted copy with the inverse
+        # permutation (``sorted[i]`` belongs to input row ``sort_perm[i]``);
+        # that is one (n_rows,) scatter per channel against the loop's n_w
+        # NUFFTs, so it costs nothing and keeps the plan from carrying a
+        # second w array for this path alone.
+        w_rel_c = jnp.zeros_like(w_rel_sorted).at[plan.sort_perm].set(w_rel_sorted)
+        return _apply_nshift_compensation(
+            jnp.sum(contributions, axis=0), w_rel_c, plan, conjugate=False
+        )
 
     # windowed_scan path: keep the carry in sorted-row order so each plane
     # touches only its (max_window_size,)-sized slice. The per-step
@@ -595,7 +687,11 @@ def _channel_forward_windowed(
         return jax.lax.dynamic_update_slice(vis_sorted_acc, new, (lo,)), None
 
     vis_sorted_init = jnp.zeros((n_rows,), dtype=cdtype)
-    vis_sorted, _ = jax.lax.scan(step, vis_sorted_init, (window_start_c, plan.w_centers))
+    vis_sorted, _ = jax.lax.scan(step, vis_sorted_init, (window_start_c, plan.w_centers_rel))
+    # issue #16: applied here, in sorted-row order, where ``vis_sorted`` and
+    # ``w_rel_sorted`` already agree -- i.e. before the unsort rather than
+    # across it.
+    vis_sorted = _apply_nshift_compensation(vis_sorted, w_rel_sorted, plan, conjugate=False)
     # Unsort once: sorted[i] is the contribution for original row sort_perm[i].
     return jnp.empty_like(vis_sorted).at[plan.sort_perm].set(vis_sorted)
 
@@ -604,7 +700,7 @@ def _channel_adjoint(
     vis_c: Array,
     u_ft_c: Array,
     v_ft_c: Array,
-    w_lambda_c: Array,
+    w_rel_c: Array,
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
@@ -616,8 +712,13 @@ def _channel_adjoint(
     two_pi = 2.0 * jnp.pi
     cdtype = vis_c.dtype
 
+    # issue #16: the adjoint of the forward's per-visibility output scaling by
+    # exp(-2πi w nshift) is the conjugate scaling on the *input*, applied once
+    # here rather than inside the plane loop (see _apply_nshift_compensation).
+    vis_c = _apply_nshift_compensation(vis_c, w_rel_c, plan, conjugate=True)
+
     def w_plane_contribution(w_k: Array) -> Array:
-        z = (w_lambda_c - w_k) / plan.w_kernel_scale
+        z = (w_rel_c - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
         vis_k = vis_c * kernel_w
         # Adjoint of the type-2 NUFFT is type 1 with iflag = +1 (the conjugate
@@ -631,13 +732,15 @@ def _channel_adjoint(
             eps=_nufft_epsilon(plan.epsilon),
             opts=opts,
         )
-        # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1)) is its conjugate.
-        phase = (two_pi * w_k) * plan.n_minus_1
+        # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1+nshift)) is
+        # its conjugate; issue #16 evaluates it on the shifted grid, matching
+        # the forward's plane phase exactly.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
 
     if w_strategy == "dense_vmap":
-        contributions = jax.vmap(w_plane_contribution)(plan.w_centers)
+        contributions = jax.vmap(w_plane_contribution)(plan.w_centers_rel)
         return jnp.sum(contributions, axis=0)
 
     if w_strategy == "dense_scan":
@@ -646,7 +749,7 @@ def _channel_adjoint(
             return acc + w_plane_contribution(w_k), None
 
         init = jnp.zeros((plan.n_l, plan.n_m), dtype=cdtype)
-        result, _ = jax.lax.scan(step, init, plan.w_centers)
+        result, _ = jax.lax.scan(step, init, plan.w_centers_rel)
         return result
 
     raise ValueError(f"unknown w_strategy: {w_strategy!r}")
@@ -666,12 +769,18 @@ def _dirty2vis_jit(
 ) -> Array:
     opts = Opts(nthreads=nthreads)
 
+    # issue #16 follow-up: the w-range midpoint leaves the plane loop as a
+    # constant image-domain phase screen. Applied here, once per call on the
+    # (n_chan, n_l, n_m) image, rather than once per plane -- it depends on the
+    # pixel but on neither the visibility nor the plane.
+    image = image * plan.w0_screen
+
     if w_strategy in ("windowed_scan", "windowed_vmap"):
         # Windowed path: per-channel function takes precomputed FINUFFT
         # coords (input row order, gathered via sort_perm inside the helper)
         # plus the pre-permuted w-component and the per-channel window-start
         # table from the plan.
-        w_lambda_sorted = plan.uvw_lambda_sorted[..., 2]  # (n_chan, n_rows)
+        w_rel_sorted = _w_relative(plan.uvw_lambda_sorted[..., 2], plan)  # (n_chan, n_rows)
         if channel_strategy == "vmap":
             vis_per_chan = jax.vmap(
                 lambda im_c, u_c, v_c, w_s_c, ws_c: _channel_forward_windowed(
@@ -681,7 +790,7 @@ def _dirty2vis_jit(
                 image,
                 plan.u_finufft,
                 plan.v_finufft,
-                w_lambda_sorted,
+                w_rel_sorted,
                 plan.window_start,
             )
         elif channel_strategy == "scan":
@@ -702,7 +811,7 @@ def _dirty2vis_jit(
                     image,
                     plan.u_finufft,
                     plan.v_finufft,
-                    w_lambda_sorted,
+                    w_rel_sorted,
                     plan.window_start,
                 ),
             )
@@ -710,22 +819,20 @@ def _dirty2vis_jit(
             raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
         return vis_per_chan.T  # (n_rows, n_chan)
 
-    w_lambda = plan.uvw_lambda[..., 2]  # (n_chan, n_rows)
+    w_rel = _w_relative(plan.uvw_lambda[..., 2], plan)  # (n_chan, n_rows)
     if channel_strategy == "vmap":
         vis_per_chan = jax.vmap(
             lambda im_c, u_c, v_c, w_c: _channel_forward(
                 im_c, u_c, v_c, w_c, plan, opts, w_strategy
             )
-        )(image, plan.u_finufft, plan.v_finufft, w_lambda)
+        )(image, plan.u_finufft, plan.v_finufft, w_rel)
     elif channel_strategy == "scan":
 
         def step(_: None, args: tuple[Array, Array, Array, Array]) -> tuple[None, Array]:
             im_c, u_c, v_c, w_c = args
             return None, _channel_forward(im_c, u_c, v_c, w_c, plan, opts, w_strategy)
 
-        _, vis_per_chan = jax.lax.scan(
-            step, None, (image, plan.u_finufft, plan.v_finufft, w_lambda)
-        )
+        _, vis_per_chan = jax.lax.scan(step, None, (image, plan.u_finufft, plan.v_finufft, w_rel))
     else:
         raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
 
@@ -801,7 +908,7 @@ def _channel_adjoint_windowed(
     vis_sorted_c: Array,
     u_finufft_c: Array,
     v_finufft_c: Array,
-    w_lambda_sorted_c: Array,
+    w_rel_sorted_c: Array,
     window_start_c: Array,
     plan: WGridderPlan,
     opts: Opts,
@@ -821,21 +928,26 @@ def _channel_adjoint_windowed(
     two_pi = 2.0 * jnp.pi
     u_sorted = u_finufft_c[plan.sort_perm]
     v_sorted = v_finufft_c[plan.sort_perm]
-    w_lambda_sorted = w_lambda_sorted_c
+    w_rel_sorted = w_rel_sorted_c
 
     cdtype = vis_sorted_c.dtype
     max_window_size = plan.max_window_size
     lo_max = max(plan.n_rows - max_window_size, 0)
+
+    # issue #16: conjugate compensating phase on the input visibilities, once
+    # per visibility before the plane loop. Both arrays are in sorted-row
+    # order here, so no permutation is involved.
+    vis_sorted_c = _apply_nshift_compensation(vis_sorted_c, w_rel_sorted, plan, conjugate=True)
 
     def plane_to_image(lo_raw: Array, w_k: Array) -> Array:
         lo = jnp.clip(lo_raw, 0, lo_max)
 
         u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (max_window_size,))
         v_k = jax.lax.dynamic_slice(v_sorted, (lo,), (max_window_size,))
-        w_k_lambda = jax.lax.dynamic_slice(w_lambda_sorted, (lo,), (max_window_size,))
+        w_rel_window = jax.lax.dynamic_slice(w_rel_sorted, (lo,), (max_window_size,))
         vis_k = jax.lax.dynamic_slice(vis_sorted_c, (lo,), (max_window_size,))
 
-        z = (w_k_lambda - w_k) / plan.w_kernel_scale
+        z = (w_rel_window - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
         vis_k = vis_k * kernel_w
 
@@ -848,12 +960,13 @@ def _channel_adjoint_windowed(
             eps=_nufft_epsilon(plan.epsilon),
             opts=opts,
         )
-        phase = (two_pi * w_k) * plan.n_minus_1
+        # issue #16: shifted grid, matching the forward's plane phase.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
 
     if w_strategy == "windowed_vmap":
-        contributions = jax.vmap(plane_to_image)(window_start_c, plan.w_centers)
+        contributions = jax.vmap(plane_to_image)(window_start_c, plan.w_centers_rel)
         return jnp.sum(contributions, axis=0)
 
     def step(dirty_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
@@ -861,7 +974,7 @@ def _channel_adjoint_windowed(
         return dirty_acc + plane_to_image(lo_raw, w_k), None
 
     dirty_init = jnp.zeros((plan.n_l, plan.n_m), dtype=cdtype)
-    dirty_c, _ = jax.lax.scan(step, dirty_init, (window_start_c, plan.w_centers))
+    dirty_c, _ = jax.lax.scan(step, dirty_init, (window_start_c, plan.w_centers_rel))
     return dirty_c
 
 
@@ -893,7 +1006,7 @@ def _vis2dirty_jit(
         # Apply sort_perm once per channel so windowed slices line up with
         # plan.window_start.
         vis_sorted_per_chan = vis_per_chan[:, plan.sort_perm]
-        w_lambda_sorted = plan.uvw_lambda_sorted[..., 2]
+        w_rel_sorted = _w_relative(plan.uvw_lambda_sorted[..., 2], plan)
         if channel_strategy == "vmap":
             dirty_per_chan = jax.vmap(
                 lambda v_s_c, u_c, vv_c, w_s_c, ws_c: _channel_adjoint_windowed(
@@ -903,7 +1016,7 @@ def _vis2dirty_jit(
                 vis_sorted_per_chan,
                 plan.u_finufft,
                 plan.v_finufft,
-                w_lambda_sorted,
+                w_rel_sorted,
                 plan.window_start,
             )
         elif channel_strategy == "scan":
@@ -924,34 +1037,61 @@ def _vis2dirty_jit(
                     vis_sorted_per_chan,
                     plan.u_finufft,
                     plan.v_finufft,
-                    w_lambda_sorted,
+                    w_rel_sorted,
                     plan.window_start,
                 ),
             )
         else:
             raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
     elif channel_strategy == "vmap":
-        w_lambda = plan.uvw_lambda[..., 2]
+        w_rel = _w_relative(plan.uvw_lambda[..., 2], plan)
         dirty_per_chan = jax.vmap(
             lambda v_c, u_c, vv_c, w_c: _channel_adjoint(
                 v_c, u_c, vv_c, w_c, plan, opts, w_strategy
             )
-        )(vis_per_chan, plan.u_finufft, plan.v_finufft, w_lambda)
+        )(vis_per_chan, plan.u_finufft, plan.v_finufft, w_rel)
     elif channel_strategy == "scan":
-        w_lambda = plan.uvw_lambda[..., 2]
+        w_rel = _w_relative(plan.uvw_lambda[..., 2], plan)
 
         def step(_: None, args: tuple[Array, Array, Array, Array]) -> tuple[None, Array]:
             v_c, u_c, vv_c, w_c = args
             return None, _channel_adjoint(v_c, u_c, vv_c, w_c, plan, opts, w_strategy)
 
         _, dirty_per_chan = jax.lax.scan(
-            step, None, (vis_per_chan, plan.u_finufft, plan.v_finufft, w_lambda)
+            step, None, (vis_per_chan, plan.u_finufft, plan.v_finufft, w_rel)
         )
     else:
         raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
 
+    # issue #16 follow-up: conjugate of the forward's w0 phase screen.
+    #
+    # Which side it belongs on follows from the adjoint relation, not from
+    # trial and error. The forward is A = D . N . M, reading right to left:
+    # M multiplies the image by the screen, N is the w-plane machinery, D
+    # multiplies the output visibilities by the nshift compensation. Both M and
+    # D are diagonal, so A^H = M^H . N^H . D^H with M^H = diag(conj(screen)) --
+    # i.e. the screen's conjugate acts on the *image* end of the adjoint, which
+    # is its output. D^H = diag(conj(compensation)) acts on the adjoint's input
+    # and is already applied inside the channel helpers.
+    #
+    # It must land before ``.real`` below: conjugating a complex screen and then
+    # discarding the imaginary part is not the same operation in the other
+    # order, and the dot-product identity in tests/test_adjoint.py is what
+    # would catch getting this wrong.
+    dirty_per_chan = dirty_per_chan * jnp.conj(plan.w0_screen)
+
     # Apply 1/n on the output (matching ducc's divide_by_n=True), and take
     # the real part to land in real space.
+    #
+    # issue #16: this is ``plan.n_minus_1``, NOT ``plan.n_minus_1_shifted``,
+    # and that is not an oversight. ``nshift`` is a bookkeeping device for the
+    # w-phase only -- it is introduced and removed by an exact identity, and
+    # the operator it defines is still the one whose output is divided by the
+    # *physical* ``n = sqrt(1 - l² - m²)``. Using the shifted grid here would
+    # divide by ``n + nshift``, a smooth per-pixel gain error of tens of
+    # percent that no parity test's epsilon budget would absorb -- but it
+    # would leave the plane count halved and every structural nshift test
+    # green, which is exactly why it gets its own comment.
     n_grid = (plan.n_minus_1 + 1.0).astype(dirty_per_chan.real.dtype)
     safe_n = jnp.where(n_grid > 0.0, n_grid, 1.0)
     return jnp.where(n_grid > 0.0, dirty_per_chan.real / safe_n, 0.0)
