@@ -6,7 +6,11 @@ JAX-native wgridder for radio interferometric imaging.
 > (sorted-order windowed forward, constant-w fast path, precomputed
 > FINUFFT coords, GPU benchmark suite) plus a third opt-in `w_strategy`
 > value, `"auto"`, which resolves to one of the four canonical
-> strategies via a platform-aware heuristic; defaults are unchanged.
+> strategies via a platform-aware heuristic. One default *has* changed
+> (issue #24, R11/D4): `nthreads` is now `None` by default and resolves,
+> before the JIT boundary, to a strategy-aware thread count instead of the
+> old flat `0` -- see [`nthreads`](#nthreads-issue-24-r11d4) below. Pass an
+> explicit `nthreads=0` to opt back into the pre-#24 behaviour.
 
 ## Overview
 
@@ -265,17 +269,51 @@ The returned plan also exposes `max_window_size` and
 `window_padding_overhead` for callers that want to inspect whether the
 windowed strategies will be efficient on a given uvw distribution.
 
-### `dirty2vis(plan, image, *, w_strategy="dense_scan", channel_strategy="scan", nthreads=0) -> Array`
+### `dirty2vis(plan, image, *, w_strategy="dense_scan", channel_strategy="scan", nthreads=None) -> Array`
 
 Forward operator. `image` may be `(n_chan, n_l, n_m)` or `(n_l, n_m)`
 (broadcast across channels), real or complex. Output is complex
 `(n_rows, n_chan)`.
 
-### `vis2dirty(plan, vis, *, weights=None, w_strategy="dense_scan", channel_strategy="scan", nthreads=0) -> Array`
+### `vis2dirty(plan, vis, *, weights=None, w_strategy="dense_scan", channel_strategy="scan", nthreads=None) -> Array`
 
 Adjoint operator. `vis` is complex `(n_rows, n_chan)`; optional `weights` is
 real `(n_rows, n_chan)`. Output is real `(n_chan, n_l, n_m)` with the `1/n`
 factor applied (matching ducc's `divide_by_n=True`).
+
+### `nthreads` (issue #24, R11/D4)
+
+`nthreads: int | None = None` on both operators. The default resolves
+*before* the JIT boundary to a strategy-aware choice, not a flat number:
+`1` for `dense_scan` / `windowed_scan` (each w-plane makes its own FINUFFT
+call, so `nthreads > 1` just re-spins the whole OpenMP pool on every plane
+— 4.80x-8.49x slower than `nthreads=1` for the old flat default of `0`,
+measured on a 10-core Apple M-series: MWA_extended off30 3343.6ms vs
+696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith 36.6ms vs 4.3ms), and
+`0` (let FINUFFT decide) for `dense_vmap` / `windowed_vmap` (one batched
+FINUFFT call across all w-planes, which benefits from threads at large
+enough `n_w`). Below 100k rows every strategy gets `1` regardless, since the
+whole plane loop is short enough that spinning up a pool isn't worth it.
+Pass an explicit `int` (including `0`) to opt out of the strategy-aware
+default.
+
+**Limitation:** every fixture in this repository is below the 100k-row
+cutoff -- 400-600 rows for the CPU telescope fixtures, 50k for the
+`GH200_LARGE` GPU fixture -- so on every benchmark and test in
+this repo the small-`n_rows` override applies to *all four* strategies --
+the vmap-family steady-state branch (`nthreads=0` above the cutoff) is
+never exercised by anything measured here, only by unit tests that build a
+plan above the cutoff explicitly. Measured directly at these repo-sized row
+counts (`dense_vmap` / `windowed_vmap`, `nthreads=1` vs `nthreads=0`, same
+timing protocol as above): `dense_vmap` is ~1.8-2.3x faster at `nthreads=0`
+on MWA_extended off30 and MeerKAT off30, but ~1.2x faster at `nthreads=1`
+on EDA2 zenith (too little batched work at that `n_w` to amortise a pool
+spin-up); `windowed_vmap` on MWA_extended off30 is ~6-7x *faster* at
+`nthreads=1` than `nthreads=0` (windowing shrinks each plane's per-call row
+count, so it behaves like the scan family here, not like `dense_vmap` at
+large `n_w`). That split verdict is why the small-`n_rows` override stays
+strategy-blind rather than exempting the vmap family -- see the comment
+above `_NTHREADS_SMALL_N_ROWS` in `wgridder.py` for the full numbers.
 
 ### Strategy options
 
@@ -595,31 +633,90 @@ per-call cost on every step. Treat the ducc column as a fair
 comparison against current ducc *usage* rather than against a
 hypothetical "ducc with reused plan".
 
-#### Indicative numbers (Mac M-series CPU, eps=1e-6, single-threaded)
+#### Indicative numbers (Mac M-series CPU, eps=1e-6)
 
-Median wall-clock time for `dirty2vis` / `vis2dirty`, taken from a
-single sweep of the benchmark suite. Rerun on your hardware before
-making strategy decisions &mdash; these are CI-runner sized problems and
-absolute timings vary several-fold across machines.
+Median wall-clock time for `dirty2vis` / `vis2dirty`, from a full sweep of
+`tests/test_benchmark_against_ducc.py --runbench --bench-pointing=both`
+(160 benchmark cases, Apple M4, 10 cores, macOS arm64, 2026-09-04). Rerun
+on your hardware before making strategy decisions &mdash; these are
+CI-runner sized problems and absolute timings vary several-fold across
+machines.
 
-**Zenith pointing**
+Regenerated for issue #24 (R11/D4), which found the previous version of
+this table silently comparing jax at its old implicit default
+(`nthreads=0`, every OpenMP core re-spun per w-plane call) against ducc's
+explicit `nthreads=1` &mdash; not the "single-threaded" comparison the old
+caption claimed. The two tables below give the honest comparison instead:
+one with both sides pinned to the *same* explicit thread count, one with
+both sides left at "let the library decide" (`nthreads=0` passed
+explicitly to both jax and ducc).
+
+Every fixture below has 400-600 rows, far under the 100k-row
+`_NTHREADS_SMALL_N_ROWS` cutoff (see [`nthreads`](#nthreads-issue-24-r11d4)
+above), so jax's new strategy-aware default (`nthreads=None`) resolves to
+`nthreads=1` for *all four* strategies on every problem in these tables,
+vmap included &mdash; the strategy split (`0` for `dense_vmap` /
+`windowed_vmap`) only takes effect above that cutoff, which nothing here
+reaches. **The "matched `nthreads=1`" table below is therefore what
+`dirty2vis` / `vis2dirty` produce today with no `nthreads=` argument at
+all**, across every strategy shown. The "`nthreads=0`" table is an
+explicit opt-out (`nthreads=0` passed by hand) or a preview of the
+vmap-family steady state at larger row counts, not a second flavour of the
+current default.
+
+**Matched threads, jax and ducc both explicit `nthreads=1`**
+
+Zenith pointing:
 
 | Telescope     | dense_scan       | dense_vmap       | windowed_scan    | windowed_vmap    | ducc           |
 |---------------|------------------|------------------|------------------|------------------|----------------|
-| EDA2          | 2.7 / 3.0 ms     | 1.0 / 1.2 ms     | 2.8 / 4.2 ms     | 1.0 / 1.2 ms     | 0.7 / 0.9 ms   |
-| MWA_compact   | 2.7 / 3.8 ms     | 1.6 / 1.8 ms     | 2.7 / 3.3 ms     | 1.9 / 1.9 ms     | 1.7 / 1.9 ms   |
-| MWA_extended  | 22.0 / 33.5 ms   | 15.6 / 20.2 ms   | 21.7 / 31.6 ms   | 16.9 / 22.4 ms   | 9.9 / 10.9 ms  |
-| MeerKAT       | 8.8 / 13.9 ms    | 6.3 / 8.2 ms     | 8.8 / 12.0 ms    | 6.9 / 8.3 ms     | 7.5 / 8.3 ms   |
+| EDA2          | 4.2 / 4.6 ms     | 1.3 / 1.4 ms     | 4.5 / 4.2 ms     | 1.6 / 1.4 ms     | 0.9 / 1.3 ms   |
+| MWA_compact   | 4.9 / 5.8 ms     | 2.5 / 2.8 ms     | 5.1 / 6.2 ms     | 2.8 / 3.6 ms     | 2.1 / 2.8 ms   |
+| MWA_extended  | 37.1 / 40.0 ms   | 25.6 / 25.9 ms   | 42.2 / 38.3 ms   | 27.6 / 30.1 ms   | 13.6 / 15.5 ms |
+| MeerKAT       | 14.2 / 22.5 ms   | 9.7 / 16.7 ms    | 16.0 / 23.4 ms   | 10.0 / 19.2 ms   | 9.1 / 11.8 ms  |
 
-**30-deg off-zenith pointing** (`n_w` is much larger; this is where
-both improvements have the most to bite into):
+30-deg off-zenith pointing (`n_w` is much larger; this is where both v0.1.1
+improvements have the most to bite into):
 
 | Telescope     | dense_scan        | dense_vmap        | windowed_scan       | windowed_vmap       | ducc            |
 |---------------|-------------------|-------------------|---------------------|---------------------|-----------------|
-| EDA2          | 33.2 / 38.3 ms    | 9.4 / 12.9 ms     | 31.4 / 32.7 ms      | 7.7 / 10.5 ms       | 1.5 / 1.9 ms    |
-| MWA_compact   | 10.2 / 13.8 ms    | 5.2 / 6.4 ms      | 10.8 / 9.0 ms       | 5.9 / 6.2 ms        | 2.1 / 2.5 ms    |
-| MWA_extended  | 561 / 872 ms      | 394 / 546 ms      | 566 / 731 ms        | 417 / 482 ms        | 34.7 / 38.4 ms  |
-| MeerKAT       | 32.9 / 44.8 ms    | 23.2 / 30.6 ms    | 34.4 / 42.5 ms      | 25.0 / 32.2 ms      | 10.2 / 10.9 ms  |
+| EDA2          | 52.7 / 50.9 ms    | 14.0 / 13.7 ms    | 49.8 / 50.4 ms      | 11.9 / 13.6 ms      | 2.0 / 2.7 ms    |
+| MWA_compact   | 16.2 / 22.9 ms    | 7.8 / 11.0 ms     | 18.8 / 20.4 ms      | 8.9 / 10.8 ms       | 2.7 / 3.6 ms    |
+| MWA_extended  | 969.7 / 951.9 ms  | 594.2 / 664.5 ms  | 869.6 / 631.9 ms    | 562.4 / 504.0 ms    | 41.0 / 55.1 ms  |
+| MeerKAT       | 49.3 / 81.7 ms    | 32.0 / 56.6 ms    | 53.3 / 83.2 ms      | 35.2 / 64.9 ms      | 12.2 / 15.6 ms  |
+
+**Both sides `nthreads=0`** ("let the library decide", passed explicitly on
+both sides &mdash; this is what *every* column looked like pre-#24, since
+jax's old flat default *was* `0`; at the row counts in this table, none of
+it is what jax's new default produces post-#24, including the vmap
+columns, per the small-`n_rows` override explained above):
+
+Zenith pointing:
+
+| Telescope     | dense_scan       | dense_vmap       | windowed_scan    | windowed_vmap    | ducc           |
+|---------------|------------------|------------------|------------------|------------------|----------------|
+| EDA2          | 38.0 / 58.8 ms   | 2.1 / 2.7 ms     | 42.4 / 57.4 ms   | 29.6 / 45.2 ms   | 2.0 / 2.5 ms   |
+| MWA_compact   | 36.1 / 29.5 ms   | 3.2 / 3.1 ms     | 37.3 / 29.5 ms   | 26.3 / 33.0 ms   | 2.7 / 3.7 ms   |
+| MWA_extended  | 154.0 / 220.6 ms | 13.4 / 19.5 ms   | 155.9 / 237.0 ms | 133.4 / 210.3 ms | 7.1 / 10.3 ms  |
+| MeerKAT       | 80.8 / 67.0 ms   | 8.0 / 8.1 ms     | 77.5 / 76.9 ms   | 61.7 / 58.7 ms   | 7.6 / 9.4 ms   |
+
+30-deg off-zenith pointing:
+
+| Telescope     | dense_scan          | dense_vmap        | windowed_scan       | windowed_vmap        | ducc            |
+|---------------|----------------------|-------------------|---------------------|-----------------------|-----------------|
+| EDA2          | 469.7 / 656.0 ms     | 9.6 / 20.0 ms     | 545.9 / 411.3 ms    | 384.0 / 299.7 ms      | 6.3 / 7.1 ms    |
+| MWA_compact   | 100.0 / 145.8 ms     | 6.1 / 10.0 ms     | 99.3 / 133.4 ms     | 79.5 / 114.1 ms       | 3.4 / 4.3 ms    |
+| MWA_extended  | 3377.8 / 3816.1 ms   | 238.2 / 476.5 ms  | 4300.6 / 4536.4 ms  | 3881.3 / 3270.1 ms    | 36.8 / 40.4 ms  |
+| MeerKAT       | 206.2 / 217.0 ms     | 15.7 / 23.1 ms    | 210.4 / 245.7 ms    | 180.3 / 201.6 ms      | 8.0 / 11.8 ms   |
+
+The gap between the two tables' scan columns is the effect issue #24
+fixes: `dense_scan` / `windowed_scan` at `nthreads=0` re-spin the whole
+OpenMP pool on every w-plane's FINUFFT call, which is why they are
+2.7-13.7x slower than the matched-`nthreads=1` table above on the same
+problem (e.g. MWA_extended off30 dense_scan: 3377.8ms at `nthreads=0` vs
+969.7ms at `nthreads=1`, ~3.5x; the largest gaps are on EDA2, up to 13.7x
+on zenith windowed_scan adjoint). This is exactly why the strategy-aware
+default resolves `dense_scan` / `windowed_scan` to `1`, not `0`.
 
 #### Isolating Part 1 (standard n_w) vs Part 2 (windowed)
 

@@ -15,8 +15,18 @@ Notes on what the numbers do and don't mean:
   workstation. Treat absolute numbers as ballparks.
 * The first JAX call compiles; the benchmark runs a manual warmup so this
   doesn't pollute the median.
-* Both implementations are run single-threaded by default to keep the
-  comparison apples-to-apples on the wall-clock dimension.
+* Thread parity (issue #24, R11/D4): the primary group (``test_bench_jax_*``
+  / ``test_bench_ducc_*``) passes ``nthreads=BENCH_NTHREADS`` (1) to *both*
+  sides explicitly. Before #24 the JAX calls didn't pass ``nthreads`` at all
+  and silently ran at the old default (0, i.e. every OpenMP core) against
+  ducc's explicit ``nthreads=1`` -- not the apples-to-apples comparison this
+  docstring already claimed. A second group, the ``*_nthreads0`` suffixed
+  tests below, runs both sides at ``nthreads=0`` ("let the library decide")
+  instead, so the README can present both a fixed-thread column and a
+  both-sides-auto column. Every benchmark row also records its thread count
+  in ``benchmark.extra_info["nthreads"]`` so a README table generator (or a
+  human) can state the setting per column without cross-referencing this
+  file.
 * These are *small* telescope configs (64 - 256 pixels). Real workloads at
   1k - 4k pixels behave qualitatively the same but absolute timings differ.
 * JAX-side variants are parametrised over ``w_strategy`` so that scan vs
@@ -47,6 +57,9 @@ jax.config.update("jax_enable_x64", True)
 
 BENCH_EPSILON = 1e-6
 BENCH_NTHREADS = 1
+# Second benchmark group (issue #24 point 4): both sides at "let the
+# library decide" instead of a fixed thread count.
+BENCH_NTHREADS_AUTO = 0
 
 
 def _setup_problem(tel: Telescope, zen_deg: float, *, seed: int = 7):
@@ -79,17 +92,26 @@ def test_bench_jax_dirty2vis(
     _, _, _, _, image, _, plan = _setup_problem(tel, zen_deg)
     image_j = jnp.asarray(image)
 
-    # Warm up so JIT compile cost is not in the timed window.
-    dirty2vis(plan, image_j, w_strategy=w_strategy).block_until_ready()
+    # Warm up so JIT compile cost is not in the timed window. nthreads is
+    # passed explicitly (matching ducc's explicit nthreads=BENCH_NTHREADS
+    # below) so this group is a fixed-thread apples-to-apples comparison,
+    # not the jax-at-whatever-the-default-is-today comparison it used to be
+    # pre-#24.
+    dirty2vis(plan, image_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS).block_until_ready()
 
     benchmark.extra_info["telescope"] = tel.name
     benchmark.extra_info["n_pix"] = tel.n_pix
     benchmark.extra_info["n_rows"] = tel.n_rows
     benchmark.extra_info["n_w"] = plan.n_w
     benchmark.extra_info["w_strategy"] = w_strategy
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS
     benchmark.extra_info["max_window_size"] = plan.max_window_size
     benchmark.extra_info["padding_overhead"] = round(plan.window_padding_overhead, 2)
-    benchmark(lambda: dirty2vis(plan, image_j, w_strategy=w_strategy).block_until_ready())
+    benchmark(
+        lambda: dirty2vis(
+            plan, image_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS
+        ).block_until_ready()
+    )
 
 
 def test_bench_ducc_dirty2vis(benchmark, bench_telescope_pointing: tuple[Telescope, float]) -> None:
@@ -99,6 +121,7 @@ def test_bench_ducc_dirty2vis(benchmark, bench_telescope_pointing: tuple[Telesco
     benchmark.extra_info["telescope"] = tel.name
     benchmark.extra_info["n_pix"] = tel.n_pix
     benchmark.extra_info["n_rows"] = tel.n_rows
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS
     benchmark(
         lambda: ducc0.wgridder.dirty2vis(
             uvw=uvw,
@@ -118,6 +141,67 @@ def test_bench_ducc_dirty2vis(benchmark, bench_telescope_pointing: tuple[Telesco
 @pytest.mark.parametrize(
     "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
 )
+def test_bench_jax_dirty2vis_nthreads0(
+    benchmark,
+    bench_telescope_pointing: tuple[Telescope, float],
+    w_strategy: str,
+) -> None:
+    """Second benchmark group (issue #24 point 4): both sides at
+    ``nthreads=0`` ("let the library decide"), instead of the fixed
+    ``BENCH_NTHREADS=1`` used by ``test_bench_jax_dirty2vis`` above. Select
+    just this group with ``-k nthreads0``."""
+    tel, zen_deg = bench_telescope_pointing
+    _, _, _, _, image, _, plan = _setup_problem(tel, zen_deg)
+    image_j = jnp.asarray(image)
+
+    dirty2vis(
+        plan, image_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS_AUTO
+    ).block_until_ready()
+
+    benchmark.extra_info["telescope"] = tel.name
+    benchmark.extra_info["n_pix"] = tel.n_pix
+    benchmark.extra_info["n_rows"] = tel.n_rows
+    benchmark.extra_info["n_w"] = plan.n_w
+    benchmark.extra_info["w_strategy"] = w_strategy
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS_AUTO
+    benchmark.extra_info["max_window_size"] = plan.max_window_size
+    benchmark.extra_info["padding_overhead"] = round(plan.window_padding_overhead, 2)
+    benchmark(
+        lambda: dirty2vis(
+            plan, image_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS_AUTO
+        ).block_until_ready()
+    )
+
+
+def test_bench_ducc_dirty2vis_nthreads0(
+    benchmark, bench_telescope_pointing: tuple[Telescope, float]
+) -> None:
+    tel, zen_deg = bench_telescope_pointing
+    _, uvw, freq, pix, image, _, _ = _setup_problem(tel, zen_deg)
+
+    benchmark.extra_info["telescope"] = tel.name
+    benchmark.extra_info["n_pix"] = tel.n_pix
+    benchmark.extra_info["n_rows"] = tel.n_rows
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS_AUTO
+    benchmark(
+        lambda: ducc0.wgridder.dirty2vis(
+            uvw=uvw,
+            freq=freq,
+            dirty=image,
+            pixsize_x=pix,
+            pixsize_y=pix,
+            epsilon=BENCH_EPSILON,
+            do_wgridding=True,
+            divide_by_n=False,
+            nthreads=BENCH_NTHREADS_AUTO,
+            verbosity=0,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
 def test_bench_jax_vis2dirty(
     benchmark,
     bench_telescope_pointing: tuple[Telescope, float],
@@ -127,16 +211,21 @@ def test_bench_jax_vis2dirty(
     _, _, _, _, _, vis, plan = _setup_problem(tel, zen_deg)
     vis_j = jnp.asarray(vis)
 
-    vis2dirty(plan, vis_j, w_strategy=w_strategy).block_until_ready()
+    vis2dirty(plan, vis_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS).block_until_ready()
 
     benchmark.extra_info["telescope"] = tel.name
     benchmark.extra_info["n_pix"] = tel.n_pix
     benchmark.extra_info["n_rows"] = tel.n_rows
     benchmark.extra_info["n_w"] = plan.n_w
     benchmark.extra_info["w_strategy"] = w_strategy
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS
     benchmark.extra_info["max_window_size"] = plan.max_window_size
     benchmark.extra_info["padding_overhead"] = round(plan.window_padding_overhead, 2)
-    benchmark(lambda: vis2dirty(plan, vis_j, w_strategy=w_strategy).block_until_ready())
+    benchmark(
+        lambda: vis2dirty(
+            plan, vis_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS
+        ).block_until_ready()
+    )
 
 
 def test_bench_ducc_vis2dirty(benchmark, bench_telescope_pointing: tuple[Telescope, float]) -> None:
@@ -146,6 +235,7 @@ def test_bench_ducc_vis2dirty(benchmark, bench_telescope_pointing: tuple[Telesco
     benchmark.extra_info["telescope"] = tel.name
     benchmark.extra_info["n_pix"] = tel.n_pix
     benchmark.extra_info["n_rows"] = tel.n_rows
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS
     benchmark(
         lambda: ducc0.wgridder.vis2dirty(
             uvw=uvw,
@@ -159,6 +249,64 @@ def test_bench_ducc_vis2dirty(benchmark, bench_telescope_pointing: tuple[Telesco
             do_wgridding=True,
             divide_by_n=True,
             nthreads=BENCH_NTHREADS,
+            verbosity=0,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+def test_bench_jax_vis2dirty_nthreads0(
+    benchmark,
+    bench_telescope_pointing: tuple[Telescope, float],
+    w_strategy: str,
+) -> None:
+    """Adjoint counterpart of ``test_bench_jax_dirty2vis_nthreads0``."""
+    tel, zen_deg = bench_telescope_pointing
+    _, _, _, _, _, vis, plan = _setup_problem(tel, zen_deg)
+    vis_j = jnp.asarray(vis)
+
+    vis2dirty(plan, vis_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS_AUTO).block_until_ready()
+
+    benchmark.extra_info["telescope"] = tel.name
+    benchmark.extra_info["n_pix"] = tel.n_pix
+    benchmark.extra_info["n_rows"] = tel.n_rows
+    benchmark.extra_info["n_w"] = plan.n_w
+    benchmark.extra_info["w_strategy"] = w_strategy
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS_AUTO
+    benchmark.extra_info["max_window_size"] = plan.max_window_size
+    benchmark.extra_info["padding_overhead"] = round(plan.window_padding_overhead, 2)
+    benchmark(
+        lambda: vis2dirty(
+            plan, vis_j, w_strategy=w_strategy, nthreads=BENCH_NTHREADS_AUTO
+        ).block_until_ready()
+    )
+
+
+def test_bench_ducc_vis2dirty_nthreads0(
+    benchmark, bench_telescope_pointing: tuple[Telescope, float]
+) -> None:
+    tel, zen_deg = bench_telescope_pointing
+    _, uvw, freq, pix, _, vis, _ = _setup_problem(tel, zen_deg)
+
+    benchmark.extra_info["telescope"] = tel.name
+    benchmark.extra_info["n_pix"] = tel.n_pix
+    benchmark.extra_info["n_rows"] = tel.n_rows
+    benchmark.extra_info["nthreads"] = BENCH_NTHREADS_AUTO
+    benchmark(
+        lambda: ducc0.wgridder.vis2dirty(
+            uvw=uvw,
+            freq=freq,
+            vis=vis,
+            npix_x=tel.n_pix,
+            npix_y=tel.n_pix,
+            pixsize_x=pix,
+            pixsize_y=pix,
+            epsilon=BENCH_EPSILON,
+            do_wgridding=True,
+            divide_by_n=True,
+            nthreads=BENCH_NTHREADS_AUTO,
             verbosity=0,
         )
     )

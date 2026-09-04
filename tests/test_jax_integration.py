@@ -11,9 +11,33 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import jax_nufft.wgridder as wgridder
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 
 jax.config.update("jax_enable_x64", True)
+
+
+def _setup_with_n_rows(n_rows: int, seed: int = 0):
+    """Like ``_tiny_setup`` but with a caller-chosen ``n_rows``, so tests can
+    straddle ``_NTHREADS_SMALL_N_ROWS`` deliberately. ``n_l``/``n_m`` stay
+    tiny regardless of ``n_rows`` -- ``make_plan`` is host-side numpy work
+    (fast even at 100k+ rows, see the boundary tests below), and the tests
+    that use this stub out the JIT call entirely, so image/plan size never
+    drives execution cost."""
+    rng = np.random.default_rng(seed)
+    n_l = n_m = 16
+    pixsize = 0.005
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-50.0, 50.0, size=n_rows)
+    uvw[:, 1] = rng.uniform(-50.0, 50.0, size=n_rows)
+    uvw[:, 2] = rng.uniform(-3.0, 3.0, size=n_rows)
+    freq = np.array([1.4e9])
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-6)
+    image = rng.standard_normal((1, n_l, n_m)) + 1j * rng.standard_normal((1, n_l, n_m))
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
+    return plan, jnp.asarray(image), jnp.asarray(vis)
 
 
 def _tiny_setup(seed: int = 0):
@@ -203,6 +227,69 @@ def test_jit_static_strategy_args() -> None:
     assert out.shape == (plan.n_rows, plan.n_chan)
 
 
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+def test_dirty2vis_nthreads_invariant(w_strategy: str) -> None:
+    """``nthreads`` is a scheduling knob, not a semantic one: dirty2vis at
+    ``nthreads=None`` (issue #24's new default) and ``nthreads=2`` must
+    match ``nthreads=1`` exactly to within 1e-11, across every w_strategy.
+
+    dirty2vis is a type-2 NUFFT (interpolation), which has no thread-order-
+    dependent reduction, so in principle this could be checked exactly; the
+    1e-11 bound is kept for parity with the adjoint check below and with
+    the issue's stated contract. Against the current default (``nthreads:
+    int = 0``, no ``None`` handling), the ``nthreads=None`` case fails
+    immediately with a jax-finufft ``Opts`` validation error rather than a
+    numerical mismatch -- that failure is the point: this test cannot pass
+    until ``nthreads: int | None = None`` resolves before the JIT boundary.
+    """
+    plan, image, _ = _tiny_setup(11)
+    reference = np.asarray(dirty2vis(plan, image, w_strategy=w_strategy, nthreads=1))
+    for nthreads in (None, 2):
+        out = np.asarray(dirty2vis(plan, image, w_strategy=w_strategy, nthreads=nthreads))
+        np.testing.assert_allclose(
+            out,
+            reference,
+            atol=1e-11,
+            rtol=0,
+            err_msg=(
+                f"dirty2vis(nthreads={nthreads}) vs nthreads=1 mismatch "
+                f"for w_strategy={w_strategy!r}"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+def test_vis2dirty_nthreads_invariant(w_strategy: str) -> None:
+    """Adjoint counterpart of ``test_dirty2vis_nthreads_invariant``.
+
+    vis2dirty is a type-1 NUFFT (parallel scatter-add), so its reduction
+    order is not fixed across calls on a multithreaded FINUFFT CPU build --
+    ``nthreads=None``/``1``/``2`` are expected to differ only at that
+    floor, which ``test_jit_idempotent_with_eager`` above measured at up to
+    ~8e-12 relative on a 72-core build; 1e-11 leaves headroom over that
+    while still catching a strategy/threading wiring bug (which would be
+    O(1), not O(1e-11)).
+    """
+    plan, _, vis = _tiny_setup(12)
+    reference = np.asarray(vis2dirty(plan, vis, w_strategy=w_strategy, nthreads=1))
+    for nthreads in (None, 2):
+        out = np.asarray(vis2dirty(plan, vis, w_strategy=w_strategy, nthreads=nthreads))
+        np.testing.assert_allclose(
+            out,
+            reference,
+            atol=1e-11,
+            rtol=0,
+            err_msg=(
+                f"vis2dirty(nthreads={nthreads}) vs nthreads=1 mismatch "
+                f"for w_strategy={w_strategy!r}"
+            ),
+        )
+
+
 def test_w_strategy_aliases_emit_deprecation() -> None:
     """v0.1 names ``scan``/``vmap`` still work but warn."""
     plan, image, _ = _tiny_setup(6)
@@ -212,3 +299,147 @@ def test_w_strategy_aliases_emit_deprecation() -> None:
     with pytest.warns(DeprecationWarning, match=r"vmap.*deprecated"):
         out = dirty2vis(plan, image, w_strategy="vmap")
     assert out.shape == (plan.n_rows, plan.n_chan)
+
+
+# -- boundary tests: the exact ``nthreads`` reaching the JIT boundary -------
+#
+# ``test_dirty2vis_nthreads_invariant`` / ``test_vis2dirty_nthreads_invariant``
+# above only check that different ``nthreads`` values produce numerically
+# equivalent output -- exactly the property that would still hold if the
+# wrapper ignored resolution entirely and always forwarded a fixed value
+# (e.g. ``1``). They also only ever use ``_tiny_setup``'s 24-row plan, which
+# is far below ``_NTHREADS_SMALL_N_ROWS`` (100_000), so the vmap-family arm
+# of the resolution rule (-> ``0``) is never exercised through the public
+# wrappers, only through the isolated ``_resolve_nthreads`` unit tests in
+# ``tests/test_nthreads_resolution.py``. The tests below close that gap by
+# spying on the internal ``_dirty2vis_jit`` / ``_vis2dirty_jit`` functions
+# (whose ``nthreads`` is a ``static_argname``) and asserting the *exact*
+# value ``dirty2vis`` / ``vis2dirty`` hand them, across the cases the
+# resolution rule branches on. The JIT/FINUFFT call itself is stubbed out
+# (returning a dummy array) so a 100k+-row "above cutoff" plan costs only
+# the host-side ``make_plan`` build (~tens of ms), not a real transform.
+
+
+def _spy_jit(monkeypatch: pytest.MonkeyPatch, jit_name: str) -> list[dict]:
+    """Replace ``jax_nufft.wgridder.<jit_name>`` with a stub that records
+    every call's kwargs and returns a dummy array (the public wrapper
+    returns the JIT function's result directly, with no further
+    processing, so any return value is fine)."""
+    calls: list[dict] = []
+
+    def stub(*args: object, **kwargs: object) -> jax.Array:
+        calls.append(kwargs)
+        return jnp.zeros(())
+
+    monkeypatch.setattr(wgridder, jit_name, stub)
+    return calls
+
+
+def test_dirty2vis_default_nthreads_reaches_jit_scan_below_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scan-family strategy on a plan below the cutoff must resolve to
+    ``nthreads=1`` at the point it reaches ``_dirty2vis_jit``."""
+    calls = _spy_jit(monkeypatch, "_dirty2vis_jit")
+    plan, image, _ = _tiny_setup(6)  # 24 rows, well below the 100_000 cutoff
+    dirty2vis(plan, image, w_strategy="dense_scan")
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 1
+
+
+def test_dirty2vis_default_nthreads_reaches_jit_vmap_above_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vmap-family strategy on a plan *above* the cutoff must resolve to
+    ``nthreads=0`` at the point it reaches ``_dirty2vis_jit`` -- the one
+    combination the numerical-invariance tests above cannot exercise."""
+    calls = _spy_jit(monkeypatch, "_dirty2vis_jit")
+    n_rows = wgridder._NTHREADS_SMALL_N_ROWS + 1
+    plan, image, _ = _setup_with_n_rows(n_rows, seed=6)
+    dirty2vis(plan, image, w_strategy="dense_vmap")
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 0
+
+
+def test_vis2dirty_default_nthreads_reaches_jit_scan_below_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adjoint counterpart of the scan-below-cutoff test above."""
+    calls = _spy_jit(monkeypatch, "_vis2dirty_jit")
+    plan, _, vis = _tiny_setup(7)
+    vis2dirty(plan, vis, w_strategy="windowed_scan")
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 1
+
+
+def test_vis2dirty_default_nthreads_reaches_jit_vmap_above_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adjoint counterpart of the vmap-above-cutoff test above."""
+    calls = _spy_jit(monkeypatch, "_vis2dirty_jit")
+    n_rows = wgridder._NTHREADS_SMALL_N_ROWS + 1
+    plan, _, vis = _setup_with_n_rows(n_rows, seed=7)
+    vis2dirty(plan, vis, w_strategy="windowed_vmap")
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 0
+
+
+def test_dirty2vis_default_nthreads_reaches_jit_auto_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``w_strategy="auto"`` must canonicalise (via ``plan``/``is_adjoint``)
+    and resolve all the way through to a concrete ``nthreads`` at the JIT
+    boundary, not raise and not leak ``None`` through. On CPU, ``"auto"``
+    always resolves to a scan-family strategy (``_auto_w_strategy_cpu``),
+    and this plan is below the cutoff either way, so ``1`` is expected
+    regardless of which scan variant is picked."""
+    calls = _spy_jit(monkeypatch, "_dirty2vis_jit")
+    plan, image, _ = _tiny_setup(6)
+    dirty2vis(plan, image, w_strategy="auto")
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 1
+
+
+def test_dirty2vis_default_nthreads_reaches_jit_deprecated_scan_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deprecated ``"scan"`` alias (-> ``dense_scan``) must resolve the
+    same as its canonical name at the JIT boundary."""
+    calls = _spy_jit(monkeypatch, "_dirty2vis_jit")
+    plan, image, _ = _tiny_setup(6)
+    with pytest.warns(DeprecationWarning, match=r"scan.*deprecated"):
+        dirty2vis(plan, image, w_strategy="scan")
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 1
+
+
+def test_dirty2vis_default_nthreads_reaches_jit_deprecated_vmap_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deprecated ``"vmap"`` alias (-> ``dense_vmap``) must resolve the
+    same as its canonical name at the JIT boundary -- on a plan above the
+    cutoff, so this is distinguishable from the (also correct) ``1`` a
+    below-cutoff plan would give."""
+    calls = _spy_jit(monkeypatch, "_dirty2vis_jit")
+    n_rows = wgridder._NTHREADS_SMALL_N_ROWS + 1
+    plan, image, _ = _setup_with_n_rows(n_rows, seed=6)
+    with pytest.warns(DeprecationWarning, match=r"vmap.*deprecated"):
+        dirty2vis(plan, image, w_strategy="vmap")
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 0
+
+
+def test_dirty2vis_explicit_nthreads_reaches_jit_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``nthreads`` must reach ``_dirty2vis_jit`` completely
+    untouched by the resolution rule -- including on a vmap-family,
+    above-cutoff plan where the default would resolve to ``0``, to prove
+    the explicit value (here ``5``) isn't coincidentally matching a
+    resolved one."""
+    calls = _spy_jit(monkeypatch, "_dirty2vis_jit")
+    n_rows = wgridder._NTHREADS_SMALL_N_ROWS + 1
+    plan, image, _ = _setup_with_n_rows(n_rows, seed=6)
+    dirty2vis(plan, image, w_strategy="dense_vmap", nthreads=5)
+    assert len(calls) == 1
+    assert calls[0]["nthreads"] == 5

@@ -128,6 +128,109 @@ def _canonicalise_w_strategy(
     )
 
 
+# Below this many rows, the whole plane loop is short enough that spinning up
+# an OpenMP thread pool per FINUFFT call isn't worth it regardless of
+# strategy -- ``_resolve_nthreads`` overrides the strategy-family rule to `1`
+# in that regime. 100k is a round number well above every review fixture
+# (largest is GH200_large at 50k rows) and well below workloads where the
+# scan-family per-plane cost would actually amortise the pool spin-up;
+# tunable, and pinned by ``tests/test_nthreads_resolution.py``.
+#
+# This override applies to *every* strategy, including the vmap family, even
+# though the vmap family's steady-state rule (above the cutoff) is
+# `nthreads=0`. That is deliberate, not an oversight: measured directly with
+# the repository's timing protocol (plan + 1 warm-up outside the timer,
+# median of 9 calls, `.block_until_ready()`) at the row counts every fixture
+# in this repo actually uses (400-600 rows for the CPU telescope
+# fixtures, 50k for GH200_LARGE -- all below this cutoff),
+# `nthreads=0` is *not* uniformly better for the vmap family here:
+#
+#   * `dense_vmap`: `nthreads=0` is faster on MWA_extended off30 (170.5ms vs
+#     384.9ms forward, 289.4ms vs 506.7ms adjoint -- ~1.8-2.3x) and MeerKAT
+#     off30 (12.0ms vs 23.3ms forward, 16.3ms vs 30.3ms adjoint -- ~1.9x),
+#     but `nthreads=1` is faster on EDA2 zenith (1.28ms vs 1.51ms forward,
+#     1.37ms vs 1.68ms adjoint -- small n_w means too little batched work to
+#     amortise a multi-threaded pool spin-up).
+#   * `windowed_vmap` on MWA_extended off30 goes the *other* way entirely:
+#     `nthreads=1` is ~6-7x *faster* than `nthreads=0` (409ms vs 2915ms
+#     forward, 470ms vs 2997ms adjoint). Windowing shrinks each plane's
+#     per-call row count to `max_window_size`, so at this row count the
+#     windowed vmap call is thread-pool-spin-up-bound the same way the scan
+#     family is, not batch-parallelism-bound the way dense_vmap at large n_w
+#     is -- the assumption that "vmap wants threads" turns out to be a
+#     dense_vmap-at-large-n_w statement, not a strategy-family-wide one.
+#
+# Given that split verdict -- and that the worst case of forcing `1` below
+# the cutoff (losing ~2x on dense_vmap at moderate n_w) is far smaller than
+# the worst case of not forcing it (losing ~7x on windowed_vmap) -- the
+# override stays strategy-blind. One consequence worth being explicit about:
+# every fixture currently in this repository has n_rows well below this
+# cutoff, so the vmap-family steady-state branch of ``_resolve_nthreads``
+# (the `else: return 0` below) is never exercised by anything in
+# ``tests/test_benchmark_against_ducc.py`` or the README's benchmark
+# tables -- only by the direct unit tests in
+# ``tests/test_nthreads_resolution.py`` and the JIT-boundary spy tests in
+# ``tests/test_jax_integration.py``, both of which pass a plan built with
+# `n_rows > _NTHREADS_SMALL_N_ROWS` explicitly to reach it.
+_NTHREADS_SMALL_N_ROWS = 100_000
+
+
+def _resolve_nthreads(
+    nthreads: int | None,
+    w_strategy: str,
+    n_rows: int,
+    *,
+    plan: WGridderPlan | None = None,
+    is_adjoint: bool | None = None,
+) -> int:
+    """Resolve the public ``nthreads: int | None = None`` default to an ``int``.
+
+    Runs *before* the JIT boundary in :func:`dirty2vis` / :func:`vis2dirty`
+    so the value that reaches ``_dirty2vis_jit`` / ``_vis2dirty_jit`` (whose
+    ``static_argnames`` includes ``"nthreads"``) is always a concrete
+    ``int`` -- never ``None`` -- and so two callers that both leave
+    ``nthreads`` at its default still share a JIT cache entry.
+
+    Rule (issue #24, R11/D4):
+
+      * an explicit ``nthreads`` (any int, including ``0``, i.e. "let
+        FINUFFT decide") always passes straight through unchanged. No
+        strategy canonicalisation is attempted in this branch, so
+        ``w_strategy="auto"`` with no ``plan`` / ``is_adjoint`` does *not*
+        raise here -- that context is only needed to pick a default.
+      * otherwise ``w_strategy`` is canonicalised via
+        :func:`_canonicalise_w_strategy` (resolving ``"auto"`` and the
+        deprecated ``"scan"`` / ``"vmap"`` aliases the same way the
+        strategy dispatch itself does), and:
+          - if ``n_rows < _NTHREADS_SMALL_N_ROWS``, the plane loop is short
+            enough that spinning up a thread pool per call isn't worth it
+            regardless of strategy -> ``1`` (this overrides the strategy
+            family below);
+          - else ``"dense_scan"`` / ``"windowed_scan"`` (the *scan* family,
+            which re-enters FINUFFT once per w-plane, so ``nthreads > 1``
+            just re-spins the whole OpenMP pool on every plane) -> ``1``;
+          - else ``"dense_vmap"`` / ``"windowed_vmap"`` (the *vmap* family,
+            one batched FINUFFT call across planes) -> ``0`` (let FINUFFT
+            thread the batch).
+
+    Measured on the review machine (Apple M-series, 10 cores), default
+    ``nthreads=0`` vs. explicit ``nthreads=1`` on ``dense_scan``: MWA_extended
+    off30 3343.6ms vs 696.0ms (4.80x), MeerKAT off30 207.5ms vs 41.5ms
+    (5.01x), EDA2 zenith 36.6ms vs 4.3ms (8.49x). The batched ``dense_vmap``
+    is the opposite story -- it benefits from threads -- so a flat default of
+    ``1`` would regress it; hence the strategy-family split rather than a
+    single number.
+    """
+    if nthreads is not None:
+        return nthreads
+    canonical = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=is_adjoint)
+    if n_rows < _NTHREADS_SMALL_N_ROWS:
+        return 1
+    if canonical in ("dense_scan", "windowed_scan"):
+        return 1
+    return 0
+
+
 def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     """CPU-tuned heuristic from ``docs/v0.1.2-plan.md`` Part 4.
 
@@ -635,7 +738,7 @@ def dirty2vis(
     *,
     w_strategy: WStrategy = "dense_scan",
     channel_strategy: ChannelStrategy = "scan",
-    nthreads: int = 0,
+    nthreads: int | None = None,
 ) -> Array:
     """Forward wgridder: image cube -> visibilities.
 
@@ -660,7 +763,21 @@ def dirty2vis(
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"`` for the channel loop.
     nthreads:
-        Threads to pass to jax-finufft (0 = let FINUFFT decide).
+        Threads to pass to jax-finufft. Default ``None`` resolves (before the
+        JIT boundary, via :func:`_resolve_nthreads`, so the JIT cache is
+        still shared across callers that leave it at the default) to a
+        strategy-aware choice: ``1`` for the ``*_scan`` strategies, which
+        re-enter FINUFFT once per w-plane, so ``nthreads > 1`` just re-spins
+        the whole OpenMP thread pool on every plane -- measured on the
+        review machine (Apple M-series, 10 cores) at 4.80x-8.49x slower than
+        ``nthreads=1`` for the pre-#24 default of ``0`` (MWA_extended off30
+        3343.6ms vs 696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith
+        36.6ms vs 4.3ms); ``0`` (let FINUFFT decide) for the ``*_vmap``
+        strategies, whose single batched FINUFFT call over all w-planes does
+        benefit from threads. Below ``_NTHREADS_SMALL_N_ROWS`` rows this
+        override doesn't apply -- the plane loop is short enough that
+        spinning up a pool at all isn't worth it, so every strategy gets
+        ``1``. Pass an explicit ``int`` (including ``0``) to opt out.
 
     Returns
     -------
@@ -670,12 +787,13 @@ def dirty2vis(
     """
     w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=False)
     image = _prepare_image(image, plan)
+    resolved_nthreads = _resolve_nthreads(nthreads, w_strategy, plan.n_rows)
     return _dirty2vis_jit(
         plan,
         image,
         w_strategy=w_strategy,
         channel_strategy=channel_strategy,
-        nthreads=nthreads,
+        nthreads=resolved_nthreads,
     )
 
 
@@ -846,7 +964,7 @@ def vis2dirty(
     weights: Array | None = None,
     w_strategy: WStrategy = "dense_scan",
     channel_strategy: ChannelStrategy = "scan",
-    nthreads: int = 0,
+    nthreads: int | None = None,
 ) -> Array:
     """Adjoint wgridder: visibilities -> image cube (with 1/n factor).
 
@@ -873,7 +991,21 @@ def vis2dirty(
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"``.
     nthreads:
-        Threads to pass to jax-finufft (0 = let FINUFFT decide).
+        Threads to pass to jax-finufft. Default ``None`` resolves (before the
+        JIT boundary, via :func:`_resolve_nthreads`, so the JIT cache is
+        still shared across callers that leave it at the default) to a
+        strategy-aware choice: ``1`` for the ``*_scan`` strategies, which
+        re-enter FINUFFT once per w-plane, so ``nthreads > 1`` just re-spins
+        the whole OpenMP thread pool on every plane -- measured on the
+        review machine (Apple M-series, 10 cores) at 4.80x-8.49x slower than
+        ``nthreads=1`` for the pre-#24 default of ``0`` (MWA_extended off30
+        3343.6ms vs 696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith
+        36.6ms vs 4.3ms); ``0`` (let FINUFFT decide) for the ``*_vmap``
+        strategies, whose single batched FINUFFT call over all w-planes does
+        benefit from threads. Below ``_NTHREADS_SMALL_N_ROWS`` rows this
+        override doesn't apply -- the plane loop is short enough that
+        spinning up a pool at all isn't worth it, so every strategy gets
+        ``1``. Pass an explicit ``int`` (including ``0``) to opt out.
 
     Returns
     -------
@@ -885,13 +1017,14 @@ def vis2dirty(
     vis = _validate_vis(vis, plan)
     weights = _validate_weights(weights, plan)
     apply_w = weights is not None
+    resolved_nthreads = _resolve_nthreads(nthreads, w_strategy, plan.n_rows)
     return _vis2dirty_jit(
         plan,
         vis,
         weights if apply_w else jnp.zeros((), dtype=vis.real.dtype),
         w_strategy=w_strategy,
         channel_strategy=channel_strategy,
-        nthreads=nthreads,
+        nthreads=resolved_nthreads,
         apply_w_weights=apply_w,
     )
 
