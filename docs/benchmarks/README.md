@@ -22,6 +22,20 @@ ducc rows omit `n_w`, `w_strategy`, `max_window_size`,
 `padding_overhead` because those concepts are specific to jax-nufft's
 plan.
 
+`padding_overhead` is `plan.window_padding_overhead`, whose **definition
+changed in v0.1.3** (issue #43): the denominator moved from the mean of the
+padded per-plane window lengths to `plan.live_row_count`, the incidences
+inside the unpadded *nominal* kernel support (a host-side count — see the
+`live_row_count` field comment in `planning.py` for how far it can sit from
+what the compiled operators weight, and why that does not matter here). Every JSON file in this directory was
+recorded through v0.1.2 and so carries the old scale, which reads 0 – 17%
+lower on the same plan. The two are not convertible after the fact — the
+conversion needs the per-`(channel, plane)` window lengths, which are
+plan-time locals and have never been stored — so a `padding_overhead` value
+is only comparable against another recorded by the same version. Compare
+timings across the boundary freely; compare this column only within a
+version.
+
 ## v0.1.2+ GPU benchmark JSON: `v0.1.2-baseline-gpu.json` (Part 5.5+)
 
 Produced by `pytest tests/test_benchmark_gpu.py --runbench-gpu` with the
@@ -66,7 +80,7 @@ metadata. Stable keys (the merge script in v0.1.3+ keys joins by these):
 | `n_pix`            | `int`   | Image side                                                        |
 | `n_w`              | `int`   | From `plan.n_w`                                                   |
 | `w_kernel_width`   | `int`   | From `plan.w_kernel_width` (the spreading-kernel half-width, set by `epsilon`). Added in Part 6.1 so the auto-strategy heuristic can be validated against the JSON without re-deriving plan-internal quantities. |
-| `window_padding_overhead` | `float` | From `plan.window_padding_overhead` (= `max_window_size / mean_window_size`). Added in Part 6.1; gates the windowed-vs-dense choice in the heuristic. |
+| `window_padding_overhead` | `float` | From `plan.window_padding_overhead`. Added in Part 6.1; gates the windowed-vs-dense choice in the heuristic. **Scale changed in v0.1.3** (issue #43): it is now `n_chan * n_w * max_window_size / live_row_count`, where it was `max_window_size / mean_window_size` over the *padded* windows through v0.1.2. Rows recorded before v0.1.3 — including `v0.1.2-baseline-gpu.json` — hold the old scale and cannot be converted; see the note under the CPU schema above. |
 | `is_constant_w`    | `bool`  | From `plan.is_constant_w`                                         |
 | `median_s`         | `float` | Time-harness median seconds                                       |
 | `min_s`            | `float` | Time-harness min seconds                                          |

@@ -314,9 +314,26 @@ suitable for the kernel chosen by `epsilon` (32 for `W <= 4`, 64 for `W <= 8`,
 128 for `W in {9, 10}`, then one doubling per digit up to a cap of 4096); pass
 an explicit integer to override.
 
-The returned plan also exposes `max_window_size` and
-`window_padding_overhead` for callers that want to inspect whether the
-windowed strategies will be efficient on a given uvw distribution.
+The returned plan also exposes `max_window_size`,
+`window_padding_overhead`, `live_row_count` and `empty_plane_count` for
+callers that want to inspect whether the windowed strategies will be
+efficient on a given uvw distribution. `live_row_count` is the number of
+`(channel, plane, row)` incidences inside a plane's nominal kernel support
+(`|w - w_k| <= w_kernel_scale`, as the host computes `w`), and
+`empty_plane_count` the number of `(channel, plane)` pairs holding none — a
+long tail of empty planes is the signature of a clumped `w`-distribution, and
+the reason the windowed strategies stop paying on one.
+
+`live_row_count` is a nominal-support count, not a census of the weights the
+operators apply. The operators derive their own `w` inside the JIT — where the
+multiply and the `- w0` may contract into one FMA, and where a float32 plan
+runs the whole chain in single precision — then test `|z| <= 1`. Measured
+against that compiled expression over the review fixtures, the two counts
+differ on 20 of 40 cells in float64 and 7 of 10 in float32, never by more than
+3 incidences and never by more than 0.19%. `window_padding_overhead` is a work
+ratio rather than a kernel-weight audit, so a disagreement of that size sits
+well below the precision it is read at; an exact census would have to be taken
+against a compiled executable, which does not exist at plan time.
 
 **Plan memory.** The plan stores nothing per `(channel, row)`: the baselines
 are kept once in metres (`plan.uvw_m`, `(n_rows, 3)`) next to one scalar per
@@ -392,9 +409,29 @@ names are kept as deprecated aliases:
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
 
 For the windowed strategies, the plan exposes
-`plan.window_padding_overhead = max_window_size / mean_window_size` as a
-diagnostic. Pathological `w`-distributions can drive this above ~3, at
-which point dense strategies usually win on absolute time.
+
+```
+plan.window_padding_overhead = n_chan * n_w * max_window_size / plan.live_row_count
+```
+
+as a diagnostic: the factor by which a windowed traversal's row-work exceeds
+the irreducible minimum. The numerator is what the traversal actually touches
+— each `(channel, plane)` step slices a *static* `max_window_size` rows, since
+the shape has to be static for `lax.scan` / `vmap` — and the denominator counts
+only the rows inside a plane's nominal `w`-kernel support. It is bounded below
+by 1.0, attaining it
+on the constant-`w` fast path where the single plane holds every row and none
+of the slice is padding; pathological `w`-distributions can drive it above ~3,
+at which point dense strategies usually win on absolute time.
+
+The denominator changed in v0.1.3. Through v0.1.2 it was the mean of the
+per-`(channel, plane)` window lengths, which are measured *after* the builder
+widens each window by `window_boundary_margin` and by one further row at each
+end. Those rows are real work but lie outside nominal support, so counting
+them as irreducible understated the waste — by up to 17% on the review
+fixtures, worst where the windows are narrowest and the padding is therefore
+relatively largest. The two scales are not convertible after the fact: the per-plane
+window lengths are plan-time locals and were never stored.
 
 #### `w_strategy="auto"` (v0.1.2+, opt-in)
 
@@ -409,7 +446,11 @@ on the same plan. The heuristic is **platform-aware**
 - **CPU.** Conservative: never picks a windowed forward (no measured
   win on the v0.1.1 algorithm), and only picks `windowed_scan` on the
   adjoint when `n_w / w_kernel_width > 2` and the windowed padding
-  overhead is below 5x. Otherwise `dense_scan`.
+  overhead is below 6x. Otherwise `dense_scan`. (That cutoff was 5x
+  through v0.1.2, against the pre-v0.1.3 denominator; it was restated so
+  that redefining the diagnostic changes no decision on the calibration
+  grid, where the worst fixture reads 5.78 on the new scale against 4.93
+  on the old.)
 - **GPU** (tuned on the GH200 baseline sweep). Never picks a `_scan`
   variant (5-30x slower than `_vmap` there). Picks `windowed_vmap` only
   on large-row plans (`n_rows >= 10000`) with padding overhead below 3x

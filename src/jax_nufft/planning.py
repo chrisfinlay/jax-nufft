@@ -183,11 +183,82 @@ class WGridderPlan:
     # so it belongs in the JIT cache key.
     w0: float
     # v0.1.1 windowed-scan fields:
-    # ``max_window_size`` is the worst-case live-window length across all
-    # (channel, plane) pairs; ``window_padding_overhead`` is
-    # ``max_window_size / mean_window_size`` and is purely diagnostic.
+    # ``max_window_size`` is the worst-case window length across all
+    # (channel, plane) pairs -- the static slice length every windowed
+    # strategy pays per plane. ``window_padding_overhead`` is the factor by
+    # which that traversal exceeds the irreducible row-work,
+    #
+    #     n_chan * n_w * max_window_size / live_row_count
+    #
+    # and is purely diagnostic (it gates the ``auto`` strategy choice in
+    # ``wgridder._auto_w_strategy_*`` and nothing else).
     max_window_size: int
     window_padding_overhead: float
+    # issue #43: the denominator above, and the emptiness the window builder's
+    # insurance clamp hides.
+    #
+    # ``live_row_count`` is the number of ``(channel, plane, row)`` incidences
+    # inside the plane's NOMINAL SUPPORT: ``|w_lambda - w_k| <=
+    # w_kernel_scale``, with ``w`` as *this function* computes it, on the
+    # unpadded interval. That, and not "the incidences the kernel weights",
+    # is the whole of what the field means -- the two are close but not the
+    # same thing, and the difference is worth stating rather than glossing.
+    #
+    # The operators never evaluate that predicate. They derive their own ``w``
+    # (``wgridder._channel_ft_coords``, where XLA may contract the multiply
+    # and the ``- w0`` into one FMA, and where a float32 plan runs the whole
+    # chain in single precision), form ``z = fl(fl(w - w_k) / S)``, and test
+    # ``|z| <= 1``. Measured against exactly that expression, JIT-compiled,
+    # over the calibration grid: the counts differ on 20 of the 40 cells in
+    # float64 and 7 of the 10 in float32, never by more than 3 incidences,
+    # worst 0.19% relative (EDA2 zenith at eps 1e-3 in float32, 3 of 1598).
+    # ``kernel.phi`` and ``kernel.phi_numpy`` are the same expression line for
+    # line, so all of that gap is in how ``z`` is formed, none of it in the
+    # kernel.
+    #
+    # The nominal count is the right quantity here, not a tolerable
+    # approximation of a better one. This is the denominator of a *work*
+    # ratio -- what fraction of a windowed traversal is padding -- so three
+    # incidences in several thousand is far below the resolution at which the
+    # number is read, while an exact device census would cost an
+    # ``(n_w, n_rows)`` evaluation of ``phi`` per channel at plan time to move
+    # a diagnostic's fourth decimal place. It would also be the wrong
+    # quantity: which rows the device weights is a property of a compiled
+    # executable, and the plan is built before one exists.
+    #
+    # The name ``live`` is shorthand for that nominal-support membership. It
+    # is a slightly stronger-sounding word than the measurement supports; this
+    # comment is where that difference is recorded, since the name cannot
+    # carry it.
+    #
+    # The builder then widens every window by ``window_boundary_margin`` and
+    # by one further row at each end. Those rows are real work for a windowed
+    # traversal but lie outside nominal support, so they belong in the
+    # numerator and not in the denominator. The two widenings are not outside
+    # it by the same margin, and the comment should not pretend otherwise: a
+    # clamp row is outside by two whole rows and the kernel does ignore it,
+    # whereas a margin row is outside by a few ulps and the kernel may not --
+    # the margin exists precisely because the device might place such a row
+    # inside support. Both are excluded all the same, on the principle that
+    # the denominator is what the host can establish is irreducible. Counting
+    # them as irreducible instead (which ``max_window_size /
+    # window_size.mean()`` did through v0.1.2) understates the waste by up to
+    # 17% on the review fixtures, worst exactly where the windows are
+    # narrowest and the padding is therefore relatively largest.
+    #
+    # ``empty_plane_count`` is the number of ``(channel, plane)`` pairs with no
+    # live rows at all. The ``lo - 1`` / ``hi + 1`` clamp guarantees
+    # ``window_size >= 1``, so downstream of it a plane holding nothing is
+    # indistinguishable from one holding a single row; this makes it visible.
+    #
+    # Both are scalars, and deliberately so: issue #23 removed the
+    # ``(n_chan, n_w)`` ``window_size`` leaf to cut plan memory (3.9 GB to
+    # 31 MB on a 64-channel, 1M-row plan) and nothing here may bring a
+    # per-(channel, plane) array back. Static for the same reason the two
+    # fields above are -- they are plan-shape constants that feed a strategy
+    # choice made before tracing.
+    live_row_count: int
+    empty_plane_count: int
     # v0.1.2 w-degeneracy metadata:
     # ``w_extent`` is ``max(w_lambda) - min(w_lambda)`` over all channels (in
     # wavelengths); ``is_constant_w`` is True iff ``w_extent == 0.0`` exactly.
@@ -375,6 +446,8 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.w0,
         plan.max_window_size,
         plan.window_padding_overhead,
+        plan.live_row_count,
+        plan.empty_plane_count,
         plan.w_extent,
         plan.is_constant_w,
         plan.real_dtype,
@@ -399,6 +472,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0,
         max_window_size,
         window_padding_overhead,
+        live_row_count,
+        empty_plane_count,
         w_extent,
         is_constant_w,
         real_dtype,
@@ -430,6 +505,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0=w0,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
+        live_row_count=live_row_count,
+        empty_plane_count=empty_plane_count,
         w_extent=w_extent,
         is_constant_w=is_constant_w,
         real_dtype=real_dtype,
@@ -483,6 +560,18 @@ def _coerce_uvw_freq_dtype(
         raise ValueError(f"uvw must have shape (N, 3); got {uvw_arr.shape}")
     if freq_arr.ndim != 1:
         raise ValueError(f"freq must have shape (Nchan,); got {freq_arr.shape}")
+    # Reject the empty cases by name. Both were already impossible -- the
+    # w-extent block takes ``np.min`` over the rows and again over the
+    # per-channel endpoints, so either one raised numpy's "zero-size array to
+    # reduction operation minimum which has no identity" a few dozen lines
+    # later. That is a true statement about numpy and tells the caller nothing
+    # about their input, and it arrives from a line whose subject is the
+    # w-range rather than the argument at fault. There is also nothing to
+    # build: a plan over no rows or no channels has no transform to define.
+    if uvw_arr.shape[0] == 0:
+        raise ValueError("uvw must contain at least one row; got shape (0, 3)")
+    if freq_arr.shape[0] == 0:
+        raise ValueError("freq must contain at least one channel; got shape (0,)")
     # "b" (bool), "i"/"u" (integers) and "f" all cast losslessly enough for
     # coordinates; complex/object/str input is a mistake worth naming.
     for name, arr in (("uvw", uvw_arr), ("freq", freq_arr)):
@@ -957,6 +1046,25 @@ def make_plan(
         sort_perm_np = np.arange(n_rows, dtype=np.int32)
         window_start_np = np.zeros((n_chan, 1), dtype=np.int32)
         max_window_size = max(n_rows, 1)
+        # issue #43: the single plane sits on the constant w, so every
+        # (channel, row) incidence is inside its nominal support -- all of
+        # them are counted, none of the window is padding, and the ratio
+        # ``n_chan * 1 * n_rows / (n_chan * n_rows)`` below is exactly 1.0.
+        # Nominal support, as everywhere in this field's definition: the
+        # host's ``w - w_k`` is zero here, but the operators re-derive w in
+        # the JIT and may contract the multiply and the subtraction into one
+        # FMA, so the compiled ``z`` need not be zero (a float32 plan at
+        # constant ``w_m = 1e6`` reaches ``z ~ 0.056``, ``phi ~ 0.986``).
+        # That does not move the count -- ``|z| <= 1`` either way -- which is
+        # the ordinary case for the gap measured on the field above.
+        #
+        # This plan shape attains the lower bound; it is not the only one
+        # that can. A constant-w plan built through the generic branch
+        # (``_force_generic``) attains it too.
+        live_row_count = n_chan * n_rows
+        # No plane can be empty here: ``_coerce_uvw_freq_dtype`` guarantees
+        # ``n_rows >= 1``, and the single plane holds all of them.
+        empty_plane_count = 0
         window_padding_overhead = 1.0
     else:
         # --- number of w-planes ---
@@ -1056,6 +1164,12 @@ def make_plan(
         # no operator path ever read it -- so since issue #23 it is a local,
         # not a leaf.
         window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
+        # issue #43: the denominator of ``window_padding_overhead``, and the
+        # emptiness count, are accumulated as Python scalars across the channel
+        # loop rather than into a second ``(n_chan, n_w)`` array -- same reason
+        # ``window_size`` above is a local and not a leaf, one step further.
+        live_row_count = 0
+        empty_plane_count = 0
         half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
 
         # The widening that makes the windowed-vs-dense invariant hold by
@@ -1095,6 +1209,31 @@ def make_plan(
             # the rows an FMA would move across the edge as well.
             lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw - boundary_margin, "left")
             hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw + boundary_margin, "right")
+            # issue #43: the same two boundaries WITHOUT the margin, taken
+            # before the clamp below widens them -- the rows inside nominal
+            # support, which is what ``live_row_count`` means (see its field
+            # comment: not the same as the rows the *device* weights, and the
+            # gap is measured there). Two more binary searches per channel,
+            # so the builder stays O(n_chan * n_w * log n_rows) and still
+            # never materialises anything of shape (n_chan, n_rows).
+            #
+            # In practice the clamp is what this removes. ``boundary_margin``
+            # is a few ulps of the absolute w scale, so it almost never has a
+            # row to catch: measured over the forty-cell calibration grid it
+            # adds one or two rows on twelve cells and none on the other
+            # twenty-eight -- on MWA_extended off30 at eps 1e-3, the worst
+            # fixture, the whole 487-row live-vs-padded gap is the clamp
+            # (2 * n_w = 496, less end-clipping). The margin is excluded on
+            # principle all the same: it is outside nominal support, which is
+            # the predicate being counted. Note that this is the one exclusion
+            # that cannot also be justified by appeal to the kernel -- a
+            # margin row is precisely one the *device* might place inside
+            # support under FMA contraction, which is why the margin exists.
+            live_lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw, "left")
+            live_hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw, "right")
+            live_sizes_c = live_hi - live_lo
+            live_row_count += int(live_sizes_c.sum())
+            empty_plane_count += int(np.count_nonzero(live_sizes_c == 0))
             # One more row at each end, clamped into range. Redundant while the
             # margin above is correct -- see its derivation -- and kept as cheap
             # insurance against that derivation, for two rows on a slice sized
@@ -1105,13 +1244,31 @@ def make_plan(
             window_size_np[c] = (hi - lo).astype(np.int32)
 
         max_window_size = int(window_size_np.max(initial=0))
-        # mean_window_size: ignore empty windows (entirely outside data range)
-        # so that the diagnostic isn't dominated by edge planes.
-        nonzero_windows = window_size_np[window_size_np > 0]
-        if nonzero_windows.size:
-            mean_window_size = float(nonzero_windows.mean())
-            window_padding_overhead = max_window_size / mean_window_size
+        # --- padding overhead: windowed row-work over irreducible row-work ---
+        #
+        # Every (channel, plane) step slices a *static* ``max_window_size``
+        # rows out of the w-sorted array -- the shape has to be static for
+        # ``lax.scan`` / ``vmap`` -- so a windowed traversal touches
+        # ``n_chan * n_w * max_window_size`` rows however narrow the individual
+        # windows are. ``live_row_count`` is how many of those are inside
+        # nominal support.
+        #
+        # Through v0.1.2 this was ``max_window_size`` over the mean of the
+        # nonzero ``window_size``, which measured the widest window against the
+        # average *padded* one. That denominator contains the clamp rows, i.e.
+        # it counts padding as work that cannot be avoided, and the "nonzero"
+        # filter had become a no-op once the clamp guaranteed
+        # ``window_size >= 1``. See the ``live_row_count`` field comment.
+        if live_row_count > 0:
+            window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
         else:
+            # Defensive, and unreachable through ``make_plan``: the plane grid
+            # spans the whole w-range with a support half-width of ``W/2``
+            # planes, so every one of the ``n_rows >= 1`` rows that
+            # ``_coerce_uvw_freq_dtype`` guarantees is inside at least one
+            # plane's nominal support. Kept as a division guard rather than an expected case --
+            # a future change to the plane spacing or to ``w_kernel_scale``
+            # would land here rather than on a ZeroDivisionError.
             window_padding_overhead = 1.0
         # Clamp max_window_size to at least 1 so the static dynamic_slice
         # shape is well-defined (e.g. n_rows >= 1 always).
@@ -1157,6 +1314,8 @@ def make_plan(
         w0=float(w0),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
+        live_row_count=int(live_row_count),
+        empty_plane_count=int(empty_plane_count),
         w_extent=float(w_extent),
         # ``is_constant_w`` reflects the plan SHAPE (n_w==1 collapse), not
         # the data shape. When ``_force_generic`` builds a generic plan

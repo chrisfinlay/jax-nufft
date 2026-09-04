@@ -552,6 +552,28 @@ def test_plan_invalid_inputs() -> None:
         make_plan(uvw[..., :2], freq, (64, 64), 1e-3, 1e-3, epsilon=1e-6)
 
 
+def test_plan_rejects_zero_rows() -> None:
+    """An empty ``uvw`` is named as such, not reported as a numpy reduction error.
+
+    Both empty cases were already impossible -- the w-extent block takes
+    ``np.min`` over the rows -- but they surfaced as numpy's "zero-size array
+    to reduction operation minimum which has no identity", which says nothing
+    about which argument was wrong. Issue #43 made this worth pinning: the
+    padding-overhead code downstream has a ``live_row_count == 0`` branch, and
+    the reason that branch is defensive rather than reachable is precisely
+    that ``n_rows >= 1`` is guaranteed here.
+    """
+    freq = np.array([200e6])
+    with pytest.raises(ValueError, match="at least one row"):
+        make_plan(np.zeros((0, 3)), freq, (64, 64), 1e-3, 1e-3, epsilon=1e-6)
+
+
+def test_plan_rejects_zero_channels() -> None:
+    """An empty ``freq`` likewise: there is no transform over no channels."""
+    with pytest.raises(ValueError, match="at least one channel"):
+        make_plan(_baseline_uvw(), np.zeros(0), (64, 64), 1e-3, 1e-3, epsilon=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # The plan's pytree contract, field by field (AGENTS.md sec 4)
 # ---------------------------------------------------------------------------
@@ -636,6 +658,13 @@ _STATIC_FIELD_PROBES: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("w0", lambda v: v + 1.0),  # issue #16 follow-up
     ("max_window_size", lambda v: v + 1),
     ("window_padding_overhead", lambda v: v + 1.0),
+    # issue #43: the two ints that replaced the padded ``window_size`` mean as
+    # the diagnostic's denominator. They are STATIC on purpose -- issue #23
+    # (PR #42) removed the per-(channel, plane) ``window_size`` leaf to cut
+    # plan memory, and the fix for #43 must not reintroduce a per-plane array
+    # in any form. ``_EXPECTED_LEAF_FIELDS`` stays at eight entries.
+    ("live_row_count", lambda v: v + 1),
+    ("empty_plane_count", lambda v: v + 1),
     ("w_extent", lambda v: v + 1.0),
     ("is_constant_w", lambda v: not v),
     ("real_dtype", lambda v: np.dtype(np.float32)),
@@ -765,14 +794,25 @@ def test_plan_is_a_jax_pytree() -> None:
     leaves, treedef = jax.tree_util.tree_flatten(plan)
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
-    # Static fields preserved exactly.
-    assert rebuilt.n_l == plan.n_l
-    assert rebuilt.n_w == plan.n_w
-    assert rebuilt.beta == plan.beta
+
+    # EVERY static field survives with its value intact, not a hand-picked
+    # few. ``_STATIC_FIELD_PROBES`` above establishes that each of these is in
+    # the aux data at all -- it compares treedefs, which a *permutation* of
+    # ``_plan_unflatten``'s unpacking survives untouched, since the aux tuple
+    # is the same tuple either way. Only reading the values back catches one.
+    # (A permutation of two fields holding equal values is still invisible;
+    # the issue #43 pair is not such a case, see below.)
+    for field_name, _ in _STATIC_FIELD_PROBES:
+        assert getattr(rebuilt, field_name) == getattr(plan, field_name), (
+            f"{field_name} did not survive tree_unflatten -- check that "
+            "_plan_aux and _plan_unflatten unpack the aux tuple in the same order"
+        )
+    # Non-vacuity for the pair issue #43 added, which are adjacent in the aux
+    # tuple and both plain ints: their values must differ, or swapping them in
+    # _plan_unflatten would round-trip cleanly.
+    assert plan.live_row_count != plan.empty_plane_count
     # issue #11: real_dtype / complex_dtype are aux data, so they survive the
     # round-trip unchanged (AGENTS.md sec 4 plan-field checklist).
-    assert rebuilt.real_dtype == plan.real_dtype
-    assert rebuilt.complex_dtype == plan.complex_dtype
     assert np.dtype(plan.real_dtype) == np.dtype(jnp.float64)
     assert np.dtype(plan.complex_dtype) == np.dtype(jnp.complex128)
 
@@ -916,59 +956,112 @@ def test_window_builder_matches_independent_reference(freq: np.ndarray) -> None:
     # the same searchsorted logic -- a builder that systematically widened its
     # windows would widen the reference with it and stay green. Anchor the
     # aggregate on something make_plan computes instead.
-    nonzero = expected_size[expected_size > 0]
+    #
+    # issue #43: the denominator is ``live_row_count``, the incidences inside
+    # the *unpadded* nominal support, so ``expected_size`` (which carries the margin
+    # and the +/-1 clamp) is the wrong array to divide by and is strictly
+    # larger. ``tests/test_padding_overhead.py`` is where the live count is
+    # pinned against a reference that does not go through ``searchsorted`` at
+    # all; here it is enough that the identity holds and that the padding is
+    # visibly excluded.
     assert plan.window_padding_overhead == pytest.approx(
-        int(expected_size.max()) / float(nonzero.mean())
+        plan.n_chan * plan.n_w * plan.max_window_size / plan.live_row_count
     )
+    assert plan.live_row_count < int(expected_size.sum())
 
 
-# Pixel size for test_window_builder_clumped_distribution. The bare 2e-3 this
-# test used before issue #16 is scaled by sqrt(2) so that the *plan geometry*
-# it measures is bit-for-bit the geometry it was written against.
-#
-# Why: nshift halves ``max|n-1|`` -> ``dw = x0 / max|n-1|`` doubles -> the
-# w-window count halves and each window widens. On a 64x64 image
-# ``max|n-1|`` is ``1024 * pixsize^2`` before the shift and ``512 * pixsize^2``
-# after, so ``pixsize * sqrt(2)`` restores the pre-#16 value exactly, giving
-# back the same ``n_w`` (12 clumped / 17 uniform), the same ``window_size``
-# rows, and therefore the same two padding-overhead numbers (1.7137 / 1.6757).
-# Only the sampling resolution is retuned -- the clumped-vs-uniform w geometry
-# that is actually under test is untouched, and the assertion is unchanged.
-#
-# Left at 2e-3 the fixture drops to 3 inner planes with a kernel half-width
-# (344) wider than the whole w extent (295), i.e. every plane sees every row
-# and the clumped/uniform contrast the assertion is about no longer exists.
-# That contrast is in any case not monotone in resolution (measured on this
-# fixture: it holds at inner = 5/10 and at 182/347, but not at 10/19 or
-# 40/76, because ``window_padding_overhead`` excludes empty windows and a
-# well-resolved clumped distribution is all-or-nothing windows with overhead
-# ~1.0). Making this a robust invariant rather than a fixture-specific
-# heuristic is out of scope here; see the note in the issue #16 PR.
-_CLUMPED_PIXSIZE = 2e-3 * math.sqrt(2.0)
+def _clumped_and_uniform_uvw(n_rows: int = 400) -> tuple[np.ndarray, np.ndarray]:
+    """Two w-distributions with the same u, v scale: two tight clumps, and flat.
 
-
-def test_window_builder_clumped_distribution() -> None:
-    """A clumped w-distribution should produce a high padding overhead."""
+    Drawn from one generator in this order so the arrays are exactly the ones
+    the pre-#43 version of the test below used.
+    """
     rng = np.random.default_rng(2)
-    n_rows = 400
-    # Two tight clumps in w: padding overhead should be large because most
-    # planes have ~0 rows while the two clump-overlapping planes hold many.
     uvw = np.zeros((n_rows, 3))
     uvw[:, 0] = rng.uniform(-100, 100, n_rows)
     uvw[:, 1] = rng.uniform(-100, 100, n_rows)
     half = n_rows // 2
     uvw[:half, 2] = rng.normal(loc=-30.0, scale=0.5, size=half)
     uvw[half:, 2] = rng.normal(loc=+30.0, scale=0.5, size=n_rows - half)
+    return uvw, rng.uniform(-60.0, 60.0, size=(n_rows, 3))
+
+
+# The resolutions this sweep runs at. issue #16 added a ``sqrt(2)`` factor to a
+# single hard-coded pixel size here so that a NON-INVARIANT assertion kept
+# passing: "clumped overhead > uniform overhead" is simply false below a
+# resolution crossover, and the fudge picked a point on the true side of it.
+# issue #43 replaces the fudge with the crossover itself, which is analytic.
+#
+# Write ``n_rows * W`` for the live incidence count (every row is live in W
+# planes, whatever the distribution -- ``live_row_count`` is 2800/2801 at every
+# resolution below, against 400 * 7). Then
+#
+#   overhead = n_w * max_window_size / (n_rows * W)
+#
+# and the two distributions differ only in ``max_window_size``:
+#
+#   * two equal clumps, each narrow against the kernel support: the widest
+#     window holds one whole clump, ``n_rows / 2``, so
+#     ``overhead_clumped ~ n_w / (2W)``;
+#   * uniform over the w-extent: the widest window holds its share of the
+#     inner planes, ``n_rows * W / (n_w - W)``, so
+#     ``overhead_uniform ~ n_w / (n_w - W)``.
+#
+# Those are equal at ``n_w - W == 2W``, i.e. ``n_w == 3W``. Below it the
+# clumped plan is genuinely the flatter of the two and the assertion *should*
+# fail; above it the clumped plan's peak dominates and the ordering is real.
+# Measured on this fixture at W=7 (eps=1e-6), so the crossover is n_w = 21:
+#
+#   pixsize   n_w clumped/uniform   overhead clumped/uniform
+#   2.0e-3     10 / 12               1.428 / 1.714   (below crossover)
+#   2.8e-3     12 / 17               1.714 / 1.681   (below; the #16 fudge)
+#   4.0e-3     17 / 26               1.220 / 1.448   (below crossover)
+#   5.0e-3     23 / 36               1.650 / 1.427
+#   8.0e-3     47 / 83               3.374 / 1.423
+#   1.2e-2    101 / 187              7.248 / 1.669
+#   1.5e-2    163 / 304             11.697 / 1.954
+#
+# Larger pixels mean a wider field, hence a larger ``max|n-1+nshift|``, hence
+# more planes -- so the sweep runs *up* in pixel size to get above ``3W``.
+_CLUMPED_SWEEP_PIXSIZES = (5e-3, 6e-3, 8e-3, 1e-2, 1.2e-2, 1.5e-2)
+
+
+@pytest.mark.parametrize("pixsize", _CLUMPED_SWEEP_PIXSIZES)
+def test_window_builder_clumped_distribution(pixsize: float) -> None:
+    """Above the ``n_w = 3W`` crossover, clumped w really does pad more.
+
+    The precondition is asserted rather than skipped: if a planning change
+    moves ``n_w`` back below the crossover, this fixture stops measuring what
+    the test claims and that must fail loudly instead of silently passing at
+    one lucky resolution.
+    """
+    uvw, uvw_uniform = _clumped_and_uniform_uvw()
     freq = np.array([1.4e9])
-    plan_clumped = make_plan(uvw, freq, (64, 64), _CLUMPED_PIXSIZE, _CLUMPED_PIXSIZE, epsilon=1e-6)
+    plan_clumped = make_plan(uvw, freq, (64, 64), pixsize, pixsize, epsilon=1e-6)
+    plan_uniform = make_plan(uvw_uniform, freq, (64, 64), pixsize, pixsize, epsilon=1e-6)
 
-    uvw_uniform = rng.uniform(-60.0, 60.0, size=(n_rows, 3))
-    plan_uniform = make_plan(
-        uvw_uniform, freq, (64, 64), _CLUMPED_PIXSIZE, _CLUMPED_PIXSIZE, epsilon=1e-6
+    width = plan_clumped.w_kernel_width
+    assert plan_clumped.n_w > 3 * width, (
+        f"pixsize={pixsize} puts the clumped plan at n_w={plan_clumped.n_w}, "
+        f"below the 3W={3 * width} crossover -- the ordering asserted below is "
+        "not an invariant there"
     )
+    assert plan_uniform.n_w > 3 * width
 
-    # Padding overhead should be noticeably higher for the clumped case.
+    # The live incidence count is ~n_rows * W for both, so the ordering is
+    # entirely a statement about the widest window. Pin that so a failure
+    # says which half moved.
+    for plan in (plan_clumped, plan_uniform):
+        nominal = plan.n_rows * plan.w_kernel_width
+        assert abs(plan.live_row_count - nominal) <= plan.n_w
+
     assert plan_clumped.window_padding_overhead > plan_uniform.window_padding_overhead
+
+    # The clumped plan is the one with dead planes; the uniform one has none
+    # at these resolutions. Under the pre-#43 definition both read zero,
+    # because the +/-1 clamp gives every window at least one row.
+    assert plan_clumped.empty_plane_count > 0
+    assert plan_uniform.empty_plane_count == 0
 
 
 def test_plan_sample_consistency() -> None:
