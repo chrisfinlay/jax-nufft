@@ -30,6 +30,7 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft.wgridder import (
+    _CPU_PADDING_CUTOFF,
     _auto_w_strategy,
     _auto_w_strategy_cpu,
     _auto_w_strategy_gpu,
@@ -97,10 +98,15 @@ def test_cpu_constant_w_fast_path_picks_dense_scan(is_adjoint: bool) -> None:
 
 @pytest.mark.parametrize("is_adjoint", [False, True])
 def test_cpu_high_padding_overhead_forces_dense_scan(is_adjoint: bool) -> None:
-    """If the windowed plane builder paid >5x average overhead per plane,
-    the windowed savings disappear -- dense_scan even for the adjoint
-    at large n_w."""
-    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=7.5)
+    """Past the padding cutoff the windowed savings disappear -- dense_scan
+    even for the adjoint at large n_w.
+
+    Stated relative to ``_CPU_PADDING_CUTOFF`` rather than at a literal
+    overhead: issue #43 moved the cutoff (the corrected metric reads on a
+    different scale), and pinning a number here would only re-encode
+    whichever one shipped last.
+    """
+    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=_CPU_PADDING_CUTOFF * 1.5)
     assert _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint) == "dense_scan"
 
 
@@ -134,12 +140,14 @@ def test_cpu_adjoint_just_above_ratio_boundary_picks_windowed_scan() -> None:
 
 
 def test_cpu_padding_overhead_boundary_is_strict() -> None:
-    """The padding cutoff is strict ``>``: at exactly 5.0 we still take
+    """The padding cutoff is strict ``>``: at exactly the cutoff we still take
     the next branch and (because is_adjoint with large n_w) pick
     windowed_scan."""
-    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=5.0)
+    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=_CPU_PADDING_CUTOFF)
     assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "windowed_scan"
-    plan = _stub_plan(n_w=200, w_kernel_width=8, window_padding_overhead=5.001)
+    plan = _stub_plan(
+        n_w=200, w_kernel_width=8, window_padding_overhead=_CPU_PADDING_CUTOFF + 0.001
+    )
     assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "dense_scan"
 
 
