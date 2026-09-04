@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
+from jax_nufft._utils import SPEED_OF_LIGHT
 
 jax.config.update("jax_enable_x64", True)
 
@@ -236,20 +237,70 @@ def _rows_dropped_by_windows(plan: object, uvw: np.ndarray) -> int:
     return dropped
 
 
+def _unwidened_builder_drops(plan: object, uvw: np.ndarray, freq: np.ndarray) -> int:
+    """Rows the *pre-fix* window builder would drop on this fixture.
+
+    Mirrors ``make_plan``'s searchsorted loop as it stood before the widening --
+    no ``boundary_margin``, no extra row at either end -- and counts rows that
+    the production ``_channel_ft_coords`` puts inside kernel support but that
+    those narrower windows could not reach.
+
+    This is what selects the fixture, and it has to be, because the obvious
+    criterion is circular: searching for a ``w`` that makes the *current*
+    builder drop a row finds nothing once the builder is correct, and the test
+    then skips or -- worse -- silently falls back to a fixture that gates
+    nothing. Simulating the defective builder here keeps the search meaningful
+    on a fixed build: it picks a fixture that provably defeats the old
+    algorithm, and the assertions then check that the real one survives it.
+    """
+    perm = np.asarray(plan.sort_perm)  # type: ignore[attr-defined]
+    centres = np.asarray(plan.w_centers_rel, dtype=np.float64)  # type: ignore[attr-defined]
+    scale = plan.w_kernel_scale  # type: ignore[attr-defined]
+    n_rows = plan.n_rows  # type: ignore[attr-defined]
+    w_m_sorted = uvw[perm, 2].astype(np.float64)
+
+    los, sizes = [], []
+    for chan in range(plan.n_chan):  # type: ignore[attr-defined]
+        w_host = (w_m_sorted * (float(freq[chan]) / SPEED_OF_LIGHT)).astype(np.float64) - plan.w0  # type: ignore[attr-defined]
+        lo = np.searchsorted(w_host, centres - scale, side="left")
+        hi = np.searchsorted(w_host, centres + scale, side="right")
+        los.append(lo)
+        sizes.append(hi - lo)
+    max_window = max(1, int(np.max(np.asarray(sizes))))
+
+    dropped = 0
+    for chan in range(plan.n_chan):  # type: ignore[attr-defined]
+        w_dev = _device_w_sorted(plan, uvw, chan)
+        for k in range(centres.shape[0]):
+            inside = np.nonzero(np.abs((w_dev - centres[k]) / scale) <= 1.0)[0]
+            if inside.size == 0:
+                continue
+            lo = min(max(int(los[chan][k]), 0), max(n_rows - max_window, 0))
+            dropped += int(np.sum((inside < lo) | (inside >= lo + max_window)))
+    return dropped
+
+
 def _find_invariant_breaking_w(
     plan: object, uvw: np.ndarray, freq: np.ndarray, plan_kwargs: dict, n_step: int = 12
 ) -> tuple[float, np.ndarray] | None:
-    """Search for a ``w`` (metres) that makes the windowed slice drop a row.
+    """Search for a fixture that defeats the *unwidened* window builder.
 
-    Two conditions have to line up, which is why this searches rather than
+    Three conditions have to line up, which is why this searches rather than
     hard-codes. First the value must sit in the ulp-wide band where the host's
     two-rounding w and the device's FMA-contracted w fall on opposite sides of
     a window edge -- only there can the builder and the operator disagree about
-    membership at all. Second, the row must not be rescued by padding: the
-    slice is ``max_window_size`` long while the window is usually shorter, so
-    most straddling rows are covered anyway and no error results. Only a
-    candidate that fails :func:`_rows_dropped_by_windows` after being spliced
-    in is a real regression fixture.
+    membership at all. Second, the row must not be rescued by padding: the slice
+    is ``max_window_size`` long while the window is usually shorter, so most
+    straddling rows are covered anyway. Third, the candidate is spliced into
+    **one and then two adjacent** interior rows.
+
+    That third condition is not a refinement, it is the point. The two halves of
+    the widening are independent, and a single straddling row is rescued
+    unconditionally by ``lo = max(lo - 1, 0)``: with ``boundary_margin`` deleted
+    the one-row fixture still passes, so a search that only ever splices one row
+    leaves the half the code calls provable completely unpinned. Two rows
+    sharing the same straddling ``w`` exhaust the one-row slack, and the margin
+    has to carry it.
 
     Returns ``(w_metres, spliced_uvw)`` or ``None`` when no candidate qualifies
     -- e.g. on a platform whose compiler does not contract the multiply-subtract,
@@ -293,17 +344,22 @@ def _find_invariant_breaking_w(
         straddles = host[i] < bound <= device[i] if side == "lo" else host[i] > bound >= device[i]
         if not straddles or not (w_lo < cand[i] < w_hi):
             continue
-        # Splice into an interior row -- strictly inside the existing w-range,
-        # so w_min / w_max and every plan quantity derived from them are
-        # untouched and the only change is which side of one edge a row is on.
-        for row in (order[1], order[2], order[len(order) // 2]):
-            spliced = uvw.copy()
-            spliced[row, 2] = float(cand[i])
-            candidate_plan = make_plan(spliced, freq, **plan_kwargs)
-            if candidate_plan.w0 != plan.w0 or candidate_plan.n_w != plan.n_w:  # type: ignore[attr-defined]
-                continue
-            if _rows_dropped_by_windows(candidate_plan, spliced):
-                return float(cand[i]), spliced
+        # Splice into interior rows -- strictly inside the existing w-range, so
+        # w_min / w_max and every plan quantity derived from them are untouched
+        # and the only change is which side of one edge those rows are on.
+        # ``n_splice = 2`` uses adjacent sorted positions, which stay adjacent in
+        # the rebuilt plan since they share the same w.
+        for n_splice in (2, 1):
+            for first in (1, 2, len(order) // 2):
+                if first + n_splice >= len(order):
+                    continue  # never touch the max-w row
+                spliced = uvw.copy()
+                spliced[order[first : first + n_splice], 2] = float(cand[i])
+                candidate_plan = make_plan(spliced, freq, **plan_kwargs)
+                if candidate_plan.w0 != plan.w0 or candidate_plan.n_w != plan.n_w:  # type: ignore[attr-defined]
+                    continue
+                if _unwidened_builder_drops(candidate_plan, spliced, freq):
+                    return float(cand[i]), spliced
     return None
 
 
@@ -356,7 +412,21 @@ def test_windowed_dense_parity_at_window_edge() -> None:
     )
 
     found = _find_invariant_breaking_w(base, uvw, freq, plan_kwargs)
-    uvw_adv = uvw if found is None else found[1]
+    if found is None:  # pragma: no cover - platform-dependent
+        pytest.skip(
+            "no w value in this plan's window-edge neighbourhoods is placed on opposite "
+            "sides by the host builder and the device operator, so this compiler is not "
+            "contracting the multiply-subtract into an FMA and the invariant is trivially "
+            "safe here. Nothing to gate -- but note that this test then checks nothing, "
+            "rather than quietly checking the non-adversarial base fixture"
+        )
+    _, uvw_adv = found
+    # Never let the fixture silently degrade into the base one: every assertion
+    # below is written against a spliced row, and would be decorative without it.
+    assert not np.array_equal(uvw_adv[:, 2], uvw[:, 2]), (
+        "the adversarial splice did not change the fixture, so the assertions below "
+        "would be running against the plain base plan and gating nothing"
+    )
 
     plan = make_plan(uvw_adv, freq, **plan_kwargs)
     assert plan.w0 == base.w0

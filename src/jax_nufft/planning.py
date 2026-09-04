@@ -296,10 +296,14 @@ class WGridderPlan:
         property vs the pre-#23 stored leaf, in float64:
 
             grid                        nshift  max|n-1|    stored   property
-            MeerKAT zenith              0.0001     0.000       0.0        0.0
-            MWA_compact / _extended     0.0244     0.024       0.0        0.0
-            EDA2 zenith (120 deg FoV)   1.0462     2.092       0.0   1.16e-16
-            pixsize_m = 5000*pixsize_l 80.4984   160.997       0.0   7.00e-15
+            MeerKAT zenith              0.0001    0.0002       0.0        0.0
+            MWA_compact / _extended     0.0244    0.0488       0.0        0.0
+            EDA2 zenith (120 deg FoV)   1.0462    2.0924       0.0   1.16e-16
+            pixsize_m = 5000*pixsize_l 80.4984  160.9969       0.0   7.00e-15
+
+        (``max|n-1|`` is twice ``nshift`` on every one of these, as it must be:
+        each grid reaches ``n - 1 = 0`` at the phase centre, so the range is
+        ``[-max, 0]`` and ``nshift = -(0 + min)/2`` is exactly half of it.)
 
         So: bit-exact on the narrow-field fixtures, half an ulp out on EDA2 --
         the repo's own wide-field fixture, and the case that makes the blanket
@@ -969,19 +973,50 @@ def make_plan(
         # kernel support gets ``phi(|z| > 1) = 0`` and contributes exactly
         # nothing -- while under-inclusion is a value error. So widen.
         #
-        # ``boundary_margin`` bounds |device w - host w| from above. The device
-        # can skip the product's rounding (<= u * |w_absolute|) and each side
-        # rounds its own subtraction (<= u * |w_relative| each), so 3u of the
-        # larger scale covers it; ``4 * eps == 8u`` is comfortable margin on
-        # that. Searching at ``b -/+ margin`` then guarantees the slice is a
-        # superset of the device's support set whatever the two roundings do --
-        # provably, not merely probably, which matters because the cost of being
-        # wrong is a silent parity break (measured at 3.7e-9 forward / 2.5e-9
-        # adjoint against a 1e-11 contract) that only appears when a row lands
-        # within an ulp of an edge. Pinned by
-        # ``tests/test_boundary_planes.py::test_windowed_dense_parity_at_window_edge``.
+        # ``boundary_margin`` is ``8u`` of the absolute-w scale, and what it has
+        # to dominate is a sum of two terms, not one:
         #
-        # In practice this widens nothing: the margin is ~1e-11 wavelengths
+        #   (a) |device w - host w|. The device may skip the product's rounding
+        #       (<= u * |w_absolute|) and the two sides round their own
+        #       subtraction (<= u * |w_relative| each): about 3u of the larger
+        #       scale, i.e. 3u * w_abs_scale.
+        #   (b) 2u * S, where S is ``w_kernel_scale``. The operator does not
+        #       compare w against the edge; it forms z = fl(fl(w - w_k) / S) and
+        #       tests |z| <= 1, so a row can be *in* support with an exact
+        #       |w - w_k| as large as S(1 + 2u). This term is about S, not about
+        #       w_abs_scale, so it does not shrink with the margin and must be
+        #       carried explicitly. (An earlier version of this comment claimed
+        #       "3u covers it" and omitted (b) entirely; measured, ``4 * eps`` is
+        #       up to 3.1x too small at the value level once (b) is counted.)
+        #
+        # What rescues it is that (b) can only matter where nothing can be
+        # dropped. A window spans 2S = W * dw and the data span
+        # n_w_inner * dw, so ``max_window_size == n_rows`` -- every window holds
+        # every row -- unless ``n_w_inner > W``. Whenever any window *is* a
+        # strict subset, and only then is a drop possible at all,
+        #
+        #     S = (W / 2) * w_extent / n_w_inner < w_extent / 2 <= w_abs_scale / 2,
+        #
+        # so (b) < u * w_abs_scale and (a) + (b) <= 4u * w_abs_scale, half the
+        # margin. Swept over 48 plans (float64 and float32, eps 1e-3 to 1e-14,
+        # w from 3e1 to 1e7 wavelengths, narrow and wide spreads): the worst
+        # safety factor over the 30 strict-subset plans is 5.40, while the worst
+        # over all 48 is 1.61 and occurs on a plan whose windows cover every row.
+        #
+        # If ``w_kernel_scale`` or the plane count is ever redefined, that
+        # inequality is what has to be re-derived -- the margin does not
+        # self-adjust.
+        #
+        # The extra row at each end (below) is *not* a second line of defence
+        # against (b); it is insurance against this derivation being wrong, and
+        # it is deliberately not load-bearing. It cannot be: a single row that
+        # straddles an edge is rescued by ``lo - 1`` on its own, which is why
+        # ``test_windowed_dense_parity_at_window_edge`` splices the straddling w
+        # into *two* adjacent rows -- that fixture fails with the margin removed
+        # and the extra row kept, and passes with the margin kept and the extra
+        # row removed.
+        #
+        # In practice neither widens anything: the margin is ~1e-11 wavelengths
         # against a ``w_kernel_scale`` of order 1e2-1e4, so a window only grows
         # when a row really does sit that close to an edge.
         w_abs_scale = max(abs(w_min_all), abs(w_max_all), w_extent)
@@ -1020,11 +1055,10 @@ def make_plan(
             # the rows an FMA would move across the edge as well.
             lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw - boundary_margin, "left")
             hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw + boundary_margin, "right")
-            # One more row at each end, clamped into range. The margin above
-            # already makes the *value* comparison safe; this makes the *index*
-            # arithmetic safe too, for two rows on a slice that is sized by its
-            # widest member anyway. Belt and braces on the one invariant in this
-            # file whose violation is silent.
+            # One more row at each end, clamped into range. Redundant while the
+            # margin above is correct -- see its derivation -- and kept as cheap
+            # insurance against that derivation, for two rows on a slice sized
+            # by its widest member anyway.
             lo = np.maximum(lo - 1, 0)
             hi = np.minimum(hi + 1, n_rows)
             window_start_np[c] = lo.astype(np.int32)

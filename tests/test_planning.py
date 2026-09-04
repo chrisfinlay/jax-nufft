@@ -1317,24 +1317,25 @@ def test_make_plan_host_cost_is_independent_of_n_chan_times_n_rows(
 # hide in one and not the others.
 
 
-_UVW_LAMBDA_PROBE_N_CHAN = 3
+_UVW_LAMBDA_PROBE_N_CHAN = 5
 _UVW_LAMBDA_PROBE_N_ROWS = 257
 _UVW_LAMBDA_PROBE_N_PIX = 16
 
+# StableHLO tensor types: ``tensor<5x257xf64>``, ``tensor<257x3xcomplex<f64>>``.
+_TENSOR_TYPE_RE = re.compile(r"tensor<([0-9]+(?:x[0-9]+)*)x(complex<[a-z0-9]+>|[a-z][a-z0-9]*)>")
 
-def _lowered_tensor_shapes(text: str) -> list[tuple[int, ...]]:
-    """Every ``tensor<...>`` shape in a StableHLO module, as int tuples.
 
-    Shapes are matched structurally rather than by substring so the check does
-    not depend on the element type or on the dimension order the compiler
-    happens to choose.
+def _lowered_tensors(text: str) -> list[tuple[tuple[int, ...], str]]:
+    """Every ``tensor<...>`` in a StableHLO module, as ``(dims, element type)``.
+
+    Parsed structurally rather than matched as a substring so the check does not
+    depend on the element type or on whichever dimension order the compiler
+    happened to pick.
     """
-    shapes: list[tuple[int, ...]] = []
-    for dims in re.findall(r"tensor<([0-9x]*)x?[a-z]", text):
-        parts = [d for d in dims.split("x") if d]
-        if parts:
-            shapes.append(tuple(int(d) for d in parts))
-    return shapes
+    out: list[tuple[tuple[int, ...], str]] = []
+    for dims, elem in _TENSOR_TYPE_RE.findall(text):
+        out.append((tuple(int(d) for d in dims.split("x")), elem))
+    return out
 
 
 @requires_x64
@@ -1342,14 +1343,48 @@ def _lowered_tensor_shapes(text: str) -> list[tuple[int, ...]]:
 @pytest.mark.parametrize(
     "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
 )
-def test_no_operator_path_materialises_uvw_lambda(w_strategy: str, channel_strategy: str) -> None:
-    """Neither operator may build an ``(n_chan, n_rows, 3)`` tensor.
+def test_no_operator_path_materialises_per_channel_row_coordinates(
+    w_strategy: str, channel_strategy: str
+) -> None:
+    """No operator may build a *real* tensor of order ``n_chan * n_rows``.
 
-    ``n_rows = 257`` is chosen to be unlike every other dimension in the
-    problem (3 channels, a 16x16 image, ``n_w`` in the tens), so a tensor
-    carrying it can only have come from the per-row baselines. The assertion is
-    on the *multiset* of dimensions, so a transposed or otherwise permuted
-    materialisation counts too.
+    The ban is on element membership, not on a literal shape, because issue #23
+    deleted four leaves of two different ranks: ``uvw_lambda`` and
+    ``uvw_lambda_sorted`` at ``(n_chan, n_rows, 3)``, and ``u_finufft`` /
+    ``v_finufft`` at ``(n_chan, n_rows)``. The rank-2 pair is half the 64 bytes
+    per (channel, row) this issue removes -- about 1.0 GB of transient at 64
+    channels x 1M rows -- so a gate that only looks for the rank-3 form misses
+    half the regression, and misses it silently: reintroducing ``u_finufft`` /
+    ``v_finufft`` live leaves the whole suite green while adding 56% to the
+    lowered temp size on a 16-channel, 20k-row problem. Flagging any tensor
+    whose dimensions include both ``n_chan`` and ``n_rows`` catches ``(5, 257)``,
+    ``(257, 5)``, ``(257, 5, 3)`` and the rank-3 form alike.
+
+    Restricted to *real* element types, and that restriction is load-bearing
+    rather than incidental: the visibility cube genuinely is ``n_chan * n_rows``
+    and legitimately appears as ``(257, 5)`` and ``(5, 257)`` complex tensors in
+    both operators. Coordinates are real, visibilities are complex, so the
+    element type separates them exactly. The one real array of that order in the
+    API is ``weights``, which is why this probe leaves it at ``None``; a
+    weighted call would legitimately show ``(257, 5)`` in f64.
+
+    ``n_rows = 257`` and ``n_chan = 5`` are both unlike every other dimension in
+    the problem -- a 16x16 image, the coordinate axis of 3, ``n_w`` in the tens
+    -- so a tensor carrying either can only have come from the per-row
+    baselines or the per-channel scaling, and ``n_chan`` cannot be confused with
+    the length-3 coordinate axis.
+
+    ``channel_strategy="vmap"`` is held to the coordinate-*cube* form only, and
+    that is not a hole being papered over. ``jax.vmap`` over the channel axis
+    *is* the request to batch the per-channel work, so it lifts
+    ``_channel_ft_coords``'s three ``(n_rows,)`` outputs to ``(n_chan, n_rows)``
+    by construction; pairing it with a ``*_vmap`` w-strategy lifts the kernel
+    weights to ``(n_chan, n_w, n_rows)`` for the same reason. No implementation
+    of those strategies can avoid either, and AGENTS.md sec 5 already prices
+    them as "allocates n_chan x per-channel transient memory". What no strategy
+    ever needs is the array that *also* carries the length-3 baseline axis, so
+    that stays banned in all eight. The default ``"scan"`` path -- the one the
+    memory argument in issue #23 is about -- is held to the full rule.
     """
     n_chan = _UVW_LAMBDA_PROBE_N_CHAN
     n_rows = _UVW_LAMBDA_PROBE_N_ROWS
@@ -1364,29 +1399,46 @@ def test_no_operator_path_materialises_uvw_lambda(w_strategy: str, channel_strat
         rng.standard_normal((n_rows, n_chan)) + 1j * rng.standard_normal((n_rows, n_chan))
     )
 
-    banned = sorted((n_chan, n_rows, 3))
-    for name, fn, arg in (
-        ("dirty2vis", dirty2vis, image),
-        ("vis2dirty", vis2dirty, vis),
-    ):
+    for name, fn, arg in (("dirty2vis", dirty2vis, image), ("vis2dirty", vis2dirty, vis)):
         lowered = jax.jit(
             lambda p, x, _fn=fn: _fn(
                 p, x, w_strategy=w_strategy, channel_strategy=channel_strategy, nthreads=1
             )
         ).lower(plan, arg)
-        shapes = _lowered_tensor_shapes(lowered.as_text())
-        # Sanity: the baselines themselves must be in there, or the search
-        # below is looking at the wrong module and would pass vacuously.
-        assert any(sorted(s) == sorted((n_rows, 3)) for s in shapes), (
+        tensors = _lowered_tensors(lowered.as_text())
+        # Sanity: the baselines themselves must be in there, or this is looking
+        # at the wrong module and every assertion below passes vacuously.
+        assert any(sorted(dims) == sorted((n_rows, 3)) for dims, _ in tensors), (
             f"{name} ({w_strategy}, {channel_strategy}): no (n_rows, 3) tensor in the "
             "lowered IR at all -- the probe is not seeing the operator it thinks it is"
         )
-        offenders = [s for s in shapes if len(s) == 3 and sorted(s) == banned]
+
+        def banned(dims: tuple[int, ...], elem: str) -> bool:
+            if elem.startswith("complex"):
+                return False  # the visibility cube; see the docstring
+            # Squeeze degenerate axes: vmap leaves the batched coordinates as
+            # ``(n_chan, 1, n_rows)``, which is the rank-2 form wearing a
+            # broadcast axis.
+            squeezed = [d for d in dims if d != 1]
+            if not (n_chan in squeezed and n_rows in squeezed):
+                return False
+            if channel_strategy == "scan":
+                return True
+            # Under channel vmap the rank-2 batched coordinates are inherent,
+            # and so is ``(n_chan, n_w, n_rows)`` when the w-plane loop is
+            # vmapped too -- that is the kernel-weight array, which dense_vmap
+            # is defined to materialise. The coordinate *cube* is not inherent
+            # to anything, so it stays banned: it is the one that also carries
+            # the length-3 baseline axis.
+            return 3 in squeezed
+
+        offenders = [(dims, elem) for dims, elem in tensors if banned(dims, elem)]
         assert not offenders, (
             f"{name} ({w_strategy}, channel_strategy={channel_strategy}) materialises "
-            f"{offenders[0]} -- an (n_chan, n_rows, 3) per-(channel, row) array. That is "
-            "plan.uvw_lambda (or an equivalent broadcast of plan.uvw_m by "
-            "plan.inv_lambda) being read in an operator path: 3.9 GB at 64 channels x 1M "
-            "rows, and the whole point of issue #23. Read uvw_m and inv_lambda and derive "
-            "per channel via _channel_ft_coords instead"
+            f"tensor<{'x'.join(str(d) for d in offenders[0][0])}x{offenders[0][1]}> -- a real "
+            f"array of order n_chan * n_rows. That is a per-(channel, row) coordinate array "
+            "(plan.uvw_lambda, or a revived u_finufft / v_finufft, or an equivalent broadcast "
+            "of plan.uvw_m by plan.inv_lambda) being built in an operator path: up to 3.9 GB "
+            "at 64 channels x 1M rows, and the whole point of issue #23. Read uvw_m and "
+            "inv_lambda and derive per channel via _channel_ft_coords instead"
         )

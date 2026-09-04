@@ -228,7 +228,8 @@ The windowed strategies rely on a contract between
   builder places its boundaries in the same *relative* coordinate
   (`w - w0`) the operator uses and forms the per-channel w in the
   plan's `real_dtype`, then widens each boundary by
-  `boundary_margin` and by one row at each end. The widening is
+  `boundary_margin` (load-bearing) and by one row at each end
+  (redundant insurance against the margin's derivation). The widening is
   load-bearing since issue #23: the operator derives `w` as a
   multiply immediately followed by a subtract, which XLA may contract
   into a single FMA — one rounding where the builder's numpy steps
@@ -240,9 +241,21 @@ The windowed strategies rely on a contract between
   against a fusing compiler. Widen instead: over-inclusion is free
   (`phi(|z| > 1) = 0` contributes nothing), under-inclusion is a
   silent `phi(z = ±1) = exp(-beta)` (~1e-7 at W=7) windowed-vs-dense
-  mismatch, ~1e-9 in relative L2 against a 1e-11 contract. Pinned by
-  `test_windowed_dense_parity_at_window_edge`, whose fixture places a
-  row in the ulp-wide band where the two disagree.
+  mismatch, ~1e-9 in relative L2 against a 1e-11 contract.
+  `boundary_margin` must dominate **two** terms, not one: the
+  host/device gap (~`3u · w_abs_scale`) *and* `2u · w_kernel_scale`,
+  because the operator tests `|fl(fl(w − w_k) / S)| ≤ 1` rather than
+  comparing `w` against the edge, so a row can be in support with an
+  exact `|w − w_k|` up to `S(1 + 2u)`. That second term is not
+  bounded by `w_abs_scale` in general; it is bounded exactly when a
+  window is a strict subset of the rows, which is the only case where
+  a drop is possible — see the derivation in `planning.py`, and
+  re-derive it if `w_kernel_scale` or the plane count ever changes.
+  Pinned by `test_windowed_dense_parity_at_window_edge`, whose
+  fixture places **two adjacent rows** in the ulp-wide band where
+  host and device disagree: one row is rescued by the `±1`-row
+  widening on its own, so a one-row fixture gates the margin not at
+  all.
 * `plan.max_window_size` is a static int used as the
   `dynamic_slice` size — must be `>=` every window's length, and is
   computed from the widened windows above, so it already carries the
