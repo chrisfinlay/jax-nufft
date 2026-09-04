@@ -528,13 +528,40 @@ _MARGIN_CASES = [
     ("float32 |w0| 5e7 m", np.float32, 5.0e7, 8.0e3, np.array([1.4e9]), 1e-3),
 ]
 
-# Minimum acceptable ratio of ``boundary_margin`` to the largest overhang any
-# in-support row actually needs. Measured worst over these cases is 0.130 of
-# the margin, i.e. 7.7x headroom (float32, |w0| 5e7 m); the worst float64 case
-# is 0.110, i.e. 9.1x. Tripping below 3x leaves a factor of ~2.5 of slack while
-# still failing outright if the coefficient is cut to a half, a quarter or an
-# eighth of its shipped value.
-_MIN_MARGIN_HEADROOM = 3.0
+# Minimum headroom -- ``boundary_margin`` over the largest overhang any
+# in-support row actually needs -- that this gate will accept.
+#
+# 5.0, not the 3.0 it started at, because 3.0 admitted coefficients the
+# derivation forbids. ``window_boundary_margin`` requires
+# ``(a) + (b) <= 4u * w_abs_scale``, i.e. a coefficient of at least 2.0. With
+# the worst measured ratio at 1/7.72 = 0.130 and a gate firing above 1/3, the
+# coefficient could have fallen to about 1.55 and still passed: measured, 3.0,
+# 2.0 and 1.9 all passed and only 1.5 failed. Firing above 1/5 = 0.200 instead
+# makes coefficient 2.0 (ratio 0.259) fail, so the gate now rejects everything
+# below what the derivation asks for, while the shipped 4.0 (0.130) passes with
+# 1.54x of slack. Measured after the change: 4.0 and 3.0 pass; 2.0, 1.5, 1.0,
+# 0.5 and 0.0 fail.
+#
+# (The comment this replaces claimed the gate "still fails outright if the
+# coefficient is cut to a half, a quarter or an eighth of its shipped value".
+# That was false at 3.0 -- a half, 2.0, passed. A comment asserting a property
+# the code does not have is what let the original regression through in the
+# first place: 38e5f85 softened a claim to match the code instead of fixing the
+# code. Check the sweep, do not describe it from memory.)
+#
+# The numbers this gate reports are optimistic, deliberately, for speed:
+# ``_edge_probe_w_metres`` subsamples to 40 interior planes, and each probe is
+# paired only with the plane whose edge produced it. Probing every plane with
+# all-plane pairing raises the float64 ``|w0| ~ 0`` requirement from 4.320e-12
+# to 7.276e-12, i.e. 15.31x headroom down to 9.09x -- the largest such shift
+# across these cases, about 1.7x. The *binding* case is invariant under both
+# restrictions: float32 at ``|w0|`` 5e7 m measures 0.130 (7.72x) either way, so
+# the verdict does not depend on the subsample, only the reported slack does.
+_MIN_MARGIN_HEADROOM = 5.0
+
+# Smallest fraction of the margin the strongest case per dtype must exercise.
+# See the per-dtype guard in the test below for why a bare > 0 was not enough.
+_MIN_PROBE_RATIO = 0.02
 
 
 def _edge_probe_w_metres(
@@ -596,7 +623,7 @@ def _edge_probe_w_metres(
 
 
 def _margin_requirement(uvw: np.ndarray, freq: np.ndarray, dtype: type, eps: float) -> tuple:
-    """``(requirement, margin, plan)`` for one fixture.
+    """``(requirement, margin, plan, n_fma_disagreements)`` for one fixture.
 
     The requirement is the largest distance by which a row that the *production*
     ``_channel_ft_coords`` places inside kernel support (``|z| <= 1``) falls
@@ -639,6 +666,12 @@ def _margin_requirement(uvw: np.ndarray, freq: np.ndarray, dtype: type, eps: flo
         return np.maximum(np.maximum(centre - scale - host, host - centre - scale), 0.0)
 
     requirement = 0.0
+    # How many probe/row values the device and the host disagree on at all. The
+    # requirement can be non-zero without any disagreement -- the ``2u * S``
+    # term of the derivation exists whether or not the multiply contracts -- so
+    # the caller checks this separately to confirm the FMA path is really being
+    # exercised.
+    n_disagree = 0
     for chan in range(plan.n_chan):
         probes, probe_plane = _edge_probe_w_metres(plan, float(inv_lambda[chan]), w_lo, w_hi)
         rows_m = np.concatenate([uvw_m[perm, 2], probes])
@@ -655,6 +688,7 @@ def _margin_requirement(uvw: np.ndarray, freq: np.ndarray, dtype: type, eps: flo
             dtype=np.float64,
         )
         n_fixture = perm.size
+        n_disagree += int(np.count_nonzero(device != host))
 
         # Fixture rows: every plane, but only 120 of them.
         host_rows, dev_rows = host[:n_fixture], device[:n_fixture]
@@ -671,7 +705,7 @@ def _margin_requirement(uvw: np.ndarray, freq: np.ndarray, dtype: type, eps: flo
             if hit.any():
                 over_p = overhang_of(host_p, centre_p)
                 requirement = max(requirement, float(over_p[hit].max()))
-    return requirement, margin, plan
+    return requirement, margin, plan, n_disagree
 
 
 def test_window_boundary_margin_covers_host_device_gap() -> None:
@@ -679,7 +713,10 @@ def test_window_boundary_margin_covers_host_device_gap() -> None:
 
     ``test_windowed_dense_parity_at_window_edge`` gates that the margin is
     non-zero -- it fails with the margin deleted -- but nothing gated its
-    *magnitude*, which is the substance of the derivation in ``planning.py``.
+    *magnitude*, which is the substance of the derivation in
+    ``planning.window_boundary_margin``. The bar here is that derivation's own
+    requirement, not a round number: it needs a coefficient of at least 2.0, so
+    the gate is set to reject anything below that.
     Measured: with the coefficient at 0.5, 1.0 or 1.5 instead of 4.0, that test
     and the entire fast suite stayed green. A fixture cannot close that gap,
     because on any fixture whose rows are not adversarially placed the margin
@@ -706,13 +743,13 @@ def test_window_boundary_margin_covers_host_device_gap() -> None:
         uvw[:, 1] = rng.uniform(-120.0, 120.0, size=n_rows)
         uvw[:, 2] = offset_m + rng.uniform(-spread_m, spread_m, size=n_rows)
 
-        requirement, margin, plan = _margin_requirement(uvw, freq, dtype, eps)
+        requirement, margin, plan, n_disagree = _margin_requirement(uvw, freq, dtype, eps)
         assert plan.max_window_size < plan.n_rows, (
             f"{tag}: every window already spans every row, so no row can be dropped and "
             "this case gates nothing -- pick a fixture with more planes"
         )
         assert margin > 0.0, f"{tag}: boundary_margin is zero"
-        ratios.append((requirement / margin, tag, requirement, margin, dtype))
+        ratios.append((requirement / margin, tag, requirement, margin, dtype, n_disagree))
 
     # Per *dtype*, not just overall. float64 is the dtype the whole tolerance
     # contract is written in, and it is the one where a requirement of zero is
@@ -721,15 +758,34 @@ def test_window_boundary_margin_covers_host_device_gap() -> None:
     # float64 cases reporting zero, cutting the coefficient 8x for float64 alone
     # left the entire suite green -- so "some case is non-zero" is not enough.
     for want in (np.float64, np.float32):
+        name = np.dtype(want).name
         best = max(r[0] for r in ratios if r[4] is want)
-        assert best > 0.0, (
-            f"every {np.dtype(want).name} case measures a requirement of exactly zero, so "
-            f"this gate would pass with boundary_margin set to zero for {np.dtype(want).name}. "
-            "The edge probes are not reaching the host/device disagreement band -- check "
-            "_edge_probe_w_metres, and that the device side runs under jax.jit"
+        disagreements = max(r[5] for r in ratios if r[4] is want)
+        # A *floor*, not merely non-zero. "Non-zero" was satisfied by the very
+        # regression this guard exists to catch: with the device side executed
+        # eagerly -- no FMA contraction, the bug round 4 found -- float64's best
+        # ratio falls from 7.4e-2 to 8.6e-4 and the whole test still passed,
+        # because the surviving signal is the ``2u * S`` term, which does not
+        # come from contraction at all. 0.02 sits an order of magnitude above
+        # that residual and an order below the shipped 0.074 / 0.130.
+        assert best >= _MIN_PROBE_RATIO, (
+            f"the strongest {name} case exercises only {best:.3e} of the margin, under the "
+            f"{_MIN_PROBE_RATIO:g} floor. The edge probes are not reaching the host/device "
+            "disagreement band, so this gate is measuring the 2u*S term alone and would "
+            "pass with the FMA path broken -- check _edge_probe_w_metres, and that the "
+            "device side runs under jax.jit rather than eagerly"
+        )
+        # And directly: the two really must differ somewhere. In float64 an
+        # eager device side reproduces the host bit-for-bit, so this fires on
+        # its own; in float32 it is a weaker check (the eager subtract rounds to
+        # float32 where the host's does not), which is why the floor above
+        # carries the load.
+        assert disagreements > 0, (
+            f"device and host agree bit-for-bit on every probe of every {name} case, so "
+            "the FMA-contraction path this gate exists for is not being exercised at all"
         )
 
-    worst_ratio, worst_tag, worst_req, worst_margin, _ = max(ratios)
+    worst_ratio, worst_tag, worst_req, worst_margin, _, _ = max(ratios)
     assert worst_ratio <= 1.0 / _MIN_MARGIN_HEADROOM, (
         f"boundary_margin has only {1.0 / worst_ratio:.2f}x headroom on {worst_tag} "
         f"(rows need {worst_req:.3e} wavelengths of widening, margin is {worst_margin:.3e}), "
