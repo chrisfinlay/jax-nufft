@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import pathlib
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -16,6 +17,8 @@ import numpy as np
 import pytest
 from jax import Array
 
+import jax_nufft
+from jax_nufft import dirty2vis, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
 from jax_nufft.planning import W_OVERSAMPLE_X0, WGridderPlan, make_plan
@@ -835,16 +838,33 @@ def _independent_window_bounds(
     is not reintroduced by issue #23 in any form.
     """
     sort_perm = np.asarray(plan.sort_perm)
+    n_rows = uvw.shape[0]
     w_m_sorted = uvw[sort_perm, 2].astype(np.float64)
     w_centers_rel64 = np.asarray(plan.w_centers_rel, dtype=np.float64)
     half_w_dw = plan.w_kernel_scale
     n_chan, n_w = plan.n_chan, plan.n_w
+    # The builder widens each boundary before searching, and then by one row at
+    # each end, so that a window is guaranteed to contain every row the *device*
+    # puts inside kernel support even though the device's FMA-contracted w
+    # differs from the host's in the last bits (AGENTS.md sec 4's window-builder
+    # invariant; test_windowed_dense_parity_at_window_edge is the value gate).
+    # Reproduced here because it is part of the contract this reference exists
+    # to pin -- an implementation that dropped the widening would be a silent
+    # parity regression, so this must not quietly accept one.
+    w_abs = np.outer(np.asarray(freq, dtype=np.float64) / SPEED_OF_LIGHT, uvw[:, 2])
+    margin = (
+        4.0
+        * float(np.finfo(plan.real_dtype).eps)
+        * max(abs(float(w_abs.min())), abs(float(w_abs.max())), plan.w_extent)
+    )
     window_start = np.zeros((n_chan, n_w), dtype=np.int64)
     window_size = np.zeros((n_chan, n_w), dtype=np.int64)
     for c in range(n_chan):
         w_lambda_c = w_m_sorted * (float(freq[c]) / SPEED_OF_LIGHT) - plan.w0
-        lo = np.searchsorted(w_lambda_c, w_centers_rel64 - half_w_dw, side="left")
-        hi = np.searchsorted(w_lambda_c, w_centers_rel64 + half_w_dw, side="right")
+        lo = np.searchsorted(w_lambda_c, w_centers_rel64 - half_w_dw - margin, side="left")
+        hi = np.searchsorted(w_lambda_c, w_centers_rel64 + half_w_dw + margin, side="right")
+        lo = np.maximum(lo - 1, 0)
+        hi = np.minimum(hi + 1, n_rows)
         window_start[c] = lo
         window_size[c] = hi - lo
     return window_start, window_size
@@ -1140,6 +1160,7 @@ jax.config.update("jax_enable_x64", True)
 
 import numpy as np
 
+import jax_nufft
 from jax_nufft.planning import make_plan
 
 # The same fixture as _footprint_fixture_uvw (seed 0, max_baseline 5000 m),
@@ -1158,7 +1179,7 @@ plan = make_plan(uvw, freq, (n_pix, n_pix), pixsize, pixsize, epsilon)
 peak = tracemalloc.get_traced_memory()[1]
 tracemalloc.stop()
 
-print(peak, plan.n_w)
+print(peak, plan.n_w, jax_nufft.__file__)
 """
 
 
@@ -1167,9 +1188,20 @@ def _peak_host_alloc_bytes(
 ) -> tuple[int, int]:
     """Run one ``make_plan`` in a fresh interpreter; return ``(peak_bytes, n_w)``.
 
-    ``cwd`` is the repository root (this file's parent's parent) so the probe
-    imports the same ``jax_nufft`` the suite is testing, editable install or
-    not.
+    The probe reports the ``jax_nufft.__file__`` it resolved and this asserts it
+    against the parent's. Setting ``cwd`` to the repository root is *not* what
+    makes the import land on the right copy -- there is no ``jax_nufft/``
+    directory at the root, so the import succeeds through the editable install's
+    ``.pth`` entry, and a non-editable install of some other version would be
+    measured just as happily and pass. Only comparing the resolved paths rules
+    that out.
+
+    A caveat on the instrument, since it bounds what this can catch:
+    ``tracemalloc``'s peak is a *maximum* over the traced window, so a
+    per-(channel, row) transient that is allocated and freed entirely before
+    ``compute_phi_hat_table``'s FFT plateau would not raise it and would go
+    unseen. What the difference measures is peak-to-peak, which is what the
+    memory budget is about; it is not a leak detector.
     """
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     completed = subprocess.run(
@@ -1191,7 +1223,13 @@ def _peak_host_alloc_bytes(
     assert completed.returncode == 0, (
         f"host-allocation probe failed for n_chan={n_chan}:\n{completed.stdout}\n{completed.stderr}"
     )
-    peak_str, n_w_str = completed.stdout.split()[-2:]
+    peak_str, n_w_str, probe_module = completed.stdout.split()[-3:]
+    expected_module = str(pathlib.Path(jax_nufft.__file__).resolve())
+    assert str(pathlib.Path(probe_module).resolve()) == expected_module, (
+        f"the probe imported jax_nufft from {probe_module!r}, but this test process has it "
+        f"at {expected_module!r} -- the subprocess is measuring a different installation, "
+        "so its numbers say nothing about the code under test"
+    )
     return int(peak_str), int(n_w_str)
 
 
@@ -1256,3 +1294,99 @@ def test_make_plan_host_cost_is_independent_of_n_chan_times_n_rows(
         f"about {naive / 1e6:.0f} MB here, and the measured growth is "
         f"{100.0 * delta / naive:.1f}% of that"
     )
+
+
+# ---------------------------------------------------------------------------
+# issue #23: no operator path may materialise the per-(channel, row) array
+# ---------------------------------------------------------------------------
+#
+# ``plan.uvw_lambda`` is a compatibility accessor: reading it rebuilds the
+# ``(n_chan, n_rows, 3)`` array this issue exists to delete -- 3.9 GB at 64
+# channels x 1M rows. Until now that rule was prose in AGENTS.md sec 4 and in
+# the property's own docstring, and prose is not a gate: reintroducing the read
+# in ``_dirty2vis_jit``'s *default* path (dense_scan, channel_strategy="scan")
+# leaves the entire suite green, because ``test_plan_footprint`` counts stored
+# leaves and the host-cost probe measures ``make_plan``, and neither sees an
+# array conjured at call time.
+#
+# So gate it where it is observable: in the lowered IR. Every strategy pair is
+# swept, not just the default, because the four w-strategies and two channel
+# strategies reach the coordinates through different code
+# (``_channel_forward`` / ``_channel_adjoint`` take ``plan.uvw_m`` directly;
+# the windowed helpers take a ``sort_perm`` gather of it), so a regression can
+# hide in one and not the others.
+
+
+_UVW_LAMBDA_PROBE_N_CHAN = 3
+_UVW_LAMBDA_PROBE_N_ROWS = 257
+_UVW_LAMBDA_PROBE_N_PIX = 16
+
+
+def _lowered_tensor_shapes(text: str) -> list[tuple[int, ...]]:
+    """Every ``tensor<...>`` shape in a StableHLO module, as int tuples.
+
+    Shapes are matched structurally rather than by substring so the check does
+    not depend on the element type or on the dimension order the compiler
+    happens to choose.
+    """
+    shapes: list[tuple[int, ...]] = []
+    for dims in re.findall(r"tensor<([0-9x]*)x?[a-z]", text):
+        parts = [d for d in dims.split("x") if d]
+        if parts:
+            shapes.append(tuple(int(d) for d in parts))
+    return shapes
+
+
+@requires_x64
+@pytest.mark.parametrize("channel_strategy", ["scan", "vmap"])
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+def test_no_operator_path_materialises_uvw_lambda(w_strategy: str, channel_strategy: str) -> None:
+    """Neither operator may build an ``(n_chan, n_rows, 3)`` tensor.
+
+    ``n_rows = 257`` is chosen to be unlike every other dimension in the
+    problem (3 channels, a 16x16 image, ``n_w`` in the tens), so a tensor
+    carrying it can only have come from the per-row baselines. The assertion is
+    on the *multiset* of dimensions, so a transposed or otherwise permuted
+    materialisation counts too.
+    """
+    n_chan = _UVW_LAMBDA_PROBE_N_CHAN
+    n_rows = _UVW_LAMBDA_PROBE_N_ROWS
+    n_pix = _UVW_LAMBDA_PROBE_N_PIX
+
+    rng = np.random.default_rng(23)
+    uvw = rng.normal(scale=200.0, size=(n_rows, 3))
+    freq = np.linspace(1.0e9, 2.0e9, n_chan)
+    plan = make_plan(uvw, freq, (n_pix, n_pix), 2e-3, 2e-3, epsilon=1e-6)
+    image = jnp.asarray(rng.standard_normal((n_chan, n_pix, n_pix)))
+    vis = jnp.asarray(
+        rng.standard_normal((n_rows, n_chan)) + 1j * rng.standard_normal((n_rows, n_chan))
+    )
+
+    banned = sorted((n_chan, n_rows, 3))
+    for name, fn, arg in (
+        ("dirty2vis", dirty2vis, image),
+        ("vis2dirty", vis2dirty, vis),
+    ):
+        lowered = jax.jit(
+            lambda p, x, _fn=fn: _fn(
+                p, x, w_strategy=w_strategy, channel_strategy=channel_strategy, nthreads=1
+            )
+        ).lower(plan, arg)
+        shapes = _lowered_tensor_shapes(lowered.as_text())
+        # Sanity: the baselines themselves must be in there, or the search
+        # below is looking at the wrong module and would pass vacuously.
+        assert any(sorted(s) == sorted((n_rows, 3)) for s in shapes), (
+            f"{name} ({w_strategy}, {channel_strategy}): no (n_rows, 3) tensor in the "
+            "lowered IR at all -- the probe is not seeing the operator it thinks it is"
+        )
+        offenders = [s for s in shapes if len(s) == 3 and sorted(s) == banned]
+        assert not offenders, (
+            f"{name} ({w_strategy}, channel_strategy={channel_strategy}) materialises "
+            f"{offenders[0]} -- an (n_chan, n_rows, 3) per-(channel, row) array. That is "
+            "plan.uvw_lambda (or an equivalent broadcast of plan.uvw_m by "
+            "plan.inv_lambda) being read in an operator path: 3.9 GB at 64 channels x 1M "
+            "rows, and the whole point of issue #23. Read uvw_m and inv_lambda and derive "
+            "per channel via _channel_ft_coords instead"
+        )

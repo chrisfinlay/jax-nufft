@@ -162,3 +162,232 @@ def test_small_nw_zenith_regression() -> None:
     # Same eps-independent bound as ``_parity_check`` above (issue #10); see
     # its comment for the measured values behind 1e-11.
     assert err < 1e-11
+
+
+# ---------------------------------------------------------------------------
+# The window-builder invariant at an ulp of a window edge (issue #23)
+# ---------------------------------------------------------------------------
+#
+# The windowed strategies are correct only if every window contains every row
+# the dense path gives a non-zero kernel weight. Which rows those are is
+# decided on the *device*, by ``wgridder._channel_ft_coords``; which rows the
+# window holds is decided on the *host*, by ``make_plan``'s searchsorted. So
+# the invariant lives on the seam between two evaluations of the same
+# quantity, and issue #23 moved that seam.
+#
+# Before #23 the plan stored the per-channel w and the device merely subtracted
+# ``w0`` from it, so host and device agreed bit for bit and the invariant was
+# free. Since #23 the device derives w as a multiply immediately followed by a
+# subtract, which XLA contracts into a single FMA -- one rounding where the
+# host's numpy steps round twice. The two now differ in the last bits on a
+# large fraction of rows (~23% on MWA_extended, ~18% on MeerKAT), and a row
+# landing in that ulp-wide band on the wrong side of a window edge is kept by
+# the dense path at ``phi(z = +/-1) = exp(-beta)`` and dropped entirely by the
+# windowed one. Measured on the fixture below before the builder was widened:
+# 3.694e-09 forward and 2.480e-09 adjoint against this file's 1e-11 contract,
+# where ``origin/main`` is 1.5e-17 / 2.4e-15 on the identical inputs.
+#
+# make_plan now widens each boundary by ``boundary_margin`` (an upper bound on
+# that host/device gap) and by one row at each end, which makes the invariant
+# hold by construction: over-inclusion is free, since a row inside the slice
+# but outside kernel support gets ``phi(|z| > 1) = 0``.
+
+
+def _device_w_sorted(plan: object, uvw: np.ndarray, chan: int = 0) -> np.ndarray:
+    """The relative w the *operator* computes, in sorted-row order.
+
+    This is the production helper, not a transcription of it: which rows the
+    dense path weights is decided by exactly this function, so the invariant
+    below has to be checked against it and nothing else.
+    """
+    from jax_nufft.wgridder import _channel_ft_coords
+
+    perm = np.asarray(plan.sort_perm)  # type: ignore[attr-defined]
+    return np.asarray(
+        jax.jit(_channel_ft_coords)(
+            jnp.asarray(uvw[perm]),
+            plan.inv_lambda[chan],  # type: ignore[attr-defined]
+            plan,
+        )[2]
+    )
+
+
+def _rows_dropped_by_windows(plan: object, uvw: np.ndarray) -> int:
+    """Rows the dense path weights but the windowed slice cannot reach.
+
+    Zero is the window-builder invariant (AGENTS.md sec 4). Mirrors the
+    operator's own slice arithmetic, including ``_channel_*_windowed``'s clamp
+    of the start index into ``[0, n_rows - max_window_size]``.
+    """
+    centres = np.asarray(plan.w_centers_rel, dtype=np.float64)  # type: ignore[attr-defined]
+    scale = plan.w_kernel_scale  # type: ignore[attr-defined]
+    starts = np.asarray(plan.window_start)  # type: ignore[attr-defined]
+    size = plan.max_window_size  # type: ignore[attr-defined]
+    n_rows = plan.n_rows  # type: ignore[attr-defined]
+    dropped = 0
+    for chan in range(plan.n_chan):  # type: ignore[attr-defined]
+        w = _device_w_sorted(plan, uvw, chan)
+        for k in range(centres.shape[0]):
+            inside = np.nonzero(np.abs((w - centres[k]) / scale) <= 1.0)[0]
+            if inside.size == 0:
+                continue
+            lo = min(max(int(starts[chan, k]), 0), max(n_rows - size, 0))
+            dropped += int(np.sum((inside < lo) | (inside >= lo + size)))
+    return dropped
+
+
+def _find_invariant_breaking_w(
+    plan: object, uvw: np.ndarray, freq: np.ndarray, plan_kwargs: dict, n_step: int = 12
+) -> tuple[float, np.ndarray] | None:
+    """Search for a ``w`` (metres) that makes the windowed slice drop a row.
+
+    Two conditions have to line up, which is why this searches rather than
+    hard-codes. First the value must sit in the ulp-wide band where the host's
+    two-rounding w and the device's FMA-contracted w fall on opposite sides of
+    a window edge -- only there can the builder and the operator disagree about
+    membership at all. Second, the row must not be rescued by padding: the
+    slice is ``max_window_size`` long while the window is usually shorter, so
+    most straddling rows are covered anyway and no error results. Only a
+    candidate that fails :func:`_rows_dropped_by_windows` after being spliced
+    in is a real regression fixture.
+
+    Returns ``(w_metres, spliced_uvw)`` or ``None`` when no candidate qualifies
+    -- e.g. on a platform whose compiler does not contract the multiply-subtract,
+    where host and device agree exactly and the invariant is trivially safe.
+    """
+    from jax_nufft.wgridder import _channel_ft_coords
+
+    invl = float(np.asarray(plan.inv_lambda)[0])  # type: ignore[attr-defined]
+    w0 = plan.w0  # type: ignore[attr-defined]
+    scale = plan.w_kernel_scale  # type: ignore[attr-defined]
+    centres = np.asarray(plan.w_centers_rel, dtype=np.float64)  # type: ignore[attr-defined]
+    w_lo, w_hi = float(np.min(uvw[:, 2])), float(np.max(uvw[:, 2]))
+
+    candidates: list[float] = []
+    edges: list[tuple[str, float]] = []
+    for k in range(1, centres.shape[0] - 1):
+        for side, bound in (("lo", centres[k] - scale), ("hi", centres[k] + scale)):
+            x = (bound + w0) / invl
+            for _ in range(n_step // 2):
+                x = np.nextafter(x, -np.inf)
+            for _ in range(n_step):
+                candidates.append(float(x))
+                edges.append((side, float(bound)))
+                x = np.nextafter(x, np.inf)
+
+    cand = np.asarray(candidates, dtype=np.float64)
+    host = (cand * invl).astype(np.float64) - w0
+    zeros = np.zeros_like(cand)
+    device = np.asarray(
+        jax.jit(_channel_ft_coords)(
+            jnp.asarray(np.stack([zeros, zeros, cand], axis=1)),
+            plan.inv_lambda[0],  # type: ignore[attr-defined]
+            plan,
+        )[2]
+    )
+
+    order = np.argsort(uvw[:, 2])
+    for i, (side, bound) in enumerate(edges):
+        # "lo": searchsorted(..., "left") drops rows below the bound, but the
+        # dense path keeps any row the device puts at or above it. "hi" mirrors.
+        straddles = host[i] < bound <= device[i] if side == "lo" else host[i] > bound >= device[i]
+        if not straddles or not (w_lo < cand[i] < w_hi):
+            continue
+        # Splice into an interior row -- strictly inside the existing w-range,
+        # so w_min / w_max and every plan quantity derived from them are
+        # untouched and the only change is which side of one edge a row is on.
+        for row in (order[1], order[2], order[len(order) // 2]):
+            spliced = uvw.copy()
+            spliced[row, 2] = float(cand[i])
+            candidate_plan = make_plan(spliced, freq, **plan_kwargs)
+            if candidate_plan.w0 != plan.w0 or candidate_plan.n_w != plan.n_w:  # type: ignore[attr-defined]
+                continue
+            if _rows_dropped_by_windows(candidate_plan, spliced):
+                return float(cand[i]), spliced
+    return None
+
+
+def test_windowed_dense_parity_at_window_edge() -> None:
+    """A row within an ulp of a window edge must not break windowed/dense parity.
+
+    The fixture is adversarial and built in two passes: plan the base geometry,
+    then search (:func:`_find_invariant_breaking_w`) for a ``w`` that both lands
+    in the host/device disagreement band at a window edge *and* is not rescued
+    by ``max_window_size`` padding, splice it into an interior row and re-plan.
+    The splice leaves ``w0``, ``n_w`` and ``w_centers_rel`` untouched -- asserted
+    below -- so the only thing that changed is which side of one window edge a
+    single row sits on.
+
+    Large ``|w0|`` (~2.3e5 wavelengths against a w-extent of ~4e3) is what makes
+    the host/device gap reach an edge at all: the gap is bounded by an ulp of
+    the *absolute* w, so a zenith fixture with ``w0 ~ 0`` cannot exhibit this
+    however the rows fall. Windows also have to be a strict subset of the rows,
+    or the windowed path trivially sees everything.
+
+    Measured on this fixture before ``make_plan``'s boundaries were widened:
+    3.694e-09 forward and 2.480e-09 adjoint, against the 1e-11 contract this
+    file uses throughout and ``origin/main``'s 1.5e-17 / 2.4e-15 on identical
+    inputs.
+
+    If the search finds nothing -- a compiler that does not contract the
+    multiply-subtract -- the parity assertions still run on the base fixture.
+    The test is sharper where the platform allows and never vacuous.
+    """
+    n_rows = 60
+    freq = np.array([1.0e9])
+    n_pix, pixsize, eps = 32, 0.004, 1e-6
+    plan_kwargs = {
+        "image_shape": (n_pix, n_pix),
+        "pixsize_l": pixsize,
+        "pixsize_m": pixsize,
+        "epsilon": eps,
+    }
+
+    rng = np.random.default_rng(0)
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-120.0, 120.0, size=n_rows)
+    uvw[:, 1] = rng.uniform(-120.0, 120.0, size=n_rows)
+    uvw[:, 2] = 5.0e4 + rng.uniform(-2.0e3, 2.0e3, size=n_rows)
+
+    base = make_plan(uvw, freq, **plan_kwargs)
+    assert base.max_window_size < n_rows, (
+        "the windows must be a strict subset of the rows, or a dropped row "
+        "cannot show up in the first place"
+    )
+
+    found = _find_invariant_breaking_w(base, uvw, freq, plan_kwargs)
+    uvw_adv = uvw if found is None else found[1]
+
+    plan = make_plan(uvw_adv, freq, **plan_kwargs)
+    assert plan.w0 == base.w0
+    assert plan.n_w == base.n_w
+    np.testing.assert_array_equal(np.asarray(plan.w_centers_rel), np.asarray(base.w_centers_rel))
+
+    # Measured up front so it can be quoted as the *diagnosis* alongside the
+    # parity numbers below, which are the contract the library actually owes.
+    dropped = _rows_dropped_by_windows(plan, uvw_adv)
+    why = (
+        f"{dropped} row(s) that the dense path weights at phi(z = +/-1) = exp(-beta) lie "
+        "outside the windowed slice. See AGENTS.md sec 4's window-builder invariant: "
+        "make_plan must widen its boundaries, because the operator's FMA-contracted w "
+        "does not agree bit-for-bit with the builder's two-rounding one"
+    )
+
+    rng = np.random.default_rng(7)
+    image = jnp.asarray(rng.standard_normal((n_pix, n_pix)))
+    vis = jnp.asarray(rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1)))
+
+    vis_dense = np.asarray(dirty2vis(plan, image, w_strategy="dense_scan"))
+    dirty_dense = np.asarray(vis2dirty(plan, vis, w_strategy="dense_scan"))
+    for strategy in ("windowed_scan", "windowed_vmap"):
+        vis_win = np.asarray(dirty2vis(plan, image, w_strategy=strategy))
+        dirty_win = np.asarray(vis2dirty(plan, vis, w_strategy=strategy))
+        fwd = np.linalg.norm(vis_win - vis_dense) / np.linalg.norm(vis_dense)
+        adj = np.linalg.norm(dirty_win - dirty_dense) / np.linalg.norm(dirty_dense)
+        assert fwd < 1e-11, f"dirty2vis dense-vs-{strategy} rel L2 {fwd:.3e} > 1e-11: {why}"
+        assert adj < 1e-11, f"vis2dirty dense-vs-{strategy} rel L2 {adj:.3e} > 1e-11: {why}"
+
+    # The invariant itself, checked against the production coordinate helper.
+    # Strictly stronger than the parity assertions above: a dropped row whose
+    # kernel weight happens to underflow the norms would slip past those.
+    assert dropped == 0, why

@@ -222,19 +222,32 @@ The windowed strategies rely on a contract between
   `plan.uvw_m[plan.sort_perm]` once per call (issue #23).
 * `plan.window_start[c, k]` is the start index in the sorted array
   for the rows inside `[w_centers[k] - W/2 * dw, w_centers[k] + W/2 * dw]`.
-  The builder places those boundaries in the *relative* coordinate
-  (`w - w0`) and forms the per-channel w in the plan's `real_dtype`
-  before widening, so they agree with what `_channel_ft_coords`
-  computes at call time to within one rounding of the absolute w
-  (~`ulp(w0)`) — not bit-for-bit, since XLA may contract the
-  operator's multiply-then-subtract into an FMA. Building them any
-  other way lets a row within an ulp of an edge be kept by one path
-  and dropped by the other, a `phi(z = ±1) = exp(-beta)` (~1e-7 at
-  W=7) windowed-vs-dense mismatch.
+  **Invariant: every window contains every row the dense path gives a
+  non-zero kernel weight.** That is what makes the windowed and dense
+  strategies agree, and it holds *by construction*, not by luck. The
+  builder places its boundaries in the same *relative* coordinate
+  (`w - w0`) the operator uses and forms the per-channel w in the
+  plan's `real_dtype`, then widens each boundary by
+  `boundary_margin` and by one row at each end. The widening is
+  load-bearing since issue #23: the operator derives `w` as a
+  multiply immediately followed by a subtract, which XLA may contract
+  into a single FMA — one rounding where the builder's numpy steps
+  round twice — so host and device values differ on a fifth to a
+  quarter of rows (measured: ~23% on MWA_extended, ~18% on MeerKAT).
+  Before #23 the device subtracted `w0` from a *stored, already
+  rounded* product, so the two agreed bit for bit and no margin was
+  needed. Do not "restore" bit-equality here; it is not achievable
+  against a fusing compiler. Widen instead: over-inclusion is free
+  (`phi(|z| > 1) = 0` contributes nothing), under-inclusion is a
+  silent `phi(z = ±1) = exp(-beta)` (~1e-7 at W=7) windowed-vs-dense
+  mismatch, ~1e-9 in relative L2 against a 1e-11 contract. Pinned by
+  `test_windowed_dense_parity_at_window_edge`, whose fixture places a
+  row in the ulp-wide band where the two disagree.
 * `plan.max_window_size` is a static int used as the
-  `dynamic_slice` size — must be `>=` every window's length. The
-  per-window lengths themselves are plan-time locals, not a leaf
-  (issue #23 removed `window_size`).
+  `dynamic_slice` size — must be `>=` every window's length, and is
+  computed from the widened windows above, so it already carries the
+  two extra rows. The per-window lengths themselves are plan-time
+  locals, not a leaf (issue #23 removed `window_size`).
 
 If you touch any of these, run `tests/test_planning.py` and
 `tests/test_boundary_planes.py` to confirm the contract still holds.

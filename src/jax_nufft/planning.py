@@ -277,25 +277,38 @@ class WGridderPlan:
         **Exact in the reals, not bit-exact in ``real_dtype``.**
         ``n_minus_1_shifted`` is rounded to ``real_dtype`` at plan time, so this
         subtraction recovers ``n_minus_1`` to about ``ulp(nshift)`` absolute,
-        where the pre-issue-#23 stored leaf was good to ``ulp(n_minus_1)``. That
-        costs nothing on any grid whose ``|nshift|`` is O(1) -- which is every
-        grid with a squarish pixel, since ``n_minus_1`` then spans ``[-1, 0]``.
-        The operators form ``n = n_minus_1 + 1``, and that cancellation already
-        costs ``ulp(1)`` on the stored leaf too, so the two are equally accurate
-        where it matters.
+        where the pre-issue-#23 stored leaf was good to ``ulp(n_minus_1)``. The
+        operators form ``n = n_minus_1 + 1``, and that cancellation already
+        costs ``ulp(1)`` on the stored leaf too, so on most grids the two are
+        equally accurate where it matters.
+
+        Most, not all -- and "float64 makes this exact" is the tempting and
+        wrong summary. ``fl(shifted - nshift)`` returns the stored
+        ``n_minus_1`` bit-for-bit when ``|nshift| >= |n_minus_1|``, where the
+        subtraction is error-free by the argument behind Dekker's
+        ``fast_two_sum``. A grid whose ``|n_minus_1|`` runs past ``|nshift|``
+        breaks that condition, and wide fields do: outside the unit disc the
+        analytic extension ``n - 1 = -sqrt(l² + m² - 1) - 1`` grows without
+        bound while ``nshift`` is only half the range.
 
         Measured over the pixels the adjoint actually divides by (``n > 0``),
-        against the exact float64 grid, worst-case relative error in ``n``,
-        property vs pre-#23 stored leaf: float32 gives ratio **1.00x** at 17 deg
-        field radius (4.1e-9), at 40 deg (1.5e-7) and on a grid reaching the
-        horizon (1.1e-5, where the ``n = n_minus_1 + 1`` cancellation dominates
-        both); float64 is bit-exact (0.0) on all three. The only regime that
-        degrades needs a wildly anisotropic pixel making ``|nshift| >> 1``: at
-        ``pixsize_m = 5000 * pixsize_l`` (``nshift`` 26) the ratio is 33x, but
-        the absolute error is 3.2e-6 -- still an order of magnitude under
-        float32's own 3.4e-5 accuracy floor -- and 5.7e-15 in float64. Those
-        pixels are far below the horizon, so such a grid is not a physically
-        meaningful image.
+        worst-case relative error in ``n`` against the exact float64 grid, this
+        property vs the pre-#23 stored leaf, in float64:
+
+            grid                        nshift  max|n-1|    stored   property
+            MeerKAT zenith              0.0001     0.000       0.0        0.0
+            MWA_compact / _extended     0.0244     0.024       0.0        0.0
+            EDA2 zenith (120 deg FoV)   1.0462     2.092       0.0   1.16e-16
+            pixsize_m = 5000*pixsize_l 80.4984   160.997       0.0   7.00e-15
+
+        So: bit-exact on the narrow-field fixtures, half an ulp out on EDA2 --
+        the repo's own wide-field fixture, and the case that makes the blanket
+        claim false -- and still only 7e-15 on a grid so anisotropic that its
+        pixels sit far below the horizon. In float32 the property matches the
+        stored leaf to a ratio of 1.00 on every one of those but the last
+        (3.4e-6 absolute there, an order of magnitude under float32's own
+        3.4e-5 accuracy floor, on a grid that is not a physically meaningful
+        image).
         """
         return self.n_minus_1_shifted - self.nshift
 
@@ -934,6 +947,46 @@ def make_plan(
         # not a leaf.
         window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
         half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
+
+        # --- the windowed-vs-dense invariant, and why it holds by construction ---
+        #
+        # The contract (AGENTS.md sec 4) is that a window contains EVERY row the
+        # dense path gives a non-zero kernel weight, i.e. every row whose w --
+        # as the *operator* computes it on the device -- satisfies |z| <= 1.
+        #
+        # Host and device do not compute that w identically, and cannot be made
+        # to. The operator evaluates ``inv_lambda[c] * uvw_m[:, 2] - w0`` as a
+        # multiply immediately followed by a subtract, which XLA is free to
+        # contract into a single FMA: one rounding where the two numpy steps
+        # below round twice. (Before issue #23 the device subtracted ``w0`` from
+        # a *stored, already-rounded* product, so the two agreed bit for bit by
+        # construction. They no longer do: measured, they differ on ~23% of
+        # (channel, row) pairs on MWA_extended and ~18% on MeerKAT.)
+        #
+        # Chasing bit-equality is therefore the wrong fix; the right one is to
+        # make the disagreement unable to matter. The asymmetry that lets us do
+        # that: over-inclusion is free -- a row inside the slice but outside
+        # kernel support gets ``phi(|z| > 1) = 0`` and contributes exactly
+        # nothing -- while under-inclusion is a value error. So widen.
+        #
+        # ``boundary_margin`` bounds |device w - host w| from above. The device
+        # can skip the product's rounding (<= u * |w_absolute|) and each side
+        # rounds its own subtraction (<= u * |w_relative| each), so 3u of the
+        # larger scale covers it; ``4 * eps == 8u`` is comfortable margin on
+        # that. Searching at ``b -/+ margin`` then guarantees the slice is a
+        # superset of the device's support set whatever the two roundings do --
+        # provably, not merely probably, which matters because the cost of being
+        # wrong is a silent parity break (measured at 3.7e-9 forward / 2.5e-9
+        # adjoint against a 1e-11 contract) that only appears when a row lands
+        # within an ulp of an edge. Pinned by
+        # ``tests/test_boundary_planes.py::test_windowed_dense_parity_at_window_edge``.
+        #
+        # In practice this widens nothing: the margin is ~1e-11 wavelengths
+        # against a ``w_kernel_scale`` of order 1e2-1e4, so a window only grows
+        # when a row really does sit that close to an edge.
+        w_abs_scale = max(abs(w_min_all), abs(w_max_all), w_extent)
+        boundary_margin = 4.0 * float(np.finfo(real_dtype).eps) * w_abs_scale
+
         # issue #16 follow-up: compute the boundaries in the SAME coordinate the
         # operators use for ``z``, i.e. relative to ``w0``, not in absolute
         # wavelengths. The two differ by the rounding of ``w0 + w_centers_rel``
@@ -956,27 +1009,24 @@ def make_plan(
             # against the numbers the operators actually compute at call time:
             # they derive w the same way, from the same two leaves, in
             # ``real_dtype``. Skipping the narrowing would place a float32
-            # plan's window edges against values the operator never sees, and a
-            # row landing between the two would be dropped by the windowed path
-            # while the dense path gives it ``phi(z = +/-1) = exp(-beta)``.
-            #
-            # Not bit-for-bit, though: the operator computes this as a single
-            # multiply-then-subtract (``_w_relative``), which XLA is free to
-            # contract into an FMA -- one rounding where the two numpy steps
-            # here round twice. The two therefore agree to within one rounding
-            # of the *absolute* w, i.e. ~ulp(w0). Measured at |w0| ~ 1.1e6
-            # lambda in float32, about 80% of rows differ, by at most 1.2e-10
-            # lambda -- 5e-15 of ``w_kernel_scale``, so a row has to fall that
-            # close to an edge for the two paths to disagree at all, and the
-            # disagreement is then one row at ``phi(z = +/-1)``.
+            # plan's window edges against values the operator never sees, which
+            # is a far bigger discrepancy than the sub-ulp one
+            # ``boundary_margin`` above absorbs.
             w_lambda_c = (w_m_sorted * inv_lambda_np[c]).astype(np.float64) - w0
             # ``side="left"``  for lower bound, ``side="right"`` for upper bound
-            # gives a half-open interval [lo, hi) of strictly-inside rows. Rows
-            # exactly at ``w_k +/- half_W_dw`` have phi(z=+/-1) = exp(-beta),
-            # numerically tiny but nonzero — including them costs at most one
-            # extra row per side and avoids edge surprises.
-            lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw, side="left")
-            hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw, side="right")
+            # gives a half-open interval [lo, hi). Rows exactly at
+            # ``w_k +/- half_W_dw`` have phi(z=+/-1) = exp(-beta), numerically
+            # tiny but nonzero, so they must be kept; ``boundary_margin`` keeps
+            # the rows an FMA would move across the edge as well.
+            lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw - boundary_margin, "left")
+            hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw + boundary_margin, "right")
+            # One more row at each end, clamped into range. The margin above
+            # already makes the *value* comparison safe; this makes the *index*
+            # arithmetic safe too, for two rows on a slice that is sized by its
+            # widest member anyway. Belt and braces on the one invariant in this
+            # file whose violation is silent.
+            lo = np.maximum(lo - 1, 0)
+            hi = np.minimum(hi + 1, n_rows)
             window_start_np[c] = lo.astype(np.int32)
             window_size_np[c] = (hi - lo).astype(np.int32)
 
