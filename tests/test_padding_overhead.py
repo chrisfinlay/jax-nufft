@@ -4,19 +4,32 @@
 row-work exceeds the irreducible minimum. Each ``(channel, plane)`` step
 slices a *static* ``max_window_size`` rows out of the w-sorted array (the
 shape has to be static for ``lax.scan`` / ``vmap``), so a windowed traversal
-touches ``n_chan * n_w * max_window_size`` rows. Only some of those carry a
-nonzero kernel weight, and issue #43 is about which ones:
+touches ``n_chan * n_w * max_window_size`` rows. Only some of those lie inside
+a plane's kernel support, and issue #43 is about which ones:
 
     window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
 
 ``live_row_count`` counts the ``(channel, plane, row)`` incidences with
-``|w_lambda - w_k| <= w_kernel_scale`` -- i.e. ``|z| <= 1``, the support of
-``kernel.phi`` -- measured on the *unpadded* window. The builder then widens
-each window by ``window_boundary_margin`` and by one further row at each end
-(``lo - 1`` / ``hi + 1``, clamped into range). Those extra rows exist so the
-host's window provably contains every row the *device* puts inside support
-despite FMA contraction; they are real work, but they carry ``phi = 0``
-exactly, so they belong in the numerator, never in the denominator.
+``|w_lambda - w_k| <= w_kernel_scale``, measured on the *unpadded* window and
+on the host's own w. That is the *nominal* support, which is close to but not
+identical with "the incidences ``kernel.phi`` weights": the operators form
+``z = fl(fl(w - w_k) / S)`` and test ``|z| <= 1``, and the division rounds --
+:func:`_kernel_weighted_incidence_count` below counts it that way, and the two
+disagree on at most three incidences over the whole calibration grid, which
+:func:`test_padding_overhead_is_windowed_work_over_live_work` pins at four.
+The nominal count is what the denominator of a work ratio wants; an exact
+weight census would cost an ``(n_w, n_rows)`` ``phi`` evaluation per channel
+at plan time to move a diagnostic's fourth decimal place.
+
+The builder then widens each window by ``window_boundary_margin`` and by one
+further row at each end (``lo - 1`` / ``hi + 1``, clamped into range). Those
+extra rows exist so the host's window provably contains every row the *device*
+puts inside support despite FMA contraction; they are real work, and they lie
+outside nominal support, so they belong in the numerator and not in the
+denominator. Not equally far outside it, though: a clamp row is outside by two
+whole rows and ``phi`` does return zero for it, whereas a margin row is
+outside by a few ulps and ``phi`` may not -- that possibility is the margin's
+entire reason for existing.
 
 In practice the clamp dominates: ``window_boundary_margin`` is a few ulps of
 the absolute w scale, so it seldom has a row to catch. Measured over the
@@ -548,8 +561,8 @@ def _plan_with_a_row_in_the_margin_band(
 
     The construction is two-pass because the target depends on the geometry it
     is placed into: build once to read ``w_kernel_scale``, ``w_centers_rel``,
-    ``w0`` and the margin off the plan, aim at the middle of the band above an
-    *interior* plane's upper edge, then walk the representable grid of the
+    ``w0`` and the margin off the plan, aim at the middle of the band below an
+    *interior* plane's lower edge, then walk the representable grid of the
     row's w-in-metres with ``nextafter`` until the value the builder would
     compute lands inside the band. The band is about four ulps of that grid
     wide -- ``window_boundary_margin`` is ``4u`` of the absolute w scale --
@@ -560,6 +573,11 @@ def _plan_with_a_row_in_the_margin_band(
     second plan's ``w0``, ``dw``, ``n_w`` and centres are then identical to
     the first's, which is asserted, and the target computed against the first
     plan is therefore still valid in the second.
+
+    The *lower* edge specifically, because ``window_start`` is built from the
+    lower boundary alone (``max(lo - 1, 0)``). A row planted below it moves a
+    number the plan actually stores, which is what lets the test below assert
+    against ``plan.window_start`` rather than against a reconstruction.
     """
     base_uvw = _margin_fixture_uvw()
     image_shape = (64, 64)
@@ -573,7 +591,7 @@ def _plan_with_a_row_in_the_margin_band(
         dtype=real_dtype,
     )
     probe = build(base_uvw)
-    assert probe.n_w > 2, "the fixture must have interior planes to plant a row above"
+    assert probe.n_w > 2, "the fixture must have interior planes to plant a row below"
 
     scale = probe.w_kernel_scale
     margin = _boundary_margin_for(probe)
@@ -583,7 +601,7 @@ def _plan_with_a_row_in_the_margin_band(
 
     # Aim at the middle of the band, then walk outward one representable
     # value at a time in each direction.
-    ideal_metres = (centre + scale + margin / 2.0 + probe.w0) / inv_lambda
+    ideal_metres = (centre - scale - margin / 2.0 + probe.w0) / inv_lambda
     planted: float | None = None
     for direction in (np.inf, -np.inf):
         candidate = np.float64(ideal_metres)
@@ -626,6 +644,24 @@ def test_margin_rows_are_excluded_from_the_denominator(real_dtype: DTypeLike) ->
     clamp -- passes ``test_padding_rows_are_excluded_from_the_denominator``
     and fails here.
 
+    Both directions are asserted, and both against a real plan field:
+
+    * ``plan.live_row_count`` must *exclude* the planted row, and
+    * ``plan.window_start`` must *include* it -- the production window really
+      is widened by the margin, not merely reported as if it were.
+
+    The second matters because the first alone is satisfied by a builder with
+    no margin at all: the two would then agree by both being nominal. It is
+    also the only assertion in this module that reads ``window_start``, so it
+    is what keeps the fixture honest about which quantity it is exercising.
+    ``tests/test_boundary_planes.py::test_windowed_dense_parity_at_window_edge``
+    independently fails if the margin is deleted from the builder, via the
+    windowed-vs-dense value mismatch rather than the index; the two are
+    complementary, and neither makes the other redundant. (Its neighbour
+    ``test_window_boundary_margin_covers_host_device_gap`` does *not* cover
+    that mutation -- it derives the margin from ``window_boundary_margin``
+    directly and never looks at whether the builder applied it.)
+
     The preconditions are asserted rather than skipped: if the construction
     stops landing a row in the band, that must fail loudly instead of passing
     vacuously.
@@ -654,12 +690,42 @@ def test_margin_rows_are_excluded_from_the_denominator(real_dtype: DTypeLike) ->
         "the fixture no longer carries a margin row, so the assertions below "
         "cannot distinguish the live bounds from the margin-widened ones"
     )
-    # ... and the widened windows really do slice it: it is work, just not
-    # irreducible work.
     assert padded_sizes[0, plane] >= margin_sizes[0, plane]
 
-    # The gate. Both totals are available to a wrong implementation; only the
-    # live one is correct.
+    # ... and the window the operators actually slice really does reach the
+    # planted row. ``window_start`` is built from the lower boundary alone
+    # (``max(lo - 1, 0)``), which is why the row was planted below an edge:
+    # the two candidate starts -- with the margin and without it -- differ by
+    # exactly one row at this plane, and the plan stores the widened one.
+    # Reconstructing the two *expectations* is unavoidable; the subject of the
+    # assertion is ``plan.window_start``, a stored leaf, so a builder that
+    # dropped ``boundary_margin`` fails here rather than agreeing with a
+    # reference that dropped it too.
+    sorted_w_rel = _w_rel_per_channel(plan, 0)[np.asarray(plan.sort_perm)]
+    centres = np.asarray(plan.w_centers_rel, dtype=np.float64)
+    start_with_margin = np.maximum(
+        np.searchsorted(sorted_w_rel, centres - scale - margin, side="left") - 1, 0
+    )
+    start_without_margin = np.maximum(
+        np.searchsorted(sorted_w_rel, centres - scale, side="left") - 1, 0
+    )
+    assert start_with_margin[plane] == start_without_margin[plane] - 1, (
+        "the planted row does not move this plane's lower boundary, so the "
+        "window_start assertions below cannot tell the margin from its absence"
+    )
+    assert start_with_margin[plane] > 0, (
+        "the planted row is at the very start of the sorted array, where the "
+        "-1 clamp flattens both candidates to 0 and hides the difference"
+    )
+    window_start = np.asarray(plan.window_start)[0]
+    assert np.array_equal(window_start, start_with_margin), (
+        "plan.window_start does not match the margin-widened bounds: the "
+        "builder is not applying boundary_margin"
+    )
+    assert not np.array_equal(window_start, start_without_margin)
+
+    # The gate on the denominator. Both totals are available to a wrong
+    # implementation; only the live one is correct.
     assert plan.live_row_count == int(live_sizes.sum())
     assert plan.live_row_count < int(margin_sizes.sum()) < int(padded_sizes.sum())
     assert plan.window_padding_overhead == pytest.approx(
@@ -860,7 +926,10 @@ def test_calibration_grid_padding_overhead(
     lo, hi = _HIGH_OVERHEAD_RANGE if is_high else _ORDINARY_OVERHEAD_RANGE
     assert lo <= overhead <= hi, f"{overhead:.4f} outside the measured band ({lo}, {hi})"
 
-    # The guard is a guard: no review fixture reaches it at any epsilon.
+    # The guard is a guard: no cell of *this* grid reaches it at any epsilon.
+    # Scoped to the grid deliberately -- other draws of these same fixtures do
+    # cross it, which ``test_auto_picks_survive_the_redefinition_across_seeds``
+    # relies on and issue #34 is about.
     assert overhead < _CPU_PADDING_CUTOFF
 
 

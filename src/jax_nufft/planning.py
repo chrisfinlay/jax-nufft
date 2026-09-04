@@ -198,15 +198,39 @@ class WGridderPlan:
     # insurance clamp hides.
     #
     # ``live_row_count`` is the number of ``(channel, plane, row)`` incidences
-    # with ``|w_lambda - w_k| <= w_kernel_scale``, i.e. the incidences whose
-    # w-kernel weight is nonzero, measured on the *unpadded* support. The
-    # builder then widens every window by ``window_boundary_margin`` and by one
-    # further row at each end; those rows are real work for a windowed
-    # traversal but carry ``phi = 0``, so they belong in the numerator and
-    # never in the denominator. Counting them as irreducible (which
-    # ``max_window_size / window_size.mean()`` did through v0.1.2) understates
-    # the waste by up to 17% on the review fixtures, worst exactly where the
-    # windows are narrowest and the padding is therefore relatively largest.
+    # with ``|w_lambda - w_k| <= w_kernel_scale``: the *nominal* support,
+    # measured on the host, on the unpadded interval. It is deliberately not
+    # an audit of which incidences the operators end up weighting. The device
+    # forms ``z = fl(fl(w - w_k) / S)`` and tests ``|z| <= 1``, from a w that
+    # may differ from the host's by an FMA contraction, so the two counts
+    # disagree a little. Measured over the forty-cell calibration grid: 15 of
+    # the 40 cells disagree at all, never by more than 3 incidences (worst,
+    # MWA_extended off30 at eps 1e-6: 4201 nominal against 4198 that ``phi``
+    # weights) or 0.083% relative, and the float32 leg's ten cells agree
+    # exactly.
+    #
+    # The nominal count is the right quantity here, not a tolerable
+    # approximation of a better one. This is the denominator of a *work*
+    # ratio -- what fraction of a windowed traversal is padding -- so three
+    # incidences in several thousand is far below the resolution at which the
+    # number is read, while an exact kernel-weight audit would cost an
+    # ``(n_w, n_rows)`` evaluation of ``phi`` per channel at plan time to move
+    # a diagnostic's fourth decimal place.
+    #
+    # The builder then widens every window by ``window_boundary_margin`` and
+    # by one further row at each end. Those rows are real work for a windowed
+    # traversal but lie outside nominal support, so they belong in the
+    # numerator and not in the denominator. The two widenings are not outside
+    # it by the same margin, and the comment should not pretend otherwise: a
+    # clamp row is outside by two whole rows and the kernel does ignore it,
+    # whereas a margin row is outside by a few ulps and the kernel may not --
+    # the margin exists precisely because the device might place such a row
+    # inside support. Both are excluded all the same, on the principle that
+    # the denominator is what the host can establish is irreducible. Counting
+    # them as irreducible instead (which ``max_window_size /
+    # window_size.mean()`` did through v0.1.2) understates the waste by up to
+    # 17% on the review fixtures, worst exactly where the windows are
+    # narrowest and the padding is therefore relatively largest.
     #
     # ``empty_plane_count`` is the number of ``(channel, plane)`` pairs with no
     # live rows at all. The ``lo - 1`` / ``hi + 1`` clamp guarantees

@@ -318,10 +318,18 @@ The returned plan also exposes `max_window_size`,
 `window_padding_overhead`, `live_row_count` and `empty_plane_count` for
 callers that want to inspect whether the windowed strategies will be
 efficient on a given uvw distribution. `live_row_count` is the number of
-`(channel, plane, row)` incidences the `w`-kernel gives a nonzero weight, and
-`empty_plane_count` the number of `(channel, plane)` pairs it gives none — a
+`(channel, plane, row)` incidences inside a plane's nominal kernel support
+(`|w - w_k| <= w_kernel_scale`, as the host computes `w`), and
+`empty_plane_count` the number of `(channel, plane)` pairs holding none — a
 long tail of empty planes is the signature of a clumped `w`-distribution, and
 the reason the windowed strategies stop paying on one.
+
+`live_row_count` is a nominal-support count, not a census of the weights the
+operators apply: the device tests `|z| <= 1` on a `w` that may differ from the
+host's by an FMA contraction, so the two disagree on a handful of incidences
+per plan (measured over the review fixtures: at most 3, and at most 0.083%).
+It is the denominator of a work ratio rather than a kernel-weight audit, and a
+disagreement of that size does not reach the precision the ratio is read at.
 
 **Plan memory.** The plan stores nothing per `(channel, row)`: the baselines
 are kept once in metres (`plan.uvw_m`, `(n_rows, 3)`) next to one scalar per
@@ -414,10 +422,10 @@ at which point dense strategies usually win on absolute time.
 The denominator changed in v0.1.3. Through v0.1.2 it was the mean of the
 per-`(channel, plane)` window lengths, which are measured *after* the builder
 widens each window by `window_boundary_margin` and by one further row at each
-end. Those rows are real work but carry `phi = 0` exactly, so counting them as
-irreducible understated the waste — by up to 17% on the review fixtures, worst
-where the windows are narrowest and the padding is therefore relatively
-largest. The two scales are not convertible after the fact: the per-plane
+end. Those rows are real work but lie outside nominal support, so counting
+them as irreducible understated the waste — by up to 17% on the review
+fixtures, worst where the windows are narrowest and the padding is therefore
+relatively largest. The two scales are not convertible after the fact: the per-plane
 window lengths are plan-time locals and were never stored.
 
 #### `w_strategy="auto"` (v0.1.2+, opt-in)

@@ -275,11 +275,21 @@ The windowed strategies rely on a contract between
   `live_row_count` is measured on the **unpadded** support, i.e. from
   a second pair of `searchsorted` calls per channel that see neither
   `boundary_margin` nor the `±1` clamp. That is the whole point: the
-  widened rows are work, so they belong in the numerator, but they
-  carry `phi = 0` exactly, so counting them as irreducible understates
-  the waste. Through v0.1.2 the denominator was the mean of the
-  *padded* window lengths and did exactly that, by up to 17% on the
-  review fixtures. In practice it is the `±1` clamp that the
+  widened rows are work, so they belong in the numerator, but they lie
+  outside nominal support, so counting them as irreducible understates
+  the waste. The two widenings are not outside it equally: a clamp row
+  is outside by two whole rows and the kernel does ignore it, while a
+  margin row is outside by a few ulps and the kernel may not — the
+  margin exists because the device might place such a row inside
+  support. Both are excluded regardless, the denominator being what the
+  host can establish is irreducible. Note also that `live_row_count` is
+  a host-side nominal count, not a census of applied weights: over the
+  calibration grid it differs from a `phi`-weighted count on 15 of 40
+  cells, by at most 3 incidences (0.083%), which is far below the
+  resolution a work ratio is read at. Through v0.1.2 the denominator
+  was the mean of the *padded* window lengths and counted the widening
+  as irreducible, understating the waste by up to 17% on the review
+  fixtures. In practice it is the `±1` clamp that the
   correction removes — `boundary_margin` is a few ulps of the absolute
   w scale and catches a row on twelve of the forty float64 calibration
   cells, one or two rows each; on MWA_extended off30 at eps 1e-3 it

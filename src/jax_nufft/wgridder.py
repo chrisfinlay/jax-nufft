@@ -236,8 +236,15 @@ def _resolve_nthreads(
 #
 # Through v0.1.2 this was a bare ``5.0`` sitting just above the *padded*-scale
 # maximum of the review calibration grid (4.933, MWA_extended off30 at
-# eps 1e-9), so it never actually bound: no fixture reached it, and the branch
+# eps 1e-9), so it never bound on that grid: no cell reached it, and the branch
 # below was exercised only by the stub plans in ``tests/test_auto_strategy.py``.
+# "No cell of the grid" is the honest scope -- the grid is one draw per fixture
+# (``synthetic_uvw(..., seed=0)``), and other draws of the same fixtures do
+# cross both cutoffs. Over seeds 0-11, MWA_extended off30 at eps 1e-3 spans
+# 4.81 to 6.68 on the padded scale and 5.78 to 8.09 on the corrected one,
+# crossing 5.0 and 6.0 respectively on ten of the twelve. The seed sensitivity
+# is issue #34; what matters here is that the two rules agree on all twelve,
+# which ``test_auto_picks_survive_the_redefinition_across_seeds`` pins.
 # Issue #43 moved the denominator onto the live rows, which raises the same
 # grid's maximum to 5.784 in float64 and 5.792 in float32 -- both MWA_extended
 # off30 at eps 1e-3. Left at 5.0 the cutoff would start binding, and the first
@@ -280,8 +287,9 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 
     A high ``window_padding_overhead`` means windowed traversal would
     waste enough cycles on padded plane rows that dense wins;
-    :data:`_CPU_PADDING_CUTOFF` is conservative and no review fixture
-    reaches it.
+    :data:`_CPU_PADDING_CUTOFF` is conservative and no cell of the pinned
+    calibration grid reaches it -- though other random draws of the same
+    fixtures do, so this branch is live in practice rather than dead.
 
     The constant-w fast path collapses ``n_w`` to one, so the
     small-``n_w`` branch always picks ``dense_scan`` there.
