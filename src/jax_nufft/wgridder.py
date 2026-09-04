@@ -135,6 +135,42 @@ def _canonicalise_w_strategy(
 # (largest is GH200_large at 50k rows) and well below workloads where the
 # scan-family per-plane cost would actually amortise the pool spin-up;
 # tunable, and pinned by ``tests/test_nthreads_resolution.py``.
+#
+# This override applies to *every* strategy, including the vmap family, even
+# though the vmap family's steady-state rule (above the cutoff) is
+# `nthreads=0`. That is deliberate, not an oversight: measured directly with
+# the repository's timing protocol (plan + 1 warm-up outside the timer,
+# median of 9 calls, `.block_until_ready()`) at the row counts every fixture
+# in this repo actually uses (400-600 rows, all below this cutoff),
+# `nthreads=0` is *not* uniformly better for the vmap family here:
+#
+#   * `dense_vmap`: `nthreads=0` is faster on MWA_extended off30 (170.5ms vs
+#     384.9ms forward, 289.4ms vs 506.7ms adjoint -- ~1.8-2.3x) and MeerKAT
+#     off30 (12.0ms vs 23.3ms forward, 16.3ms vs 30.3ms adjoint -- ~1.9x),
+#     but `nthreads=1` is faster on EDA2 zenith (1.28ms vs 1.51ms forward,
+#     1.37ms vs 1.68ms adjoint -- small n_w means too little batched work to
+#     amortise a multi-threaded pool spin-up).
+#   * `windowed_vmap` on MWA_extended off30 goes the *other* way entirely:
+#     `nthreads=1` is ~6-7x *faster* than `nthreads=0` (409ms vs 2915ms
+#     forward, 470ms vs 2997ms adjoint). Windowing shrinks each plane's
+#     per-call row count to `max_window_size`, so at this row count the
+#     windowed vmap call is thread-pool-spin-up-bound the same way the scan
+#     family is, not batch-parallelism-bound the way dense_vmap at large n_w
+#     is -- the assumption that "vmap wants threads" turns out to be a
+#     dense_vmap-at-large-n_w statement, not a strategy-family-wide one.
+#
+# Given that split verdict -- and that the worst case of forcing `1` below
+# the cutoff (losing ~2x on dense_vmap at moderate n_w) is far smaller than
+# the worst case of not forcing it (losing ~7x on windowed_vmap) -- the
+# override stays strategy-blind. One consequence worth being explicit about:
+# every fixture currently in this repository has n_rows well below this
+# cutoff, so the vmap-family steady-state branch of ``_resolve_nthreads``
+# (the `else: return 0` below) is never exercised by anything in
+# ``tests/test_benchmark_against_ducc.py`` or the README's benchmark
+# tables -- only by the direct unit tests in
+# ``tests/test_nthreads_resolution.py`` and the JIT-boundary spy tests in
+# ``tests/test_jax_integration.py``, both of which pass a plan built with
+# `n_rows > _NTHREADS_SMALL_N_ROWS` explicitly to reach it.
 _NTHREADS_SMALL_N_ROWS = 100_000
 
 

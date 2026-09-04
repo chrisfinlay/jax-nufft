@@ -6,7 +6,11 @@ JAX-native wgridder for radio interferometric imaging.
 > (sorted-order windowed forward, constant-w fast path, precomputed
 > FINUFFT coords, GPU benchmark suite) plus a third opt-in `w_strategy`
 > value, `"auto"`, which resolves to one of the four canonical
-> strategies via a platform-aware heuristic; defaults are unchanged.
+> strategies via a platform-aware heuristic. One default *has* changed
+> (issue #24, R11/D4): `nthreads` is now `None` by default and resolves,
+> before the JIT boundary, to a strategy-aware thread count instead of the
+> old flat `0` -- see [`nthreads`](#nthreads-issue-24-r11d4) below. Pass an
+> explicit `nthreads=0` to opt back into the pre-#24 behaviour.
 
 ## Overview
 
@@ -287,10 +291,28 @@ call, so `nthreads > 1` just re-spins the whole OpenMP pool on every plane
 measured on a 10-core Apple M-series: MWA_extended off30 3343.6ms vs
 696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith 36.6ms vs 4.3ms), and
 `0` (let FINUFFT decide) for `dense_vmap` / `windowed_vmap` (one batched
-FINUFFT call across all w-planes, which does benefit from threads). Below
-100k rows every strategy gets `1` regardless, since the whole plane loop is
-short enough that spinning up a pool isn't worth it. Pass an explicit `int`
-(including `0`) to opt out of the strategy-aware default.
+FINUFFT call across all w-planes, which benefits from threads at large
+enough `n_w`). Below 100k rows every strategy gets `1` regardless, since the
+whole plane loop is short enough that spinning up a pool isn't worth it.
+Pass an explicit `int` (including `0`) to opt out of the strategy-aware
+default.
+
+**Limitation:** every telescope fixture in this repository has 400-600
+rows, well below the 100k-row cutoff, so on every benchmark and test in
+this repo the small-`n_rows` override applies to *all four* strategies --
+the vmap-family steady-state branch (`nthreads=0` above the cutoff) is
+never exercised by anything measured here, only by unit tests that build a
+plan above the cutoff explicitly. Measured directly at these repo-sized row
+counts (`dense_vmap` / `windowed_vmap`, `nthreads=1` vs `nthreads=0`, same
+timing protocol as above): `dense_vmap` is ~1.8-2.3x faster at `nthreads=0`
+on MWA_extended off30 and MeerKAT off30, but ~1.2x faster at `nthreads=1`
+on EDA2 zenith (too little batched work at that `n_w` to amortise a pool
+spin-up); `windowed_vmap` on MWA_extended off30 is ~6-7x *faster* at
+`nthreads=1` than `nthreads=0` (windowing shrinks each plane's per-call row
+count, so it behaves like the scan family here, not like `dense_vmap` at
+large `n_w`). That split verdict is why the small-`n_rows` override stays
+strategy-blind rather than exempting the vmap family -- see the comment
+above `_NTHREADS_SMALL_N_ROWS` in `wgridder.py` for the full numbers.
 
 ### Strategy options
 
@@ -626,12 +648,20 @@ explicit `nthreads=1` &mdash; not the "single-threaded" comparison the old
 caption claimed. The two tables below give the honest comparison instead:
 one with both sides pinned to the *same* explicit thread count, one with
 both sides left at "let the library decide" (`nthreads=0` passed
-explicitly to both jax and ducc). Neither table uses jax's new
-strategy-aware default (`nthreads=None`, see [above](#nthreads-issue-24-r11d4))
-directly &mdash; that default *resolves to* `nthreads=1` for `dense_scan` /
-`windowed_scan` and `nthreads=0` for `dense_vmap` / `windowed_vmap`, so the
-"matched nthreads=1" table's scan columns and the "nthreads=0" table's vmap
-columns are what the default actually produces per strategy.
+explicitly to both jax and ducc).
+
+Every fixture below has 400-600 rows, far under the 100k-row
+`_NTHREADS_SMALL_N_ROWS` cutoff (see [`nthreads`](#nthreads-issue-24-r11d4)
+above), so jax's new strategy-aware default (`nthreads=None`) resolves to
+`nthreads=1` for *all four* strategies on every problem in these tables,
+vmap included &mdash; the strategy split (`0` for `dense_vmap` /
+`windowed_vmap`) only takes effect above that cutoff, which nothing here
+reaches. **The "matched `nthreads=1`" table below is therefore what
+`dirty2vis` / `vis2dirty` produce today with no `nthreads=` argument at
+all**, across every strategy shown. The "`nthreads=0`" table is an
+explicit opt-out (`nthreads=0` passed by hand) or a preview of the
+vmap-family steady state at larger row counts, not a second flavour of the
+current default.
 
 **Matched threads, jax and ducc both explicit `nthreads=1`**
 
@@ -654,10 +684,11 @@ improvements have the most to bite into):
 | MWA_extended  | 969.7 / 951.9 ms  | 594.2 / 664.5 ms  | 869.6 / 631.9 ms    | 562.4 / 504.0 ms    | 41.0 / 55.1 ms  |
 | MeerKAT       | 49.3 / 81.7 ms    | 32.0 / 56.6 ms    | 53.3 / 83.2 ms      | 35.2 / 64.9 ms      | 12.2 / 15.6 ms  |
 
-**Both sides `nthreads=0`** ("let the library decide" &mdash; this is what
-the scan-family columns looked like pre-#24, since jax's old flat default
-*was* `0`; the vmap-family columns are what jax's new strategy-aware
-default actually produces):
+**Both sides `nthreads=0`** ("let the library decide", passed explicitly on
+both sides &mdash; this is what *every* column looked like pre-#24, since
+jax's old flat default *was* `0`; at the row counts in this table, none of
+it is what jax's new default produces post-#24, including the vmap
+columns, per the small-`n_rows` override explained above):
 
 Zenith pointing:
 
@@ -680,9 +711,10 @@ Zenith pointing:
 The gap between the two tables' scan columns is the effect issue #24
 fixes: `dense_scan` / `windowed_scan` at `nthreads=0` re-spin the whole
 OpenMP pool on every w-plane's FINUFFT call, which is why they are
-6-40x slower than the matched-`nthreads=1` table above on the same
-problem (most dramatically on MWA_extended off30: 3377.8ms at `nthreads=0`
-vs 969.7ms at `nthreads=1`). This is exactly why the strategy-aware
+2.7-13.7x slower than the matched-`nthreads=1` table above on the same
+problem (e.g. MWA_extended off30 dense_scan: 3377.8ms at `nthreads=0` vs
+969.7ms at `nthreads=1`, ~3.5x; the largest gaps are on EDA2, up to 13.7x
+on zenith windowed_scan adjoint). This is exactly why the strategy-aware
 default resolves `dense_scan` / `windowed_scan` to `1`, not `0`.
 
 #### Isolating Part 1 (standard n_w) vs Part 2 (windowed)
