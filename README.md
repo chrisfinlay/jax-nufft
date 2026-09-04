@@ -132,16 +132,36 @@ channel, which is prohibitive. The **wgridder** factorises it into a stack of
 
 1. Discretise the `w` axis into `n_w` planes with centres `w_0, ..., w_{n_w-1}`.
 2. For each plane k, perform a 2D NUFFT in `(u, v)` of the image multiplied by
-   the image-domain w-shift `exp(+2 pi i w_k (n - 1))` and divided by the
-   image-domain kernel correction `phi_hat(scale * (n - 1))`.
+   the image-domain w-shift `exp(+2 pi i w_k (n - 1 + nshift))` and divided by
+   the image-domain kernel correction `phi_hat(scale * (n - 1 + nshift))`.
 3. Multiply each per-plane visibility by the w-direction gridding kernel
    `phi((w_lambda - w_k) / scale)`.
 4. Sum over w-planes.
+5. Multiply each visibility by the compensating phase
+   `exp(-2 pi i w_lambda * nshift)`.
 
 Steps 2-3 implement a discrete approximation of the continuous w-direction
 convolution; step 4 is the inverse NUFFT in w. The kernel `phi` and its
 Fourier transform `phi_hat` are chosen as a matched pair so that the gridding
 correction in image space cancels the kernel apodisation in w-space.
+
+Steps 2 and 5 together are the **`nshift` centring** (ducc's `allow_nshift`).
+The w-phase obeys the exact identity
+
+```
+exp(2 pi i w (n - 1)) = exp(2 pi i w (n - 1 + s)) * exp(-2 pi i w s)
+```
+
+for any constant `s`, and only `max|n - 1|` enters the plane spacing (below).
+Taking `s = nshift = -(max(n-1) + min(n-1)) / 2` centres the shifted range on
+zero, halving `max|n - 1 + s|` for any image containing the phase centre. The
+plane spacing therefore doubles and `n_w_inner` halves &mdash; on the review
+fixtures, MWA_extended at 30 degrees off-zenith goes from 495 to 251 planes at
+`epsilon = 1e-6` &mdash; while the compensating factor in step 5 costs a single
+complex multiply per visibility per call, independent of the plane count. The
+adjoint applies the conjugate factor to its *input* visibilities instead. Note
+the adjoint's `1/n` output factor still uses the physical, *unshifted*
+`n = sqrt(1 - l^2 - m^2)`.
 
 ### Forward operator (`dirty2vis`)
 
@@ -154,10 +174,10 @@ For each channel `c`:
   1. `uvw_lambda = uvw * freq[c] / c`
   2. `u_finufft, v_finufft = 2*pi * uvw_lambda[:, 0:2] * pixsize`
   3. For each w-plane `k`:
-     - `image_k = B[c] * exp(+2 pi i w_k (n - 1)) / phi_hat_n`
+     - `image_k = B[c] * exp(+2 pi i w_k (n - 1 + nshift)) / phi_hat_n`
      - `vis_k = NUFFT2(image_k, u_finufft, v_finufft, iflag = -1, eps = max(epsilon / 10, 1e-14))`
      - `vis_k = vis_k * phi((w_lambda - w_k) / w_kernel_scale)`
-  4. `vis[:, c] = sum over k of vis_k`
+  4. `vis[:, c] = (sum over k of vis_k) * exp(-2 pi i w_lambda * nshift)`
 
 The `(u, v)` NUFFT is asked for `max(epsilon / 10, 1e-14)`, not `epsilon`
 itself (`_nufft_epsilon` in `wgridder.py`): the caller's budget is shared
@@ -183,11 +203,13 @@ shape `(n_chan, n_l, n_m)`:
 For each channel `c`:
 
   1. `uvw_lambda`, `u_finufft`, `v_finufft` as for the forward operator.
-  2. `vis_w = vis[:, c] * weights[:, c]` if weights are provided.
+  2. `vis_w = vis[:, c] * weights[:, c]` if weights are provided, then
+     `vis_w = vis_w * exp(+2 pi i w_lambda * nshift)` &mdash; the conjugate of
+     the forward's step 4, applied to the input rather than the output.
   3. For each w-plane `k`:
      - `vis_k = vis_w * phi((w_lambda - w_k) / w_kernel_scale)`
      - `H_k = NUFFT1((u_finufft, v_finufft), vis_k, image_shape, iflag = +1, eps = max(epsilon / 10, 1e-14))`
-     - `I_k = H_k * exp(-2 pi i w_k (n - 1)) / phi_hat_n`
+     - `I_k = H_k * exp(-2 pi i w_k (n - 1 + nshift)) / phi_hat_n`
   4. `dirty[c] = (sum over k of I_k).real / n`,
      where the `1/n` factor matches ducc's `divide_by_n=True` convention.
 
@@ -218,7 +240,8 @@ Parameters as a function of `epsilon`:
     upsampling factor sigma = 2).
 
 The plane count follows the width directly: `n_w = n_w_inner + W`, so one extra
-plane per unit of `W`. The (u,v) NUFFT is asked for one digit more than the
+plane per unit of `W`; `n_w_inner = ceil(w_extent * max|n - 1 + nshift| / x0)`
+with `x0 = 0.25`, i.e. the `nshift` centring above halves it. The (u,v) NUFFT is asked for one digit more than the
 caller's `epsilon`, so that the error the caller sees is dominated by the
 w-kernel rather than by FINUFFT's own tolerance (which is a target, not a
 bound, and runs 1-3x above `epsilon` on small transforms).
@@ -235,7 +258,8 @@ output, so the grid is refined as `W` grows (see `phi_hat_oversample_for_w`).
 
 The wgridder requires several quantities that depend on `(uvw, freq,
 image_shape, pixsize, epsilon)` but not on the image or visibility values: the
-n-1 grid, the kernel correction, the number of w-planes, the w-plane centres.
+n-1 grid (shifted and unshifted), the kernel correction, the number of
+w-planes, the w-plane centres.
 `make_plan` precomputes those once and returns a `WGridderPlan` &mdash; a frozen
 dataclass registered as a JAX pytree. The actual operators are then JIT-friendly
 functions of `(plan, image)` or `(plan, vis)`:

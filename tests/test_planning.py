@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import jax
 import jax.numpy as jnp
@@ -490,6 +491,31 @@ def test_window_builder_sum_matches_expected() -> None:
     assert total >= plan.n_rows * (W - 1)
 
 
+# Pixel size for test_window_builder_clumped_distribution. The bare 2e-3 this
+# test used before issue #16 is scaled by sqrt(2) so that the *plan geometry*
+# it measures is bit-for-bit the geometry it was written against.
+#
+# Why: nshift halves ``max|n-1|`` -> ``dw = x0 / max|n-1|`` doubles -> the
+# w-window count halves and each window widens. On a 64x64 image
+# ``max|n-1|`` is ``1024 * pixsize^2`` before the shift and ``512 * pixsize^2``
+# after, so ``pixsize * sqrt(2)`` restores the pre-#16 value exactly, giving
+# back the same ``n_w`` (12 clumped / 17 uniform), the same ``window_size``
+# rows, and therefore the same two padding-overhead numbers (1.7137 / 1.6757).
+# Only the sampling resolution is retuned -- the clumped-vs-uniform w geometry
+# that is actually under test is untouched, and the assertion is unchanged.
+#
+# Left at 2e-3 the fixture drops to 3 inner planes with a kernel half-width
+# (344) wider than the whole w extent (295), i.e. every plane sees every row
+# and the clumped/uniform contrast the assertion is about no longer exists.
+# That contrast is in any case not monotone in resolution (measured on this
+# fixture: it holds at inner = 5/10 and at 182/347, but not at 10/19 or
+# 40/76, because ``window_padding_overhead`` excludes empty windows and a
+# well-resolved clumped distribution is all-or-nothing windows with overhead
+# ~1.0). Making this a robust invariant rather than a fixture-specific
+# heuristic is out of scope here; see the note in the issue #16 PR.
+_CLUMPED_PIXSIZE = 2e-3 * math.sqrt(2.0)
+
+
 def test_window_builder_clumped_distribution() -> None:
     """A clumped w-distribution should produce a high padding overhead."""
     rng = np.random.default_rng(2)
@@ -503,10 +529,12 @@ def test_window_builder_clumped_distribution() -> None:
     uvw[:half, 2] = rng.normal(loc=-30.0, scale=0.5, size=half)
     uvw[half:, 2] = rng.normal(loc=+30.0, scale=0.5, size=n_rows - half)
     freq = np.array([1.4e9])
-    plan_clumped = make_plan(uvw, freq, (64, 64), 2e-3, 2e-3, epsilon=1e-6)
+    plan_clumped = make_plan(uvw, freq, (64, 64), _CLUMPED_PIXSIZE, _CLUMPED_PIXSIZE, epsilon=1e-6)
 
     uvw_uniform = rng.uniform(-60.0, 60.0, size=(n_rows, 3))
-    plan_uniform = make_plan(uvw_uniform, freq, (64, 64), 2e-3, 2e-3, epsilon=1e-6)
+    plan_uniform = make_plan(
+        uvw_uniform, freq, (64, 64), _CLUMPED_PIXSIZE, _CLUMPED_PIXSIZE, epsilon=1e-6
+    )
 
     # Padding overhead should be noticeably higher for the clumped case.
     assert plan_clumped.window_padding_overhead > plan_uniform.window_padding_overhead
@@ -530,7 +558,11 @@ def test_plan_sample_consistency() -> None:
     inner = plan.n_w - plan.w_kernel_width
     if inner > 0:
         dw = w_extent / inner
-        max_nm1 = float(np.max(np.abs(np.asarray(plan.n_minus_1))))
+        # issue #16: the plane-spacing denominator is max|n-1+nshift|, i.e.
+        # the *shifted* grid -- reading plan.n_minus_1 here would measure the
+        # pre-nshift quantity and land a factor of ~2 off. Same assertion,
+        # same +/-1 band; only the leaf it is read from moved.
+        max_nm1 = float(np.max(np.abs(np.asarray(plan.n_minus_1_shifted))))
         # Sampling: inner ~ ceil(w_extent * max|nm1| / x0) with the v0.1.1
         # W-independent x0 = W_OVERSAMPLE_X0.
         oversamp_check = w_extent * max_nm1 / W_OVERSAMPLE_X0

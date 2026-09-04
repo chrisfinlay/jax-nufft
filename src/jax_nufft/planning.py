@@ -4,7 +4,8 @@ Planning is a one-shot, *non-traced* preprocessing step that turns
 ``(uvw, freq, image_shape, pixsize, epsilon)`` into:
 
   * static integers (``n_w``, ``w_kernel_width``, image dimensions, ...);
-  * the ``n_minus_1`` grid evaluated on the image;
+  * the ``n_minus_1`` grid evaluated on the image, plus its ``nshift``-centred
+    counterpart ``n_minus_1_shifted`` (issue #16);
   * the ``phi_hat_n`` correction (precomputed via :class:`PhiHatTable`);
   * the w-plane centres in wavelengths;
   * ``uvw_lambda`` for each channel.
@@ -81,6 +82,19 @@ class WGridderPlan:
     pixsize_l: float
     pixsize_m: float
     w_kernel_scale: float  # half-width of the w-direction kernel, in wavelengths
+    # issue #16 n-1 centring offset (ducc's ``allow_nshift`` device), in the
+    # same dimensionless units as ``n - 1``:
+    #
+    #     nshift = -(nm1_max + nm1_min) / 2
+    #
+    # so that ``n_minus_1_shifted = n_minus_1 + nshift`` is centred on zero and
+    # ``max|n-1+nshift|`` -- the denominator of the plane spacing
+    # ``dw = x0 / max|n-1|`` -- is halved for any image containing the phase
+    # centre. Static because it is a plan-shape constant that also appears in
+    # the per-call compensating phase; two plans differing only in ``nshift``
+    # are genuinely different operators and must not share a JIT cache entry.
+    # ``0.0`` on the constant-w fast path -- see ``make_plan``.
+    nshift: float
     # v0.1.1 windowed-scan fields:
     # ``max_window_size`` is the worst-case live-window length across all
     # (channel, plane) pairs; ``window_padding_overhead`` is
@@ -107,6 +121,12 @@ class WGridderPlan:
     uvw_lambda: Array = field()  # (n_chan, n_rows, 3) — input row order
     w_centers: Array = field()  # (n_w,)
     n_minus_1: Array = field()  # (n_l, n_m)
+    # issue #16: ``n_minus_1 + nshift``. This is the grid the per-plane phase
+    # ``exp(2πi w_k (n-1+nshift))`` and the ``phi_hat`` argument
+    # ``eta = (n-1+nshift) * w_kernel_scale`` are evaluated on. ``n_minus_1``
+    # itself stays, and is the *only* thing the adjoint's ``1/n`` output factor
+    # may use -- ``n = n_minus_1 + 1``, not ``n_minus_1_shifted + 1``.
+    n_minus_1_shifted: Array = field()  # (n_l, n_m)
     phi_hat_n: Array = field()  # (n_l, n_m)
     # v0.1.1 windowed-scan support:
     sort_perm: Array = field()  # (n_rows,) int — argsort(uvw[:, 2]) ascending
@@ -138,6 +158,7 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.pixsize_l,
         plan.pixsize_m,
         plan.w_kernel_scale,
+        plan.nshift,
         plan.max_window_size,
         plan.window_padding_overhead,
         plan.w_extent,
@@ -160,6 +181,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         pixsize_l,
         pixsize_m,
         w_kernel_scale,
+        nshift,
         max_window_size,
         window_padding_overhead,
         w_extent,
@@ -171,6 +193,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         uvw_lambda,
         w_centers,
         n_minus_1,
+        n_minus_1_shifted,
         phi_hat_n,
         sort_perm,
         uvw_lambda_sorted,
@@ -191,6 +214,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         pixsize_l=pixsize_l,
         pixsize_m=pixsize_m,
         w_kernel_scale=w_kernel_scale,
+        nshift=nshift,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
         w_extent=w_extent,
@@ -200,6 +224,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         uvw_lambda=uvw_lambda,
         w_centers=w_centers,
         n_minus_1=n_minus_1,
+        n_minus_1_shifted=n_minus_1_shifted,
         phi_hat_n=phi_hat_n,
         sort_perm=sort_perm,
         uvw_lambda_sorted=uvw_lambda_sorted,
@@ -217,6 +242,7 @@ jax.tree_util.register_pytree_node(
             p.uvw_lambda,
             p.w_centers,
             p.n_minus_1,
+            p.n_minus_1_shifted,
             p.phi_hat_n,
             p.sort_perm,
             p.uvw_lambda_sorted,
@@ -425,10 +451,52 @@ def make_plan(
     inside_val = np.sqrt(np.where(inside_disc, 1.0 - eps_lm, 0.0)) - 1.0
     outside_val = -np.sqrt(np.where(inside_disc, 0.0, eps_lm - 1.0)) - 1.0
     n_minus_1_np = np.where(inside_disc, inside_val, outside_val).astype(real_dtype)
-    max_abs_nm1 = float(np.max(np.abs(n_minus_1_np)))
+
+    # --- issue #16: centre the n-1 range (ducc's ``allow_nshift`` device) ---
+    # The w-phase factor obeys the *exact* identity
+    #
+    #     exp(2πi w (n-1)) = exp(2πi w (n-1+s)) · exp(-2πi w s)
+    #
+    # for any constant ``s``. Only ``max|n-1|`` enters the plane spacing
+    # ``dw = x0 / max|n-1|`` (see W_OVERSAMPLE_X0), so picking the ``s`` that
+    # centres the ``n-1`` range on zero,
+    #
+    #     s = nshift = -(nm1_max + nm1_min) / 2,
+    #
+    # replaces ``max(|nm1_max|, |nm1_min|)`` by ``(nm1_max - nm1_min) / 2``.
+    # For any image containing the phase centre ``nm1_max == 0`` exactly (the
+    # centre pixel has n == 1) and ``nm1_min < 0``, so that is exactly half the
+    # old denominator: ``dw`` doubles and ``n_w_inner`` halves. Images that do
+    # not contain the phase centre do strictly better still.
+    #
+    # The extremes are taken over the *whole* grid, including the analytic
+    # extension outside the unit disc (``n-1 = -sqrt(l²+m²-1) - 1 < -1``,
+    # which is what dominates a wide-FoV fixture like EDA2's 120°) -- those
+    # pixels are gridded like any other and their phase has to be represented
+    # just as accurately.
+    #
+    # The price is the compensating factor ``exp(-2πi w nshift)``: a single
+    # per-visibility complex multiply per call, applied to the forward output
+    # and (conjugated) to the adjoint input in wgridder.py. It is *not* a
+    # per-plane cost, which is why halving the plane count is a straight win.
+    #
+    # Note ``w_kernel_scale = dw * W / 2`` doubles alongside ``dw`` while
+    # ``max|n-1+nshift|`` halves, so ``eta_max = max|n-1+nshift| *
+    # w_kernel_scale`` is unchanged and the phi_hat table's conditioning is
+    # exactly as before.
+    nm1_max = float(np.max(n_minus_1_np))
+    nm1_min = float(np.min(n_minus_1_np))
+    nshift = -(nm1_max + nm1_min) / 2.0
+    n_minus_1_shifted_np = (n_minus_1_np + nshift).astype(real_dtype)
+    # Read the plane-spacing denominator off the two extremes rather than
+    # recomputing ``max(abs(n_minus_1_shifted_np))``: it is by construction the
+    # quantity ``nshift`` was chosen to minimise, and taking it from the same
+    # two numbers keeps the two definitions from drifting under rounding.
+    max_abs_nm1 = max(abs(nm1_max + nshift), abs(nm1_min + nshift))
     if max_abs_nm1 == 0.0:
-        # Pathological: a 1x1 image at zenith. Force a tiny but non-zero value
-        # so that downstream ratios are well-defined.
+        # Pathological: a 1x1 image at zenith (nm1_max == nm1_min == 0, so
+        # nshift == 0 too). Force a tiny but non-zero value so that downstream
+        # ratios are well-defined.
         max_abs_nm1 = 1e-12
 
     # --- per-channel uvw in wavelengths ---
@@ -457,6 +525,21 @@ def make_plan(
         # carries no correction (the operator code multiplies by
         # phi((w_lambda-w_k)/scale) = phi(0) = 1, and there is nothing to
         # invert).
+        #
+        # issue #16: this path deliberately takes ``nshift = 0.0``. nshift
+        # exists to shrink ``n_w_inner = ceil(w_extent * max|n-1+nshift| / x0)``,
+        # and here ``n_w`` is pinned at 1 by construction, ``phi_hat_n`` is
+        # ones, and there is a single ``w_centers`` entry -- so it cannot buy
+        # a single plane. It would only add one complex multiply per
+        # visibility per call to the cheapest path in the library. Keeping it
+        # at zero is *internally consistent*, which is the part that matters:
+        # ``n_minus_1_shifted == n_minus_1``, so the plane phase below is the
+        # unshifted one, and the compensating factor in wgridder.py is
+        # exp(0) = 1 (that code skips the multiply entirely when
+        # ``plan.nshift == 0.0``). Shifted phase and compensation are both
+        # off, never one without the other.
+        nshift = 0.0
+        n_minus_1_shifted_np = n_minus_1_np
         w_constant = w_min_all  # = w_max_all by construction
         n_w = 1
         # Any nonzero ``w_kernel_scale`` makes ``z = (w_lambda - w_k)/scale``
@@ -515,7 +598,9 @@ def make_plan(
         # nominal eta_max is x0 * W / 2 = W/8 (W=4 -> 0.5, W=8 -> 1.0,
         # W=10 -> 1.25). We size the phi_hat oversample to keep cubic-Lagrange
         # interpolation accurate on that wider range.
-        eta_n = n_minus_1_np * w_kernel_scale
+        # issue #16: evaluated on the *shifted* grid, because the shifted
+        # phase is what the per-plane kernel sum actually approximates.
+        eta_n = n_minus_1_shifted_np * w_kernel_scale
         eta_max_request = max(float(np.max(np.abs(eta_n))), 1e-9)
         if phi_hat_oversample is None:
             phi_hat_oversample = phi_hat_oversample_for_w(w_kernel_width)
@@ -606,6 +691,7 @@ def make_plan(
         pixsize_l=float(pixsize_l),
         pixsize_m=float(pixsize_m),
         w_kernel_scale=float(w_kernel_scale),
+        nshift=float(nshift),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
         w_extent=float(w_extent),
@@ -619,6 +705,7 @@ def make_plan(
         uvw_lambda=jnp.asarray(uvw_lambda_np),
         w_centers=jnp.asarray(w_centers_np),
         n_minus_1=jnp.asarray(n_minus_1_np),
+        n_minus_1_shifted=jnp.asarray(n_minus_1_shifted_np),
         phi_hat_n=jnp.asarray(phi_hat_n_np),
         sort_perm=jnp.asarray(sort_perm_np),
         uvw_lambda_sorted=jnp.asarray(uvw_lambda_sorted_np),

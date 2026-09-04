@@ -143,7 +143,7 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
 * `make_plan` is host-side (numpy) and returns a `WGridderPlan` — a
   frozen dataclass that's also a registered JAX pytree.
 * Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
-  w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale,
+  w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale, nshift,
   max_window_size, window_padding_overhead, w_extent,
   is_constant_w, real_dtype, complex_dtype`) live in the pytree
   aux_data and become part of the JIT cache key. This list must
@@ -152,10 +152,13 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   `real_dtype` / `complex_dtype` (issue #11) are `np.dtype` objects
   recording the precision requested via `make_plan(dtype=...)`;
   being aux data is what keeps a float32 and a float64 plan on
-  separate JIT cache entries.
+  separate JIT cache entries. `nshift` (issue #16) is the `n-1`
+  centring offset `-(nm1_max + nm1_min) / 2`; it is `0.0` on the
+  constant-w fast path, which cannot benefit from it.
 * Plan **traced fields** (`uvw_lambda, w_centers, n_minus_1,
-  phi_hat_n, sort_perm, uvw_lambda_sorted, window_start,
-  window_size, u_finufft, v_finufft`) are JAX device arrays.
+  n_minus_1_shifted, phi_hat_n, sort_perm, uvw_lambda_sorted,
+  window_start, window_size, u_finufft, v_finufft`) are JAX device
+  arrays.
   `u_finufft` / `v_finufft` are `(n_chan, n_rows)` precomputed
   FINUFFT-input coordinates (`2π · pixsize_* · uvw_lambda[..., axis]`,
   v0.1.2+). They add roughly `2 · n_chan · n_rows · sizeof(real)` to the
@@ -163,6 +166,11 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   arrays since each is now-half the shape). Sorted variants are not
   stored; the windowed helpers gather them via `plan.sort_perm` at
   scan time, trading half the memory for one gather per channel iter.
+  `n_minus_1_shifted` (issue #16) is `n_minus_1 + nshift` and is the
+  grid the per-plane phase and the `phi_hat` argument are evaluated
+  on; `n_minus_1` itself stays, and the adjoint's `1/n` output factor
+  must keep using it (`n = n_minus_1 + 1`) — using the shifted grid
+  there is a silent, test-passing gain error.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and

@@ -456,6 +456,52 @@ def _validate_weights(weights: Array | None, plan: WGridderPlan) -> Array | None
     return _cast_to_plan_dtype(weights, plan, name="weights", target=plan.real_dtype)
 
 
+def _apply_nshift_compensation(
+    vis: Array,
+    w_lambda: Array,
+    plan: WGridderPlan,
+    *,
+    conjugate: bool,
+) -> Array:
+    """Apply issue #16's per-visibility ``nshift`` compensating phase.
+
+    The w-plane loop evaluates its image-domain phase on
+    ``plan.n_minus_1_shifted = n - 1 + nshift`` rather than on ``n - 1``, which
+    is what halves the plane count (see ``planning.make_plan``). The exact
+    identity that licenses the substitution is
+
+        exp(2πi w (n-1)) = exp(2πi w (n-1+nshift)) · exp(-2πi w nshift),
+
+    so what the plane loop computes is the true answer *times*
+    ``exp(+2πi w nshift)``; multiplying by ``exp(-2πi w nshift)`` restores it.
+    That factor depends only on the visibility (through ``w``), never on the
+    pixel or the plane, so it is applied once per visibility per call rather
+    than once per plane: the whole point of the optimisation.
+
+    ``conjugate=False`` is the forward form ``exp(-2πi w nshift)``, applied to
+    the summed **output** visibilities. ``conjugate=True`` is the adjoint form
+    ``exp(+2πi w nshift)``, applied to the **input** visibilities before the
+    plane loop -- the adjoint of a diagonal scaling on the forward's output is
+    the conjugate diagonal on the adjoint's input, which is exactly what keeps
+    ``<A x, y> == <x, A^H y>`` (``tests/test_adjoint.py`` and
+    ``tests/test_nshift.py::test_dot_product_identity_survives_nshift``).
+
+    ``vis`` and ``w_lambda`` must be in the *same* row order; the windowed
+    helpers therefore call this on their w-sorted arrays, before/after the
+    sort_perm round trip rather than across it.
+
+    ``plan.nshift`` is static, so the ``== 0.0`` early-out is a trace-time
+    Python branch: the constant-w fast path (``nshift == 0.0`` by choice, see
+    ``planning.make_plan``) emits no multiply at all.
+    """
+    if plan.nshift == 0.0:
+        return vis
+    two_pi = 2.0 * jnp.pi
+    phase = (two_pi * plan.nshift) * w_lambda
+    sign = 1.0 if conjugate else -1.0
+    return vis * jnp.exp((sign * 1j * phase).astype(vis.dtype))
+
+
 def _channel_forward(
     image_c: Array,
     u_ft_c: Array,
@@ -477,7 +523,9 @@ def _channel_forward(
     n_rows = u_ft_c.shape[0]
 
     def w_plane_contribution(w_k: Array) -> Array:
-        phase = (two_pi * w_k) * plan.n_minus_1  # (n_l, n_m), real
+        # issue #16: the shifted grid, not plan.n_minus_1. The resulting
+        # exp(+2πi w nshift) excess is removed from the *summed* output below.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted  # (n_l, n_m), real
         shift = jnp.exp((1j * phase).astype(cdtype))
         image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
         vis_k = nufft2(
@@ -490,18 +538,21 @@ def _channel_forward(
 
     if w_strategy == "dense_vmap":
         contributions = jax.vmap(w_plane_contribution)(plan.w_centers)
-        return jnp.sum(contributions, axis=0)
-
-    if w_strategy == "dense_scan":
+        vis_c = jnp.sum(contributions, axis=0)
+    elif w_strategy == "dense_scan":
 
         def step(acc: Array, w_k: Array) -> tuple[Array, None]:
             return acc + w_plane_contribution(w_k), None
 
         init = jnp.zeros((n_rows,), dtype=cdtype)
-        result, _ = jax.lax.scan(step, init, plan.w_centers)
-        return result
+        vis_c, _ = jax.lax.scan(step, init, plan.w_centers)
+    else:
+        raise ValueError(f"unknown w_strategy: {w_strategy!r}")
 
-    raise ValueError(f"unknown w_strategy: {w_strategy!r}")
+    # issue #16: once per visibility, *after* the plane loop -- the factor is
+    # common to every plane, so pulling it out of the sum is both cheaper and
+    # exact (the sum is linear in it).
+    return _apply_nshift_compensation(vis_c, w_lambda_c, plan, conjugate=False)
 
 
 def _channel_forward_windowed(
@@ -561,7 +612,8 @@ def _channel_forward_windowed(
         v_k = jax.lax.dynamic_slice(v_sorted, (lo,), (max_window_size,))
         w_k_lambda = jax.lax.dynamic_slice(w_lambda_sorted, (lo,), (max_window_size,))
 
-        phase = (two_pi * w_k) * plan.n_minus_1
+        # issue #16: shifted grid; compensated once per visibility below.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted
         shift = jnp.exp((1j * phase).astype(cdtype))
         image_k = image_c * shift / plan.phi_hat_n.astype(cdtype)
 
@@ -581,7 +633,18 @@ def _channel_forward_windowed(
             return jnp.zeros((n_rows,), dtype=cdtype).at[rows_k].add(contrib)
 
         contributions = jax.vmap(plane_to_full_rows)(window_start_c, plan.w_centers)
-        return jnp.sum(contributions, axis=0)
+        # issue #16: ``plane_to_full_rows`` has already scattered back to
+        # *input* row order, so the compensating phase has to be built from
+        # the input-order w -- the phase and the visibility it multiplies must
+        # share a row order. Recover it from the sorted copy with the inverse
+        # permutation (``sorted[i]`` belongs to input row ``sort_perm[i]``);
+        # that is one (n_rows,) scatter per channel against the loop's n_w
+        # NUFFTs, so it costs nothing and keeps the plan from carrying a
+        # second w array for this path alone.
+        w_lambda_c = jnp.zeros_like(w_lambda_sorted).at[plan.sort_perm].set(w_lambda_sorted)
+        return _apply_nshift_compensation(
+            jnp.sum(contributions, axis=0), w_lambda_c, plan, conjugate=False
+        )
 
     # windowed_scan path: keep the carry in sorted-row order so each plane
     # touches only its (max_window_size,)-sized slice. The per-step
@@ -596,6 +659,10 @@ def _channel_forward_windowed(
 
     vis_sorted_init = jnp.zeros((n_rows,), dtype=cdtype)
     vis_sorted, _ = jax.lax.scan(step, vis_sorted_init, (window_start_c, plan.w_centers))
+    # issue #16: applied here, in sorted-row order, where ``vis_sorted`` and
+    # ``w_lambda_sorted`` already agree -- i.e. before the unsort rather than
+    # across it.
+    vis_sorted = _apply_nshift_compensation(vis_sorted, w_lambda_sorted, plan, conjugate=False)
     # Unsort once: sorted[i] is the contribution for original row sort_perm[i].
     return jnp.empty_like(vis_sorted).at[plan.sort_perm].set(vis_sorted)
 
@@ -616,6 +683,11 @@ def _channel_adjoint(
     two_pi = 2.0 * jnp.pi
     cdtype = vis_c.dtype
 
+    # issue #16: the adjoint of the forward's per-visibility output scaling by
+    # exp(-2πi w nshift) is the conjugate scaling on the *input*, applied once
+    # here rather than inside the plane loop (see _apply_nshift_compensation).
+    vis_c = _apply_nshift_compensation(vis_c, w_lambda_c, plan, conjugate=True)
+
     def w_plane_contribution(w_k: Array) -> Array:
         z = (w_lambda_c - w_k) / plan.w_kernel_scale
         kernel_w = phi(z, plan.beta).astype(cdtype)
@@ -631,8 +703,10 @@ def _channel_adjoint(
             eps=_nufft_epsilon(plan.epsilon),
             opts=opts,
         )
-        # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1)) is its conjugate.
-        phase = (two_pi * w_k) * plan.n_minus_1
+        # Adjoint of the image-domain shift exp(+2 pi i w_k (n-1+nshift)) is
+        # its conjugate; issue #16 evaluates it on the shifted grid, matching
+        # the forward's plane phase exactly.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
 
@@ -827,6 +901,11 @@ def _channel_adjoint_windowed(
     max_window_size = plan.max_window_size
     lo_max = max(plan.n_rows - max_window_size, 0)
 
+    # issue #16: conjugate compensating phase on the input visibilities, once
+    # per visibility before the plane loop. Both arrays are in sorted-row
+    # order here, so no permutation is involved.
+    vis_sorted_c = _apply_nshift_compensation(vis_sorted_c, w_lambda_sorted, plan, conjugate=True)
+
     def plane_to_image(lo_raw: Array, w_k: Array) -> Array:
         lo = jnp.clip(lo_raw, 0, lo_max)
 
@@ -848,7 +927,8 @@ def _channel_adjoint_windowed(
             eps=_nufft_epsilon(plan.epsilon),
             opts=opts,
         )
-        phase = (two_pi * w_k) * plan.n_minus_1
+        # issue #16: shifted grid, matching the forward's plane phase.
+        phase = (two_pi * w_k) * plan.n_minus_1_shifted
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
 
@@ -952,6 +1032,16 @@ def _vis2dirty_jit(
 
     # Apply 1/n on the output (matching ducc's divide_by_n=True), and take
     # the real part to land in real space.
+    #
+    # issue #16: this is ``plan.n_minus_1``, NOT ``plan.n_minus_1_shifted``,
+    # and that is not an oversight. ``nshift`` is a bookkeeping device for the
+    # w-phase only -- it is introduced and removed by an exact identity, and
+    # the operator it defines is still the one whose output is divided by the
+    # *physical* ``n = sqrt(1 - l² - m²)``. Using the shifted grid here would
+    # divide by ``n + nshift``, a smooth per-pixel gain error of tens of
+    # percent that no parity test's epsilon budget would absorb -- but it
+    # would leave the plane count halved and every structural nshift test
+    # green, which is exactly why it gets its own comment.
     n_grid = (plan.n_minus_1 + 1.0).astype(dirty_per_chan.real.dtype)
     safe_n = jnp.where(n_grid > 0.0, n_grid, 1.0)
     return jnp.where(n_grid > 0.0, dirty_per_chan.real / safe_n, 0.0)
