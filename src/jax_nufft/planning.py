@@ -1046,11 +1046,21 @@ def make_plan(
         sort_perm_np = np.arange(n_rows, dtype=np.int32)
         window_start_np = np.zeros((n_chan, 1), dtype=np.int32)
         max_window_size = max(n_rows, 1)
-        # issue #43: the single plane sits exactly on the constant w, so
-        # ``z = 0`` and ``phi(0) = 1`` for every (channel, row) incidence --
-        # all of them are live, none of the window is padding, and the ratio
+        # issue #43: the single plane sits on the constant w, so every
+        # (channel, row) incidence is inside its nominal support -- all of
+        # them are counted, none of the window is padding, and the ratio
         # ``n_chan * 1 * n_rows / (n_chan * n_rows)`` below is exactly 1.0.
-        # This is the one plan shape that attains the lower bound.
+        # Nominal support, as everywhere in this field's definition: the
+        # host's ``w - w_k`` is zero here, but the operators re-derive w in
+        # the JIT and may contract the multiply and the subtraction into one
+        # FMA, so the compiled ``z`` need not be zero (a float32 plan at
+        # constant ``w_m = 1e6`` reaches ``z ~ 0.056``, ``phi ~ 0.986``).
+        # That does not move the count -- ``|z| <= 1`` either way -- which is
+        # the ordinary case for the gap measured on the field above.
+        #
+        # This plan shape attains the lower bound; it is not the only one
+        # that can. A constant-w plan built through the generic branch
+        # (``_force_generic``) attains it too.
         live_row_count = n_chan * n_rows
         # No plane can be empty here: ``_coerce_uvw_freq_dtype`` guarantees
         # ``n_rows >= 1``, and the single plane holds all of them.

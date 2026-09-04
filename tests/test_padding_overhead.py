@@ -467,11 +467,13 @@ def test_accumulators_sum_over_every_channel() -> None:
     assert plan.empty_plane_count == int(per_channel_empty.sum())
 
     # Say it the other way round as well, so a failure names the defect rather
-    # than only the mismatch. Note that the per-channel live *totals* are equal
-    # here (each is ~n_rows * W whatever the channel does with its planes, the
-    # invariant the structural test above rests on), so it is the factor of
-    # n_chan that separates accumulating from assigning for ``live_row_count``;
-    # for ``empty_plane_count`` the per-channel values differ outright.
+    # than only the mismatch. Note that the per-channel live totals are all
+    # close to ``n_rows * W`` whatever the channel does with its planes -- the
+    # invariant the structural test above rests on -- and on some legs they are
+    # equal outright (float32 here gives 2400, 2400, 2400, 2401). So for
+    # ``live_row_count`` it is the factor of n_chan that separates accumulating
+    # from assigning, not a spread between the channels; for
+    # ``empty_plane_count`` the per-channel values differ outright.
     assert plan.live_row_count != int(per_channel_live[-1]), (
         "live_row_count equals the last channel's count alone -- the builder "
         "is assigning where it should accumulate"
