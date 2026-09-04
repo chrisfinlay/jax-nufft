@@ -417,8 +417,10 @@ _EXPECTED_CPU_AUTO_F64: dict[tuple[str, float], tuple[str, str]] = {
 }
 _EXPECTED_CPU_AUTO_F32: dict[tuple[str, float], tuple[str, str]] = {
     # Only EDA2 zenith and MWA_extended zenith differ from the float64 leg:
-    # the narrower float32 kernel (W=5 vs 7) drops n_w / w_kernel_width past
-    # the adjoint's ratio cutoff at those two fixtures.
+    # the kernel width is the *denominator* of the heuristic's ratio, so the
+    # narrower float32 kernel (W=5 against 7) raises n_w / w_kernel_width past
+    # the adjoint's cutoff of 2 at those two fixtures -- 14/7 = 2.0 in float64,
+    # which the strict ``>`` rejects, against 12/5 = 2.4 in float32.
     ("EDA2", 0.0): ("dense_scan", "windowed_scan"),
     ("MWA_compact", 0.0): ("dense_scan", "dense_scan"),
     ("MWA_compact", 30.0): ("dense_scan", "windowed_scan"),

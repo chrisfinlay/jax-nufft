@@ -11,9 +11,11 @@ JAX-native wgridder for radio interferometric imaging.
 > before the JIT boundary, to a strategy-aware thread count instead of the
 > old flat `0` -- see [`nthreads`](#nthreads-issue-24-r11d4) below. Pass an
 > explicit `nthreads=0` to opt back into the pre-#24 behaviour. And
-> `w_strategy` is `"auto"` from v0.1.3 (issue #46), where it was
-> `"dense_scan"` through v0.1.2 -- see [`w_strategy="auto"`](#w_strategyauto-the-default-since-v013)
-> below for what that changes and how to opt back out.
+> `w_strategy` now defaults to `"auto"` (issue #46), where it was
+> `"dense_scan"` through v0.1.2 -- see [`w_strategy="auto"`](#w_strategyauto-the-shipped-default)
+> below for what that changes and how to opt back out. Both of these
+> default changes are unreleased: the version this package reports is
+> still the v0.1.2 line.
 
 ## Overview
 
@@ -408,7 +410,7 @@ the two v0.1 names are kept as deprecated aliases:
 | `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
 | `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
-| `"auto"`          | resolves to one of the above | matches the resolved choice | v0.1.2; the default since v0.1.3. Platform-aware heuristic. |
+| `"auto"`          | resolves to one of the above | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
 
@@ -437,7 +439,7 @@ fixtures, worst where the windows are narrowest and the padding is therefore
 relatively largest. The two scales are not convertible after the fact: the per-plane
 window lengths are plan-time locals and were never stored.
 
-#### `w_strategy="auto"` (the default since v0.1.3)
+#### `w_strategy="auto"` (the shipped default)
 
 `"auto"` resolves to one of the four canonical names before the JIT
 boundary, using `plan.n_w`, `plan.w_kernel_width`,
@@ -477,32 +479,38 @@ by `tests/test_auto_strategy_acceptance.py`, which asserts the picked
 strategy is within 15% of the best measured strategy for every
 (operator, telescope) cell.
 
-##### Why it became the default in v0.1.3 (issue #46)
+##### Why it became the default (issue #46)
 
 Through v0.1.2 both operators defaulted to `"dense_scan"` and `"auto"` was
 opt-in, which meant the heuristic was never reached unless a caller asked
 for it by name. On GPU that made the shipped default the *worst* of the
-four choices. Measured on one NVIDIA GH200 (Daint) against `ducc0` on the
+four choices. (It became the default in the release now in development —
+the version this package reports is still v0.1.2.) Measured on one
+NVIDIA GH200 (Daint) against `ducc0` on the
 72 Grace cores of the same node, at `epsilon = 1e-6`, float64, single
 channel, forward / adjoint milliseconds (median of 9, warm-up outside the
 timer; the two implementations agree to `0.75 * epsilon`, so this is
 like-for-like):
 
-| fixture | `n_w` | ducc0 (72 cores) | `dense_scan` (the old default) | what `"auto"` picks |
+| fixture | `n_w` | ducc0 (72 cores) | `dense_scan` (the old default) | `dense_vmap` |
 |---|---|---|---|---|
 | MWA_extended off30, 256&sup2;, 600 rows | 251 | 89.8 / 91.1 | 501.9 / 331.8 | 30.9 / 14.4 |
 | MeerKAT off30, 256&sup2;, 600 rows | 19 | 17.2 / 17.9 | 39.4 / 26.2 | 4.9 / 3.3 |
 | GH200_large off30, 2048&sup2;, 50k rows | 43 | 67.9 / 184.8 | 160.5 / 159.2 | 47.6 / 78.8 |
+
+The last column is `dense_vmap` throughout, which is what the heuristic
+picks in five of those six cells but *not* in the sixth: on GH200_large
+off30 the adjoint pick is `windowed_vmap`, so `78.8` is not the number a
+defaulting caller gets there. The re-run below has that cell measured on
+the pick the default actually makes.
 
 So the old default ran 1.4-5.6x *slower* than ducc0 on that hardware,
 where what the heuristic picks runs 1.4-6.3x faster: the heuristic was
 never the problem, only its reachability. Re-tuning the thresholds
 themselves is a separate question (issue #34).
 
-That table was measured when #46 was filed, on the v0.1.2 planner. Re-run
-on the same hardware against the v0.1.3 code this default ships with --
-which halves the plane count off-zenith (issue #16) and derives the
-per-channel coordinates in the JIT (issue #23) -- the shipped default
+That table was measured when #46 was filed. Re-run on the same hardware
+against the code this default actually ships with, the shipped default
 against an explicit `dense_scan`, same protocol:
 
 | fixture | `n_w` | `"auto"` resolves to | default | `dense_scan` | speedup |
@@ -511,17 +519,37 @@ against an explicit `dense_scan`, same protocol:
 | MeerKAT off30 | 19 | `dense_vmap` / `dense_vmap` | 4.9 / 3.2 | 40.7 / 26.0 | 8.4x / 8.0x |
 | GH200_large off30 | 43 | `dense_vmap` / `windowed_vmap` | 47.3 / 53.1 | 159.0 / 157.3 | 3.4x / 3.0x |
 
-The picks are the same three the heuristic made in the issue, and the gap
-is wider than it was: the forward on MWA_extended off30 is the cell that
-moved, because the v0.1.3 planner leaves `dense_scan` iterating over
-plane-sequential work that `dense_vmap` batches.
+The picks are the same three the heuristic made in the issue, and the
+`n_w` column is unchanged — 251 / 19 / 43 in both tables, and what the
+current planner still produces on these three fixtures. In particular the
+plane-count halving described under *The wgridder algorithm* above (495
+&rarr; 251 on MWA_extended off30, issue #16) is already reflected in the
+issue's own table, so it is not something that separates these two runs.
+
+One cell of the six shifted between the two runs: the `dense_scan`
+forward on MWA_extended off30 read 653.6 ms against the issue's 501.9 ms,
+30% slower. The other five reproduced within 3.3%, the adjoint on that
+same fixture at the same `n_w` among them (333.9 against 331.8, 0.6%).
+The cause was not isolated. A single shifted cell on a shared-node GPU
+benchmark is at least as consistent with run-to-run variance as with any
+code change, and there is no same-node A/B of the two revisions on this
+branch to separate the two explanations — so the honest statement is that
+the gap is wider on this run, not that some particular change widened it.
+What does not depend on that cell: in all six of the re-run's cells the
+default beats `dense_scan` by 3x or more, and the smallest margin (3.0x,
+the GH200_large adjoint) is one the shifted cell has no part in.
 
 On CPU the change is much smaller, and it is not nothing. The forward is
 untouched — the CPU heuristic never picks a windowed forward, so it
 resolves to `dense_scan` on every fixture in this repository, exactly the
 old default. The adjoint does move: at off-zenith pointings the heuristic
-picks `windowed_scan`, which is the 1.05-1.53x win v0.1.1 Part 2 was
-measured at. Timed on a 10-core Apple M-series at `epsilon = 1e-6`,
+picks `windowed_scan`. That is the strategy v0.1.1 Part 2 measured its
+1.05-1.53x adjoint win on, and that range does not reproduce on current
+code: its two endpoints are MWA_compact off30 (1.53x) and MeerKAT off30
+(1.05x) in the *Part 2 only* column of the v0.1.1 table below, and both
+now come out flat. Only MWA_extended off30, 1.19x then, still shows a win.
+
+Timed on a 10-core Apple M-series at `epsilon = 1e-6`,
 float64, single channel, with the plan built and warm-ups taken outside
 the timed window and each number the median of 9 `block_until_ready()`
 calls over five interleaved rounds, the new default against an explicit
@@ -536,30 +564,46 @@ calls over five interleaved rounds, the new default against an explicit
 | MWA_extended zenith | 14 | 0.99x (both `dense_scan`) | 1.01x (both `dense_scan`) |
 
 The cells where both arms run the same strategy are controls, and they
-bracket this machine's noise floor at about &plusmn;4%. The MWA_extended
-off30 adjoint is given as a range because it was the one cell measured
-twice: 1.24x over five rounds and 1.14x over a second, nine-round pass in
-which the windowed arm was faster in every single round. Read against the
-noise floor, it is the only cell showing a real adjoint win; the other two
-off-zenith adjoints change strategy but land within noise, their `n_w`
-being under 20. Nothing measured slower than the old default. In float32
-the picture is the same with two more fixtures crossing over to
+bracket this machine's noise floor at about &plusmn;4%.
+
+The three strategy-changing cells were then re-measured in a second,
+nine-round paired pass: MWA_extended off30 1.14x (301.3 ms against
+344.0 ms, with the windowed arm faster in every one of the nine rounds),
+MWA_compact off30 1.01x, MeerKAT off30 0.99x. That is why MWA_extended
+off30 carries a range; the other two reproduce their first-pass verdict.
+Read against the noise floor, MWA_extended off30 is the only cell showing
+a real adjoint win — the other two change strategy but land inside the
+floor, their `n_w` being under 20. Nothing measured slower than the old
+default *outside* that floor: the worst cell is the MeerKAT off30 adjoint
+at 0.99x, 24.96 ms against 24.72 ms, and it is a strategy-changing cell
+rather than a control, so it is a real 1% that happens to be smaller than
+this machine can resolve — not a demonstrated tie.
+
+In float32 the picture is the same with two more fixtures crossing over to
 `windowed_scan` on the adjoint (EDA2 zenith and MWA_extended zenith): the
 narrower float32 kernel, `W = 5` against `W = 7`, pushes `n_w /
 w_kernel_width` past the cutoff there.
 
 **Backward compatibility.** `w_strategy="dense_scan"` restores the
-pre-v0.1.3 behaviour on both operators. What changing the default does
-*not* preserve is bit-identical output across versions: the four
-strategies accumulate the w-planes in a different order, so they agree to
-the strategy-equivalence bound that `tests/test_strategies_equivalent.py`
-pins — `1e-11` relative in float64 — and not to the last bit. In practice
-the gap is far smaller than that bound: on the three GH200 fixtures above,
-the default and `dense_scan` agree to `5e-16` relative, i.e. to float64
-rounding. The `1e-11` is what is *guaranteed*, not what is typical. Code
-that needs exactly reproducible numbers across this version boundary
-should still name its `w_strategy` explicitly rather than take the
-default.
+pre-#46 *code path* on both operators: the same strategy, so the same
+reduction order. What it does not restore is the pre-#46 *numbers*,
+because this release carries more than #46. #16, #23 and #43 also landed
+in it, and #16 moved the numbers on its own — the worst cell against the
+exact DFT went from `0.67 * epsilon` to `1.47 * epsilon` after its
+`nshift` centring (see *Accuracy expectation* below). Pinning
+`w_strategy` therefore removes the strategy change from the comparison
+and nothing else; it is not a way to reproduce v0.1.2 output.
+
+Scoped to the strategy change alone, what is promised is that the four
+strategies accumulate the w-planes in a different order but agree to the
+bound `tests/test_strategies_equivalent.py` pins — `1e-11` relative in
+float64 — rather than to the last bit. In practice the gap is far
+smaller: on the three GH200 fixtures above, the default and `dense_scan`
+agree to `5e-16` relative, i.e. to float64 rounding. The `1e-11` is what
+is *guaranteed*, not what is typical. Code that needs bit-identical
+output from one run to the next on one build should name its
+`w_strategy`; code that needs it across releases needs the release
+pinned, not the strategy.
 
 ### Accuracy expectation
 

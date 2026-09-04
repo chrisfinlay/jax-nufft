@@ -956,7 +956,7 @@ def dirty2vis(
         ``plan.complex_dtype`` is cast up to it, a wider one raises
         ``TypeError`` (issue #11).
     w_strategy:
-        ``"auto"`` (the default since v0.1.3, issue #46) resolves to one of
+        ``"auto"`` (the shipped default since issue #46) resolves to one of
         the four canonical names before the JIT boundary via
         :func:`_auto_w_strategy` -- so cache sharing is preserved, and see
         that helper's docstring for the heuristic itself. The canonical
@@ -973,13 +973,20 @@ def dirty2vis(
         72 Grace cores of the same node (eps 1e-6, float64, single
         channel), ``dense_scan`` runs 1.4-5.6x *slower* than ducc0 on the
         fixtures of issue #46, where what ``"auto"`` picks there runs
-        1.4-6.3x faster. Passing ``w_strategy="dense_scan"`` restores the
-        pre-v0.1.3 behaviour. Note that the strategies agree to the
-        strategy-equivalence bound (1e-11 in float64,
-        ``tests/test_strategies_equivalent.py``) and not bit-for-bit --
-        they accumulate the w-planes in a different order -- so output
-        that is exactly reproducible across this version boundary needs an
-        explicit ``w_strategy``.
+        1.4-6.3x faster.
+
+        Passing ``w_strategy="dense_scan"`` restores the pre-#46 *code
+        path*: the same strategy, so the same reduction order. It does not
+        restore the pre-#46 *numbers*, because the release carrying #46
+        also carries #16, #23 and #43, and #16's ``nshift`` centring moved
+        the numbers on its own (the worst cell against the exact DFT went
+        from 0.67x to 1.47x ``epsilon``). Scoped to the strategy change
+        alone, the four strategies accumulate the w-planes in a different
+        order and so agree to the strategy-equivalence bound (1e-11 in
+        float64, ``tests/test_strategies_equivalent.py``) rather than
+        bit-for-bit. Pinning ``w_strategy`` removes the strategy from a
+        cross-version comparison and nothing else; reproducing an older
+        release's output needs that release pinned.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"`` for the channel loop.
     nthreads:
@@ -1225,11 +1232,12 @@ def vis2dirty(
         array is rejected with ``TypeError`` rather than silently losing its
         imaginary part.
     w_strategy:
-        ``"auto"`` (the default since v0.1.3, issue #46), ``"dense_scan"``,
+        ``"auto"`` (the shipped default since issue #46), ``"dense_scan"``,
         ``"dense_vmap"``, ``"windowed_scan"`` or ``"windowed_vmap"``; same
         semantics as in :func:`dirty2vis`, including that an explicit name
-        overrides the heuristic, that ``"dense_scan"`` restores the
-        pre-v0.1.3 default, and that the strategies agree to 1e-11 in
+        overrides the heuristic, that ``"dense_scan"`` restores the pre-#46
+        code path but not the pre-#46 numbers (other changes in the same
+        release moved those), and that the strategies agree to 1e-11 in
         float64 rather than bit-for-bit. The bare names ``"scan"`` /
         ``"vmap"`` are accepted as deprecated aliases.
 

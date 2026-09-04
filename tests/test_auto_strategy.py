@@ -88,6 +88,35 @@ def test_cpu_small_n_w_picks_dense_scan(is_adjoint: bool) -> None:
     assert _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint) == "dense_scan"
 
 
+def test_cpu_small_n_w_gate_stops_at_plus_two() -> None:
+    """The small-``n_w`` gate is ``n_w <= w_kernel_width + 2``, and the
+    ``+ 2`` is load-bearing: at ``+ 3`` the adjoint must already be out of
+    the gate and free to pick ``windowed_scan``.
+
+    The case above pins the inside of the gate but not its edge, because at
+    the stub's default ``w_kernel_width=8`` the two are indistinguishable:
+    ``n_w = 11`` clears a ``+ 2`` gate only to fail the ratio test
+    (``11 / 8 = 1.375``, not ``> 2``) and land on ``dense_scan`` anyway. The
+    gate's width is observable only where the ratio test would *pass*, which
+    needs ``w_kernel_width + 3 > 2 * w_kernel_width``, i.e. ``W < 3``.
+
+    ``W = 2`` is not a contrived value: ``kernel_params(1e-1)`` returns
+    width 2, so this is the regime a real plan at a very loose ``epsilon``
+    lands in. At ``W = 2, n_w = 5`` the ratio is ``2.5 > 2``, so the adjoint
+    pick is ``windowed_scan`` -- and a gate widened by one to ``+ 3`` would
+    swallow it and return ``dense_scan`` instead. Without this case that
+    off-by-one passes the whole suite.
+    """
+    plan = _stub_plan(n_w=5, w_kernel_width=2, window_padding_overhead=1.0)
+    assert plan.n_w == plan.w_kernel_width + 3  # sanity: one past the gate
+    assert plan.n_w / plan.w_kernel_width > 2.0  # sanity: the ratio test passes
+    assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "windowed_scan"
+    # The forward has no windowed win to claim at any n_w, so it stays dense
+    # either side of the gate; asserted so this case does not read as if the
+    # gate were the only thing keeping it there.
+    assert _auto_w_strategy_cpu(plan, is_adjoint=False) == "dense_scan"
+
+
 @pytest.mark.parametrize("is_adjoint", [False, True])
 def test_cpu_constant_w_fast_path_picks_dense_scan(is_adjoint: bool) -> None:
     """The constant-w fast path collapses ``n_w`` to one; that case must

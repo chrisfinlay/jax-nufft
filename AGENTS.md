@@ -316,7 +316,7 @@ If you touch any of these, run `tests/test_planning.py` and
 
 | `w_strategy`      | Per-plane work          | Peak transient memory       | Notes                                          |
 |-------------------|-------------------------|-----------------------------|------------------------------------------------|
-| `auto`            | resolves to one below   | matches the resolved choice | **Default since v0.1.3** (issue #46). Platform-aware heuristic. |
+| `auto`            | resolves to one below   | matches the resolved choice | **The shipped default** (issue #46). Platform-aware heuristic. |
 | `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
 | `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
 | `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
@@ -328,7 +328,8 @@ the JIT boundary, so the static arg reaching `_dirty2vis_jit` /
 caller shares a JIT cache entry with the explicit equivalent. An explicit
 `w_strategy` is passed through untouched and overrides the heuristic.
 
-It became the default in v0.1.3 because until then it was unreachable
+It became the default (issue #46; unreleased — the version the package
+reports is still the v0.1.2 line) because until then it was unreachable
 unless asked for by name, which left the GPU default on the worst of the
 four choices: on one GH200, against ducc0 on the 72 Grace cores of the
 same node, `dense_scan` runs 1.4-5.6x slower than ducc0 where what the
@@ -342,15 +343,25 @@ faster on MWA_extended off30 and within a ±4% noise floor on MWA_compact
 off30 and MeerKAT off30, whose `n_w` is under 20; the zenith fixtures keep
 `dense_scan` in float64 and cross over in float32, where the narrower
 `W = 5` kernel raises `n_w / w_kernel_width` past the cutoff. Nothing
-measured slower. Two consequences to keep in mind when changing anything
-here: retuning the heuristic now moves the *shipped* default, so
+measured slower outside that noise floor — the worst cell is the MeerKAT
+off30 adjoint at 0.99x, which is a strategy-changing cell rather than a
+control, so it is a real 1% too small for this machine to resolve rather
+than a demonstrated tie. Note also that the 1.05-1.53x range in section 9
+does not reproduce: its endpoints are MWA_compact off30 and MeerKAT off30,
+the two cells now measured flat.
+
+Two consequences to keep in mind when changing anything here. Retuning the
+heuristic now moves the *shipped* default, so
 `tests/test_default_w_strategy.py` pins the resolved pick for every CPU
-fixture as a literal table that a retune has to edit deliberately; and
+fixture as a literal table that a retune has to edit deliberately. And
 because the strategies differ in w-plane accumulation order, they agree
 only to the 1e-11 strategy-equivalence bound
-(`tests/test_strategies_equivalent.py`), so this change does not preserve
-bit-identical output across the version boundary. `w_strategy="dense_scan"`
-restores the pre-v0.1.3 behaviour.
+(`tests/test_strategies_equivalent.py`) rather than bit-for-bit.
+`w_strategy="dense_scan"` restores the pre-#46 *code path*; it does not
+restore pre-#46 *numbers*, since #16, #23 and #43 land in the same release
+and #16's `nshift` centring moved the DFT worst cell from 0.67x to 1.47x
+`eps` on its own (section 9's accuracy table). Reproducing an older
+release's output needs that release pinned, not the strategy.
 
 The v0.1 names `"scan"` / `"vmap"` are accepted as deprecated aliases
 that emit `DeprecationWarning` and resolve to their `dense_*`
