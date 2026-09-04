@@ -231,6 +231,34 @@ def _resolve_nthreads(
     return 0
 
 
+# The CPU windowed/dense cutoff on ``plan.window_padding_overhead``, named
+# rather than inlined since issue #43 moved the scale it is stated on.
+#
+# Through v0.1.2 this was a bare ``5.0`` sitting just above the *padded*-scale
+# maximum of the review calibration grid (4.933, MWA_extended off30 at
+# eps 1e-9), so it never actually bound: no fixture reached it, and the branch
+# below was exercised only by the stub plans in ``tests/test_auto_strategy.py``.
+# Issue #43 moved the denominator onto the live rows, which raises the same
+# grid's maximum to 5.784 in float64 and 5.792 in float32 -- both MWA_extended
+# off30 at eps 1e-3. Left at 5.0 the cutoff would start binding, and the first
+# thing it would catch is the four MWA_extended off30 adjoint cells, flipping
+# them from ``windowed_scan`` to ``dense_scan`` against the measured CPU win
+# recorded in AGENTS.md section 9. The metric changed; the measurements did
+# not, so the cutoff has to move with it.
+#
+# 6.0 is the smallest round value that clears the grid, and it is also where
+# carrying the old cutoff across the change of scale lands: the worst
+# padded-to-live inflation on the grid is 5.7843 / 4.8089 = 1.2028 (1.2043 on
+# the float32 leg), and 5.0 * 1.2028 = 6.014. So it is not a fresh calibration
+# -- it is the same 5.0, restated on the denominator that replaced the one it
+# was written against. It sits 3.7% above the worst fixture where 5.0 sat 1.4%
+# above the worst on the old scale, i.e. slightly the more permissive of the
+# two; that direction is the safe one here, since crossing this cutoff can only
+# take a plan off ``windowed_scan``, which AGENTS.md section 9 measures as the
+# CPU win on exactly the fixtures that approach it.
+_CPU_PADDING_CUTOFF = 6.0
+
+
 def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     """CPU-tuned heuristic from ``docs/v0.1.2-plan.md`` Part 4.
 
@@ -242,15 +270,16 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
         algorithm, so we never auto-pick a windowed forward.
 
     A high ``window_padding_overhead`` means windowed traversal would
-    waste enough cycles on padded plane rows that dense wins -- the 5x
-    cutoff is conservative.
+    waste enough cycles on padded plane rows that dense wins;
+    :data:`_CPU_PADDING_CUTOFF` is conservative and no review fixture
+    reaches it.
 
     The constant-w fast path collapses ``n_w`` to one, so the
     small-``n_w`` branch always picks ``dense_scan`` there.
     """
     if plan.n_w <= plan.w_kernel_width + 2:
         return "dense_scan"
-    if plan.window_padding_overhead > 5.0:
+    if plan.window_padding_overhead > _CPU_PADDING_CUTOFF:
         return "dense_scan"
     if is_adjoint and plan.n_w / plan.w_kernel_width > 2.0:
         return "windowed_scan"
@@ -263,6 +292,17 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 # work); the windowed_vmap wins only on the GH200_large (50k-row)
 # fixture where dense_vmap's per-plane n_rows*W^2 starts to bite.
 _GPU_LARGE_N_ROWS = 10_000
+# Unmoved by issue #43, unlike ``_CPU_PADDING_CUTOFF`` above -- and that is a
+# measurement, not an omission. The redefinition raises every cell's overhead
+# (by under 0.1% where the windows are wide, by up to 20% where they are
+# narrow),
+# but 3.0 happens to sit in a gap no cell crosses: over the whole calibration
+# grid the nearest below it reads 2.906 after the change (EDA2 off30 at
+# eps 1e-3, up from 2.599, the largest shift of any cell near the cutoff) and
+# the nearest above reads 3.050 (MWA_compact off30 at eps 1e-3, up from 3.026).
+# Every cell keeps the side it was on, on both precision legs, so the GH200
+# sweep this number was fitted to still resolves to the same strategy in all 20
+# of its cells and there is nothing to recalibrate.
 _GPU_PADDING_CUTOFF = 3.0
 _GPU_FORWARD_RATIO_CUTOFF = 3.0
 

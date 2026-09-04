@@ -144,7 +144,8 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   frozen dataclass that's also a registered JAX pytree.
 * Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
   w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale, nshift, w0,
-  max_window_size, window_padding_overhead, w_extent,
+  max_window_size, window_padding_overhead, live_row_count,
+  empty_plane_count, w_extent,
   is_constant_w, real_dtype, complex_dtype`) live in the pytree
   aux_data and become part of the JIT cache key. This list must
   match `_plan_aux` in `planning.py` exactly — drift here is the
@@ -199,6 +200,12 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   test still passed. `window_size` was removed outright with no
   accessor: it was diagnostic-only, feeding the (static)
   `max_window_size` and `window_padding_overhead` at plan time.
+  Issue #43 added `live_row_count` and `empty_plane_count` to that
+  diagnostic and kept them **scalars** for the same reason — two static
+  ints is the whole budget, and reintroducing a `(n_chan, n_w)` array
+  in any form would undo #23. `tests/test_planning.py` pins the leaf
+  set at eight entries, which is what makes that a checked constraint
+  rather than an intention.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and
@@ -261,6 +268,26 @@ The windowed strategies rely on a contract between
   computed from the widened windows above, so it already carries the
   two extra rows. The per-window lengths themselves are plan-time
   locals, not a leaf (issue #23 removed `window_size`).
+* `plan.window_padding_overhead` is `n_chan * n_w * max_window_size /
+  plan.live_row_count` (issue #43): the row-work a windowed traversal
+  actually does — every `(channel, plane)` step slices a *static*
+  `max_window_size` rows — over the row-work it cannot avoid.
+  `live_row_count` is measured on the **unpadded** support, i.e. from
+  a second pair of `searchsorted` calls per channel that see neither
+  `boundary_margin` nor the `±1` clamp. That is the whole point: the
+  widened rows are work, so they belong in the numerator, but they
+  carry `phi = 0` exactly, so counting them as irreducible understates
+  the waste. Through v0.1.2 the denominator was the mean of the
+  *padded* window lengths and did exactly that, by up to 17% on the
+  review fixtures. In practice it is the `±1` clamp that the
+  correction removes — `boundary_margin` is a few ulps of the absolute
+  w scale and catches a row on only nine of the forty calibration
+  cells, one or two rows each; on MWA_extended off30 the entire
+  487-row gap is the clamp (`2 · n_w = 496`, less end-clipping). The
+  clamp is also why `empty_plane_count` has to be measured here rather
+  than inferred downstream: it guarantees `window_size >= 1`, so a
+  plane holding no rows is otherwise indistinguishable from one
+  holding a single row.
 
 If you touch any of these, run `tests/test_planning.py` and
 `tests/test_boundary_planes.py` to confirm the contract still holds.

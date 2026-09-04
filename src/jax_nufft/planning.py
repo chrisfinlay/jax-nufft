@@ -183,11 +183,44 @@ class WGridderPlan:
     # so it belongs in the JIT cache key.
     w0: float
     # v0.1.1 windowed-scan fields:
-    # ``max_window_size`` is the worst-case live-window length across all
-    # (channel, plane) pairs; ``window_padding_overhead`` is
-    # ``max_window_size / mean_window_size`` and is purely diagnostic.
+    # ``max_window_size`` is the worst-case window length across all
+    # (channel, plane) pairs -- the static slice length every windowed
+    # strategy pays per plane. ``window_padding_overhead`` is the factor by
+    # which that traversal exceeds the irreducible row-work,
+    #
+    #     n_chan * n_w * max_window_size / live_row_count
+    #
+    # and is purely diagnostic (it gates the ``auto`` strategy choice in
+    # ``wgridder._auto_w_strategy_*`` and nothing else).
     max_window_size: int
     window_padding_overhead: float
+    # issue #43: the denominator above, and the emptiness the window builder's
+    # insurance clamp hides.
+    #
+    # ``live_row_count`` is the number of ``(channel, plane, row)`` incidences
+    # with ``|w_lambda - w_k| <= w_kernel_scale``, i.e. the incidences whose
+    # w-kernel weight is nonzero, measured on the *unpadded* support. The
+    # builder then widens every window by ``window_boundary_margin`` and by one
+    # further row at each end; those rows are real work for a windowed
+    # traversal but carry ``phi = 0``, so they belong in the numerator and
+    # never in the denominator. Counting them as irreducible (which
+    # ``max_window_size / window_size.mean()`` did through v0.1.2) understates
+    # the waste by up to 17% on the review fixtures, worst exactly where the
+    # windows are narrowest and the padding is therefore relatively largest.
+    #
+    # ``empty_plane_count`` is the number of ``(channel, plane)`` pairs with no
+    # live rows at all. The ``lo - 1`` / ``hi + 1`` clamp guarantees
+    # ``window_size >= 1``, so downstream of it a plane holding nothing is
+    # indistinguishable from one holding a single row; this makes it visible.
+    #
+    # Both are scalars, and deliberately so: issue #23 removed the
+    # ``(n_chan, n_w)`` ``window_size`` leaf to cut plan memory (3.9 GB to
+    # 31 MB on a 64-channel, 1M-row plan) and nothing here may bring a
+    # per-(channel, plane) array back. Static for the same reason the two
+    # fields above are -- they are plan-shape constants that feed a strategy
+    # choice made before tracing.
+    live_row_count: int
+    empty_plane_count: int
     # v0.1.2 w-degeneracy metadata:
     # ``w_extent`` is ``max(w_lambda) - min(w_lambda)`` over all channels (in
     # wavelengths); ``is_constant_w`` is True iff ``w_extent == 0.0`` exactly.
@@ -375,6 +408,8 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.w0,
         plan.max_window_size,
         plan.window_padding_overhead,
+        plan.live_row_count,
+        plan.empty_plane_count,
         plan.w_extent,
         plan.is_constant_w,
         plan.real_dtype,
@@ -399,6 +434,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0,
         max_window_size,
         window_padding_overhead,
+        live_row_count,
+        empty_plane_count,
         w_extent,
         is_constant_w,
         real_dtype,
@@ -430,6 +467,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0=w0,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
+        live_row_count=live_row_count,
+        empty_plane_count=empty_plane_count,
         w_extent=w_extent,
         is_constant_w=is_constant_w,
         real_dtype=real_dtype,
@@ -957,6 +996,16 @@ def make_plan(
         sort_perm_np = np.arange(n_rows, dtype=np.int32)
         window_start_np = np.zeros((n_chan, 1), dtype=np.int32)
         max_window_size = max(n_rows, 1)
+        # issue #43: the single plane sits exactly on the constant w, so
+        # ``z = 0`` and ``phi(0) = 1`` for every (channel, row) incidence --
+        # all of them are live, none of the window is padding, and the ratio
+        # ``n_chan * 1 * n_rows / (n_chan * n_rows)`` below is exactly 1.0.
+        # This is the one plan shape that attains the lower bound.
+        live_row_count = n_chan * n_rows
+        # A zero-row plan has one plane per channel and nothing in it. The
+        # ratio has no meaning there; the ``1.0`` below is the same
+        # no-padding-measured convention the generic branch uses.
+        empty_plane_count = n_chan if n_rows == 0 else 0
         window_padding_overhead = 1.0
     else:
         # --- number of w-planes ---
@@ -1056,6 +1105,12 @@ def make_plan(
         # no operator path ever read it -- so since issue #23 it is a local,
         # not a leaf.
         window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
+        # issue #43: the denominator of ``window_padding_overhead``, and the
+        # emptiness count, are accumulated as Python scalars across the channel
+        # loop rather than into a second ``(n_chan, n_w)`` array -- same reason
+        # ``window_size`` above is a local and not a leaf, one step further.
+        live_row_count = 0
+        empty_plane_count = 0
         half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
 
         # The widening that makes the windowed-vs-dense invariant hold by
@@ -1095,6 +1150,27 @@ def make_plan(
             # the rows an FMA would move across the edge as well.
             lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw - boundary_margin, "left")
             hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw + boundary_margin, "right")
+            # issue #43: the same two boundaries WITHOUT the margin, taken
+            # before the clamp below widens them -- the rows that actually
+            # carry a nonzero ``phi``. Two more binary searches per channel,
+            # so the builder stays O(n_chan * n_w * log n_rows) and still
+            # never materialises anything of shape (n_chan, n_rows).
+            #
+            # In practice the clamp is what this removes. ``boundary_margin``
+            # is a few ulps of the absolute w scale, so it almost never has a
+            # row to catch: measured over the forty-cell calibration grid it
+            # adds one or two rows on nine cells and none on the other
+            # thirty-one -- on MWA_extended off30 at eps 1e-3, the worst
+            # fixture, the whole 487-row live-vs-padded gap is the clamp
+            # (2 * n_w = 496, less end-clipping). The margin is excluded on
+            # principle all the same: a margin row is one the *device* might
+            # place inside support under FMA contraction, not one the kernel
+            # gives weight.
+            live_lo = np.searchsorted(w_lambda_c, w_centers64 - half_W_dw, "left")
+            live_hi = np.searchsorted(w_lambda_c, w_centers64 + half_W_dw, "right")
+            live_sizes_c = live_hi - live_lo
+            live_row_count += int(live_sizes_c.sum())
+            empty_plane_count += int(np.count_nonzero(live_sizes_c == 0))
             # One more row at each end, clamped into range. Redundant while the
             # margin above is correct -- see its derivation -- and kept as cheap
             # insurance against that derivation, for two rows on a slice sized
@@ -1105,13 +1181,26 @@ def make_plan(
             window_size_np[c] = (hi - lo).astype(np.int32)
 
         max_window_size = int(window_size_np.max(initial=0))
-        # mean_window_size: ignore empty windows (entirely outside data range)
-        # so that the diagnostic isn't dominated by edge planes.
-        nonzero_windows = window_size_np[window_size_np > 0]
-        if nonzero_windows.size:
-            mean_window_size = float(nonzero_windows.mean())
-            window_padding_overhead = max_window_size / mean_window_size
+        # --- padding overhead: windowed row-work over irreducible row-work ---
+        #
+        # Every (channel, plane) step slices a *static* ``max_window_size``
+        # rows out of the w-sorted array -- the shape has to be static for
+        # ``lax.scan`` / ``vmap`` -- so a windowed traversal touches
+        # ``n_chan * n_w * max_window_size`` rows however narrow the individual
+        # windows are. ``live_row_count`` is how many of those carry weight.
+        #
+        # Through v0.1.2 this was ``max_window_size`` over the mean of the
+        # nonzero ``window_size``, which measured the widest window against the
+        # average *padded* one. That denominator contains the clamp rows, i.e.
+        # it counts padding as work that cannot be avoided, and the "nonzero"
+        # filter had become a no-op once the clamp guaranteed
+        # ``window_size >= 1``. See the ``live_row_count`` field comment.
+        if live_row_count > 0:
+            window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
         else:
+            # No row is inside any plane's support -- reachable only for a
+            # zero-row plan, since a plane is placed at every occupied w.
+            # There is no work to be in excess of, so report the lower bound.
             window_padding_overhead = 1.0
         # Clamp max_window_size to at least 1 so the static dynamic_slice
         # shape is well-defined (e.g. n_rows >= 1 always).
@@ -1157,6 +1246,8 @@ def make_plan(
         w0=float(w0),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
+        live_row_count=int(live_row_count),
+        empty_plane_count=int(empty_plane_count),
         w_extent=float(w_extent),
         # ``is_constant_w`` reflects the plan SHAPE (n_w==1 collapse), not
         # the data shape. When ``_force_generic`` builds a generic plan
