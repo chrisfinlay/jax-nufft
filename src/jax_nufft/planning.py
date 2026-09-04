@@ -277,18 +277,25 @@ class WGridderPlan:
         **Exact in the reals, not bit-exact in ``real_dtype``.**
         ``n_minus_1_shifted`` is rounded to ``real_dtype`` at plan time, so this
         subtraction recovers ``n_minus_1`` to about ``ulp(nshift)`` absolute,
-        where the pre-issue-#23 stored leaf was good to ``ulp(n_minus_1)``. The
-        difference is immaterial for any grid lying near the unit disc, where
-        ``|nshift| <= ~1``: the operators form ``n = n_minus_1 + 1``, and that
-        cancellation already costs ``ulp(1)`` on the stored leaf too. Measured
-        against a stored float32 leaf, the worst-case relative error in ``n``
-        is 1.0x the leaf's at 17 deg field radius, 1.7x at 40 deg and 1.3x on a
-        grid reaching the horizon -- 1e-7 to 1e-5 in all three, i.e. float32's
-        own resolution of ``n`` -- while float64 plans stay bit-exact across
-        that range. It degrades only on grids extending many radians outside
-        the unit disc, where ``_n_minus_1_grid``'s analytic extension drives
-        ``|nshift| >> 1``; those pixels are below the horizon, so such a grid is
-        not a physically meaningful image.
+        where the pre-issue-#23 stored leaf was good to ``ulp(n_minus_1)``. That
+        costs nothing on any grid whose ``|nshift|`` is O(1) -- which is every
+        grid with a squarish pixel, since ``n_minus_1`` then spans ``[-1, 0]``.
+        The operators form ``n = n_minus_1 + 1``, and that cancellation already
+        costs ``ulp(1)`` on the stored leaf too, so the two are equally accurate
+        where it matters.
+
+        Measured over the pixels the adjoint actually divides by (``n > 0``),
+        against the exact float64 grid, worst-case relative error in ``n``,
+        property vs pre-#23 stored leaf: float32 gives ratio **1.00x** at 17 deg
+        field radius (4.1e-9), at 40 deg (1.5e-7) and on a grid reaching the
+        horizon (1.1e-5, where the ``n = n_minus_1 + 1`` cancellation dominates
+        both); float64 is bit-exact (0.0) on all three. The only regime that
+        degrades needs a wildly anisotropic pixel making ``|nshift| >> 1``: at
+        ``pixsize_m = 5000 * pixsize_l`` (``nshift`` 26) the ratio is 33x, but
+        the absolute error is 3.2e-6 -- still an order of magnitude under
+        float32's own 3.4e-5 accuracy floor -- and 5.7e-15 in float64. Those
+        pixels are far below the horizon, so such a grid is not a physically
+        meaningful image.
         """
         return self.n_minus_1_shifted - self.nshift
 
