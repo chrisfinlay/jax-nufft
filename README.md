@@ -281,9 +281,10 @@ output, so the grid is refined as `W` grows (see `phi_hat_oversample_for_w`).
 
 The wgridder requires several quantities that depend on `(uvw, freq,
 image_shape, pixsize, epsilon)` but not on the image or visibility values: the
-n-1 grid (shifted and unshifted), the kernel correction, the number of
-w-planes, the w-plane centres (absolute and relative to the w-range
-midpoint), and the `w0` phase screen.
+`nshift`-centred n-1 grid, the kernel correction, the number of w-planes, the
+w-plane centres relative to the w-range midpoint, and the `w0` phase screen.
+The unshifted n-1 grid and the absolute plane centres are *derived* from those
+on access rather than stored &mdash; see **Plan memory** below.
 `make_plan` precomputes those once and returns a `WGridderPlan` &mdash; a frozen
 dataclass registered as a JAX pytree. The actual operators are then JIT-friendly
 functions of `(plan, image)` or `(plan, vis)`:

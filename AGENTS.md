@@ -571,11 +571,6 @@ a worked example.
 
 These are seeds for later releases, not v0.1.2 candidates:
 
-* **Reduce plan memory.** `plan.uvw_lambda_sorted` doubles the coord
-  storage (`(n_chan, n_rows, 3)` floats). For very large
-  `(n_chan, n_rows)` we could keep only `sort_perm` and apply it at
-  scan time, trading one gather per scan iter for half the plan
-  memory.
 * **Plan-time pre-compilation cache (JIT-level).** Currently each
   `dirty2vis(plan, ..., w_strategy=...)` JIT-compiles on the first
   call. A `jax_nufft.compile_plan(plan, w_strategy=...)` helper that

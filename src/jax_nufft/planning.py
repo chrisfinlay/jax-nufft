@@ -251,10 +251,12 @@ class WGridderPlan:
         return (self.n_l, self.n_m)
 
     # ---- backward-compatible accessors (issue #23) ----
-    # These three were pytree leaves before issue #23. Two of them are an exact
-    # affine image of a surviving leaf plus a *static* field, and the third is
-    # the per-channel broadcast this issue exists to delete. They stay readable
-    # -- they are documented plan fields that tests and downstream code
+    # These three were pytree leaves before issue #23. Two of them are an affine
+    # image of a surviving leaf plus a *static* field -- exact in the reals, and
+    # in finite precision accurate to an ulp of the static offset rather than of
+    # the result (see ``n_minus_1`` for the bound and why it is harmless) -- and
+    # the third is the per-channel broadcast this issue exists to delete. They
+    # stay readable -- they are documented plan fields that tests and downstream code
     # introspect (``tests/test_adjoint.py``, ``tests/test_dtype.py``,
     # ``tests/test_nshift.py``) -- but as computed properties, so they are not
     # flattened, not shipped to the device with the plan, and not part of the
@@ -265,11 +267,27 @@ class WGridderPlan:
         """``n - 1`` on the image grid: the *unshifted* grid.
 
         Recovered from the stored ``n_minus_1_shifted`` by removing the static
-        ``nshift``, inverting issue #16's exact identity ``n_minus_1_shifted =
+        ``nshift``, inverting issue #16's identity ``n_minus_1_shifted =
         n_minus_1 + nshift``. This is the grid -- and the only grid -- the
         adjoint's ``1/n`` output factor may use (see ``wgridder._vis2dirty_jit``
         for why using the shifted one there is a silent, test-passing gain
         error).
+
+        **Exact in the reals, not bit-exact in ``real_dtype``.**
+        ``n_minus_1_shifted`` is rounded to ``real_dtype`` at plan time, so this
+        subtraction recovers ``n_minus_1`` to about ``ulp(nshift)`` absolute,
+        where the pre-issue-#23 stored leaf was good to ``ulp(n_minus_1)``. The
+        difference is immaterial for any grid lying near the unit disc, where
+        ``|nshift| <= ~1``: the operators form ``n = n_minus_1 + 1``, and that
+        cancellation already costs ``ulp(1)`` on the stored leaf too. Measured
+        against a stored float32 leaf, the worst-case relative error in ``n``
+        is 1.0x the leaf's at 17 deg field radius, 1.7x at 40 deg and 1.3x on a
+        grid reaching the horizon -- 1e-7 to 1e-5 in all three, i.e. float32's
+        own resolution of ``n`` -- while float64 plans stay bit-exact across
+        that range. It degrades only on grids extending many radians outside
+        the unit disc, where ``_n_minus_1_grid``'s analytic extension drives
+        ``|nshift| >> 1``; those pixels are below the horizon, so such a grid is
+        not a physically meaningful image.
         """
         return self.n_minus_1_shifted - self.nshift
 
