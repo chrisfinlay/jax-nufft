@@ -19,6 +19,7 @@ from jax import Array
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
 from jax_nufft.planning import W_OVERSAMPLE_X0, WGridderPlan, make_plan
+from jax_nufft.wgridder import _channel_ft_coords
 from tests.conftest import (
     EDA2,
     MEERKAT,
@@ -82,73 +83,112 @@ def test_plan_kernel_params_match_eps() -> None:
 # (uvw_lambda[..., 2], uvw_lambda_sorted[..., 2], u_finufft, v_finufft). The
 # fix stores ``uvw_m`` (metres, once, input row order) and ``inv_lambda =
 # freq / c`` (once, per channel) and derives the per-channel FINUFFT
-# coordinates and w (wavelengths) inside the JIT -- three multiplies per row
+# coordinates and the relative w inside the JIT -- three multiplies per row
 # per channel. ``test_plan_uvw_lambda_correct`` and
 # ``test_plan_finufft_coords_match_uvw_lambda`` (their v0.1.2-Part-3
 # predecessors) asserted the *stored* per-channel arrays were correct; since
-# those arrays no longer exist as plan leaves, the same property is now
-# gated by reconstructing the derivation as a small jitted helper here and
-# checking it against a reference computed independently of both the old and
-# the new plan fields, straight from (uvw metres, freq Hz, pixsize) --
-# following this file's ``_nm1_extremes`` convention so a bug shared between
-# make_plan's real derivation and this helper cannot hide behind it.
+# those arrays no longer exist as plan leaves, what has to be gated instead is
+# the derivation that replaced them.
+#
+# So this calls the PRODUCTION derivation, ``jax_nufft.wgridder.
+# _channel_ft_coords`` -- the one and only implementation, shared by
+# ``_channel_forward``, ``_channel_adjoint`` and both windowed helpers -- and
+# compares all three of its outputs against references built here from
+# ``uvw`` (metres) and ``freq`` (Hz) alone. An earlier draft of this test
+# re-implemented the formula locally and checked *that* against the reference,
+# which gated nothing: a swapped u/v axis, a dropped 2*pi, the wrong column of
+# ``uvw_m`` or an absolute-instead-of-relative w in the real helper would all
+# have left it green. The strategy-equivalence suite cannot catch such a bug
+# either, because all four strategies call this same helper and would inherit
+# the same wrong coordinates -- the shared-mode failure AGENTS.md sec 6
+# records from issue #16, where the dot-product identity stayed green at every
+# offset while the forward was catastrophically wrong.
+#
+# The references below therefore import nothing from ``src/``: they redo the
+# arithmetic from the raw inputs, following this file's ``_nm1_extremes``
+# convention, so a bug shared between the production helper and a test helper
+# cannot hide behind it.
 # ---------------------------------------------------------------------------
 
 
 def _independent_ft_coords(
     uvw: np.ndarray, freq: np.ndarray, pixsize_l: float, pixsize_m: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Ground truth for (u_ft, v_ft, w_lambda), (n_chan, n_rows) each.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Ground truth for ``(u_ft, v_ft, w_lambda, w0)``.
 
-    Deliberately not built from any WGridderPlan field, old or new.
+    The three arrays are ``(n_chan, n_rows)``; ``w0`` is the w-range midpoint
+    over every (channel, row), which is what ``_channel_ft_coords`` subtracts
+    to produce the relative w the plane loop uses.
+
+    Deliberately built from ``uvw`` / ``freq`` / ``pixsize`` only -- no
+    WGridderPlan field, old or new, and nothing imported from ``src/``.
     """
     inv_lambda = freq / SPEED_OF_LIGHT  # (n_chan,)
     u_ft = (2.0 * np.pi * pixsize_l) * np.outer(inv_lambda, uvw[:, 0])
     v_ft = (2.0 * np.pi * pixsize_m) * np.outer(inv_lambda, uvw[:, 1])
     w_lambda = np.outer(inv_lambda, uvw[:, 2])
-    return u_ft, v_ft, w_lambda
+    w0 = (float(np.min(w_lambda)) + float(np.max(w_lambda))) / 2.0
+    return u_ft, v_ft, w_lambda, w0
 
 
 @jax.jit
-def _jit_derive_channel_ft_coords(
-    uvw_m: Array, inv_lambda_c: Array, pixsize_l: Array, pixsize_m: Array
-) -> tuple[Array, Array, Array]:
-    """The formula issue #23 requires inside ``_channel_forward`` /
-    ``_channel_adjoint`` for one channel: ``u_ft_c = 2π · pixsize_l ·
-    inv_lambda[c] · uvw_m[:, 0]``, and likewise for ``v_ft`` / ``w_lambda``.
-    This is the derivation under test, written fresh here -- it is not a call
-    into ``jax_nufft.wgridder``, which does not implement it (that is the
-    implementation agent's job; this pins the contract it must satisfy).
+def _jit_channel_ft_coords(plan: WGridderPlan, inv_lambda_c: Array) -> tuple[Array, Array, Array]:
+    """Call the production per-channel derivation under ``jax.jit``.
+
+    Thin on purpose: the point of this test is that the assertion below runs
+    the *shipped* helper, on the plan's own leaves, through the same tracing
+    machinery the operators use -- not a transcription of it.
     """
-    two_pi = 2.0 * jnp.pi
-    u_ft = (two_pi * pixsize_l * inv_lambda_c) * uvw_m[:, 0]
-    v_ft = (two_pi * pixsize_m * inv_lambda_c) * uvw_m[:, 1]
-    w_lambda = inv_lambda_c * uvw_m[:, 2]
-    return u_ft, v_ft, w_lambda
+    return _channel_ft_coords(plan.uvw_m, inv_lambda_c, plan)
 
 
 @requires_x64
-def test_plan_derived_channel_coords_match_independent_reference() -> None:
-    """``plan.uvw_m`` (metres) + ``plan.inv_lambda`` (freq / c) must carry
-    enough information to reconstruct, per channel, the exact (u_ft, v_ft)
-    FINUFFT input coordinates and the w-component in wavelengths that the
-    removed ``uvw_lambda`` / ``u_finufft`` / ``v_finufft`` leaves used to
-    store directly.
+def test_channel_ft_coords_match_independent_reference() -> None:
+    """``wgridder._channel_ft_coords`` must rebuild, from ``plan.uvw_m``
+    (metres) and ``plan.inv_lambda`` (freq / c), exactly the (u_ft, v_ft)
+    FINUFFT input coordinates and the relative w that the removed
+    ``uvw_lambda`` / ``u_finufft`` / ``v_finufft`` leaves used to store.
 
-    Tolerances: ``w_lambda`` is a single float64 multiply
-    (``inv_lambda[c] * uvw_m[:, 2]``) in both the derivation and the
-    independent reference, and IEEE-754 multiplication is exactly
-    commutative, so it is checked to bit-for-bit equality. ``u_ft`` / ``v_ft``
-    additionally fold in ``2π · pixsize``, and the derivation's grouping
-    (``(2π · pixsize_l · inv_lambda[c]) · uvw_m[:, 0]``) reassociates that
-    product differently than the reference's (``(2π · pixsize_l) · (inv_lambda
-    · uvw)``, via ``np.outer``) -- multiplication is commutative but not
-    associative in floating point, so the two can differ by a couple of ulps.
-    ``rtol`` below is ~20x float64 eps, generous for a two-multiply
-    reassociation and far tighter than an axis swap, sign flip, or
-    wrong-channel bug would need to slip through.
+    All three outputs are checked, per channel, against
+    :func:`_independent_ft_coords`. Checking only ``u_ft`` would miss a
+    swapped axis; checking only the magnitudes would miss the ``2*pi *
+    pixsize`` factor; and checking an absolute w would miss the ``- w0``
+    that makes the plane loop's phases small (issue #16's follow-up), which
+    is why the third output is compared against ``w_lambda - w0`` with ``w0``
+    recomputed here rather than read off the plan.
+
+    Tolerances. ``plan.w0`` is compared bit for bit against the independently
+    computed midpoint -- it is a plain min/max/average of the same float64
+    products. The relative w is *not*: the helper computes
+    ``(inv_lambda[c] * uvw_m[:, 2]) - w0``, and XLA is free to contract that
+    multiply-then-subtract into a single FMA, one rounding where the numpy
+    reference does two. The gap is bounded by half an ulp of the *absolute* w,
+    not of the (much smaller) relative one, so the bound is an ``atol`` scaled
+    by ``max|w_lambda|`` rather than an ``rtol``. ``u_ft`` / ``v_ft``
+    additionally fold in ``2*pi * pixsize``, and the helper's grouping
+    (``(2*pi * pixsize_l * inv_lambda[c]) * uvw_m[:, 0]``) reassociates that
+    product differently from the reference's (``(2*pi * pixsize_l) *
+    (inv_lambda * uvw)``, via ``np.outer``) -- multiplication is commutative
+    but not associative in floating point, so the two can differ by a couple
+    of ulps. Both bounds stay ~12 orders of magnitude below what an axis swap,
+    a sign flip, a dropped ``2*pi``, an absolute-instead-of-relative w or a
+    wrong-channel bug would produce on this fixture.
+
+    Three properties of the fixture make those bugs visible, and none is
+    incidental: ``pixsize_l != pixsize_m`` (so swapping the u and v scalings
+    shows up), two widely separated channels (so reading ``inv_lambda[0]`` for
+    every channel shows up), and a large constant w offset, giving
+    ``|w0| ~ 1.1e4`` wavelengths -- about 5x the relative-w spread, and some
+    14 orders of magnitude above the tolerance the relative w is checked to,
+    so returning the absolute w instead of ``w - w0`` is a gross failure
+    rather than a rounding argument.
     """
     uvw = _baseline_uvw(n_rows=12, max_baseline=80.0)
+    # Push the whole array off zenith by 2 km so the w-range midpoint is far
+    # from zero (see the docstring): without this, w0 lands near 0 on a
+    # symmetric fixture and returning the absolute w would be indistinguishable
+    # from returning the relative one.
+    uvw = uvw + np.array([0.0, 0.0, 2000.0])
     freq = np.array([1.4e9, 2.0e9])
     pixsize_l = 1.3e-3
     pixsize_m = 1.7e-3
@@ -166,30 +206,46 @@ def test_plan_derived_channel_coords_match_independent_reference() -> None:
     np.testing.assert_array_equal(np.asarray(plan.uvw_m), uvw)
     np.testing.assert_array_equal(np.asarray(plan.inv_lambda), freq / SPEED_OF_LIGHT)
 
-    expected_u, expected_v, expected_w = _independent_ft_coords(uvw, freq, pixsize_l, pixsize_m)
+    expected_u, expected_v, expected_w, expected_w0 = _independent_ft_coords(
+        uvw, freq, pixsize_l, pixsize_m
+    )
+    assert plan.w0 == expected_w0, (
+        f"plan.w0 {plan.w0!r} is not the w-range midpoint {expected_w0!r} over all "
+        "(channel, row); the relative-w comparison below would then be self-consistent "
+        "but wrong"
+    )
     rtol = 20.0 * np.finfo(np.float64).eps
+    # See the docstring: bound the relative w by ulps of the absolute w, since
+    # an FMA-contracted (a*b - c) rounds once where the reference rounds twice.
+    w_atol = 8.0 * np.finfo(np.float64).eps * float(np.max(np.abs(expected_w)))
+    # The fixture must actually separate absolute from relative w, or the w
+    # assertion below is vacuous: returning the absolute w would be an error of
+    # |w0|, and that has to sit far above the tolerance it is measured against.
+    assert abs(expected_w0) > 1e6 * w_atol
 
     for c in range(plan.n_chan):
-        u_ft, v_ft, w_lambda = _jit_derive_channel_ft_coords(
-            plan.uvw_m, plan.inv_lambda[c], plan.pixsize_l, plan.pixsize_m
+        u_ft, v_ft, w_rel = _jit_channel_ft_coords(plan, plan.inv_lambda[c])
+        np.testing.assert_allclose(
+            np.asarray(w_rel), expected_w[c] - expected_w0, rtol=0.0, atol=w_atol
         )
-        np.testing.assert_array_equal(np.asarray(w_lambda), expected_w[c])
         np.testing.assert_allclose(np.asarray(u_ft), expected_u[c], rtol=rtol, atol=0.0)
         np.testing.assert_allclose(np.asarray(v_ft), expected_v[c], rtol=rtol, atol=0.0)
 
-    # Windowed path (issue #16's helpers gather via plan.sort_perm rather than
-    # storing a separate (n_chan, n_rows, 3) sorted array; issue #23 removes
-    # the last remaining sorted leaf, uvw_lambda_sorted, on the same logic).
-    # The sorted w-component the windowed helpers need is therefore a gather
-    # of uvw_m by sort_perm, not a stored per-channel array -- check the two
-    # compose correctly.
+    # Windowed path: the helpers feed the *same* production function a
+    # sort_perm gather of uvw_m rather than a stored sorted array (issue #23
+    # removed uvw_lambda_sorted on the same logic v0.1.2 used to drop the
+    # sorted u/v coordinates). Check that composition end to end, again
+    # through the production helper.
     sort_perm = np.asarray(plan.sort_perm)
     assert sorted(sort_perm.tolist()) == list(range(plan.n_rows))
-    uvw_m_sorted = np.asarray(plan.uvw_m)[sort_perm]
-    inv_lambda = np.asarray(plan.inv_lambda)
+    uvw_m_sorted = jnp.asarray(np.asarray(plan.uvw_m)[sort_perm])
     for c in range(plan.n_chan):
-        w_sorted = inv_lambda[c] * uvw_m_sorted[:, 2]
-        np.testing.assert_array_equal(w_sorted, expected_w[c][sort_perm])
+        u_s, v_s, w_s = _channel_ft_coords(uvw_m_sorted, plan.inv_lambda[c], plan)
+        np.testing.assert_allclose(
+            np.asarray(w_s), (expected_w[c] - expected_w0)[sort_perm], rtol=0.0, atol=w_atol
+        )
+        np.testing.assert_allclose(np.asarray(u_s), expected_u[c][sort_perm], rtol=rtol, atol=0.0)
+        np.testing.assert_allclose(np.asarray(v_s), expected_v[c][sort_perm], rtol=rtol, atol=0.0)
 
 
 @requires_x64
