@@ -499,6 +499,23 @@ where what the heuristic picks runs 1.4-6.3x faster: the heuristic was
 never the problem, only its reachability. Re-tuning the thresholds
 themselves is a separate question (issue #34).
 
+That table was measured when #46 was filed, on the v0.1.2 planner. Re-run
+on the same hardware against the v0.1.3 code this default ships with --
+which halves the plane count off-zenith (issue #16) and derives the
+per-channel coordinates in the JIT (issue #23) -- the shipped default
+against an explicit `dense_scan`, same protocol:
+
+| fixture | `n_w` | `"auto"` resolves to | default | `dense_scan` | speedup |
+|---|---|---|---|---|---|
+| MWA_extended off30 | 251 | `dense_vmap` / `dense_vmap` | 30.8 / 14.3 | 653.6 / 333.9 | 21.3x / 23.4x |
+| MeerKAT off30 | 19 | `dense_vmap` / `dense_vmap` | 4.9 / 3.2 | 40.7 / 26.0 | 8.4x / 8.0x |
+| GH200_large off30 | 43 | `dense_vmap` / `windowed_vmap` | 47.3 / 53.1 | 159.0 / 157.3 | 3.4x / 3.0x |
+
+The picks are the same three the heuristic made in the issue, and the gap
+is wider than it was: the forward on MWA_extended off30 is the cell that
+moved, because the v0.1.3 planner leaves `dense_scan` iterating over
+plane-sequential work that `dense_vmap` batches.
+
 On CPU the change is much smaller, and it is not nothing. The forward is
 untouched — the CPU heuristic never picks a windowed forward, so it
 resolves to `dense_scan` on every fixture in this repository, exactly the
@@ -536,9 +553,13 @@ pre-v0.1.3 behaviour on both operators. What changing the default does
 *not* preserve is bit-identical output across versions: the four
 strategies accumulate the w-planes in a different order, so they agree to
 the strategy-equivalence bound that `tests/test_strategies_equivalent.py`
-pins — `1e-11` relative in float64 — and not to the last bit. Code that
-needs exactly reproducible numbers across this version boundary should
-name its `w_strategy` explicitly rather than take the default.
+pins — `1e-11` relative in float64 — and not to the last bit. In practice
+the gap is far smaller than that bound: on the three GH200 fixtures above,
+the default and `dense_scan` agree to `5e-16` relative, i.e. to float64
+rounding. The `1e-11` is what is *guaranteed*, not what is typical. Code
+that needs exactly reproducible numbers across this version boundary
+should still name its `w_strategy` explicitly rather than take the
+default.
 
 ### Accuracy expectation
 
