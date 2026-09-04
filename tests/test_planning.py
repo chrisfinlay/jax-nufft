@@ -12,7 +12,15 @@ import pytest
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
 from jax_nufft.planning import W_OVERSAMPLE_X0, WGridderPlan, make_plan
-from tests.conftest import requires_x64
+from tests.conftest import (
+    EDA2,
+    MEERKAT,
+    MWA_COMPACT,
+    MWA_EXTENDED,
+    Telescope,
+    requires_x64,
+    synthetic_uvw,
+)
 
 
 def _baseline_uvw(n_rows: int = 50, max_baseline: float = 100.0, seed: int = 0) -> np.ndarray:
@@ -231,6 +239,88 @@ def test_plan_nm1_nonpositive_inside_disc() -> None:
     assert nm1[plan.n_l // 2, plan.n_m // 2] == pytest.approx(0.0)
 
 
+def _nm1_extremes(
+    image_shape: tuple[int, int], pixsize_l: float, pixsize_m: float
+) -> tuple[float, float]:
+    """Independently recompute ``(max, min)`` of ``n - 1`` over the image grid.
+
+    Deliberately a *separate* implementation from ``make_plan``'s (this
+    repository's convention -- see ``tests/test_against_dft.py::reference_lmn_grids``
+    and ``tests/test_adjoint.py::_reference_adjoint`` for the same pattern), so
+    that a bug shared between ``make_plan`` and this helper cannot hide behind
+    an ``nshift`` test that trusts the code it is checking. Matches ducc's
+    analytic extension outside the unit disc (``n - 1 = -sqrt(l^2+m^2-1) - 1``),
+    which ``make_plan`` uses so full-sky images (large ``l^2+m^2 > 1`` region,
+    e.g. EDA2's 120-degree FoV) get a well-defined ``n - 1`` everywhere.
+    """
+    n_l, n_m = image_shape
+    i = np.arange(n_l) - n_l // 2
+    j = np.arange(n_m) - n_m // 2
+    ll = (i * pixsize_l)[:, None]
+    mm = (j * pixsize_m)[None, :]
+    r2 = ll * ll + mm * mm
+    inside_disc = r2 <= 1.0
+    inside_val = np.sqrt(np.where(inside_disc, 1.0 - r2, 0.0)) - 1.0
+    outside_val = -np.sqrt(np.where(inside_disc, 0.0, r2 - 1.0)) - 1.0
+    nm1 = np.where(inside_disc, inside_val, outside_val)
+    return float(nm1.max()), float(nm1.min())
+
+
+# A spread of fixtures for the nshift geometry check: two small synthetic
+# baselines (zenith and off30, narrow FoV -- the whole image sits inside the
+# unit disc, so nm1_max == 0 exactly and nshift == -nm1_min/2), plus EDA2's
+# 120-degree FoV at both pointings, where a large fraction of the image lies
+# *outside* the unit disc and nm1_max/nm1_min both come from the analytic
+# extension. Also MWA_extended/MeerKAT off30, the fixtures issue #16 quotes
+# numbers for.
+_NSHIFT_GEOMETRY_FIXTURES: tuple[tuple[Telescope, float], ...] = (
+    (EDA2, 0.0),
+    (EDA2, 30.0),
+    (MWA_COMPACT, 0.0),
+    (MWA_COMPACT, 30.0),
+    (MWA_EXTENDED, 30.0),
+    (MEERKAT, 30.0),
+)
+
+
+def _fixture_id(values: tuple[Telescope, float]) -> str:
+    tel, ang = values
+    return f"{tel.name}_{'zenith' if ang == 0.0 else f'off{int(ang)}'}"
+
+
+@pytest.mark.parametrize(
+    ("telescope", "zenith_angle_deg"),
+    _NSHIFT_GEOMETRY_FIXTURES,
+    ids=[_fixture_id(v) for v in _NSHIFT_GEOMETRY_FIXTURES],
+)
+def test_nshift_matches_geometry(telescope: Telescope, zenith_angle_deg: float) -> None:
+    """issue #16: ``nshift == -(nm1_max + nm1_min) / 2``, exactly.
+
+    The w-phase identity ``exp(2*pi*i*w*(n-1)) == exp(2*pi*i*w*(n-1+s)) *
+    exp(-2*pi*i*w*s)`` holds for *any* constant ``s``; the plan is required to
+    pick the specific ``s`` that centres the shifted ``n-1`` range around zero,
+    which is what halves ``max|n-1+s|`` (and therefore the plane count) for any
+    image containing the phase centre. This test recomputes ``nm1_max`` /
+    ``nm1_min`` independently (see ``_nm1_extremes``) rather than trusting
+    ``make_plan``'s own grid, so a bug shared between the two cannot hide.
+    """
+    uvw = synthetic_uvw(telescope, zenith_angle_deg, seed=0)
+    freq = np.array([telescope.freq_hz])
+    image_shape = (telescope.n_pix, telescope.n_pix)
+    plan = make_plan(
+        uvw=uvw,
+        freq=freq,
+        image_shape=image_shape,
+        pixsize_l=telescope.pixsize,
+        pixsize_m=telescope.pixsize,
+        epsilon=1e-6,
+    )
+
+    nm1_max, nm1_min = _nm1_extremes(image_shape, telescope.pixsize, telescope.pixsize)
+    expected_nshift = -(nm1_max + nm1_min) / 2.0
+    assert plan.nshift == pytest.approx(expected_nshift, abs=1e-9)
+
+
 def test_plan_invalid_inputs() -> None:
     uvw = _baseline_uvw()
     freq = np.array([200e6])
@@ -259,9 +349,12 @@ def test_plan_is_a_jax_pytree() -> None:
     leaves, treedef = jax.tree_util.tree_flatten(plan)
     # uvw_lambda, w_centers, n_minus_1, phi_hat_n, sort_perm,
     # uvw_lambda_sorted, window_start, window_size,
-    # u_finufft, v_finufft  (v0.1.2 Part 3.1 added the last two).
+    # u_finufft, v_finufft  (v0.1.2 Part 3.1 added the last two),
+    # n_minus_1_shifted (issue #16: n_minus_1 + nshift, the leaf used by the
+    # plane phase and the phi_hat argument; n_minus_1 itself is kept for the
+    # 1/n output factor -- see AGENTS.md sec 4).
     # The issue #11 dtype metadata is *static*, so it must not show up here.
-    assert len(leaves) == 10
+    assert len(leaves) == 11
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
     # Static fields preserved exactly.
@@ -300,6 +393,35 @@ def test_plan_is_a_jax_pytree() -> None:
         "below would not isolate the aux data"
     )
     assert jax.tree_util.tree_structure(plan32) != treedef
+
+    # issue #16: ``nshift`` is a new *static* plan field (the n-1 centring
+    # offset, s = -(nm1_max + nm1_min) / 2). Swap it via ``dataclasses.replace``
+    # exactly like the dtype check above -- every other aux entry and every
+    # leaf is identical by construction -- so this fails if and only if
+    # ``nshift`` is missing from ``_plan_aux``.
+    plan_alt_nshift = dataclasses.replace(plan, nshift=plan.nshift + 1.0)
+    leaves_alt_nshift = jax.tree_util.tree_leaves(plan_alt_nshift)
+    assert all(a is b for a, b in zip(leaves_alt_nshift, leaves, strict=True)), (
+        "changing nshift alone must not disturb any leaf, or the treedef "
+        "comparison below would not isolate the aux data"
+    )
+    assert jax.tree_util.tree_structure(plan_alt_nshift) != treedef, (
+        "nshift must be part of the pytree aux_data (_plan_aux), or two plans "
+        "differing only in nshift would share a treedef / JIT cache entry -- "
+        "exactly the 'silent pytree corruption' AGENTS.md sec 4 warns about"
+    )
+
+    # issue #16: ``n_minus_1_shifted`` is a new *leaf*. Swap its value (not
+    # its shape/dtype) via ``dataclasses.replace``: if it were dropped from
+    # ``register_pytree_node``'s flatten_func children tuple, the leaves
+    # would compare equal here even though the field itself changed.
+    plan_alt_leaf = dataclasses.replace(plan, n_minus_1_shifted=plan.n_minus_1_shifted + 1.0)
+    leaves_alt_leaf = jax.tree_util.tree_leaves(plan_alt_leaf)
+    assert len(leaves_alt_leaf) == len(leaves)
+    assert not all(a is b for a, b in zip(leaves_alt_leaf, leaves, strict=True)), (
+        "changing n_minus_1_shifted must change a leaf; if it were dropped "
+        "from the flatten_func children tuple this would silently pass"
+    )
 
     # And we can read it through a jit'd function.
     @jax.jit
