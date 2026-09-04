@@ -246,16 +246,25 @@ def _resolve_nthreads(
 # recorded in AGENTS.md section 9. The metric changed; the measurements did
 # not, so the cutoff has to move with it.
 #
-# 6.0 is the smallest round value that clears the grid, and it is also where
-# carrying the old cutoff across the change of scale lands: the worst
+# 6.0 is the smallest round value that clears the grid, and it is just below
+# where carrying the old cutoff across the change of scale lands. The worst
 # padded-to-live inflation on the grid is 5.7843 / 4.8089 = 1.2028 (1.2043 on
-# the float32 leg), and 5.0 * 1.2028 = 6.014. So it is not a fresh calibration
-# -- it is the same 5.0, restated on the denominator that replaced the one it
-# was written against. It sits 3.7% above the worst fixture where 5.0 sat 1.4%
-# above the worst on the old scale, i.e. slightly the more permissive of the
-# two; that direction is the safe one here, since crossing this cutoff can only
-# take a plan off ``windowed_scan``, which AGENTS.md section 9 measures as the
-# CPU win on exactly the fixtures that approach it.
+# the float32 leg), so the proportional construction gives 5.0 * 1.2028 =
+# 6.014, and 6.0 is that value rounded down to the nearest tenth -- the
+# construction does not yield 6.0 exactly, it yields 6.014, and rounding down
+# is what keeps the cutoff a round number without loosening it. So this is not
+# a fresh calibration: it is the same 5.0, restated on the denominator that
+# replaced the one it was written against. It sits 3.7% above the worst fixture
+# where 5.0 sat 1.4% above the worst on the old scale, i.e. slightly the more
+# permissive of the two; that direction is the safe one here, since crossing
+# this cutoff can only take a plan off ``windowed_scan``, which AGENTS.md
+# section 9 measures as the CPU win on exactly the fixtures that approach it.
+#
+# Pinned to this exact value by
+# ``tests/test_padding_overhead.py::test_cpu_padding_cutoff_is_six_and_still_gates``,
+# which also exercises the branch on both sides of it: a cutoff raised far
+# enough to "clear the grid" trivially would disable the guard rather than
+# restate it, and a lower bound alone cannot tell the two apart.
 _CPU_PADDING_CUTOFF = 6.0
 
 

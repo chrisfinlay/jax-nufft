@@ -552,6 +552,28 @@ def test_plan_invalid_inputs() -> None:
         make_plan(uvw[..., :2], freq, (64, 64), 1e-3, 1e-3, epsilon=1e-6)
 
 
+def test_plan_rejects_zero_rows() -> None:
+    """An empty ``uvw`` is named as such, not reported as a numpy reduction error.
+
+    Both empty cases were already impossible -- the w-extent block takes
+    ``np.min`` over the rows -- but they surfaced as numpy's "zero-size array
+    to reduction operation minimum which has no identity", which says nothing
+    about which argument was wrong. Issue #43 made this worth pinning: the
+    padding-overhead code downstream has a ``live_row_count == 0`` branch, and
+    the reason that branch is defensive rather than reachable is precisely
+    that ``n_rows >= 1`` is guaranteed here.
+    """
+    freq = np.array([200e6])
+    with pytest.raises(ValueError, match="at least one row"):
+        make_plan(np.zeros((0, 3)), freq, (64, 64), 1e-3, 1e-3, epsilon=1e-6)
+
+
+def test_plan_rejects_zero_channels() -> None:
+    """An empty ``freq`` likewise: there is no transform over no channels."""
+    with pytest.raises(ValueError, match="at least one channel"):
+        make_plan(_baseline_uvw(), np.zeros(0), (64, 64), 1e-3, 1e-3, epsilon=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # The plan's pytree contract, field by field (AGENTS.md sec 4)
 # ---------------------------------------------------------------------------
@@ -772,14 +794,25 @@ def test_plan_is_a_jax_pytree() -> None:
     leaves, treedef = jax.tree_util.tree_flatten(plan)
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
-    # Static fields preserved exactly.
-    assert rebuilt.n_l == plan.n_l
-    assert rebuilt.n_w == plan.n_w
-    assert rebuilt.beta == plan.beta
+
+    # EVERY static field survives with its value intact, not a hand-picked
+    # few. ``_STATIC_FIELD_PROBES`` above establishes that each of these is in
+    # the aux data at all -- it compares treedefs, which a *permutation* of
+    # ``_plan_unflatten``'s unpacking survives untouched, since the aux tuple
+    # is the same tuple either way. Only reading the values back catches one.
+    # (A permutation of two fields holding equal values is still invisible;
+    # the issue #43 pair is not such a case, see below.)
+    for field_name, _ in _STATIC_FIELD_PROBES:
+        assert getattr(rebuilt, field_name) == getattr(plan, field_name), (
+            f"{field_name} did not survive tree_unflatten -- check that "
+            "_plan_aux and _plan_unflatten unpack the aux tuple in the same order"
+        )
+    # Non-vacuity for the pair issue #43 added, which are adjacent in the aux
+    # tuple and both plain ints: their values must differ, or swapping them in
+    # _plan_unflatten would round-trip cleanly.
+    assert plan.live_row_count != plan.empty_plane_count
     # issue #11: real_dtype / complex_dtype are aux data, so they survive the
     # round-trip unchanged (AGENTS.md sec 4 plan-field checklist).
-    assert rebuilt.real_dtype == plan.real_dtype
-    assert rebuilt.complex_dtype == plan.complex_dtype
     assert np.dtype(plan.real_dtype) == np.dtype(jnp.float64)
     assert np.dtype(plan.complex_dtype) == np.dtype(jnp.complex128)
 

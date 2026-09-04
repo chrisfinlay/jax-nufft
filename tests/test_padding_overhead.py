@@ -51,7 +51,8 @@ Two consequences this module pins:
 
 from __future__ import annotations
 
-from functools import lru_cache
+import dataclasses
+from functools import lru_cache, partial
 
 import jax.numpy as jnp
 import numpy as np
@@ -190,6 +191,53 @@ def _kernel_weighted_incidence_count(plan: WGridderPlan) -> int:
     return total
 
 
+def _boundary_margin_for(plan: WGridderPlan) -> float:
+    """The builder's ``window_boundary_margin`` for this plan, in wavelengths.
+
+    Factored out of :func:`_independent_padded_sizes` so the margin-exclusion
+    test below can widen a boundary by exactly the amount the builder does.
+    ``window_boundary_margin`` is sized from the absolute w range, which
+    ``make_plan`` forms in ``real_dtype`` from the narrowed uvw -- so form it
+    the same way here, or the float32 leg gets a different margin.
+    """
+    w_m = np.asarray(plan.uvw_m)[:, 2]
+    inv_lambda = np.asarray(plan.inv_lambda)
+    ends_lo = inv_lambda * float(w_m.min())
+    ends_hi = inv_lambda * float(w_m.max())
+    return window_boundary_margin(
+        plan.real_dtype,
+        float(np.min(np.minimum(ends_lo, ends_hi))),
+        float(np.max(np.maximum(ends_lo, ends_hi))),
+        plan.w_extent,
+    )
+
+
+def _independent_margin_widened_sizes(plan: WGridderPlan) -> np.ndarray:
+    """``(n_chan, n_w)`` counts inside the support widened by the margin only.
+
+    The middle term of the three the builder could divide by: wider than
+    :func:`_independent_live_sizes` (no margin, no clamp), narrower than
+    :func:`_independent_padded_sizes` (margin *and* clamp). It exists so that
+    :func:`test_margin_rows_are_excluded_from_the_denominator` can separate
+    the two widenings -- against the padded reference alone, an implementation
+    that reused the builder's margin-widened ``lo`` / ``hi`` for the live
+    count would still look correct.
+
+    Counted with a dense mask in input order, like the live reference and for
+    the same reason.
+    """
+    centres = np.asarray(plan.w_centers_rel, dtype=np.float64)
+    edge = plan.w_kernel_scale + _boundary_margin_for(plan)
+    out = np.zeros((plan.n_chan, plan.n_w), dtype=np.int64)
+    for c in range(plan.n_chan):
+        w_rel = _w_rel_per_channel(plan, c)
+        for k in range(plan.n_w):
+            out[c, k] = np.count_nonzero(
+                (w_rel >= centres[k] - edge) & (w_rel <= centres[k] + edge)
+            )
+    return out
+
+
 def _independent_padded_sizes(plan: WGridderPlan) -> np.ndarray:
     """``(n_chan, n_w)`` window lengths *as the operators slice them*.
 
@@ -208,17 +256,7 @@ def _independent_padded_sizes(plan: WGridderPlan) -> np.ndarray:
     w_m_sorted = w_m[sort_perm]
     inv_lambda = np.asarray(plan.inv_lambda)
     centres = np.asarray(plan.w_centers_rel, dtype=np.float64)
-    # ``window_boundary_margin`` is sized from the absolute w range, which
-    # ``make_plan`` forms in ``real_dtype`` from the narrowed uvw -- so form it
-    # the same way here, or the float32 leg gets a different margin.
-    ends_lo = inv_lambda * float(w_m.min())
-    ends_hi = inv_lambda * float(w_m.max())
-    margin = window_boundary_margin(
-        plan.real_dtype,
-        float(np.min(np.minimum(ends_lo, ends_hi))),
-        float(np.max(np.maximum(ends_lo, ends_hi))),
-        plan.w_extent,
-    )
+    margin = _boundary_margin_for(plan)
     out = np.zeros((plan.n_chan, plan.n_w), dtype=np.int64)
     for c in range(plan.n_chan):
         w_lambda_c = (w_m_sorted * inv_lambda[c]).astype(np.float64) - plan.w0
@@ -234,6 +272,47 @@ def _independent_padded_sizes(plan: WGridderPlan) -> np.ndarray:
 def _windowed_row_work(plan: WGridderPlan) -> int:
     """Rows a windowed traversal touches: one static slice per (channel, plane)."""
     return plan.n_chan * plan.n_w * plan.max_window_size
+
+
+# The pre-#43 rule, kept whole so the equivalence tests can *recompute* what
+# v0.1.2 would have decided instead of pinning a table of strategy names. The
+# cutoffs are the shipped v0.1.2 literals and must not be restated in terms of
+# ``_CPU_PADDING_CUTOFF``: the whole point is to compare the new rule against
+# the old one as it was, so if this drifts to track the constant the tests
+# below stop comparing two rules and start comparing one rule with itself.
+_PREVIOUS_CPU_PADDING_CUTOFF = 5.0
+_PREVIOUS_GPU_PADDING_CUTOFF = 3.0
+
+
+def _pre_43_padded_overhead(plan: WGridderPlan) -> float:
+    """``max_window_size / mean(nonzero window_size)`` -- the v0.1.2 metric."""
+    padded_sizes = _independent_padded_sizes(plan)
+    nonzero = padded_sizes[padded_sizes > 0]
+    return float(padded_sizes.max()) / float(nonzero.mean())
+
+
+def _pre_43_auto_picks(plan: WGridderPlan, *, is_adjoint: bool) -> tuple[str, str]:
+    """``(cpu, gpu)`` strategy the v0.1.2 heuristic would have picked.
+
+    A transcription of ``_auto_w_strategy_cpu`` / ``_auto_w_strategy_gpu`` as
+    they stood before issue #43, reading the padded metric against the old
+    cutoffs. Everything except the padding branch is unchanged by #43 and is
+    reproduced here only so the comparison is against the complete old rule.
+    """
+    previous_overhead = _pre_43_padded_overhead(plan)
+    n_w, width = plan.n_w, plan.w_kernel_width
+    if n_w <= width + 2:
+        return "dense_scan", "dense_vmap"
+    if previous_overhead > _PREVIOUS_CPU_PADDING_CUTOFF:
+        return "dense_scan", "dense_vmap"
+    expected_cpu = "windowed_scan" if is_adjoint and n_w / width > 2.0 else "dense_scan"
+    if previous_overhead > _PREVIOUS_GPU_PADDING_CUTOFF or plan.n_rows < 10_000:
+        expected_gpu = "dense_vmap"
+    elif is_adjoint or n_w <= 3.0 * width:
+        expected_gpu = "windowed_vmap"
+    else:
+        expected_gpu = "dense_vmap"
+    return expected_cpu, expected_gpu
 
 
 # --- the identity ------------------------------------------------------------
@@ -304,6 +383,68 @@ def test_live_row_count_is_the_kernel_width_times_the_rows() -> None:
         )
 
 
+# The channel spread for the multi-channel test below. Wide enough that the
+# per-channel w in wavelengths -- and so every channel's window layout --
+# genuinely differs: w scales with ``freq``, so the top channel's w-range is
+# twice the bottom's and the two disagree about which planes are occupied.
+_MULTI_CHAN_FREQ_FACTORS = np.array([1.0, 1.3, 1.6, 2.0])
+
+
+def test_accumulators_sum_over_every_channel() -> None:
+    """Both scalars accumulate across channels, not just the last one.
+
+    Every other reference in this module runs on a single-channel plan, and
+    the multi-channel assertion in ``test_planning.py`` takes its expectation
+    from ``plan.live_row_count`` itself, so it is circular on exactly this
+    point. Changing the builder's ``live_row_count += ...`` to ``=`` -- an
+    easy slip, since the loop body assigns rather than accumulates
+    everywhere else -- drops all but the last channel and passes both.
+
+    ``epsilon=1e-3`` so this runs on the float32 leg too.
+    """
+    uvw = synthetic_uvw(MWA_EXTENDED, 30.0, seed=0)
+    freq = MWA_EXTENDED.freq_hz * _MULTI_CHAN_FREQ_FACTORS
+    plan = _plan_for_uvw(
+        uvw,
+        freq,
+        (MWA_EXTENDED.n_pix, MWA_EXTENDED.n_pix),
+        MWA_EXTENDED.pixsize,
+        _F32_SAFE_EPSILON,
+    )
+    live_sizes = _independent_live_sizes(plan)
+
+    # Preconditions, asserted rather than skipped. The channels must lay their
+    # windows out differently, or a plan with four identical channels would be
+    # a single-channel plan wearing a hat and would gate nothing about the
+    # channel loop.
+    assert plan.n_chan == len(_MULTI_CHAN_FREQ_FACTORS) > 1
+    assert not all(np.array_equal(live_sizes[0], live_sizes[c]) for c in range(1, plan.n_chan)), (
+        "the channels have identical window layouts; widen _MULTI_CHAN_FREQ_FACTORS"
+    )
+    per_channel_live = live_sizes.sum(axis=1)
+    per_channel_empty = np.count_nonzero(live_sizes == 0, axis=1)
+
+    assert plan.live_row_count == int(live_sizes.sum())
+    assert plan.empty_plane_count == int(per_channel_empty.sum())
+
+    # Say it the other way round as well, so a failure names the defect rather
+    # than only the mismatch. Note that the per-channel live *totals* are equal
+    # here (each is ~n_rows * W whatever the channel does with its planes, the
+    # invariant the structural test above rests on), so it is the factor of
+    # n_chan that separates accumulating from assigning for ``live_row_count``;
+    # for ``empty_plane_count`` the per-channel values differ outright.
+    assert plan.live_row_count != int(per_channel_live[-1]), (
+        "live_row_count equals the last channel's count alone -- the builder "
+        "is assigning where it should accumulate"
+    )
+    assert plan.empty_plane_count != int(per_channel_empty[-1]), (
+        "empty_plane_count equals the last channel's count alone -- same slip"
+    )
+    assert plan.window_padding_overhead == pytest.approx(
+        _windowed_row_work(plan) / plan.live_row_count
+    )
+
+
 # --- the regression guard: the padding is excluded ---------------------------
 
 
@@ -351,6 +492,178 @@ def test_padding_rows_are_excluded_from_the_denominator() -> None:
         f"window_padding_overhead ({plan.window_padding_overhead:.4f}) is at "
         f"the padded-denominator value ({padded_overhead:.4f}); the "
         f"boundary_margin / +-1 clamp rows are back in the denominator"
+    )
+
+
+# --- the margin exclusion, on a fixture that carries a margin row ------------
+#
+# The regression test above runs on MWA_extended off30, where the margin
+# catches nothing at either precision and the whole live-vs-padded gap is the
+# +/-1 clamp. So it gates only half of the exclusion: an implementation that
+# reused the builder's margin-widened ``lo`` / ``hi`` for the live count --
+# dropping the clamp but keeping the margin -- passes every assertion in it.
+# No repository fixture separates the two, because the margin is a few ulps
+# wide and nothing lands in it by chance. This fixture puts a row there on
+# purpose.
+
+_MARGIN_FIXTURE_N_ROWS = 200
+_MARGIN_FIXTURE_HALF_EXTENT = 400.0  # metres, so w spans [-400, 400]
+_MARGIN_FIXTURE_PIXSIZE = 2e-3
+_MARGIN_FIXTURE_FREQ = np.array([1.4e9])
+# float64 on the x64 leg AND float32, since the margin scales with the plan
+# dtype's unit roundoff and a construction that works at one precision proves
+# nothing about the other. A float64 plan cannot be requested with x64 off
+# (issue #11), so that leg covers float32 only.
+_MARGIN_DTYPES: tuple[DTypeLike, ...] = (jnp.float64, jnp.float32) if X64 else (jnp.float32,)
+
+
+def _margin_fixture_uvw() -> np.ndarray:
+    """Baselines with w spread evenly over a fixed range; row order is w order."""
+    rng = np.random.default_rng(7)
+    uvw = np.zeros((_MARGIN_FIXTURE_N_ROWS, 3))
+    uvw[:, :2] = rng.uniform(-100.0, 100.0, size=(_MARGIN_FIXTURE_N_ROWS, 2))
+    uvw[:, 2] = np.linspace(
+        -_MARGIN_FIXTURE_HALF_EXTENT, _MARGIN_FIXTURE_HALF_EXTENT, _MARGIN_FIXTURE_N_ROWS
+    )
+    return uvw
+
+
+def _w_rel_of(plan: WGridderPlan, w_metres: float, chan: int = 0) -> float:
+    """``w`` in the plan's relative coordinate, derived as the builder derives it.
+
+    Narrow to ``real_dtype``, multiply *in* ``real_dtype``, widen, subtract
+    ``w0`` -- the order matters at the ulp scale this test works at.
+    """
+    w_m = np.asarray([w_metres], dtype=plan.real_dtype)
+    inv_lambda = np.asarray(plan.inv_lambda)
+    return float((w_m * inv_lambda[chan]).astype(np.float64)[0] - plan.w0)
+
+
+def _plan_with_a_row_in_the_margin_band(
+    real_dtype: DTypeLike,
+) -> tuple[WGridderPlan, int, float]:
+    """Build a plan holding one row strictly between support and support+margin.
+
+    Returns ``(plan, plane_index, distance_from_that_plane's_centre)``.
+
+    The construction is two-pass because the target depends on the geometry it
+    is placed into: build once to read ``w_kernel_scale``, ``w_centers_rel``,
+    ``w0`` and the margin off the plan, aim at the middle of the band above an
+    *interior* plane's upper edge, then walk the representable grid of the
+    row's w-in-metres with ``nextafter`` until the value the builder would
+    compute lands inside the band. The band is about four ulps of that grid
+    wide -- ``window_boundary_margin`` is ``4u`` of the absolute w scale --
+    so a handful of candidates is always enough, but which one lands is not
+    predictable in closed form, hence the search.
+
+    An interior plane is chosen so the planted row is not a w-extreme: the
+    second plan's ``w0``, ``dw``, ``n_w`` and centres are then identical to
+    the first's, which is asserted, and the target computed against the first
+    plan is therefore still valid in the second.
+    """
+    base_uvw = _margin_fixture_uvw()
+    image_shape = (64, 64)
+    build = partial(
+        make_plan,
+        freq=_MARGIN_FIXTURE_FREQ,
+        image_shape=image_shape,
+        pixsize_l=_MARGIN_FIXTURE_PIXSIZE,
+        pixsize_m=_MARGIN_FIXTURE_PIXSIZE,
+        epsilon=_F32_SAFE_EPSILON,
+        dtype=real_dtype,
+    )
+    probe = build(base_uvw)
+    assert probe.n_w > 2, "the fixture must have interior planes to plant a row above"
+
+    scale = probe.w_kernel_scale
+    margin = _boundary_margin_for(probe)
+    assert margin > 0.0, "a zero margin would make this test vacuous"
+    centre = float(np.asarray(probe.w_centers_rel, dtype=np.float64)[probe.n_w // 2])
+    inv_lambda = float(np.asarray(probe.inv_lambda)[0])
+
+    # Aim at the middle of the band, then walk outward one representable
+    # value at a time in each direction.
+    ideal_metres = (centre + scale + margin / 2.0 + probe.w0) / inv_lambda
+    planted: float | None = None
+    for direction in (np.inf, -np.inf):
+        candidate = np.float64(ideal_metres)
+        for _ in range(64):
+            offset = abs(_w_rel_of(probe, float(candidate)) - centre)
+            if scale < offset <= scale + margin:
+                planted = float(candidate)
+                break
+            candidate = np.nextafter(candidate, direction)
+        if planted is not None:
+            break
+    assert planted is not None, (
+        f"no representable w lands in the margin band for {np.dtype(real_dtype).name}: "
+        f"scale={scale!r}, margin={margin!r}. The band is ~4 ulps of the w grid, so this "
+        "means the margin or the w scale has changed shape, not that the test was unlucky"
+    )
+
+    uvw = base_uvw.copy()
+    uvw[_MARGIN_FIXTURE_N_ROWS // 2, 2] = planted
+    plan = build(uvw)
+    assert (
+        plan.n_w == probe.n_w
+        and plan.w0 == probe.w0
+        and plan.w_kernel_scale == probe.w_kernel_scale
+        and np.array_equal(np.asarray(plan.w_centers_rel), np.asarray(probe.w_centers_rel))
+    ), "planting the row moved the plan geometry; it was supposed to be interior"
+
+    return plan, probe.n_w // 2, abs(_w_rel_of(plan, planted) - centre)
+
+
+@pytest.mark.parametrize(
+    "real_dtype", _MARGIN_DTYPES, ids=[np.dtype(d).name for d in _MARGIN_DTYPES]
+)
+def test_margin_rows_are_excluded_from_the_denominator(real_dtype: DTypeLike) -> None:
+    """A row inside ``boundary_margin`` of an edge is padding, not live work.
+
+    The other half of the issue #43 exclusion, and the half no repository
+    fixture reaches. Reverting ``live_row_count`` to the builder's
+    margin-widened ``lo`` / ``hi`` -- keeping the margin, dropping only the
+    clamp -- passes ``test_padding_rows_are_excluded_from_the_denominator``
+    and fails here.
+
+    The preconditions are asserted rather than skipped: if the construction
+    stops landing a row in the band, that must fail loudly instead of passing
+    vacuously.
+    """
+    plan, plane, offset = _plan_with_a_row_in_the_margin_band(real_dtype)
+    scale = plan.w_kernel_scale
+    margin = _boundary_margin_for(plan)
+
+    # Precondition: the planted row is strictly outside kernel support, and
+    # inside the margin the builder widens by.
+    assert scale < offset <= scale + margin, (
+        f"planted row sits at {offset - scale:.3e} past the edge, outside the "
+        f"margin band (0, {margin:.3e}]"
+    )
+    # Said through the kernel the operators actually apply: |z| > 1, so phi
+    # weights this row at exactly zero. It is unambiguously padding.
+    assert float(phi_numpy(np.array([offset / scale]), plan.beta)[0]) == 0.0
+
+    live_sizes = _independent_live_sizes(plan)
+    margin_sizes = _independent_margin_widened_sizes(plan)
+    padded_sizes = _independent_padded_sizes(plan)
+
+    # Non-vacuity: the margin genuinely moves this plane's boundary, by
+    # exactly the one row that was planted there.
+    assert margin_sizes[0, plane] == live_sizes[0, plane] + 1, (
+        "the fixture no longer carries a margin row, so the assertions below "
+        "cannot distinguish the live bounds from the margin-widened ones"
+    )
+    # ... and the widened windows really do slice it: it is work, just not
+    # irreducible work.
+    assert padded_sizes[0, plane] >= margin_sizes[0, plane]
+
+    # The gate. Both totals are available to a wrong implementation; only the
+    # live one is correct.
+    assert plan.live_row_count == int(live_sizes.sum())
+    assert plan.live_row_count < int(margin_sizes.sum()) < int(padded_sizes.sum())
+    assert plan.window_padding_overhead == pytest.approx(
+        _windowed_row_work(plan) / int(live_sizes.sum())
     )
 
 
@@ -487,21 +800,45 @@ _ORDINARY_OVERHEAD_RANGE = (1.0, 3.3)
 _HIGH_OVERHEAD_RANGE = (5.0, 5.9)
 
 
-def test_cpu_padding_cutoff_clears_the_corrected_grid_maximum() -> None:
-    """The cutoff has to be restated upward, and 6.0 is the measured floor.
+def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
+    """The cutoff is 6.0 exactly, and it still switches the strategy.
 
     Stated as its own test so the number is auditable without running the
-    forty-cell sweep: the grid maximum is 5.784 (float64) / 5.791 (float32),
-    and the guard is only a guard if it sits above every review fixture.
+    forty-cell sweep. Two halves, and the second is the one that matters:
+
+    * **6.0 exactly.** The corrected metric reaches 5.784 (float64) / 5.792
+      (float32) on MWA_extended off30, so anything at or below that flips the
+      measured CPU win to ``dense_scan``. That is a *lower* bound, and a lower
+      bound alone is satisfied by 100.0 -- which would clear the grid by
+      switching the guard off. The upper bound is the derivation: the worst
+      padded-to-live inflation on the grid is 5.7843 / 4.8089 = 1.2028, so
+      carrying the shipped 5.0 across the change of scale gives 6.014, and 6.0
+      is that rounded down to the nearest tenth. The construction yields
+      6.014, not 6.0; 6.0 is the round number just below it, which is what
+      keeps the restatement from loosening the cutoff.
+    * **It still gates.** A constant no branch can reach is not a cutoff, so
+      exercise the branch on both sides of the value rather than trusting that
+      the comparison is still wired up.
     """
-    assert _CPU_PADDING_CUTOFF >= 6.0, (
-        "the corrected window_padding_overhead reaches 5.79 on MWA_extended "
-        "off30; a cutoff at or below that flips the measured CPU win to "
-        "dense_scan"
-    )
+    assert _CPU_PADDING_CUTOFF == 6.0
     # The GPU cutoff is unchanged by the redefinition; pin that it did not
     # get dragged along.
     assert _GPU_PADDING_CUTOFF == 3.0
+
+    # A real plan that clears every earlier branch, so the padding comparison
+    # is what decides: n_w = 248 against W = 4, i.e. past both `W + 2` and the
+    # adjoint's `n_w / W > 2`. Only the overhead is substituted, so this is a
+    # test of the branch and not of the fixture.
+    plan = _plan_for(MWA_EXTENDED, _HIGH_OVERHEAD_POINTING, _F32_SAFE_EPSILON)
+    assert plan.n_w > plan.w_kernel_width + 2
+    assert plan.n_w / plan.w_kernel_width > 2.0
+
+    below = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF - 0.001)
+    at = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF)
+    above = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF + 0.001)
+    assert _auto_w_strategy_cpu(below, is_adjoint=True) == "windowed_scan"
+    assert _auto_w_strategy_cpu(at, is_adjoint=True) == "windowed_scan"  # strict >
+    assert _auto_w_strategy_cpu(above, is_adjoint=True) == "dense_scan"
 
 
 @pytest.mark.parametrize(("telescope", "zenith_angle_deg", "epsilon"), _GRID)
@@ -547,24 +884,74 @@ def test_calibration_grid_auto_picks_survive_the_redefinition(
     5.79 flips them to ``dense_scan`` and this fails.
     """
     plan = _cached_plan(telescope, zenith_angle_deg, epsilon)
-
-    padded_sizes = _independent_padded_sizes(plan)
-    nonzero = padded_sizes[padded_sizes > 0]
-    previous_overhead = float(padded_sizes.max()) / float(nonzero.mean())
-
-    n_w, width = plan.n_w, plan.w_kernel_width
-    if n_w <= width + 2:
-        expected_cpu, expected_gpu = "dense_scan", "dense_vmap"
-    elif previous_overhead > 5.0:
-        expected_cpu, expected_gpu = "dense_scan", "dense_vmap"
-    else:
-        expected_cpu = "windowed_scan" if is_adjoint and n_w / width > 2.0 else "dense_scan"
-        if previous_overhead > 3.0 or plan.n_rows < 10_000:
-            expected_gpu = "dense_vmap"
-        elif is_adjoint or n_w <= 3.0 * width:
-            expected_gpu = "windowed_vmap"
-        else:
-            expected_gpu = "dense_vmap"
+    expected_cpu, expected_gpu = _pre_43_auto_picks(plan, is_adjoint=is_adjoint)
 
     assert _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint) == expected_cpu
     assert _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint) == expected_gpu
+
+
+# The seed sweep below. The forty-cell grid above is a single draw of each
+# fixture (``synthetic_uvw(..., seed=0)``), and on MWA_extended off30 the draw
+# moves the metric a long way: measured over seeds 0-11 at eps 1e-3 the
+# corrected overhead spans 5.784 to 8.090 against a seed-0 value of 5.784, so
+# ten of the twelve sit *above* ``_CPU_PADDING_CUTOFF`` where seed 0 sits below
+# it. That the pinned grid happens to draw the gentlest seed is issue #34's
+# subject, not this module's; what belongs here is that the equivalence this
+# change promises survives the spread rather than being an artefact of one
+# draw.
+_EQUIVALENCE_SEEDS = tuple(range(12))
+
+
+def test_auto_picks_survive_the_redefinition_across_seeds() -> None:
+    """The two rules agree on every seed, on both sides of both cutoffs.
+
+    The central claim of issue #43 is that redefining the metric and restating
+    the cutoff moves no ``auto`` decision. On the pinned grid that claim is
+    tested against one draw per fixture, and on the fixture that matters most
+    the seed-0 draw is the one that stays below the cutoff -- so the grid
+    exercises the "below" branch and never the "above" one. This sweeps the
+    draw and asserts only the agreement, never which strategy a seed gets:
+    which side of a cutoff a random draw lands on is a property of the draw.
+
+    Cheap enough for the fast leg (twelve 600-row plans) and precision-
+    independent: the two rules agree on all twelve seeds in float64 and in
+    float32, so no ``requires_x64``.
+    """
+    fired_new = fired_old = 0
+    for seed in _EQUIVALENCE_SEEDS:
+        uvw = synthetic_uvw(MWA_EXTENDED, _HIGH_OVERHEAD_POINTING, seed=seed)
+        plan = _plan_for_uvw(
+            uvw,
+            np.array([MWA_EXTENDED.freq_hz]),
+            (MWA_EXTENDED.n_pix, MWA_EXTENDED.n_pix),
+            MWA_EXTENDED.pixsize,
+            _F32_SAFE_EPSILON,
+        )
+        fired_new += plan.window_padding_overhead > _CPU_PADDING_CUTOFF
+        fired_old += _pre_43_padded_overhead(plan) > _PREVIOUS_CPU_PADDING_CUTOFF
+        for is_adjoint in (False, True):
+            expected_cpu, expected_gpu = _pre_43_auto_picks(plan, is_adjoint=is_adjoint)
+            got_cpu = _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint)
+            got_gpu = _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint)
+            assert got_cpu == expected_cpu, (
+                f"seed {seed}, {'adjoint' if is_adjoint else 'forward'}: the "
+                f"corrected metric ({plan.window_padding_overhead:.4f} vs "
+                f"cutoff {_CPU_PADDING_CUTOFF}) picks {got_cpu!r} where the "
+                f"pre-#43 rule ({_pre_43_padded_overhead(plan):.4f} vs 5.0) "
+                f"picks {expected_cpu!r}"
+            )
+            assert got_gpu == expected_gpu, f"seed {seed}: GPU pick moved"
+
+    # Non-vacuity: the sweep has to straddle the cutoff, or "the two rules
+    # agree" would only be a statement about the branch neither of them takes.
+    # Both rules fire on ten of the twelve seeds and clear on two, in both
+    # precision legs -- the counts are asserted loosely, since which seeds land
+    # where is not the property under test.
+    assert 0 < fired_new < len(_EQUIVALENCE_SEEDS), (
+        f"the corrected metric crossed its cutoff on {fired_new} of "
+        f"{len(_EQUIVALENCE_SEEDS)} seeds; the sweep must cover both branches"
+    )
+    assert 0 < fired_old < len(_EQUIVALENCE_SEEDS), (
+        f"the pre-#43 metric crossed its cutoff on {fired_old} of "
+        f"{len(_EQUIVALENCE_SEEDS)} seeds; the sweep must cover both branches"
+    )

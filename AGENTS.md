@@ -281,9 +281,11 @@ The windowed strategies rely on a contract between
   *padded* window lengths and did exactly that, by up to 17% on the
   review fixtures. In practice it is the `±1` clamp that the
   correction removes — `boundary_margin` is a few ulps of the absolute
-  w scale and catches a row on only nine of the forty calibration
-  cells, one or two rows each; on MWA_extended off30 the entire
-  487-row gap is the clamp (`2 · n_w = 496`, less end-clipping). The
+  w scale and catches a row on twelve of the forty float64 calibration
+  cells, one or two rows each; on MWA_extended off30 at eps 1e-3 it
+  catches none and the entire 487-row gap is the clamp (`2 · n_w =
+  496`, less end-clipping). Both are excluded regardless — that split
+  is a measurement, not a rule. The
   clamp is also why `empty_plane_count` has to be measured here rather
   than inferred downstream: it guarantees `window_size >= 1`, so a
   plane holding no rows is otherwise indistinguishable from one

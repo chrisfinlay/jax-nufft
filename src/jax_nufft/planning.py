@@ -522,6 +522,18 @@ def _coerce_uvw_freq_dtype(
         raise ValueError(f"uvw must have shape (N, 3); got {uvw_arr.shape}")
     if freq_arr.ndim != 1:
         raise ValueError(f"freq must have shape (Nchan,); got {freq_arr.shape}")
+    # Reject the empty cases by name. Both were already impossible -- the
+    # w-extent block takes ``np.min`` over the rows and again over the
+    # per-channel endpoints, so either one raised numpy's "zero-size array to
+    # reduction operation minimum which has no identity" a few dozen lines
+    # later. That is a true statement about numpy and tells the caller nothing
+    # about their input, and it arrives from a line whose subject is the
+    # w-range rather than the argument at fault. There is also nothing to
+    # build: a plan over no rows or no channels has no transform to define.
+    if uvw_arr.shape[0] == 0:
+        raise ValueError("uvw must contain at least one row; got shape (0, 3)")
+    if freq_arr.shape[0] == 0:
+        raise ValueError("freq must contain at least one channel; got shape (0,)")
     # "b" (bool), "i"/"u" (integers) and "f" all cast losslessly enough for
     # coordinates; complex/object/str input is a mistake worth naming.
     for name, arr in (("uvw", uvw_arr), ("freq", freq_arr)):
@@ -1002,10 +1014,9 @@ def make_plan(
         # ``n_chan * 1 * n_rows / (n_chan * n_rows)`` below is exactly 1.0.
         # This is the one plan shape that attains the lower bound.
         live_row_count = n_chan * n_rows
-        # A zero-row plan has one plane per channel and nothing in it. The
-        # ratio has no meaning there; the ``1.0`` below is the same
-        # no-padding-measured convention the generic branch uses.
-        empty_plane_count = n_chan if n_rows == 0 else 0
+        # No plane can be empty here: ``_coerce_uvw_freq_dtype`` guarantees
+        # ``n_rows >= 1``, and the single plane holds all of them.
+        empty_plane_count = 0
         window_padding_overhead = 1.0
     else:
         # --- number of w-planes ---
@@ -1198,9 +1209,13 @@ def make_plan(
         if live_row_count > 0:
             window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
         else:
-            # No row is inside any plane's support -- reachable only for a
-            # zero-row plan, since a plane is placed at every occupied w.
-            # There is no work to be in excess of, so report the lower bound.
+            # Defensive, and unreachable through ``make_plan``: the plane grid
+            # spans the whole w-range with a support half-width of ``W/2``
+            # planes, so every one of the ``n_rows >= 1`` rows that
+            # ``_coerce_uvw_freq_dtype`` guarantees is live in at least one
+            # plane. Kept as a division guard rather than an expected case --
+            # a future change to the plane spacing or to ``w_kernel_scale``
+            # would land here rather than on a ZeroDivisionError.
             window_padding_overhead = 1.0
         # Clamp max_window_size to at least 1 so the static dynamic_slice
         # shape is well-defined (e.g. n_rows >= 1 always).
