@@ -18,11 +18,17 @@ host's window provably contains every row the *device* puts inside support
 despite FMA contraction; they are real work, but they carry ``phi = 0``
 exactly, so they belong in the numerator, never in the denominator.
 
-Of the two, only the clamp is observable: ``window_boundary_margin`` is a few
-ulps of the absolute w scale and moves no row on any fixture in this
-repository (measured -- widening the live bounds by it changes not one count),
-so the whole live-vs-padded gap is the two clamp rows per (channel, plane).
-That is also why the gap matters most where the windows are narrowest.
+In practice the clamp dominates: ``window_boundary_margin`` is a few ulps of
+the absolute w scale, so it seldom has a row to catch. Measured over the
+forty-cell float64 calibration grid it adds one or two rows on twelve cells
+and none on the other twenty-eight, so the live-vs-padded gap is essentially
+the two clamp rows per (channel, plane) -- on MWA_extended off30 at eps 1e-3,
+the fixture the regression test below uses, it is exactly that and the margin
+catches nothing. Both are excluded on principle regardless of how many rows
+they happen to move: a padded row is one the *device* might place inside
+support under FMA contraction, not one the kernel gives weight. That the gap
+is mostly the clamp is also why it matters most where the windows are
+narrowest.
 
 Before #43 the denominator was ``window_size.mean()`` over the *padded*
 windows, which counted the padding as irreducible work and so understated the

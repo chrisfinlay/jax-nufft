@@ -1159,8 +1159,8 @@ def make_plan(
             # In practice the clamp is what this removes. ``boundary_margin``
             # is a few ulps of the absolute w scale, so it almost never has a
             # row to catch: measured over the forty-cell calibration grid it
-            # adds one or two rows on nine cells and none on the other
-            # thirty-one -- on MWA_extended off30 at eps 1e-3, the worst
+            # adds one or two rows on twelve cells and none on the other
+            # twenty-eight -- on MWA_extended off30 at eps 1e-3, the worst
             # fixture, the whole 487-row live-vs-padded gap is the clamp
             # (2 * n_w = 496, less end-clipping). The margin is excluded on
             # principle all the same: a margin row is one the *device* might
