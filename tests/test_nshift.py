@@ -46,6 +46,8 @@ only to shrink.
 from __future__ import annotations
 
 import contextlib
+import math
+from fractions import Fraction
 
 import jax.numpy as jnp
 import numpy as np
@@ -54,7 +56,7 @@ from jax.typing import DTypeLike
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
-from jax_nufft.planning import FLOAT32_EPSILON_FLOOR
+from jax_nufft.planning import FLOAT32_EPSILON_FLOOR, _phase_turns_reduced
 from tests.conftest import (
     EDA2,
     MEERKAT,
@@ -479,3 +481,159 @@ def test_dot_product_identity_survives_nshift() -> None:
     assert rel_err < DOT_PRODUCT_TOL, (
         f"dot-product relative error {rel_err:.3e}; lhs={lhs}, rhs={rhs}"
     )
+
+
+# --------------------------------------------------------------------------
+# Issue #16 follow-up: large common w offset (the w0 centring)
+# --------------------------------------------------------------------------
+#
+# nshift alone leaves a cancellation bug. After it, the phase the plane loop
+# exponentiates is 2*pi*w*(n-1+s); at the phase centre n-1 == 0 exactly, so
+# that phase is 2*pi*w*s -- large whenever |w| is -- while the per-visibility
+# compensation is -2*pi*w*s. The two cancel, and the float64 rounding error of
+# the two *large* phases survives into the small result ([Higham2002] ch. 1).
+#
+# Before nshift this pixel was immune: n-1 == 0 made the plane phase exactly
+# zero however large w was. So nshift converted a latent weakness into a
+# measured one, which is why the regression lives in this module.
+#
+# The fixture is the sharpest possible probe: a delta image at the phase
+# centre, where the forward answer is exactly 1 for every row analytically
+# (l == m == 0, so both the (u,v) phase and the w phase vanish, whatever the
+# baseline). No DFT reference is needed and no other error source is in play,
+# so the residual *is* the phase error. A small w-extent with a large common
+# offset is what separates "w0 is large" from "the w-range is wide": the plane
+# count, the kernel and phi_hat are identical across the parametrisation --
+# only the origin the phases are measured from moves.
+#
+# A wide field of view is what makes it bite: the error scales as
+# eps_machine * 2*pi*|w|*nshift, and nshift ~= 1.05 here (full-sky, 120 deg)
+# versus ~1e-2 for a narrow-field fixture.
+
+_W0_FOV_DEG = 120.0
+_W0_N_PIX = 32
+_W0_N_ROWS = 32
+_W0_HALF_EXTENT = 10.0  # wavelengths; the w-extent is 20 regardless of offset
+
+
+def _w0_offset_problem(offset: float) -> tuple[np.ndarray, np.ndarray, tuple[int, int], float]:
+    """uvw / freq / image_shape / pixsize for a large-common-w-offset fixture.
+
+    ``freq`` is the speed of light in m/s so that ``uvw`` in metres *is*
+    ``uvw_lambda`` in wavelengths, making ``offset`` directly the w-offset the
+    test is parametrised on.
+    """
+    pixsize = math.radians(_W0_FOV_DEG) / _W0_N_PIX
+    rng = np.random.default_rng(11)
+    uvw = np.zeros((_W0_N_ROWS, 3))
+    uvw[:, 0] = rng.uniform(-50.0, 50.0, _W0_N_ROWS)
+    uvw[:, 1] = rng.uniform(-50.0, 50.0, _W0_N_ROWS)
+    uvw[:, 2] = offset + rng.uniform(-_W0_HALF_EXTENT, _W0_HALF_EXTENT, _W0_N_ROWS)
+    freq = np.array([SPEED_OF_LIGHT])
+    return uvw, freq, (_W0_N_PIX, _W0_N_PIX), pixsize
+
+
+@requires_x64
+@pytest.mark.parametrize("offset", [0.0, 1e4, 1e6], ids=["w0_0", "w0_1e4", "w0_1e6"])
+def test_large_common_w_offset_stays_in_contract(offset: float) -> None:
+    """The 2*eps contract must survive a large common w offset.
+
+    ``offset=0`` is the control: it pins the fixture's own error floor well
+    inside the contract, so the two offset cases cannot be dismissed as "this
+    fixture is just hard". Measured on this fixture at eps=1e-12, relative L2
+    in units of eps, for offsets 0 / 1e4 / 1e6:
+
+        pre-nshift   0.34 /  1.10 /   65.52
+        nshift       0.58 / 15.70 / 1334.85
+        + centring   0.57 /  0.57 /    0.57
+
+    i.e. nshift regressed the offset cases by 14x and 20x, and the centring
+    makes the error independent of the absolute w -- flatter than the code was
+    before nshift.
+    """
+    eps = 1e-12
+    uvw, freq, image_shape, pixsize = _w0_offset_problem(offset)
+    image = np.zeros(image_shape)
+    image[image_shape[0] // 2, image_shape[1] // 2] = 1.0
+
+    plan = make_plan(uvw, freq, image_shape, pixsize, pixsize, eps)
+    # A delta at the phase centre only probes the cancellation if nshift is
+    # actually large there; assert the fixture's premise rather than trusting it.
+    assert abs(plan.nshift) > 1.0
+
+    got = np.asarray(dirty2vis(plan, jnp.asarray(image)))
+    # Exact: the only lit pixel has l == m == n - 1 == 0, so every phase in the
+    # measurement equation is zero and every visibility is exactly 1.
+    want = np.ones_like(got)
+
+    err = float(np.linalg.norm(got - want) / np.linalg.norm(want))
+    assert err < DFT_TOL_FACTOR * eps, (
+        f"relative error {err:.3e} ({err / eps:.2f}x eps) exceeds "
+        f"{DFT_TOL_FACTOR:g}*eps at w-offset {offset:g} -- the plane phase and the "
+        "nshift compensation are cancelling at large |w| (issue #16 follow-up: "
+        "w must be centred on plan.w0 too, with exp(2i*pi*w0*(n-1)) factored out "
+        "into plan.w0_screen)"
+    )
+
+
+@requires_x64
+@pytest.mark.parametrize("offset", [1e4, 1e6], ids=["w0_1e4", "w0_1e6"])
+def test_large_common_w_offset_adjoint_and_adjointness(offset: float) -> None:
+    """The adjoint and the dot-product identity survive the same offset.
+
+    The w0 screen is applied to the forward's *image input* and, conjugated, to
+    the adjoint's *image output*. Putting it on the wrong side, or forgetting
+    to conjugate it, leaves the forward alone and breaks only this test.
+    """
+    eps = 1e-12
+    uvw, freq, image_shape, pixsize = _w0_offset_problem(offset)
+    plan = make_plan(uvw, freq, image_shape, pixsize, pixsize, eps)
+
+    rng = np.random.default_rng(23)
+    n_rows = uvw.shape[0]
+    image = rng.standard_normal((1, *image_shape))
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
+
+    # Mask to the unit disc: this fixture is full-sky, so pixels with n <= 0 are
+    # zeroed by vis2dirty and would break the identity's n_grid bookkeeping.
+    n_grid = np.asarray(plan.n_minus_1) + 1.0
+    inside = n_grid > 0.0
+    image = image * inside[None, :, :]
+
+    Ax = np.asarray(dirty2vis(plan, jnp.asarray(image)))
+    Ay = np.asarray(vis2dirty(plan, jnp.asarray(vis)))
+
+    lhs = np.vdot(Ax.ravel(), vis.ravel()).real
+    rhs = float(np.vdot((image * np.where(inside, n_grid, 1.0)[None, :, :]).ravel(), Ay.ravel()))
+    rel_err = abs(lhs - rhs) / max(abs(lhs), abs(rhs))
+    assert rel_err < DOT_PRODUCT_TOL, (
+        f"dot-product relative error {rel_err:.3e} at w-offset {offset:g}; lhs={lhs}, rhs={rhs}"
+    )
+
+
+def test_phase_turns_reduced_is_exact() -> None:
+    """``_phase_turns_reduced`` must beat naive float64 by many digits.
+
+    Checked against an *exactly* correct reference: Python floats are binary
+    rationals, so ``Fraction(scale) * Fraction(x)`` is the true product with no
+    rounding at all, and its fractional part is the exact answer. This is what
+    justifies calling the host-side reduction "exact range reduction" rather
+    than "a bit better"; without it the w0 screen would only be as good as the
+    naive product it replaces.
+    """
+    rng = np.random.default_rng(5)
+    xs = rng.uniform(-2.1, 0.0, size=64)
+    for scale in (1e2, 1e4, 1e6, 1e9):
+        got = _phase_turns_reduced(scale, xs)
+        naive = (scale * xs) - np.rint(scale * xs)
+        for x, g, nv in zip(xs, got, naive, strict=True):
+            exact = Fraction(float(scale)) * Fraction(float(x))
+            exact -= round(exact)  # nearest-integer reduction, exactly
+            want = float(exact)
+            assert abs(g - want) < 1e-15, f"scale={scale} x={x}: got {g}, want {want}"
+            if scale >= 1e6:
+                # The naive form has visibly lost the low digits by here; if it
+                # had not, this test would not be measuring anything.
+                assert abs(nv - want) > abs(g - want)

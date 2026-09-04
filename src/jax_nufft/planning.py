@@ -28,6 +28,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import numpy.typing as npt
 from jax import Array
 from jax.typing import DTypeLike
 
@@ -65,6 +66,62 @@ W_OVERSAMPLE_X0 = 0.25
 # issue #12). Neither affects a float64 plan.
 FLOAT32_EPSILON_FLOOR = 1e-5
 
+# Veltkamp splitting constant for :func:`_two_product`: 2**ceil(53/2) + 1.
+_VELTKAMP_SPLIT = float(2**27 + 1)
+
+
+def _two_product(a: npt.ArrayLike, b: npt.ArrayLike) -> tuple[np.ndarray, np.ndarray]:
+    """Exact float64 product: returns ``(p, err)`` with ``a * b == p + err``.
+
+    Dekker's two-product via Veltkamp splitting. ``p`` is the rounded product
+    and ``err`` the exactly-representable rounding residual, so the pair
+    carries the full ~106-bit product of two float64s.
+
+    We need this because ``np.longdouble`` is *not* a wider type everywhere:
+    on arm64 (this project's primary dev platform) it is an alias for float64
+    with a 52-bit mantissa, so "just use longdouble" silently does nothing.
+    Dekker's algorithm needs only correctly-rounded float64 ``*`` and ``+``,
+    which numpy guarantees per elementwise op -- it never contracts separate
+    array operations into an FMA, which is the one thing that would break the
+    ``ah * bh - p`` residual step.
+    """
+    a_arr = np.asarray(a, dtype=np.float64)
+    b_arr = np.asarray(b, dtype=np.float64)
+    return _two_product_f64(a_arr, b_arr)
+
+
+def _two_product_f64(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``_two_product`` on arrays already known to be float64."""
+    p = a * b
+    a1 = _VELTKAMP_SPLIT * a
+    a_hi = a1 - (a1 - a)
+    a_lo = a - a_hi
+    b1 = _VELTKAMP_SPLIT * b
+    b_hi = b1 - (b1 - b)
+    b_lo = b - b_hi
+    err = ((a_hi * b_hi - p) + a_hi * b_lo + a_lo * b_hi) + a_lo * b_lo
+    return p, err
+
+
+def _phase_turns_reduced(scale: float, x: np.ndarray) -> np.ndarray:
+    """``(scale * x) mod 1``, in turns, accurate to full float64 precision.
+
+    ``exp(2πi * scale * x)`` only depends on ``scale * x`` modulo 1, but
+    forming that product in plain float64 throws the information away before
+    the reduction can use it: at ``scale * x ~ 1e6`` an ulp is ~2e-10, so the
+    fractional part -- the only part that matters -- is left with about six
+    correct digits instead of sixteen. This is exactly the "range reduction"
+    problem of [Higham2002] ch. 1.
+
+    So take the product exactly (:func:`_two_product`) and subtract the
+    nearest integer *before* collapsing back to a single float:
+    ``p - rint(p)`` is exact (Sterbenz), and adding the residual ``err`` then
+    lands a correctly-rounded fraction in ``[-0.5, 0.5]``. Accuracy is then
+    set by the fraction's own magnitude, not by ``scale * x``'s.
+    """
+    p, err = _two_product(scale, x)
+    return (p - np.rint(p)) + err
+
 
 @dataclass(frozen=True)
 class WGridderPlan:
@@ -95,6 +152,14 @@ class WGridderPlan:
     # are genuinely different operators and must not share a JIT cache entry.
     # ``0.0`` on the constant-w fast path -- see ``make_plan``.
     nshift: float
+    # issue #16 follow-up: the w-range midpoint ``(w_min + w_max) / 2`` over all
+    # channels, in wavelengths. Everything inside the w-plane loop works with
+    # ``delta = w - w0`` instead of ``w``, so the phases the loop exponentiates
+    # are bounded by the w-*extent* rather than by the absolute w. The constant
+    # part ``exp(2πi w0 (n-1))`` is factored out into the ``w0_screen`` leaf
+    # below. Static for the same reason as ``nshift``: it changes the operator,
+    # so it belongs in the JIT cache key.
+    w0: float
     # v0.1.1 windowed-scan fields:
     # ``max_window_size`` is the worst-case live-window length across all
     # (channel, plane) pairs. ``window_padding_overhead`` is
@@ -128,6 +193,17 @@ class WGridderPlan:
     # ---- traced arrays (pytree leaves) ----
     uvw_lambda: Array = field()  # (n_chan, n_rows, 3) — input row order
     w_centers: Array = field()  # (n_w,)
+    # issue #16 follow-up: the same plane centres measured from ``w0``, i.e.
+    # ``w_centers - w0`` -- but built at small magnitude on the host rather than
+    # by subtracting two ~|w0| numbers at call time. That distinction is the
+    # whole point: ``w_centers`` is quantised to the float64 grid *at* |w0|
+    # (ulp 1.2e-10 near 1e6), so recovering the offsets from it caps their
+    # resolution at 1e-10 no matter how exact the subtraction is, and a 1e-10
+    # error in a plane centre is a ~6e-10 phase error -- 300x the eps=1e-12
+    # contract. Computed small, they carry full relative precision.
+    # This is the array the plane loop iterates over; ``w_centers`` stays
+    # absolute because the window builder and the w-coverage tests read it.
+    w_centers_rel: Array = field()  # (n_w,)
     n_minus_1: Array = field()  # (n_l, n_m)
     # issue #16: ``n_minus_1 + nshift``. This is the grid the per-plane phase
     # ``exp(2πi w_k (n-1+nshift))`` and the ``phi_hat`` argument
@@ -135,6 +211,14 @@ class WGridderPlan:
     # itself stays, and is the *only* thing the adjoint's ``1/n`` output factor
     # may use -- ``n = n_minus_1 + 1``, not ``n_minus_1_shifted + 1``.
     n_minus_1_shifted: Array = field()  # (n_l, n_m)
+    # issue #16 follow-up: ``exp(2πi * w0 * (n - 1))``, complex, the image-domain
+    # phase screen carrying the w-range midpoint that the plane loop no longer
+    # sees. Computed once on the host with exact range reduction
+    # (:func:`_phase_turns_reduced`), which is the whole point: this is the one
+    # place a large phase argument legitimately survives, and reducing it here
+    # costs nothing at call time. The forward multiplies its image by it, the
+    # adjoint multiplies its output image by the conjugate.
+    w0_screen: Array = field()  # (n_l, n_m), complex_dtype
     phi_hat_n: Array = field()  # (n_l, n_m)
     # v0.1.1 windowed-scan support:
     sort_perm: Array = field()  # (n_rows,) int — argsort(uvw[:, 2]) ascending
@@ -167,6 +251,7 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.pixsize_m,
         plan.w_kernel_scale,
         plan.nshift,
+        plan.w0,
         plan.max_window_size,
         plan.window_padding_overhead,
         plan.w_extent,
@@ -190,6 +275,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         pixsize_m,
         w_kernel_scale,
         nshift,
+        w0,
         max_window_size,
         window_padding_overhead,
         w_extent,
@@ -200,8 +286,10 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
     (
         uvw_lambda,
         w_centers,
+        w_centers_rel,
         n_minus_1,
         n_minus_1_shifted,
+        w0_screen,
         phi_hat_n,
         sort_perm,
         uvw_lambda_sorted,
@@ -223,6 +311,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         pixsize_m=pixsize_m,
         w_kernel_scale=w_kernel_scale,
         nshift=nshift,
+        w0=w0,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
         w_extent=w_extent,
@@ -231,8 +320,10 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         complex_dtype=complex_dtype,
         uvw_lambda=uvw_lambda,
         w_centers=w_centers,
+        w_centers_rel=w_centers_rel,
         n_minus_1=n_minus_1,
         n_minus_1_shifted=n_minus_1_shifted,
+        w0_screen=w0_screen,
         phi_hat_n=phi_hat_n,
         sort_perm=sort_perm,
         uvw_lambda_sorted=uvw_lambda_sorted,
@@ -249,8 +340,10 @@ jax.tree_util.register_pytree_node(
         (
             p.uvw_lambda,
             p.w_centers,
+            p.w_centers_rel,
             p.n_minus_1,
             p.n_minus_1_shifted,
+            p.w0_screen,
             p.phi_hat_n,
             p.sort_perm,
             p.uvw_lambda_sorted,
@@ -520,6 +613,51 @@ def make_plan(
         # Should be unreachable with a real telescope; guard anyway.
         raise AssertionError("internal: negative w-extent")
 
+    # --- issue #16 follow-up: centre w as well as n-1 ---
+    # nshift alone is not enough. After it, the phase the plane loop
+    # exponentiates is ``2πi w (n-1+s)``, and at the phase centre ``n-1 == 0``
+    # so that phase is ``2πi w s`` -- large whenever ``|w|`` is large -- while
+    # the compensating factor is ``-2πi w s``. The two cancel, so the result is
+    # a small number reconstructed from two large ones and the float64 rounding
+    # error of the *large* phases survives into it ([Higham2002] ch. 1). Before
+    # nshift this particular pixel was safe (``n-1 == 0`` made the plane phase
+    # exactly zero however large ``w`` was), which is why nshift turned a
+    # latent weakness into a measurable one. Measured on a delta image at the
+    # phase centre over a 120-degree field at eps=1e-12, relative L2 in units
+    # of eps, for w_lambda = offset + [-10, 10]:
+    #
+    #     offset        0      1e4      1e6
+    #     pre-nshift  0.34     1.10    65.52
+    #     nshift      0.58    15.70  1334.85
+    #     + centring  0.57     0.57     0.57
+    #
+    # Note the last row is flat: with both w and n-1 centred the accuracy no
+    # longer depends on the absolute w at all, which is stronger than what the
+    # pre-nshift code gave.
+    #
+    # The cure is the same trick applied to w. Split off the range midpoint:
+    #
+    #     exp(2πi w (n-1)) = exp(2πi w0 (n-1)) · exp(2πi (w-w0) (n-1))
+    #
+    # The first factor depends on the pixel but on neither the visibility nor
+    # the plane, so it leaves the loop entirely and becomes the ``w0_screen``
+    # image-domain phase screen (applied once per call). The second uses
+    # ``delta = w - w0``, bounded by half the w-extent, and combines with the
+    # nshift identity to give
+    #
+    #     exp(2πi delta (n-1+s)) · exp(-2πi delta s)
+    #
+    # where *both* arguments are small. Note the plane spacing, ``n_w``,
+    # ``w_centers`` and the window builder are untouched by this: only which
+    # origin the phases are measured from changes.
+    #
+    # ``w_centers`` deliberately stays in *absolute* wavelengths -- it is the
+    # documented plan field the window builder and the coverage tests read, and
+    # the operators subtract ``w0`` at the JIT boundary instead. In float64
+    # that subtraction is exact (Sterbenz: the two operands are within an
+    # w-extent of each other), so nothing is lost by deferring it.
+    w0 = (w_min_all + w_max_all) / 2.0
+
     is_constant_w_val = bool(w_extent == 0.0)
     use_fast_path = is_constant_w_val and not _force_generic
 
@@ -546,6 +684,16 @@ def make_plan(
         # exp(0) = 1 (that code skips the multiply entirely when
         # ``plan.nshift == 0.0``). Shifted phase and compensation are both
         # off, never one without the other.
+        #
+        # The w-centring follow-up makes that choice moot rather than merely
+        # harmless: here ``w0 == w_min_all == w_max_all == w_centers[0]``, so
+        # ``delta = w - w0`` is exactly 0 for every row and for the single
+        # plane. The plane phase ``2π delta (n-1+s)`` and the compensation
+        # ``-2π delta s`` are then both identically zero *whatever* nshift is,
+        # and the entire w-dependence is carried by ``w0_screen`` -- which is
+        # range-reduced on the host, so this path also stops exponentiating an
+        # unreduced ``2π w_const (n-1)`` at call time. That is a strict
+        # accuracy gain for constant-w data at large |w|.
         nshift = 0.0
         n_minus_1_shifted_np = n_minus_1_np
         w_constant = w_min_all  # = w_max_all by construction
@@ -555,6 +703,8 @@ def make_plan(
         # construction so the value doesn't affect output.
         w_kernel_scale = 1.0
         w_centers_np = np.array([w_constant], dtype=real_dtype)
+        # w0 == w_constant here, so the one plane sits exactly at the origin.
+        w_centers_rel_np = np.zeros(1, dtype=real_dtype)
         phi_hat_n_np = np.ones((n_l, n_m), dtype=real_dtype)
         # Single-window builder: one window per channel, covering all rows.
         sort_perm_np = np.arange(n_rows, dtype=np.int32)
@@ -598,8 +748,15 @@ def make_plan(
             dw = w_extent / n_w_inner
         w_kernel_scale = dw * w_kernel_width / 2.0
         k = np.arange(n_w)
-        w_centers_np = w_min_all + (k - w_kernel_width / 2.0) * dw
-        w_centers_np = w_centers_np.astype(real_dtype)
+        # Build the centres *relative to w0* first, at small magnitude, then add
+        # w0 back for the public absolute field. Doing it the other way round
+        # (absolute first, subtract later) rounds each centre onto the float64
+        # grid at |w0| and loses the low bits of the offset for good -- see the
+        # ``w_centers_rel`` field comment. ``w_min_all - w0`` is exact
+        # (Sterbenz), so the relative centres are as accurate as ``dw``.
+        w_centers_rel_np = (w_min_all - w0) + (k - w_kernel_width / 2.0) * dw
+        w_centers_np = (w0 + w_centers_rel_np).astype(real_dtype)
+        w_centers_rel_np = w_centers_rel_np.astype(real_dtype)
 
         # --- phi_hat_n (precomputed on the n-1 grid) ---
         # Argument to phi_hat is eta = (n - 1) * scale, where scale is the kernel
@@ -649,9 +806,18 @@ def make_plan(
         window_start_np = np.zeros((n_chan, n_w), dtype=np.int32)
         window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
         half_W_dw = w_kernel_scale  # = (W/2) * dw, the kernel support half-width
-        w_centers64 = w_centers_np.astype(np.float64)
+        # issue #16 follow-up: compute the boundaries in the SAME coordinate the
+        # operators use for ``z``, i.e. relative to ``w0``, not in absolute
+        # wavelengths. The two differ by the rounding of ``w0 + w_centers_rel``
+        # onto the float64 grid at |w0|, and that is not negligible here: a row
+        # sitting within an ulp of a window edge gets ``phi(z = +/-1) =
+        # exp(-beta)`` from the dense path but is dropped entirely by a windowed
+        # path whose boundary rounded the other way. exp(-beta) is ~1e-7 at W=7,
+        # which is exactly the windowed-vs-dense mismatch tests/
+        # test_boundary_planes.py measures at a 1e-12 tolerance.
+        w_centers64 = w_centers_rel_np.astype(np.float64)
         for c in range(n_chan):
-            w_lambda_c = uvw_lambda_sorted_np[c, :, 2].astype(np.float64)
+            w_lambda_c = uvw_lambda_sorted_np[c, :, 2].astype(np.float64) - w0
             # ``side="left"``  for lower bound, ``side="right"`` for upper bound
             # gives a half-open interval [lo, hi) of strictly-inside rows. Rows
             # exactly at ``w_k +/- half_W_dw`` have phi(z=+/-1) = exp(-beta),
@@ -715,6 +881,23 @@ def make_plan(
     u_finufft_np = ((two_pi * pixsize_l) * uvw_lambda_np[..., 0]).astype(real_dtype)
     v_finufft_np = ((two_pi * pixsize_m) * uvw_lambda_np[..., 1]).astype(real_dtype)
 
+    # --- issue #16 follow-up: the w0 image-domain phase screen ---
+    # ``exp(2πi w0 (n-1))``. This is the one place a large phase argument
+    # legitimately remains, so it is the one place that gets exact range
+    # reduction: ``_phase_turns_reduced`` takes ``w0 * (n-1)`` modulo 1 with a
+    # double-double product, keeping full float64 accuracy in the fraction no
+    # matter how large ``w0`` is. Doing this on the host is free -- it happens
+    # once per plan, not once per call, and never inside the plane loop.
+    #
+    # Deliberately computed from the float64 ``n_minus_1`` grid rather than the
+    # (possibly float32) plan leaf: the reduction is only worth doing if its
+    # input carries full precision, and the result is cast to the plan's
+    # complex dtype at the end.
+    n_minus_1_f64 = np.where(inside_disc, inside_val, outside_val)
+    w0_screen_np = np.exp(2j * np.pi * _phase_turns_reduced(w0, n_minus_1_f64)).astype(
+        complex_dtype
+    )
+
     return WGridderPlan(
         n_l=int(n_l),
         n_m=int(n_m),
@@ -728,6 +911,7 @@ def make_plan(
         pixsize_m=float(pixsize_m),
         w_kernel_scale=float(w_kernel_scale),
         nshift=float(nshift),
+        w0=float(w0),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
         w_extent=float(w_extent),
@@ -740,8 +924,10 @@ def make_plan(
         complex_dtype=complex_dtype,
         uvw_lambda=jnp.asarray(uvw_lambda_np),
         w_centers=jnp.asarray(w_centers_np),
+        w_centers_rel=jnp.asarray(w_centers_rel_np),
         n_minus_1=jnp.asarray(n_minus_1_np),
         n_minus_1_shifted=jnp.asarray(n_minus_1_shifted_np),
+        w0_screen=jnp.asarray(w0_screen_np),
         phi_hat_n=jnp.asarray(phi_hat_n_np),
         sort_perm=jnp.asarray(sort_perm_np),
         uvw_lambda_sorted=jnp.asarray(uvw_lambda_sorted_np),

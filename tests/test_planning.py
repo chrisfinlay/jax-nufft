@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -334,10 +336,67 @@ def test_plan_invalid_inputs() -> None:
         make_plan(uvw[..., :2], freq, (64, 64), 1e-3, 1e-3, epsilon=1e-6)
 
 
-@requires_x64
-def test_plan_is_a_jax_pytree() -> None:
-    """The plan can flow through pytree-aware transforms (jit, vmap, etc.)."""
-    plan = make_plan(
+# ---------------------------------------------------------------------------
+# The plan's pytree contract, field by field (AGENTS.md sec 4)
+# ---------------------------------------------------------------------------
+#
+# These two tables are the machine-checkable half of AGENTS.md sec 4's
+# plan-field checklist. They are written out by hand rather than derived from
+# ``dataclasses.fields(WGridderPlan)`` on purpose: deriving them would make the
+# test agree with whatever the dataclass happens to say, which is exactly the
+# drift it exists to catch. Adding a field to ``WGridderPlan`` without also
+# adding it here -- and to ``_plan_aux`` / ``register_pytree_node`` --  must
+# fail, because that combination is the "silent pytree corruption" sec 4 warns
+# about: a leaf missing from the flatten tuple is silently frozen into the
+# traced computation, and a static field missing from the aux data silently
+# shares a JIT cache entry across two genuinely different operators.
+#
+# Leaves, in flatten order.
+_EXPECTED_LEAF_FIELDS: tuple[str, ...] = (
+    "uvw_lambda",
+    "w_centers",
+    "w_centers_rel",  # issue #16 follow-up
+    "n_minus_1",
+    "n_minus_1_shifted",  # issue #16
+    "w0_screen",  # issue #16 follow-up
+    "phi_hat_n",
+    "sort_perm",
+    "uvw_lambda_sorted",
+    "window_start",
+    "window_size",
+    "u_finufft",  # v0.1.2 Part 3.1
+    "v_finufft",  # v0.1.2 Part 3.1
+)
+
+# Static (aux_data) fields, each with a way to produce a *different* value of
+# the same kind. The value only has to be distinguishable -- the mutated plans
+# below are flattened, never evaluated -- so an inconsistent one (n_l + 1 with
+# unchanged arrays) is fine and keeps the probes one-liners.
+_STATIC_FIELD_PROBES: tuple[tuple[str, Callable[[Any], Any]], ...] = (
+    ("n_l", lambda v: v + 1),
+    ("n_m", lambda v: v + 1),
+    ("n_chan", lambda v: v + 1),
+    ("n_rows", lambda v: v + 1),
+    ("n_w", lambda v: v + 1),
+    ("w_kernel_width", lambda v: v + 1),
+    ("beta", lambda v: v + 1.0),
+    ("epsilon", lambda v: v * 10.0),
+    ("pixsize_l", lambda v: v * 2.0),
+    ("pixsize_m", lambda v: v * 2.0),
+    ("w_kernel_scale", lambda v: v + 1.0),
+    ("nshift", lambda v: v + 1.0),  # issue #16
+    ("w0", lambda v: v + 1.0),  # issue #16 follow-up
+    ("max_window_size", lambda v: v + 1),
+    ("window_padding_overhead", lambda v: v + 1.0),
+    ("w_extent", lambda v: v + 1.0),
+    ("is_constant_w", lambda v: not v),
+    ("real_dtype", lambda v: np.dtype(np.float32)),
+    ("complex_dtype", lambda v: np.dtype(np.complex64)),
+)
+
+
+def _reference_plan() -> WGridderPlan:
+    return make_plan(
         uvw=_baseline_uvw(n_rows=10),
         freq=np.array([200e6]),
         image_shape=(32, 32),
@@ -346,15 +405,116 @@ def test_plan_is_a_jax_pytree() -> None:
         epsilon=1e-6,
     )
 
-    leaves, treedef = jax.tree_util.tree_flatten(plan)
-    # uvw_lambda, w_centers, n_minus_1, phi_hat_n, sort_perm,
-    # uvw_lambda_sorted, window_start, window_size,
-    # u_finufft, v_finufft  (v0.1.2 Part 3.1 added the last two),
-    # n_minus_1_shifted (issue #16: n_minus_1 + nshift, the leaf used by the
-    # plane phase and the phi_hat argument; n_minus_1 itself is kept for the
-    # 1/n output factor -- see AGENTS.md sec 4).
+
+@requires_x64
+def test_plan_leaves_are_exactly_the_expected_fields() -> None:
+    """Every pytree leaf is a named plan field, in order, and nothing else.
+
+    Comparing against ``[getattr(plan, name) for name in _EXPECTED_LEAF_FIELDS]``
+    by *identity* pins membership and order at once. A bare
+    ``len(leaves) == N`` -- which is all this used to check -- passes just as
+    happily when one leaf is swapped for another, or when a newly added leaf
+    displaces an existing one in the flatten tuple, so it gates nothing.
+    """
+    plan = _reference_plan()
+    leaves = jax.tree_util.tree_leaves(plan)
+    expected = [getattr(plan, name) for name in _EXPECTED_LEAF_FIELDS]
+
+    assert len(leaves) == len(_EXPECTED_LEAF_FIELDS), (
+        f"expected {len(_EXPECTED_LEAF_FIELDS)} leaves "
+        f"{_EXPECTED_LEAF_FIELDS}, got {len(leaves)} -- a field was added to "
+        "WGridderPlan without updating register_pytree_node, _plan_unflatten, "
+        "_EXPECTED_LEAF_FIELDS and AGENTS.md sec 4 together"
+    )
+    for name, got, want in zip(_EXPECTED_LEAF_FIELDS, leaves, expected, strict=True):
+        assert got is want, f"leaf out of order or wrong field at {name!r}"
+
     # The issue #11 dtype metadata is *static*, so it must not show up here.
-    assert len(leaves) == 11
+    assert not any(isinstance(leaf, np.dtype) for leaf in leaves)
+
+
+@requires_x64
+@pytest.mark.parametrize("field_name", _EXPECTED_LEAF_FIELDS)
+def test_each_plan_leaf_round_trips_and_is_really_a_leaf(field_name: str) -> None:
+    """Each named leaf survives flatten/unflatten *and* is actually traced.
+
+    Two distinct failures are covered. Dropping the field from
+    ``register_pytree_node``'s children tuple makes the mutation below change
+    no leaf at all (it would be baked into the aux data instead), and dropping
+    it from ``_plan_unflatten`` makes the round-trip lose it.
+    """
+    plan = _reference_plan()
+    leaves, treedef = jax.tree_util.tree_flatten(plan)
+
+    rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert isinstance(rebuilt, WGridderPlan)
+    assert getattr(rebuilt, field_name) is getattr(plan, field_name), (
+        f"{field_name} did not survive the pytree round-trip"
+    )
+
+    # Perturb this leaf only: exactly one leaf must differ.
+    mutated = dataclasses.replace(plan, **{field_name: getattr(plan, field_name) + 1})
+    mutated_leaves = jax.tree_util.tree_leaves(mutated)
+    assert len(mutated_leaves) == len(leaves)
+    differing = [
+        name
+        for name, a, b in zip(_EXPECTED_LEAF_FIELDS, mutated_leaves, leaves, strict=True)
+        if a is not b
+    ]
+    assert differing == [field_name], (
+        f"changing {field_name} should change exactly that one leaf; changed {differing}. "
+        "An empty list means the field is missing from the flatten_func children tuple"
+    )
+    # Structure is unchanged: perturbing a leaf's *value* must not move it into
+    # the aux data (that would re-trigger a JIT recompile on every new value).
+    assert jax.tree_util.tree_structure(mutated) == treedef
+
+
+@requires_x64
+@pytest.mark.parametrize(
+    ("field_name", "perturb"), _STATIC_FIELD_PROBES, ids=[n for n, _ in _STATIC_FIELD_PROBES]
+)
+def test_each_static_plan_field_is_in_the_aux_data(
+    field_name: str, perturb: Callable[[Any], Any]
+) -> None:
+    """Each static field is part of the treedef, i.e. of the JIT cache key.
+
+    The swap goes through ``dataclasses.replace`` rather than a second
+    ``make_plan(...)`` call *on purpose*. A separately built plan would differ
+    in several aux entries at once (asking for float32 also forces a different
+    epsilon, hence a different kernel width, beta, n_w and w_kernel_scale), so
+    its treedef would compare unequal even if the field under test had been
+    dropped from ``_plan_aux`` entirely -- and the assertion would prove
+    nothing. Here every other aux entry and every leaf is identical by
+    construction, so this fails if and only if this field is missing from
+    ``_plan_aux``.
+    """
+    plan = _reference_plan()
+    leaves, treedef = jax.tree_util.tree_flatten(plan)
+
+    mutated = dataclasses.replace(plan, **{field_name: perturb(getattr(plan, field_name))})
+    assert getattr(mutated, field_name) != getattr(plan, field_name), (
+        "the probe must actually change the value, or this test is vacuous"
+    )
+
+    mutated_leaves = jax.tree_util.tree_leaves(mutated)
+    assert all(a is b for a, b in zip(mutated_leaves, leaves, strict=True)), (
+        f"changing {field_name} alone must not disturb any leaf, or the treedef "
+        "comparison below would not isolate the aux data"
+    )
+    assert jax.tree_util.tree_structure(mutated) != treedef, (
+        f"{field_name} must be part of the pytree aux_data (_plan_aux), or two "
+        f"plans differing only in {field_name} would share a treedef / JIT cache "
+        "entry -- exactly the 'silent pytree corruption' AGENTS.md sec 4 warns about"
+    )
+
+
+@requires_x64
+def test_plan_is_a_jax_pytree() -> None:
+    """The plan can flow through pytree-aware transforms (jit, vmap, etc.)."""
+    plan = _reference_plan()
+
+    leaves, treedef = jax.tree_util.tree_flatten(plan)
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, WGridderPlan)
     # Static fields preserved exactly.
@@ -367,61 +527,6 @@ def test_plan_is_a_jax_pytree() -> None:
     assert rebuilt.complex_dtype == plan.complex_dtype
     assert np.dtype(plan.real_dtype) == np.dtype(jnp.float64)
     assert np.dtype(plan.complex_dtype) == np.dtype(jnp.complex128)
-
-    # Being aux data also means the dtype is part of the JIT cache key: two
-    # plans that differ only in dtype must not share a treedef.
-    #
-    # The swap is done with ``dataclasses.replace`` rather than a second
-    # ``make_plan(dtype=jnp.float32)`` call *on purpose*. A separately built
-    # plan would also need a different epsilon (float32 warns below 1e-5, and
-    # the suite runs with filterwarnings=error), which changes the kernel
-    # width, beta, n_w and w_kernel_scale too -- so the treedefs would compare
-    # unequal even if the dtype pair were dropped from ``_plan_aux``
-    # entirely, and the assertion would prove nothing. Here every other aux
-    # entry and every leaf is identical by construction, so this fails if and
-    # only if the dtype is not part of the pytree aux data.
-    plan32 = dataclasses.replace(
-        plan,
-        real_dtype=np.dtype(np.float32),
-        complex_dtype=np.dtype(np.complex64),
-    )
-    assert np.dtype(plan32.real_dtype) == np.dtype(jnp.float32)
-    assert np.dtype(plan32.complex_dtype) == np.dtype(jnp.complex64)
-    leaves32 = jax.tree_util.tree_leaves(plan32)
-    assert all(a is b for a, b in zip(leaves32, leaves, strict=True)), (
-        "the dtype swap must not disturb the leaves, or the treedef comparison "
-        "below would not isolate the aux data"
-    )
-    assert jax.tree_util.tree_structure(plan32) != treedef
-
-    # issue #16: ``nshift`` is a new *static* plan field (the n-1 centring
-    # offset, s = -(nm1_max + nm1_min) / 2). Swap it via ``dataclasses.replace``
-    # exactly like the dtype check above -- every other aux entry and every
-    # leaf is identical by construction -- so this fails if and only if
-    # ``nshift`` is missing from ``_plan_aux``.
-    plan_alt_nshift = dataclasses.replace(plan, nshift=plan.nshift + 1.0)
-    leaves_alt_nshift = jax.tree_util.tree_leaves(plan_alt_nshift)
-    assert all(a is b for a, b in zip(leaves_alt_nshift, leaves, strict=True)), (
-        "changing nshift alone must not disturb any leaf, or the treedef "
-        "comparison below would not isolate the aux data"
-    )
-    assert jax.tree_util.tree_structure(plan_alt_nshift) != treedef, (
-        "nshift must be part of the pytree aux_data (_plan_aux), or two plans "
-        "differing only in nshift would share a treedef / JIT cache entry -- "
-        "exactly the 'silent pytree corruption' AGENTS.md sec 4 warns about"
-    )
-
-    # issue #16: ``n_minus_1_shifted`` is a new *leaf*. Swap its value (not
-    # its shape/dtype) via ``dataclasses.replace``: if it were dropped from
-    # ``register_pytree_node``'s flatten_func children tuple, the leaves
-    # would compare equal here even though the field itself changed.
-    plan_alt_leaf = dataclasses.replace(plan, n_minus_1_shifted=plan.n_minus_1_shifted + 1.0)
-    leaves_alt_leaf = jax.tree_util.tree_leaves(plan_alt_leaf)
-    assert len(leaves_alt_leaf) == len(leaves)
-    assert not all(a is b for a, b in zip(leaves_alt_leaf, leaves, strict=True)), (
-        "changing n_minus_1_shifted must change a leaf; if it were dropped "
-        "from the flatten_func children tuple this would silently pass"
-    )
 
     # And we can read it through a jit'd function.
     @jax.jit
@@ -486,7 +591,22 @@ def test_window_builder_sum_matches_expected() -> None:
     # the end of the data range, so the sum is bounded above by n_rows * W
     # and below by n_rows * (W - 1) for our test geometry.
     total = int(window_size.sum())
-    assert total <= plan.n_rows * W
+    # The upper bound carries the builder's own documented slack: it uses
+    # ``searchsorted(..., "left")`` / ``"right"``, which *includes* a row lying
+    # exactly on a window edge, so each of the ``n_chan * n_w`` windows can pick
+    # up at most one extra row at each end. That inclusion is not a wart to be
+    # tolerated -- it is required for windowed/dense parity, because the dense
+    # path gives such a row ``phi(z = +/-1) = exp(-beta)`` (~1e-7 at W=7, i.e.
+    # far above tests/test_boundary_planes.py's 1e-12 tolerance) and a windowed
+    # path that dropped it would disagree by exactly that much.
+    #
+    # Exact edge hits used to be vanishingly unlikely because the boundaries
+    # were computed in absolute wavelengths; since issue #16's follow-up they
+    # are computed relative to ``w0`` (so that they agree with the operators'
+    # own ``z``), where the arithmetic is "rounder" and ties do occur -- this
+    # fixture has exactly one. The bound below is still tight enough to catch a
+    # builder that widened its windows systematically (the slack is 1.6% here).
+    assert total <= plan.n_rows * W + 2 * plan.n_chan * plan.n_w
     assert total >= plan.n_rows * (W - 1)
 
 
