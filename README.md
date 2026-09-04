@@ -160,7 +160,7 @@ Taking `s = nshift = -(max(n-1) + min(n-1)) / 2` centres the shifted range on
 zero, halving `max|n - 1 + s|` for any image containing the phase centre. The
 plane spacing therefore doubles and `n_w_inner` halves &mdash; on the review
 fixtures, MWA_extended at 30 degrees off-zenith goes from 495 to 251 planes at
-`epsilon = 1e-6` &mdash; while the compensating factor in step 5 costs a single
+`epsilon = 1e-6` &mdash; while the compensating factor in step 6 costs a single
 complex multiply per visibility per call, independent of the plane count. The
 adjoint applies the conjugate factor to its *input* visibilities instead. Note
 the adjoint's `1/n` output factor still uses the physical, *unshifted*
@@ -427,9 +427,19 @@ strategy is within 15% of the best measured strategy for every
 &mdash; relative L2, in the sign convention above &mdash; for every
 `epsilon` from `1e-3` to `1e-12`, forward and adjoint, on the seven telescope
 fixtures of `tests/test_accuracy_sweep.py`. The measured worst cell across
-that 112-cell matrix is `0.67 * epsilon`. Against `ducc0.wgridder` (with
-matched `divide_by_n` flags) the bound is `3 * epsilon`, the sum of the two
-implementations' budgets.
+that 112-cell matrix is `1.47 * epsilon` (MWA_extended off30, `epsilon =
+1e-12`, adjoint). Against `ducc0.wgridder` (with matched `divide_by_n` flags)
+the bound is `3 * epsilon`, the sum of the two implementations' budgets.
+
+That worst cell was `0.67 * epsilon` before the `nshift` centring, so the
+headroom against the `2 * epsilon` contract has genuinely narrowed, from about
+3x to about 1.4x. The cause is structural rather than a regression in the
+kernel: centring `n - 1` puts *both* ends of its range at the `eta` extreme
+where the w-kernel's aliasing error peaks, where previously only one end was
+there. It buys a halving of the w-plane count (see above), and every cell
+still meets the contract &mdash; but the margin is now thin enough that a
+future change spending more of the error budget should re-run the sweep and
+expect to have to widen the kernel rather than assume the slack is there.
 
 Both contracts are for the **default float64 plan with `jax_enable_x64`
 enabled**. `float32` / `complex64` inputs are accuracy-limited and do not

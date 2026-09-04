@@ -253,7 +253,7 @@ pixi run -e dev typecheck              # mypy (best-effort)
 
   | Comparison                                   | Bound          | Measured (this repo, 2026-09 review)       |
   |-----------------------------------------------|----------------|---------------------------------------------|
-  | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; comfortably under `2 * eps` after it |
+  | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; `0.67x eps` worst cell after it; `1.47x eps` worst cell after #16's nshift centring (MWA_extended off30, eps=1e-12, adjoint) -- still inside the contract, but the headroom is now ~1.4x, not ~3x |
   | vs. ducc0 (forward + adjoint, constant-w fast path) | `err < 3 * eps`  | ducc0 lands at `~0.1 * eps` against the DFT; the `3 * eps` gap is dominated by our own `2 * eps` budget |
   | Strategy equivalence (`w_strategy` x `channel_strategy`, `tests/test_strategies_equivalent.py`) | `err < 1e-11` (float64), `err < 1.3e-6` (float32) | worst pairwise difference between any two of the eight combinations, 3 short fixtures x eps in {1e-4,1e-6,1e-8}: float64 2.0e-13 (MWA_compact off30, eps=1e-6); float32 1.21e-7 (MWA_compact off30, eps=1e-8) -- float32 bound is ~10x that measurement, see the module docstring |
   | Adjointness (dot-product identity, dense-vs-windowed adjoint) | `err < 1e-11`  | dot-product residual 1e-16 .. 7e-13 (ducc0 itself: 1e-14 .. 8e-11, for comparison only) |
@@ -275,6 +275,28 @@ pixi run -e dev typecheck              # mypy (best-effort)
   FINUFFT bins differently from macOS arm64), the fix is to measure the
   worst case there and set the bound at 10x it, not higher -- record the
   measurement in a comment, don't just loosen it to whatever passes.
+* **Adjointness is necessary but not sufficient &mdash; it cannot
+  replace DFT parity.** The dot-product identity
+  `<A x, y> == <x, A^H y>` constrains the forward and the adjoint
+  relative to *each other*, not either of them relative to the truth.
+  Any error the two share &mdash; a common-mode error &mdash; cancels out
+  of the identity and passes it cleanly while both operators are badly
+  wrong. Issue #16's follow-up is the worked example: with a large common
+  `w` offset the plane phase and the `nshift` compensating phase were
+  cancelling catastrophically, the forward's relative L2 error against the
+  exact DFT was `1335 * eps`, and the dot-product identity passed at
+  **every** offset, because the adjoint made the identical rounding error
+  in the identical place. Both sign-mutation checks on that branch tell
+  the same story from the other side: mutations that break the *pairing*
+  (flip one operator's compensation) are caught by adjointness
+  immediately, while a mutation that moves both together is not.
+  So: adjointness catches pairing bugs, DFT parity catches shared-mode
+  bugs, and a change to the shared phase machinery needs both. When you
+  add a new phase factor, add a DFT-parity test for it &mdash; see
+  `tests/test_nshift.py::test_large_common_w_offset_stays_in_contract`,
+  which uses a delta image at the phase centre (exact answer: 1 for every
+  visibility, analytically) so that the residual *is* the phase error,
+  with no reference implementation in the loop.
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.
