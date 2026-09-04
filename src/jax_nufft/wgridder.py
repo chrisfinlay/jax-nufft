@@ -337,8 +337,11 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 
 # Empirical cutoffs from the v0.1.2 GH200 baseline sweep (160 cells,
 # docs/benchmarks/v0.1.2-baseline-gpu.json). On GPU, scan variants are
-# 5-30x slower than vmap (kernel-launch overhead dominates per-plane
-# work); the windowed_vmap wins only on the GH200_large (50k-row)
+# slower than vmap in every one of that sweep's 160 scan/vmap pairs
+# (kernel-launch overhead dominates per-plane work) -- by 1.45x to 32.7x,
+# median 6.1x, recomputed from the JSON. The "never pick scan on GPU"
+# rule rests on the *universality*, not on the size, of that gap;
+# the windowed_vmap wins only on the GH200_large (50k-row)
 # fixture where dense_vmap's per-plane n_rows*W^2 starts to bite.
 _GPU_LARGE_N_ROWS = 10_000
 # Unmoved by issue #43, unlike ``_CPU_PADDING_CUTOFF`` above -- and that is a
@@ -362,8 +365,9 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     On GH200 (cuFINUFFT on Hopper), the four-way picture across 20
     (operator, fixture) cells is:
 
-      * ``_scan`` variants are always 5-30x slower than ``_vmap``;
-        never auto-pick a scan strategy on GPU.
+      * ``_scan`` variants are always slower than ``_vmap`` -- in all
+        160 scan/vmap pairs of the sweep, by 1.45x to 32.7x (median
+        6.1x); never auto-pick a scan strategy on GPU.
       * ``dense_vmap`` wins everywhere on small-to-medium fixtures
         (MWA, MeerKAT, EDA2).
       * ``windowed_vmap`` wins on the 50k-row ``GH200_large`` fixture
@@ -1003,9 +1007,12 @@ def dirty2vis(
         heuristic unreachable and, on GPU, made the shipped default the
         worst of the four choices: measured on one GH200 against ducc0 on
         72 Grace cores of the same node (eps 1e-6, float64, single
-        channel), ``dense_scan`` runs 1.4-5.6x *slower* than ducc0 on the
-        fixtures of issue #46, where what ``"auto"`` picks there runs
-        1.4-6.3x faster.
+        channel), ``dense_scan`` runs 1.4-5.6x *slower* than ducc0 on five
+        of the six cells of issue #46's table, where what ``"auto"`` picks
+        there runs 1.4-6.3x faster on all six. The exception is the
+        GH200_large off30 adjoint, where the old default was about 1.16x
+        faster than ducc0 -- still 2.0x off the ``dense_vmap`` column of
+        the same table.
 
         Passing ``w_strategy="dense_scan"`` restores the pre-#46 *code
         path*: the same strategy, so the same reduction order. It does not

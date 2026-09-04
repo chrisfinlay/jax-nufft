@@ -5,8 +5,11 @@ and the ``"auto"`` heuristic added in Part 4 was opt-in, i.e. never reached
 unless a caller asked for it by name. On GPU that made the shipped default the
 *worst* available choice: measured on one GH200 against ducc0 on 72 Grace
 cores (issue #46's table), ``dense_scan`` runs 1.4-5.6x slower than ducc0 on
-the same node while the strategy ``"auto"`` picks there runs 1.4-6.3x
-*faster*. The heuristic was fine; only its reachability was broken.
+the same node in five of that table's six cells, while the strategy
+``"auto"`` picks there runs 1.4-6.3x *faster* in all six. (The sixth cell,
+the GH200_large off30 adjoint, had the old default about 1.16x faster than
+ducc0 -- still 2.0x off the ``dense_vmap`` column of the same table.) The heuristic was fine; only
+its reachability was broken.
 
 What this module pins
 ---------------------
@@ -556,12 +559,17 @@ def test_gpu_default_resolves_to_the_expected_strategy(
     """On a real GPU backend the default resolves to the *named* strategy.
 
     Issue #46's measurements: on a GH200, ``dense_scan`` (the old default)
-    is 1.4-5.6x *slower* than ducc0 on 72 Grace cores, while the strategy
-    ``"auto"`` picks is 1.4-6.3x faster; the GH200 sweep behind
-    ``docs/benchmarks/v0.1.2-baseline-gpu.json`` has the scan variants
-    5-30x off the vmap ones. A scan-family pick is the headline regression
-    this catches, but the exact-name assertion also catches picking the
-    wrong member of the vmap family -- see the table comment above.
+    is 1.4-5.6x *slower* than ducc0 on 72 Grace cores in five of that
+    table's six cells (the GH200_large off30 adjoint is the exception, at
+    about 1.16x faster than ducc0, though still 2.0x off that table's
+    ``dense_vmap`` column), while the strategy ``"auto"`` picks is
+    1.4-6.3x faster in all six. Independently, the 160-cell GH200 sweep
+    behind ``docs/benchmarks/v0.1.2-baseline-gpu.json`` has the scan family
+    slower than the vmap family in *every* scan/vmap pair it contains,
+    by 1.45x to 32.7x with a median of 6.1x. A scan-family pick is the
+    headline regression this catches, but the exact-name assertion also
+    catches picking the wrong member of the vmap family -- see the table
+    comment above.
 
     Unlike the CPU tests, this does *not* patch the platform: the point is
     what a user on real GPU hardware gets. Gated by
@@ -585,7 +593,8 @@ def test_gpu_default_resolves_to_the_expected_strategy(
             f"(n_w={plan.n_w}, W={plan.w_kernel_width}, n_rows={plan.n_rows}, "
             f"padding_overhead={plan.window_padding_overhead:.4f}): the GPU default "
             f"resolved to {resolved!r}, but this table says {expected!r}. A scan-family "
-            "answer is 5-30x slower on this hardware; the other vmap answer is a "
+            "answer is slower than every vmap answer in all 160 pairs of the GH200 "
+            "sweep (1.45-32.7x); the other vmap answer is a "
             "bounded loss but still not what was measured. If the heuristic was "
             "retuned on purpose (issue #34), update the table with the measurement."
         )
@@ -708,6 +717,12 @@ def test_defaulted_call_canonicalises_exactly_once(
     ``_resolve_nthreads`` reaches ``_canonicalise_w_strategy`` through the
     module global, so patching the module attribute observes both call sites
     from one spy.
+
+    Scope: this goes through a real operator call, so it exercises whichever
+    canonical name the fixture resolves to and no others.
+    ``test_resolve_nthreads_never_canonicalises_a_canonical_name`` below is
+    the per-name statement of the same property, and is what catches a
+    short-circuit that covers only some of the four.
     """
     _patch_platform(monkeypatch, "gpu")
     plan, image, vis = _offzenith_problem(real_dtype, complex_dtype)
@@ -738,6 +753,67 @@ def test_defaulted_call_canonicalises_exactly_once(
     # ...and the one resolution still produces the right answer, so this cannot
     # pass by skipping the resolution altogether.
     assert real_canonicalise("auto", plan=plan, is_adjoint=is_adjoint) == expected
+
+
+@pytest.mark.parametrize("w_strategy", CANONICAL)
+@pytest.mark.parametrize(
+    "n_rows",
+    [wgridder._NTHREADS_SMALL_N_ROWS - 1, wgridder._NTHREADS_SMALL_N_ROWS + 1],
+    ids=["below_row_cutoff", "above_row_cutoff"],
+)
+def test_resolve_nthreads_never_canonicalises_a_canonical_name(
+    monkeypatch: pytest.MonkeyPatch,
+    w_strategy: WStrategy,
+    n_rows: int,
+) -> None:
+    """The short-circuit itself, stated over *every* canonical name.
+
+    This is the general form of the requirement
+    ``test_defaulted_call_canonicalises_exactly_once`` checks end-to-end.
+    That test goes through a real operator call, so it can only ever
+    exercise whichever strategy its fixture happens to resolve to -- one of
+    the four. A short-circuit written to cover only that one (or only the
+    vmap family, or only the name the fixture produces) would satisfy it
+    while leaving the other three defaulted paths canonicalising twice.
+
+    So assert the property directly and per name: hand ``_resolve_nthreads``
+    an already-canonical strategy and require that
+    ``_canonicalise_w_strategy`` is not called *at all*. Nothing here depends
+    on the heuristic, so a retune under issue #34 cannot make it stale, and
+    no plan or JAX work is needed.
+
+    Both sides of ``_NTHREADS_SMALL_N_ROWS`` are covered: the short-circuit
+    currently sits above that branch, and this keeps it gated if the two are
+    ever reordered.
+
+    ``_resolve_nthreads`` reaches ``_canonicalise_w_strategy`` through the
+    module global, so patching the module attribute observes it however
+    ``_resolve_nthreads`` itself was imported.
+    """
+    calls: list[str] = []
+    real_canonicalise = wgridder._canonicalise_w_strategy
+
+    def spy(name, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(name)
+        return real_canonicalise(name, **kwargs)
+
+    monkeypatch.setattr(wgridder, "_canonicalise_w_strategy", spy)
+    got = _resolve_nthreads(None, w_strategy, n_rows)
+
+    assert calls == [], (
+        f"_resolve_nthreads(None, {w_strategy!r}, {n_rows}) canonicalised {calls}; "
+        "an already-canonical name must be used as-is. A short-circuit that covers "
+        "only some of the four canonical names leaves the rest resolving twice on "
+        "the defaulted path (issue #46)."
+    )
+    # ...and the answer is still the right one, so this cannot pass by
+    # short-circuiting past the thread rule as well as past canonicalisation.
+    expected = 1 if (n_rows < wgridder._NTHREADS_SMALL_N_ROWS or "scan" in w_strategy) else 0
+    assert got == expected, (
+        f"_resolve_nthreads(None, {w_strategy!r}, {n_rows}) = {got}, expected {expected}"
+    )
+    # The canonical path must also not have acquired a plan/is_adjoint
+    # dependency: the call above passed neither.
 
 
 @pytest.mark.parametrize("w_strategy", CANONICAL)

@@ -458,10 +458,12 @@ on the same plan. The heuristic is **platform-aware**
   grid, where the worst fixture reads 5.78 on the new scale against 4.93
   on the old.)
 - **GPU** (tuned on the GH200 baseline sweep). Never picks a `_scan`
-  variant (5-30x slower than `_vmap` there). Picks `windowed_vmap` only
-  on large-row plans (`n_rows >= 10000`) with padding overhead below 3x
-  -- on the adjoint at any pointing, and on the forward when `n_w` is
-  low (`n_w <= 3 * w_kernel_width`). Otherwise `dense_vmap`.
+  variant: across the sweep's 160 scan/vmap pairs the scan family is
+  slower in every one, by 1.45x to 32.7x (median 6.1x). Picks
+  `windowed_vmap` only on large-row plans (`n_rows >= 10000`) with
+  padding overhead below 3x -- on the adjoint at any pointing, and on
+  the forward when `n_w` is low (`n_w <= 3 * w_kernel_width`).
+  Otherwise `dense_vmap`.
 - **Other platforms** (e.g. TPU) fall back to the CPU heuristic.
 
 ```python
@@ -504,10 +506,15 @@ off30 the adjoint pick is `windowed_vmap`, so `78.8` is not the number a
 defaulting caller gets there. The re-run below has that cell measured on
 the pick the default actually makes.
 
-So the old default ran 1.4-5.6x *slower* than ducc0 on that hardware,
-where what the heuristic picks runs 1.4-6.3x faster: the heuristic was
-never the problem, only its reachability. Re-tuning the thresholds
-themselves is a separate question (issue #34).
+So on five of those six cells the old default ran 1.4-5.6x *slower* than
+ducc0 on that hardware, where what the heuristic picks runs 1.4-6.3x
+faster in all six. The exception is the GH200_large off30 adjoint, where
+`dense_scan` at 159.2 ms was about 1.16x *faster* than ducc0's 184.8 ms —
+the one cell in the table where the old default was not losing to ducc0
+outright, though it was still 2.0x off `dense_vmap` and 3.0x off the
+`windowed_vmap` the heuristic actually picks there. Either way the
+heuristic was never the problem, only its reachability. Re-tuning the
+thresholds themselves is a separate question (issue #34).
 
 That table was measured when #46 was filed. Re-run on the same hardware
 against the code this default actually ships with, the shipped default
