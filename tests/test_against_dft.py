@@ -1,4 +1,4 @@
-"""Tiny-problem checks against the explicit DFT (single channel for now).
+"""Tiny-problem checks against the explicit DFT.
 
 These tests use a small image and small ``Nrow`` so that we can afford the
 full O(Nrow * Nl * Nm) reference DFT. They verify the *math* of the wgridder
@@ -18,6 +18,7 @@ under-provisioned kernel.
 
 from __future__ import annotations
 
+import functools
 import itertools
 
 import jax
@@ -140,6 +141,136 @@ def test_forward_matches_dft_off_zenith(eps: float) -> None:
     assert err < DFT_TOL_FACTOR * eps, (
         f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-channel parity (issue #23; partial cover for issue #14)
+# ---------------------------------------------------------------------------
+#
+# Everything above this point is single-channel, and until issue #23 that was
+# a thin but tolerable gap: the plan stored one fully-formed coordinate array
+# per channel, so "channel c" was a slice index and little else. Issue #23
+# replaced those arrays with a per-channel *scalar*, ``inv_lambda[c] =
+# freq[c] / c``, that the operators multiply through inside the channel loop.
+# That is new machinery on the per-channel axis, and a single-channel test
+# cannot distinguish ``inv_lambda[c]`` from ``inv_lambda[0]`` -- nor a channel
+# loop that scans the image and the scalar out of step, nor a transposed
+# output -- because with one channel every one of those bugs is the identity.
+#
+# The reference is the exact DFT at the usual ``2 * eps`` contract, not another
+# jax-nufft call: comparing strategies against each other cannot catch this
+# either, since all four call the same per-channel helper and would inherit the
+# same wrong scalar (the shared-mode failure AGENTS.md sec 6 records from issue
+# #16). Issue #14 tracks fuller per-channel and multi-channel coverage; this is
+# the slice of it that issue #23 makes load-bearing.
+#
+# Three channels spanning a factor of four in frequency, and an image that
+# differs per channel, so the wrong scalar or the wrong slice is a gross error
+# rather than a tolerance argument.
+_MULTI_CHAN_FREQ = np.array([0.7e9, 1.4e9, 2.8e9])
+
+
+@functools.cache
+def _multi_channel_case() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """The shared multi-channel fixture: ``(uvw, image, vis, freq, pixsize)``.
+
+    Cached so every parametrisation below measures the same inputs, and so the
+    two row-loop DFT references (which are epsilon- and strategy-independent)
+    are computed against identical data each time.
+    """
+    rng = np.random.default_rng(20231)
+    n_l = n_m = 16
+    n_rows = 24
+    pixsize = 0.006
+
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-60.0, 60.0, size=n_rows)
+    uvw[:, 1] = rng.uniform(-60.0, 60.0, size=n_rows)
+    # Real w content, off zenith, so the w-plane machinery (whose plane
+    # spacing and window placement are per-channel) actually does work.
+    uvw[:, 2] = rng.uniform(-25.0, 25.0, size=n_rows) + 40.0
+
+    freq = _MULTI_CHAN_FREQ
+    n_chan = freq.shape[0]
+    image = rng.standard_normal((n_chan, n_l, n_m)) + 1j * rng.standard_normal((n_chan, n_l, n_m))
+    vis = (
+        rng.standard_normal((n_rows, n_chan)) + 1j * rng.standard_normal((n_rows, n_chan))
+    ).astype(np.complex128)
+    return uvw, image, vis, freq, pixsize
+
+
+@pytest.mark.parametrize("channel_strategy", ["scan", "vmap"])
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+def test_multi_channel_matches_dft_forward_and_adjoint(
+    w_strategy: str, channel_strategy: str
+) -> None:
+    """Three distinct frequencies, forward and adjoint, against the exact DFT.
+
+    Both channel strategies are covered because they are two different ways of
+    walking the same new per-channel scalar -- ``scan`` carries
+    ``plan.inv_lambda`` as a scan input alongside the image, ``vmap`` maps over
+    it -- and a mismatch between the two axes only shows up with more than one
+    channel. Likewise both strategy families: the windowed helpers take the
+    sort_perm gather of ``uvw_m`` (shared across channels) and this channel's
+    scalar as separate arguments, which is a different composition from the
+    dense path's.
+    """
+    eps = 1e-6
+    uvw, image, vis, freq, pixsize = _multi_channel_case()
+    n_chan, n_l, n_m = image.shape
+
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    assert plan.n_chan == n_chan
+
+    vis_jax = np.asarray(
+        dirty2vis(
+            plan,
+            jnp.asarray(image),
+            w_strategy=w_strategy,
+            channel_strategy=channel_strategy,
+        )
+    )
+    dirty_jax = np.asarray(
+        vis2dirty(
+            plan,
+            jnp.asarray(vis),
+            w_strategy=w_strategy,
+            channel_strategy=channel_strategy,
+        )
+    )
+
+    vis_ref = _reference_forward(image, uvw, freq, pixsize, pixsize)
+    dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize)
+
+    fwd_err = np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref)
+    adj_err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
+    assert fwd_err < DFT_TOL_FACTOR * eps, (
+        f"forward relative error {fwd_err:.3e} exceeds "
+        f"{DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e} "
+        f"({w_strategy}, channel_strategy={channel_strategy})"
+    )
+    assert adj_err < DFT_TOL_FACTOR * eps, (
+        f"adjoint relative error {adj_err:.3e} exceeds "
+        f"{DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e} "
+        f"({w_strategy}, channel_strategy={channel_strategy})"
+    )
+
+    # Per channel as well as in aggregate: a norm over all three channels is
+    # dominated by the loudest, so a single mis-scaled channel could hide
+    # inside an otherwise-good total.
+    for c in range(n_chan):
+        c_err = np.linalg.norm(vis_jax[:, c] - vis_ref[:, c]) / np.linalg.norm(vis_ref[:, c])
+        assert c_err < DFT_TOL_FACTOR * eps, (
+            f"forward channel {c} (freq={freq[c]:.3g} Hz) relative error {c_err:.3e} "
+            f"exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+        )
+        c_err = np.linalg.norm(dirty_jax[c] - dirty_ref[c]) / np.linalg.norm(dirty_ref[c])
+        assert c_err < DFT_TOL_FACTOR * eps, (
+            f"adjoint channel {c} (freq={freq[c]:.3g} Hz) relative error {c_err:.3e} "
+            f"exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+        )
 
 
 # Every decade from 1e-3 to 1e-12, not just a subsample: the old rule

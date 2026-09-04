@@ -67,7 +67,7 @@ jax-nufft/
 │   ├── __init__.py           # public API surface
 │   ├── _version.py           # __version__
 │   ├── _types.py             # Literal aliases (WStrategy, ChannelStrategy)
-│   ├── _utils.py             # SPEED_OF_LIGHT, small helpers
+│   ├── _utils.py             # SPEED_OF_LIGHT
 │   ├── kernel.py             # exp-of-semicircle kernel + phi_hat table
 │   ├── planning.py           # WGridderPlan dataclass + make_plan
 │   └── wgridder.py           # dirty2vis / vis2dirty + per-channel helpers
@@ -158,28 +158,47 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   follow-up) is the w-range midpoint: the plane loop works in
   `delta = w - w0` so no phase it exponentiates scales with the
   absolute w, and the constant part leaves as the `w0_screen` leaf.
-* Plan **traced fields** (`uvw_lambda, w_centers, w_centers_rel,
-  n_minus_1, n_minus_1_shifted, w0_screen, phi_hat_n, sort_perm,
-  uvw_lambda_sorted, window_start, window_size, u_finufft,
-  v_finufft` — 13 leaves) are JAX device arrays.
-  `u_finufft` / `v_finufft` are `(n_chan, n_rows)` precomputed
-  FINUFFT-input coordinates (`2π · pixsize_* · uvw_lambda[..., axis]`,
-  v0.1.2+). They add roughly `2 · n_chan · n_rows · sizeof(real)` to the
-  plan's HBM footprint (about +33% on top of the dense `uvw_lambda*`
-  arrays since each is now-half the shape). Sorted variants are not
-  stored; the windowed helpers gather them via `plan.sort_perm` at
-  scan time, trading half the memory for one gather per channel iter.
+* Plan **traced fields** (`uvw_m, inv_lambda, w_centers_rel,
+  n_minus_1_shifted, w0_screen, phi_hat_n, sort_perm, window_start`
+  — 8 leaves, in that flatten order) are JAX device arrays.
+  `uvw_m` is `(n_rows, 3)` in **metres**, in input row order, and
+  `inv_lambda` is `(n_chan,)` = `freq / c` (issue #23). Nothing per
+  `(channel, row)` is stored: the per-channel FINUFFT coordinates and
+  w in wavelengths are derived inside the JIT by
+  `wgridder._channel_ft_coords` — `u_ft = (2π · pixsize_l ·
+  inv_lambda[c]) · uvw_m[:, 0]`, likewise `v_ft`, and
+  `w = inv_lambda[c] · uvw_m[:, 2]` — three multiplies per row per
+  channel, invisible next to the `n_w` NUFFTs. That replaced
+  `uvw_lambda` / `uvw_lambda_sorted` `(n_chan, n_rows, 3)` and
+  `u_finufft` / `v_finufft` `(n_chan, n_rows)`: 12.98 MB → 2.42 MB of
+  leaves for a 16-channel, 10k-row, 256² plan, 3.9 GB → 31 MB at
+  64 channels × 1M rows. No *sorted* coordinate array is stored either;
+  the sort is by w in metres, so the permutation is
+  channel-independent and the windowed helpers gather
+  `uvw_m[sort_perm]` once per call.
   `n_minus_1_shifted` (issue #16) is `n_minus_1 + nshift` and is the
   grid the per-plane phase and the `phi_hat` argument are evaluated
-  on; `n_minus_1` itself stays, and the adjoint's `1/n` output factor
-  must keep using it (`n = n_minus_1 + 1`) — using the shifted grid
-  there is a silent, test-passing gain error.
+  on; the adjoint's `1/n` output factor must keep using the *unshifted*
+  grid (`n = n_minus_1 + 1`) — using the shifted one there is a silent,
+  test-passing gain error.
   `w_centers_rel` and `w0_screen` (issue #16 follow-up) are the
   plane centres measured from `w0` and the image-domain screen
   `exp(2πi·w0·(n-1))`. Both are built at plan time *at small
   magnitude* / with exact range reduction; deriving either from its
   absolute counterpart at call time reintroduces the large-|w|
   cancellation they exist to remove.
+* **Non-leaf compatibility accessors** (issue #23): `plan.n_minus_1`
+  (`n_minus_1_shifted - nshift`), `plan.w_centers` (`w0 +
+  w_centers_rel`) and `plan.uvw_lambda` (`uvw_m[None] *
+  inv_lambda[:, None, None]`) are `@property`, not fields. They are
+  documented plan attributes that tests and downstream code read, but
+  they are *not* pytree leaves and must not be treated as such.
+  Nothing under `src/` may read `plan.uvw_lambda` in an operator path
+  — materialising it is exactly the `(n_chan, n_rows, 3)` allocation
+  issue #23 deleted, and doing so would undo the change while every
+  test still passed. `window_size` was removed outright with no
+  accessor: it was diagnostic-only, feeding the (static)
+  `max_window_size` and `window_padding_overhead` at plan time.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and
@@ -196,12 +215,52 @@ benchmark numbers in the README reflect this steady-state regime.
 The windowed strategies rely on a contract between
 `planning.make_plan` and `wgridder._channel_*_windowed`:
 
-* `plan.sort_perm` is `argsort(uvw[:, 2])` (ascending, stable).
-* `plan.uvw_lambda_sorted[c] = plan.uvw_lambda[c][sort_perm]`.
+* `plan.sort_perm` is `argsort(uvw[:, 2])` (ascending, stable). The
+  sort key is w in *metres*, so the same permutation serves every
+  channel (`freq[c]/c > 0` is monotonic) — which is why no sorted
+  coordinate array is stored and the helpers gather
+  `plan.uvw_m[plan.sort_perm]` once per call (issue #23).
 * `plan.window_start[c, k]` is the start index in the sorted array
   for the rows inside `[w_centers[k] - W/2 * dw, w_centers[k] + W/2 * dw]`.
+  **Invariant: every window contains every row the dense path gives a
+  non-zero kernel weight.** That is what makes the windowed and dense
+  strategies agree, and it holds *by construction*, not by luck. The
+  builder places its boundaries in the same *relative* coordinate
+  (`w - w0`) the operator uses and forms the per-channel w in the
+  plan's `real_dtype`, then widens each boundary by
+  `boundary_margin` (load-bearing) and by one row at each end
+  (redundant insurance against the margin's derivation). The widening is
+  load-bearing since issue #23: the operator derives `w` as a
+  multiply immediately followed by a subtract, which XLA may contract
+  into a single FMA — one rounding where the builder's numpy steps
+  round twice — so host and device values differ on a fifth to a
+  quarter of rows (measured: ~23% on MWA_extended, ~18% on MeerKAT).
+  Before #23 the device subtracted `w0` from a *stored, already
+  rounded* product, so the two agreed bit for bit and no margin was
+  needed. Do not "restore" bit-equality here; it is not achievable
+  against a fusing compiler. Widen instead: over-inclusion is free
+  (`phi(|z| > 1) = 0` contributes nothing), under-inclusion is a
+  silent `phi(z = ±1) = exp(-beta)` (~1e-7 at W=7) windowed-vs-dense
+  mismatch, ~1e-9 in relative L2 against a 1e-11 contract.
+  `boundary_margin` must dominate **two** terms, not one: the
+  host/device gap (~`3u · w_abs_scale`) *and* `2u · w_kernel_scale`,
+  because the operator tests `|fl(fl(w − w_k) / S)| ≤ 1` rather than
+  comparing `w` against the edge, so a row can be in support with an
+  exact `|w − w_k|` up to `S(1 + 2u)`. That second term is not
+  bounded by `w_abs_scale` in general; it is bounded exactly when a
+  window is a strict subset of the rows, which is the only case where
+  a drop is possible — see the derivation in `planning.py`, and
+  re-derive it if `w_kernel_scale` or the plane count ever changes.
+  Pinned by `test_windowed_dense_parity_at_window_edge`, whose
+  fixture places **two adjacent rows** in the ulp-wide band where
+  host and device disagree: one row is rescued by the `±1`-row
+  widening on its own, so a one-row fixture gates the margin not at
+  all.
 * `plan.max_window_size` is a static int used as the
-  `dynamic_slice` size — must be `>= max(plan.window_size)`.
+  `dynamic_slice` size — must be `>=` every window's length, and is
+  computed from the widened windows above, so it already carries the
+  two extra rows. The per-window lengths themselves are plan-time
+  locals, not a leaf (issue #23 removed `window_size`).
 
 If you touch any of these, run `tests/test_planning.py` and
 `tests/test_boundary_planes.py` to confirm the contract still holds.
@@ -540,11 +599,6 @@ a worked example.
 
 These are seeds for later releases, not v0.1.2 candidates:
 
-* **Reduce plan memory.** `plan.uvw_lambda_sorted` doubles the coord
-  storage (`(n_chan, n_rows, 3)` floats). For very large
-  `(n_chan, n_rows)` we could keep only `sort_perm` and apply it at
-  scan time, trading one gather per scan iter for half the plan
-  memory.
 * **Plan-time pre-compilation cache (JIT-level).** Currently each
   `dirty2vis(plan, ..., w_strategy=...)` JIT-compiles on the first
   call. A `jax_nufft.compile_plan(plan, w_strategy=...)` helper that

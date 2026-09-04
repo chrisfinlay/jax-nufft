@@ -275,21 +275,47 @@ def compute_phi_hat_table(
     # Approximate phi_hat(eta_k) = integral phi(z) exp(-2 pi i eta_k z) dz
     # via the trapezoidal-equivalent DFT with grid spacing dz. ifftshift moves
     # z=0 to index 0; fft does the sum; fftshift puts negative-eta first.
-    phi_for_fft = np.fft.ifftshift(phi_centered)
-    fft_out = np.fft.fft(phi_for_fft)
-    phi_hat_complex = np.fft.fftshift(fft_out) * dz
+    #
+    # The next three statements are written to keep as few ``n_fft``-sized
+    # arrays alive at once as the FFT allows, because this table is by a wide
+    # margin the largest transient in ``make_plan``: ``n_fft = n_fine *
+    # oversample`` is 262144 at eps=1e-6 (2.1 MB real, 4.2 MB complex) and
+    # 4194304 at eps=1e-12 (33.5 MB / 67 MB), against a whole float64 plan of
+    # 2.4 MB for a 16-channel, 10k-row job.
+    #
+    # This is here as part of issue #23 -- a plan-*storage* change -- and that
+    # is not drift: #23 gates ``make_plan``'s host peak, and once the
+    # per-(channel, row) copies it removed were gone, this FFT was the only
+    # transient of any size left in the call. The rewrite is
+    # allocation-shaped only; the table values are bit-identical (verified
+    # against the pre-change output at eps = 1e-3, 1e-6, 1e-8 and 1e-12), so
+    # nothing downstream of ``phi_hat_n`` moves. The naive spelling -- a
+    # separate pre-shift name, then the complex FFT output, its shifted copy
+    # and the scaled copy all live together -- costs 2x the peak for nothing.
+    #
+    # Rebinding rather than naming the shifted copy separately is what drops
+    # the reference to the pre-shift array.
+    phi_centered = np.fft.ifftshift(phi_centered)
 
     # phi(z) is real and symmetric, so phi_hat is real to within FFT rounding.
+    # The real part is taken *before* the fftshift and the dz scaling rather
+    # than after: fftshift is a permutation and dz is a real scalar, so
+    # ``fftshift(x).real * dz`` and ``fftshift(x.real) * dz`` are the same
+    # numbers bit for bit -- but this order lets the complex FFT output be
+    # collected as soon as its real half has been copied out.
+    #
     # ``.real`` on a complex array is a *view*: it shares the interleaved
     # real/imag buffer via ``.base``, at 2x the nominal size of the real
     # array. ``PhiHatTable`` is not stored on ``WGridderPlan`` (it is a
     # planning-time intermediate, consumed by ``.evaluate()`` and then
     # discarded), but it is still held for the rest of that ``make_plan``
-    # call -- which goes on to build the sorted/windowed arrays -- so
-    # without ``ascontiguousarray`` the (unused) imaginary half of this
-    # array would sit resident for that whole window. Copy out just the
-    # real part so ``phi_hat_complex`` can be collected right away.
-    phi_hat = np.ascontiguousarray(phi_hat_complex.real)
+    # call -- which goes on to build the windowed arrays -- so without
+    # ``ascontiguousarray`` the (unused) imaginary half would sit resident
+    # for that whole window.
+    phi_hat = np.ascontiguousarray(np.fft.fft(phi_centered).real)
+    del phi_centered  # the FFT input is dead here; the shift below needs room
+    phi_hat = np.fft.fftshift(phi_hat)
+    phi_hat *= dz  # in place: ``fftshift`` already returned a fresh array
 
     eta_step = 1.0 / (n_fft * dz)
     eta_max_table = (n_fft // 2) * eta_step
