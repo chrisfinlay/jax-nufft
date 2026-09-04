@@ -297,8 +297,9 @@ whole plane loop is short enough that spinning up a pool isn't worth it.
 Pass an explicit `int` (including `0`) to opt out of the strategy-aware
 default.
 
-**Limitation:** every telescope fixture in this repository has 400-600
-rows, well below the 100k-row cutoff, so on every benchmark and test in
+**Limitation:** every fixture in this repository is below the 100k-row
+cutoff -- 400-600 rows for the CPU telescope fixtures, 50k for the
+`GH200_LARGE` GPU fixture -- so on every benchmark and test in
 this repo the small-`n_rows` override applies to *all four* strategies --
 the vmap-family steady-state branch (`nthreads=0` above the cutoff) is
 never exercised by anything measured here, only by unit tests that build a

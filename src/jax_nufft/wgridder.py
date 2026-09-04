@@ -141,7 +141,8 @@ def _canonicalise_w_strategy(
 # `nthreads=0`. That is deliberate, not an oversight: measured directly with
 # the repository's timing protocol (plan + 1 warm-up outside the timer,
 # median of 9 calls, `.block_until_ready()`) at the row counts every fixture
-# in this repo actually uses (400-600 rows, all below this cutoff),
+# in this repo actually uses (400-600 rows for the CPU telescope
+# fixtures, 50k for GH200_LARGE -- all below this cutoff),
 # `nthreads=0` is *not* uniformly better for the vmap family here:
 #
 #   * `dense_vmap`: `nthreads=0` is faster on MWA_extended off30 (170.5ms vs

@@ -26,19 +26,17 @@ helper in ``jax_nufft.wgridder``:
     FINUFFT call) -> ``0`` (measured to benefit from threads in the issue:
     0.27 vs 0.62 ms per transform).
 
-Neither ``_resolve_nthreads`` nor ``_NTHREADS_SMALL_N_ROWS`` exist in
-``src/`` yet, so every test below currently fails -- but they are imported
-*inside* the ``resolve_nthreads`` / ``small_n_rows_cutoff`` fixtures below,
-not at module scope, so the missing symbol surfaces as an ordinary per-test
-failure (each test using the fixture fails individually, with the
-``ImportError`` as its cause) rather than a module-collection error that
-would abort the entire ``pytest`` run -- including every unrelated test file
--- before anything executes. That is the expected pre-implementation state;
-providing both names is what the implementation agent must do. The grid in
-:data:`_RESOLUTION_GRID` below hardcodes every expected value rather than
-deriving it from the imported cutoff constant, precisely so a later change
-to the rule (e.g. quietly widening the vmap family, or moving the cutoff) is
-caught as a test failure instead of silently redefining "correct".
+``_resolve_nthreads`` and ``_NTHREADS_SMALL_N_ROWS`` are imported *inside*
+the ``resolve_nthreads`` / ``small_n_rows_cutoff`` fixtures rather than at
+module scope, so if either is ever renamed or removed the breakage surfaces
+as ordinary per-test failures instead of a module-collection error that
+would abort the whole ``pytest`` run before anything executes.
+
+The grid in :data:`_RESOLUTION_GRID` below hardcodes every expected value
+rather than deriving it from the imported cutoff constant, precisely so a
+later change to the rule -- quietly widening the vmap family, say, or moving
+the cutoff -- is caught as a test failure instead of silently redefining
+what "correct" means.
 """
 
 from __future__ import annotations
