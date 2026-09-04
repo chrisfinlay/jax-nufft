@@ -67,7 +67,7 @@ jax-nufft/
 │   ├── __init__.py           # public API surface
 │   ├── _version.py           # __version__
 │   ├── _types.py             # Literal aliases (WStrategy, ChannelStrategy)
-│   ├── _utils.py             # SPEED_OF_LIGHT, small helpers
+│   ├── _utils.py             # SPEED_OF_LIGHT
 │   ├── kernel.py             # exp-of-semicircle kernel + phi_hat table
 │   ├── planning.py           # WGridderPlan dataclass + make_plan
 │   └── wgridder.py           # dirty2vis / vis2dirty + per-channel helpers
