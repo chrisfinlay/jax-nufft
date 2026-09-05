@@ -174,8 +174,17 @@ def test_windowed_dot_product_identity(eps: float) -> None:
     # the literal adjoint of A (see test_dot_product_identity's docstring for
     # the full derivation). This form is only exact where n_grid > 0, i.e.
     # every pixel inside the unit disc; the fixture's small image is fully
-    # inside it here, so no masking is needed. It will be replaced with the
-    # cleaner divide_by_n-exposed form once that lands (a later issue).
+    # inside it here, so no masking is needed.
+    #
+    # Issue #20 landed the cleaner form -- ``divide_by_n`` is now a flag on
+    # both operators, and with **equal** flags the plain identity
+    # ``Re<A x, y> = <x, A^H y>`` holds with no ``n`` correction at all. The
+    # ``n * x`` tests in this file were *not* replaced by it: they are the
+    # behavioural pin on the shipped mixed defaults (forward ``False``,
+    # adjoint ``True``), which nothing else in this file provides, and #20
+    # explicitly does not move those defaults. The equal-flag identity, the
+    # flag semantics and the ducc0 parity for the two new combinations live in
+    # ``tests/test_divide_by_n.py``.
     n_grid = np.asarray(plan.n_minus_1) + 1.0
     image_n = image * n_grid[None, :, :]
 

@@ -129,6 +129,27 @@ for the w part. Note the **plus** sign on the w-term &mdash; ducc uses
 `-w (n - 1)` inside the parenthesis rather than `+w (n - 1)`, which is
 algebraically the same flip.
 
+##### The `1/n` factor (`divide_by_n`, issue #20)
+
+The measurement equation above carries a `B(l, m) / n` weighting that the
+sign-convention formula omits. Both operators take a keyword-only, static
+`divide_by_n` flag deciding whether to apply it, with ducc0's meaning and
+ducc0's names:
+
+| | `divide_by_n=False` | `divide_by_n=True` |
+|---|---|---|
+| `dirty2vis` (forward) | **default.** No `1/n`; the `exp(+2 pi i w (n - 1))` phase is evaluated on the analytic extension `n - 1 = -sqrt(l^2 + m^2 - 1) - 1` at pixels outside the unit disc too | multiplies the image by `1/n` inside the disc and by **zero** outside, so the visibilities become insensitive to every pixel outside it |
+| `vis2dirty` (adjoint) | returns the analytic-extension result with no division and no mask, so outside-disc pixels carry their (large) values | **default.** Divides by `n` inside the disc and returns exactly `0` outside |
+
+The defaults are the mixed pair `dirty2vis(divide_by_n=False)` /
+`vis2dirty(divide_by_n=True)`. That is ducc0's default pairing and reproduces
+every release of this library through v0.1.2 &mdash; but it is **not an
+adjoint pair on a wide field**. See *Adjoint operator* below for the numbers
+and the recommendation.
+
+`n = sqrt(1 - l^2 - m^2)` here is always the *physical* `n` on the unshifted
+grid, never the `nshift`-centred one the w-phase is evaluated on (issue #16).
+
 ### The wgridder algorithm
 
 Direct evaluation of the visibility integral is `O(n_rows * n_l * n_m)` per
@@ -243,7 +264,61 @@ For each channel `c`:
      conjugate screen is the adjoint of the forward's step 3 and must be
      applied before taking the real part.
 
-Pixels with `n <= 0` (i.e. outside the unit disc) are returned as exactly 0.
+With `divide_by_n=True` (the default), pixels with `n <= 0` (i.e. outside the
+unit disc) are returned as exactly 0. With `divide_by_n=False` step 4 becomes
+`dirty[c] = ((sum over k of I_k) * conj(w0_screen)).real` &mdash; no division
+and no mask, so those pixels carry the analytic-extension values instead. The
+conjugate screen is applied on **both** settings; it is the adjoint of the
+forward's `w0` screen, which `divide_by_n` does not touch.
+
+#### Adjointness: equal flags only
+
+`dirty2vis` and `vis2dirty` form an exact adjoint pair &mdash;
+
+```
+Re<A x, y> == <x, A^H y>          for real x
+```
+
+&mdash; **only when both are given the same `divide_by_n`.** Measured on the
+EDA2 full-sky fixture (`tests/conftest.py`: 64&times;64 at a 120&deg; field of
+view, 400 rows, `synthetic_uvw(EDA2, 0.0, seed=0)`), `epsilon = 1e-6`, float64,
+with `tests/test_divide_by_n.py`'s image and visibilities:
+
+| `dirty2vis` | `vis2dirty` | relative residual |
+|---|---|---|
+| `False` | `False` | **1.293e-13** |
+| `True`  | `True`  | **1.327e-15** |
+| `False` | `True` (the shipped defaults) | **0.630** |
+| `True`  | `False` | 0.630 |
+
+The shipped defaults are the mixed pair, so **they are not an adjoint pair on
+a wide field**. Nor does the classical `n`-corrected form rescue them: on the
+same fixture `Re<A x, y> == <n x, A^H y>` is off by **0.273**. The entire
+failure lives in the **1155 of 4096 pixels outside the unit disc**, where the
+forward at its default evaluates the analytic extension while the adjoint at
+its default zeroes them &mdash; restrict the image to the disc and the mixed
+pair is adjoint again, to **4.105e-16**.
+
+Narrow fields hide it, because they have no outside-disc pixels at all: on
+MWA_compact the mixed pair's `n x` residual is 1.20e-14 at zenith and 1.94e-12
+at 30&deg;.
+
+**Recommendation: pass `divide_by_n=True` to both operators.** It is the
+factor the measurement equation actually carries, it gives the best-conditioned
+of the two adjoint pairs (1.3e-15 against 1.3e-13), and it is what any
+gradient-based use of the pair needs:
+
+```python
+vis = dirty2vis(plan, image, divide_by_n=True)
+dirty = vis2dirty(plan, vis, divide_by_n=True)     # exactly A^H of the above
+```
+
+The defaults are left as they are for ducc0 compatibility and because moving
+them would silently change every existing caller's answer by a factor of `n`.
+The residuals above come from `tests/test_divide_by_n.py`, which gates the
+equal-flag identity at an eps-independent `1e-11` over both flag values, all
+four `w_strategy` values, both `hermitian` settings and both precision legs
+(float32 at `epsilon = 1e-5` measures 1.8e-8 &hellip; 7.2e-8, gated at `1e-6`).
 
 ### Kernel choice
 
@@ -372,7 +447,7 @@ Hermitian fold's one-byte `plan.flip_sign`.) `plan.uvw_lambda`,
 reading `plan.uvw_lambda` materialises the full `(n_chan, n_rows, 3)` array,
 so it is for introspection, not for hot loops.
 
-### `dirty2vis(plan, image, *, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
+### `dirty2vis(plan, image, *, divide_by_n=False, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
 
 Forward operator. `image` may be `(n_chan, n_l, n_m)` or `(n_l, n_m)`
 (broadcast across channels), real or complex. Output is complex
@@ -380,11 +455,24 @@ Forward operator. `image` may be `(n_chan, n_l, n_m)` or `(n_l, n_m)`
 `hermitian=False` &mdash; see `make_plan` above &mdash; and raises `ValueError`
 otherwise.
 
-### `vis2dirty(plan, vis, *, weights=None, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
+`divide_by_n` (keyword-only, static) applies the measurement equation's `1/n`
+factor to the image: `1/n` inside the unit disc, zero outside. The default
+`False` omits it, matching ducc0 and every release through v0.1.2.
+
+### `vis2dirty(plan, vis, *, divide_by_n=True, weights=None, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
 
 Adjoint operator. `vis` is complex `(n_rows, n_chan)`; optional `weights` is
-real `(n_rows, n_chan)`. Output is real `(n_chan, n_l, n_m)` with the `1/n`
-factor applied (matching ducc's `divide_by_n=True`).
+real `(n_rows, n_chan)`. Output is real `(n_chan, n_l, n_m)`.
+
+`divide_by_n` (keyword-only, static) defaults to `True` here &mdash; the `1/n`
+factor applied on the output, matching ducc's `divide_by_n=True`, with pixels
+outside the unit disc returned as exactly 0. `False` returns the
+analytic-extension result with neither the division nor the mask.
+
+The two defaults are deliberately different (ducc0's pairing) and are
+**not an adjoint pair on a wide field**; pass `divide_by_n=True` to both for
+imaging and for anything differentiating through the pair. See *Adjoint
+operator* above for the measured residuals.
 
 ### `nthreads` (issue #24, R11/D4)
 

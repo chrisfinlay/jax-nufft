@@ -8,6 +8,18 @@ arrays, and dispatch the wgridder algorithm in pure JAX:
   * ``vis2dirty(plan, vis, weights=None)`` — adjoint operator (gridder), with
     the optional ``1/n`` factor applied on the output.
 
+issue #20: the ``1/n`` factor is a keyword-only, static ``divide_by_n`` flag on
+**both** operators, defaulting to ``False`` on the forward and ``True`` on the
+adjoint — the ducc0-compatible mixed pair that reproduces every earlier
+release. That pair is *not* an adjoint pair on a field reaching past the unit
+disc: the forward evaluates the analytic extension ``n - 1 =
+-sqrt(l² + m² - 1) - 1`` there while the adjoint zeroes those pixels, which on
+the EDA2 full-sky fixture leaves ``Re<A x, y> = <n x, A^H y>`` off by a
+relative 0.273. With **equal** flags the plain identity ``Re<A x, y> =
+<x, A^H y>`` holds to 1.3e-13 (``False``) and 1.3e-15 (``True``) on that same
+fixture, and ``divide_by_n=True`` on both is the recommendation for imaging and
+for anything that differentiates through the pair.
+
 Both functions are fully traceable through ``jax.jit``, ``jax.vmap``, and
 ``jax.grad``.
 
@@ -890,6 +902,34 @@ def _apply_nshift_compensation(
     return vis * jnp.exp((sign * 1j * phase).astype(vis.dtype))
 
 
+def _disc_mask_and_safe_n(plan: WGridderPlan, dtype: np.dtype[Any]) -> tuple[Array, Array]:
+    """The unit-disc mask and a division-safe ``n`` on the plan's own grid.
+
+    issue #20: both operators can now apply the ``1/n`` factor of the
+    measurement equation (``divide_by_n``), and they have to apply the *same*
+    diagonal or the pair stops being adjoint. So the two ingredients are built
+    here, once, and each operator writes the same masked division against them.
+
+    ``n`` is taken on the **unshifted** grid, ``plan.n_minus_1 + 1``, never on
+    ``plan.n_minus_1_shifted``. ``nshift`` (issue #16) is a bookkeeping device
+    for the w-phase alone -- introduced and removed by an exact identity -- and
+    dividing by ``n + nshift`` would be a smooth per-pixel gain error of tens
+    of percent that leaves every structural test green. The adjoint's original
+    ``1/n`` carried that warning in a comment; it now applies to both operators
+    and so lives here.
+
+    ``mask`` is ``n > 0``, i.e. strictly inside the unit disc. Outside it the
+    grid carries the analytic extension ``n - 1 = -sqrt(l^2 + m^2 - 1) - 1``,
+    so ``n < 0`` and ``1/n`` is not a gain the measurement equation defines:
+    those pixels are set to zero rather than divided, on both sides. That is
+    what makes ``divide_by_n=True`` an honest projection onto the disc and, on
+    the two operators together, an exact adjoint pair on a wide field.
+    """
+    n_grid = (plan.n_minus_1 + 1.0).astype(dtype)
+    mask = n_grid > 0.0
+    return mask, jnp.where(mask, n_grid, 1.0)
+
+
 def _hermitian_conj_rows(vis: Array, flip_sign: Array, plan: WGridderPlan) -> Array:
     """Conjugate one channel's visibilities on the rows the plan folded.
 
@@ -1167,7 +1207,7 @@ def _channel_adjoint(
 
 @partial(
     jax.jit,
-    static_argnames=("w_strategy", "channel_strategy", "nthreads"),
+    static_argnames=("w_strategy", "channel_strategy", "nthreads", "divide_by_n"),
 )
 def _dirty2vis_jit(
     plan: WGridderPlan,
@@ -1176,8 +1216,31 @@ def _dirty2vis_jit(
     w_strategy: WStrategy,
     channel_strategy: ChannelStrategy,
     nthreads: int,
+    divide_by_n: bool,
 ) -> Array:
     opts = Opts(nthreads=nthreads)
+
+    # issue #20: the ``1/n`` factor of the measurement equation, when asked
+    # for. It is an *image-side* diagonal, so it belongs here -- ahead of the
+    # w0 screen and of everything the channel helpers do -- and not on the
+    # visibility side, where the nshift compensation (issue #16) and the
+    # Hermitian per-row conjugation (issue #17) live. Being innermost on this
+    # side mirrors the adjoint, where the same factor is the outermost thing
+    # applied to the image it returns: if the forward is
+    # ``A = C . D_ns . N . M_w0 . M_1/n`` then ``A^H = M_1/n . M_w0^H . N^H .
+    # D_ns^H . C^H``, since ``M_1/n`` is real and diagonal and so self-adjoint.
+    # That is the whole content of the fix -- with equal flags the pair is
+    # exactly adjoint; with the (unchanged, ducc0-compatible) mixed defaults it
+    # is not, on any field that reaches past the unit disc.
+    #
+    # Outside the disc the image is multiplied by zero, so the output becomes
+    # insensitive to those pixels; ``jnp.where`` rather than a multiply by a
+    # zeroed reciprocal so the zeros are exact regardless of what the caller
+    # put there. Inside, this is the same masked division the adjoint writes,
+    # against the same two ingredients.
+    if divide_by_n:
+        inside, safe_n = _disc_mask_and_safe_n(plan, plan.real_dtype)
+        image = jnp.where(inside, image / safe_n, 0.0)
 
     # issue #16 follow-up: the w-range midpoint leaves the plane loop as a
     # constant image-domain phase screen. Applied here, once per call on the
@@ -1243,6 +1306,7 @@ def dirty2vis(
     plan: WGridderPlan,
     image: Array,
     *,
+    divide_by_n: bool = False,
     w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int | None = None,
@@ -1269,6 +1333,35 @@ def dirty2vis(
         with a zero imaginary part is refused too -- pass ``image.real``, or
         build the plan with ``make_plan(..., hermitian=False)``.
         :func:`vis2dirty` has no equivalent restriction.
+    divide_by_n:
+        Whether to apply the measurement equation's ``1/n`` factor to the
+        image before gridding it (ducc0's flag of the same name;
+        [Arras+2021] §2). ``False`` -- the default, unchanged since v0.1 --
+        omits it, so the operator evaluates ``exp(2πi w (n-1))`` on the
+        analytic extension ``n - 1 = -sqrt(l²+m²-1) - 1`` at every pixel
+        *outside* the unit disc as well. ``True`` multiplies the image by
+        ``1/n`` inside the disc and by **zero** outside, which is where the
+        factor is defined; the output is then insensitive to every pixel
+        outside the disc.
+
+        **The pair is adjoint only with equal flags.** With
+        ``divide_by_n`` equal on both operators, ``Re<A x, y> = <x, A^H y>``
+        holds to 1.3e-13 (``False``) and 1.3e-15 (``True``) on the EDA2
+        full-sky fixture (64² at a 120° field of view, 400 rows, eps 1e-6,
+        float64 -- ``tests/test_divide_by_n.py``). The shipped defaults are
+        the *mixed* ducc0-compatible pair (``False`` here, ``True`` on
+        :func:`vis2dirty`) and are **not** an adjoint pair on a wide field:
+        on that same fixture the residual is 0.630 plain and 0.273 with the
+        ``n x`` correction, the whole of it coming from the 1155 of 4096
+        pixels outside the disc, where this operator uses the analytic
+        extension while the adjoint's default zeroes them. Restricted to the
+        disc the mixed pair is adjoint again, to 4.1e-16.
+
+        For imaging, and for anything that differentiates through the pair,
+        pass ``divide_by_n=True`` to **both** operators.
+
+        Static (part of the JIT cache key), so it may be a Python ``bool``
+        but not a traced value.
     w_strategy:
         ``"auto"`` (the shipped default since issue #46) resolves to one of
         the four canonical names before the JIT boundary via
@@ -1339,6 +1432,7 @@ def dirty2vis(
         w_strategy=w_strategy,
         channel_strategy=channel_strategy,
         nthreads=resolved_nthreads,
+        divide_by_n=divide_by_n,
     )
 
 
@@ -1427,7 +1521,13 @@ def _channel_adjoint_windowed(
 
 @partial(
     jax.jit,
-    static_argnames=("w_strategy", "channel_strategy", "nthreads", "apply_w_weights"),
+    static_argnames=(
+        "w_strategy",
+        "channel_strategy",
+        "nthreads",
+        "apply_w_weights",
+        "divide_by_n",
+    ),
 )
 def _vis2dirty_jit(
     plan: WGridderPlan,
@@ -1438,6 +1538,7 @@ def _vis2dirty_jit(
     channel_strategy: ChannelStrategy,
     nthreads: int,
     apply_w_weights: bool,
+    divide_by_n: bool,
 ) -> Array:
     opts = Opts(nthreads=nthreads)
 
@@ -1515,34 +1616,48 @@ def _vis2dirty_jit(
     # would catch getting this wrong.
     dirty_per_chan = dirty_per_chan * jnp.conj(plan.w0_screen)
 
-    # Apply 1/n on the output (matching ducc's divide_by_n=True), and take
-    # the real part to land in real space.
+    # issue #20: the ``1/n`` output factor is now optional, and the early-out
+    # sits **after** the w0 screen's conjugation above, not before it. That
+    # ordering is forced, not stylistic: the screen is part of the operator on
+    # both flag settings -- it is the adjoint of the forward's ``M_w0``, which
+    # ``divide_by_n`` does not touch -- so returning ahead of it would drop a
+    # per-pixel phase from the ``False`` path only. The result would still
+    # look like "the analytic extension without the 1/n" pixel by pixel, and
+    # would still be non-zero outside the disc, while quietly breaking
+    # ``Re<A x, y> = <x, A^H y>`` at ``divide_by_n=False`` on any plan whose
+    # ``w0`` is not zero.
     #
-    # issue #16: this is ``plan.n_minus_1``, NOT ``plan.n_minus_1_shifted``,
-    # and that is not an oversight. ``nshift`` is a bookkeeping device for the
-    # w-phase only -- it is introduced and removed by an exact identity, and
-    # the operator it defines is still the one whose output is divided by the
-    # *physical* ``n = sqrt(1 - l² - m²)``. Using the shifted grid here would
-    # divide by ``n + nshift``, a smooth per-pixel gain error of tens of
-    # percent that no parity test's epsilon budget would absorb -- but it
-    # would leave the plane count halved and every structural nshift test
-    # green, which is exactly why it gets its own comment.
+    # ``divide_by_n=False`` therefore returns the real part of the full
+    # analytic-extension result, with no mask: outside the unit disc those
+    # pixels carry the (large) values of the ``n - 1 = -sqrt(l²+m²-1) - 1``
+    # branch rather than zeros, which is exactly what the forward's ``False``
+    # path integrates over and so what makes the two adjoint there.
+    if not divide_by_n:
+        return dirty_per_chan.real
+
+    # ``divide_by_n=True`` (the default, matching ducc's flag of the same
+    # name): apply 1/n on the output and take the real part to land in real
+    # space. Same masked division as the forward's, against the same
+    # ``_disc_mask_and_safe_n`` ingredients -- the diagonal has to be
+    # identical on the two sides or the pair is only approximately adjoint.
     #
-    # issue #23: ``plan.n_minus_1`` is now a property (``n_minus_1_shifted -
-    # nshift``, both traced-leaf and static) rather than a leaf of its own, so
-    # this is one image-sized subtract added to the graph -- once per call, not
-    # once per plane. It is also the one place in either operator that reads a
-    # derived accessor, and deliberately so: this factor is exactly what the
-    # unshifted grid exists for.
-    n_grid = (plan.n_minus_1 + 1.0).astype(dirty_per_chan.real.dtype)
-    safe_n = jnp.where(n_grid > 0.0, n_grid, 1.0)
-    return jnp.where(n_grid > 0.0, dirty_per_chan.real / safe_n, 0.0)
+    # issue #23: ``plan.n_minus_1`` (read inside that helper) is a property
+    # (``n_minus_1_shifted - nshift``, both traced-leaf and static) rather
+    # than a leaf of its own, so this is one image-sized subtract added to the
+    # graph -- once per call, not once per plane. It is the one derived
+    # accessor either operator reads, and deliberately so: this factor is
+    # exactly what the unshifted grid exists for. See
+    # :func:`_disc_mask_and_safe_n` for why the unshifted grid is the only
+    # correct one here (issue #16).
+    inside, safe_n = _disc_mask_and_safe_n(plan, np.dtype(dirty_per_chan.real.dtype))
+    return jnp.where(inside, dirty_per_chan.real / safe_n, 0.0)
 
 
 def vis2dirty(
     plan: WGridderPlan,
     vis: Array,
     *,
+    divide_by_n: bool = True,
     weights: Array | None = None,
     w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
@@ -1563,6 +1678,27 @@ def vis2dirty(
         part and ``Re[v z] == Re[conj(v) conj(z)]`` identically, so issue
         #17's fold applies here unconditionally and the plane-count saving
         comes for free.
+    divide_by_n:
+        Whether to apply the measurement equation's ``1/n`` factor to the
+        image this operator returns (ducc0's flag of the same name;
+        [Arras+2021] §2). ``True`` -- the default, unchanged since v0.1 --
+        divides by ``n`` inside the unit disc and returns exactly ``0``
+        outside it, where ``n < 0`` on the analytic extension and ``1/n`` is
+        not a gain the measurement equation defines. ``False`` returns the
+        analytic-extension result *without* the division and without the
+        mask, so the outside-disc pixels carry their (large) values instead
+        of zeros.
+
+        **The pair is adjoint only with equal flags**, and the shipped
+        defaults are deliberately not equal -- see :func:`dirty2vis` for the
+        measured residuals and the recommendation (``divide_by_n=True`` on
+        both operators for imaging). Using this operator at its default as
+        the gradient of ``dirty2vis`` at *its* default is the mistake issue
+        #20 exists to make expressible: on the EDA2 full-sky fixture that
+        gradient is wrong by a relative 0.273 in the ``n x`` form.
+
+        Static (part of the JIT cache key), so it may be a Python ``bool``
+        but not a traced value.
     weights:
         Optional real array of shape ``(n_rows, n_chan)``, multiplied into the
         visibilities before gridding (matches ducc's ``wgt`` argument). Cast
@@ -1622,7 +1758,9 @@ def vis2dirty(
     -------
     dirty:
         Real array of shape ``(n_chan, n_l, n_m)`` and dtype
-        ``plan.real_dtype``.
+        ``plan.real_dtype``. Pixels outside the unit disc are exactly ``0``
+        with ``divide_by_n=True`` and carry the analytic-extension values
+        with ``divide_by_n=False``.
     """
     w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=True)
     vis = _validate_vis(vis, plan)
@@ -1637,6 +1775,7 @@ def vis2dirty(
         channel_strategy=channel_strategy,
         nthreads=resolved_nthreads,
         apply_w_weights=apply_w,
+        divide_by_n=divide_by_n,
     )
 
 
