@@ -393,8 +393,11 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 
     An earlier version of this note added that the runner-up is "always
     within the 15% acceptance bar", which the same JSON does not support:
-    the runner-up sits 1.07x to 7.36x behind the winner (median 1.86x) and
-    only one of the 20 cells is within 15%. The 15% figure belongs to
+    the runner-up sits 1.07x to 7.31x behind the winner (median 1.86x) and
+    only one of the 20 cells is within 15%. (Those figures aggregate each
+    strategy by its better channel strategy, which is the population the
+    20/20 above counts; taken as 40 separate per-channel slices the range
+    is 1.07x to 7.36x and two are within 15%.) The 15% figure belongs to
     ``tests/test_auto_strategy_acceptance.py``, which bounds how far the
     *picked* strategy may fall behind the best one -- a bound the heuristic
     meets trivially here by picking the best one every time. So a wrong

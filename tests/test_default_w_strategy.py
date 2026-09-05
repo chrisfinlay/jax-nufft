@@ -754,7 +754,7 @@ def test_gpu_default_resolves_to_the_expected_strategy(
             "answer is slower than every vmap answer in all 160 pairs of the GH200 "
             "sweep (1.45-32.7x). The other vmap answer is not a small miss either: "
             "across the sweep's 20 cells the runner-up trails the winner by 1.07x to "
-            "7.36x (median 1.86x), and only one cell is within 15%. If the heuristic was "
+            "7.31x (median 1.86x), and only one cell is within 15%. If the heuristic was "
             "retuned on purpose (issue #34), update the table with the measurement."
         )
 
