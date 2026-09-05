@@ -48,6 +48,29 @@ def _baseline_uvw(n_rows: int = 50, max_baseline: float = 100.0, seed: int = 0) 
     return uvw
 
 
+def _as_planned_uvw(uvw: np.ndarray, plan: WGridderPlan) -> np.ndarray:
+    """The baselines in the orientation ``plan`` planned against.
+
+    issue #17: a ``hermitian=True`` plan folds every row with ``w < 0`` onto
+    ``(-u, -v, -w)`` before it computes the w-range, the sort permutation and
+    the window boundaries, so every reference in this file that predicts one of
+    those from the *raw* ``uvw`` has to fold it the same way first. Recomputed
+    from the raw input and the plan's static ``hermitian`` flag -- deliberately
+    NOT read off ``plan.uvw_m``, which is the array several of those references
+    exist to check.
+
+    Written so this file says the same thing whichever way ``make_plan``'s
+    ``hermitian`` default is set. The fold's own contract (the sign rule, the
+    per-row byte cost, the plane-count saving, the conjugation) is gated in
+    ``tests/test_hermitian.py``; here it is only a coordinate convention the
+    existing plan-structure references have to respect.
+    """
+    if not plan.hermitian:
+        return np.asarray(uvw)
+    sign = np.where(np.asarray(uvw)[:, 2] < 0, -1.0, 1.0)
+    return np.asarray(uvw) * sign[:, None]
+
+
 def test_plan_basic_shapes() -> None:
     uvw = _baseline_uvw(n_rows=20, max_baseline=80.0)
     freq = np.array([100e6, 110e6, 120e6])
@@ -289,7 +312,11 @@ def test_plan_removed_leaf_names_stay_readable_via_backcompat() -> None:
 
     # uvw_lambda: same formula test_plan_uvw_lambda_correct used to check
     # directly against the (now removed) stored leaf.
-    expected_uvw_lambda = uvw[None, :, :] * (freq[:, None, None] / SPEED_OF_LIGHT)
+    # ``_as_planned_uvw``: ``plan.uvw_lambda`` broadcasts the baselines the plan
+    # STORED, which issue #17's fold may have sign-flipped per row.
+    expected_uvw_lambda = _as_planned_uvw(uvw, plan)[None, :, :] * (
+        freq[:, None, None] / SPEED_OF_LIGHT
+    )
     np.testing.assert_allclose(np.asarray(plan.uvw_lambda), expected_uvw_lambda, rtol=1e-12)
 
     # n_minus_1 / n_minus_1_shifted: pin the *relationship* issue #23 relies
@@ -336,7 +363,7 @@ def test_plan_w_centers_span_data() -> None:
         pixsize_m=1e-3,
         epsilon=1e-5,
     )
-    w_lambda = uvw[None, :, :] * (freq[:, None, None] / SPEED_OF_LIGHT)
+    w_lambda = _as_planned_uvw(uvw, plan)[None, :, :] * (freq[:, None, None] / SPEED_OF_LIGHT)
     w_min = float(np.min(w_lambda[..., 2]))
     w_max = float(np.max(w_lambda[..., 2]))
     centres = np.asarray(plan.w_centers)
@@ -636,6 +663,18 @@ _EXPECTED_LEAF_FIELDS: tuple[str, ...] = (
     "phi_hat_n",
     "sort_perm",
     "window_start",
+    # issue #17: the Hermitian w-sign fold's per-row sign, (n_rows,) int8 in
+    # {+1, -1}. This is the NINTH leaf and the only one this issue may add: the
+    # fold needs per-row information, which is inherently (n_rows,), but it must
+    # cost ONE BYTE per row and must never acquire a channel axis (the sign of w
+    # is frequency-independent, so a (n_chan, n_rows) form would carry no extra
+    # information while reintroducing exactly the per-(channel, row) allocation
+    # issue #23 deleted). The dtype, the shape and the byte cost are gated in
+    # tests/test_hermitian.py; this entry pins the *name* and the leaf count.
+    # If the implementation names it differently (a boolean mask, say), rename
+    # here and in test_plan_footprint's docstring in the same commit --
+    # AGENTS.md sec 4's plan-field checklist covers exactly that.
+    "flip_sign",
 )
 
 # Static (aux_data) fields, each with a way to produce a *different* value of
@@ -667,6 +706,10 @@ _STATIC_FIELD_PROBES: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("empty_plane_count", lambda v: v + 1),
     ("w_extent", lambda v: v + 1.0),
     ("is_constant_w", lambda v: not v),
+    # issue #17: the Hermitian fold is a plan-shape *and* operator change (the
+    # plane grid moves, and a subset of rows is conjugated), so a folded and an
+    # unfolded plan over the same data must not share a JIT cache entry.
+    ("hermitian", lambda v: not v),
     ("real_dtype", lambda v: np.dtype(np.float32)),
     ("complex_dtype", lambda v: np.dtype(np.complex64)),
 )
@@ -850,9 +893,16 @@ def test_window_builder_basic() -> None:
     sort_perm = np.asarray(plan.sort_perm)
     # Permutation property: every index appears exactly once.
     assert sorted(sort_perm.tolist()) == list(range(n_rows))
-    # Applying sort_perm yields ascending w in metres.
-    w_sorted = uvw[sort_perm, 2]
-    assert np.all(np.diff(w_sorted) >= 0)
+    # Applying sort_perm yields ascending w in metres -- in the orientation the
+    # plan sorted, i.e. after issue #17's fold if this plan applied one.
+    w_sorted = _as_planned_uvw(uvw, plan)[sort_perm, 2]
+    assert np.all(np.diff(w_sorted) >= 0), (
+        "sort_perm does not sort the baselines the plan actually planned against. "
+        "issue #17: with hermitian=True the sort key is the FOLDED w, so a sort_perm "
+        "taken before the fold leaves the sorted array non-monotonic and every "
+        "searchsorted window boundary built from it meaningless -- which the windowed "
+        "strategies only notice on a fixture where max_window_size < n_rows"
+    )
 
     window_start = np.asarray(plan.window_start)
     assert window_start.shape == (plan.n_chan, plan.n_w)
@@ -881,9 +931,18 @@ def _independent_window_bounds(
     Stands in for the removed ``window_size`` leaf, which was diagnostic-only
     (never read at call time -- see ``_EXPECTED_LEAF_FIELDS``'s comment) and
     is not reintroduced by issue #23 in any form.
+
+    issue #17: the builder sorts and searches the baselines *as the plan stores
+    them*, i.e. after the Hermitian fold if the plan applied one, so the raw
+    ``uvw`` is folded here first (``_as_planned_uvw``). This is what makes the
+    exact ``window_start`` match below a live gate on the fold's interaction
+    with the window builder rather than a comparison of two different
+    coordinate systems: the fold changes the sort key, hence ``sort_perm``,
+    hence every window boundary.
     """
     sort_perm = np.asarray(plan.sort_perm)
     n_rows = uvw.shape[0]
+    uvw = _as_planned_uvw(uvw, plan)
     w_m_sorted = uvw[sort_perm, 2].astype(np.float64)
     w_centers_rel64 = np.asarray(plan.w_centers_rel, dtype=np.float64)
     half_w_dw = plan.w_kernel_scale
@@ -1037,8 +1096,19 @@ def test_window_builder_clumped_distribution(pixsize: float) -> None:
     """
     uvw, uvw_uniform = _clumped_and_uniform_uvw()
     freq = np.array([1.4e9])
-    plan_clumped = make_plan(uvw, freq, (64, 64), pixsize, pixsize, epsilon=1e-6)
-    plan_uniform = make_plan(uvw_uniform, freq, (64, 64), pixsize, pixsize, epsilon=1e-6)
+    # hermitian=False (issue #17), and not incidentally: this fixture's clumped
+    # w-distribution is two equal clumps at -30 and +30 m, which is exactly the
+    # symmetry the Hermitian fold exists to collapse. Folded, the two clumps
+    # become one, ``max_window_size`` halves, and the analytic crossover table
+    # above -- measured on the two-clump geometry -- stops describing the
+    # fixture. The fold's effect on this distribution is a real (and welcome)
+    # one, but it is not what this test measures, and re-deriving the crossover
+    # for the folded geometry would be a different test. Pinned explicitly so
+    # this holds whichever way make_plan's default is set.
+    plan_clumped = make_plan(uvw, freq, (64, 64), pixsize, pixsize, epsilon=1e-6, hermitian=False)
+    plan_uniform = make_plan(
+        uvw_uniform, freq, (64, 64), pixsize, pixsize, epsilon=1e-6, hermitian=False
+    )
 
     width = plan_clumped.w_kernel_width
     assert plan_clumped.n_w > 3 * width, (
@@ -1077,7 +1147,7 @@ def test_plan_sample_consistency() -> None:
         epsilon=1e-6,
     )
     # dw * max|nm1| / x0 should be (close to) the inner w-plane count.
-    w_lambda = uvw * (freq[0] / SPEED_OF_LIGHT)
+    w_lambda = _as_planned_uvw(uvw, plan) * (freq[0] / SPEED_OF_LIGHT)
     w_extent = float(np.max(w_lambda[:, 2]) - np.min(w_lambda[:, 2]))
     inner = plan.n_w - plan.w_kernel_width
     if inner > 0:
@@ -1131,8 +1201,9 @@ def _footprint_bound_bytes(n_chan: int, n_rows: int, n_w: int, n_l: int, n_m: in
         phi_hat_n           (n_l, n_m)     float64      8 * n_l * n_m
         sort_perm           (n_rows,)      int32        4 * n_rows
         window_start        (n_chan, n_w)  int32        4 * n_chan * n_w
+        flip_sign           (n_rows,)      int8         1 * n_rows
                                                         -------------------
-        total = 28*n_rows + 8*n_chan + 8*n_w + 32*n_l*n_m + 4*n_chan*n_w
+        total = 29*n_rows + 8*n_chan + 8*n_w + 32*n_l*n_m + 4*n_chan*n_w
 
     This is an *exact* target, not a loose ceiling: every term above is
     achieved by exactly one leaf, so there is no slack for a removed leaf
@@ -1153,8 +1224,16 @@ def _footprint_bound_bytes(n_chan: int, n_rows: int, n_w: int, n_l: int, n_m: in
     B/pixel) + 1 complex (16 B/pixel) = 32 B/pixel -- 32 * n_l * n_m above,
     which happens to numerically match the issue's stale constant even
     though the leaf set it was computed from is different.
+
+    issue #17 adds the ``flip_sign`` term, and exactly one byte of it: the
+    Hermitian w-sign fold needs per-row sign information, which is inherently
+    ``(n_rows,)``, so 28 B/row becomes 29 B/row. It must stay one byte -- an
+    int32 leaf would make it 32 and a float64 one 36, and a per-(channel, row)
+    form would put ``n_chan`` bytes on every row, which is the allocation
+    issue #23 exists to have deleted. ``tests/test_hermitian.py`` gates the
+    per-row and per-channel slopes directly; this bound gates the total.
     """
-    return 28 * n_rows + 8 * n_chan + 8 * n_w + 32 * n_l * n_m + 4 * n_chan * n_w
+    return 29 * n_rows + 8 * n_chan + 8 * n_w + 32 * n_l * n_m + 4 * n_chan * n_w
 
 
 @requires_x64

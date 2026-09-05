@@ -73,10 +73,20 @@ def _reference_adjoint(
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6, 1e-8])
+@pytest.mark.parametrize("hermitian", [False, True])
 @pytest.mark.parametrize(
     "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
 )
-def test_adjoint_matches_dft_zenith(eps: float, w_strategy: str) -> None:
+def test_adjoint_matches_dft_zenith(eps: float, w_strategy: str, hermitian: bool) -> None:
+    """Parametrised over issue #17's Hermitian w-sign fold.
+
+    Unlike the forward, the adjoint may fold *unconditionally*: its output is
+    the real part, and ``Re[vis * phase] == Re[conj(vis) * phase_folded]`` is an
+    identity, so complex visibilities are no obstacle. Both settings therefore
+    have to meet the same ``2 * eps`` contract on the same complex input, which
+    is what this asserts; ``hermitian`` is passed explicitly so the test says
+    the same thing whichever way ``make_plan``'s default is set.
+    """
     rng = np.random.default_rng(11)
     n_l = n_m = 16
     n_rows = 24
@@ -91,18 +101,29 @@ def test_adjoint_matches_dft_zenith(eps: float, w_strategy: str) -> None:
         np.complex128
     )
 
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps, hermitian=hermitian)
+    # The fixture must give the fold something to do, or the hermitian=True leg
+    # is the hermitian=False leg under another name.
+    assert 0 < int((uvw[:, 2] < 0).sum()) < n_rows
     dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy=w_strategy))
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
     assert err < DFT_TOL_FACTOR * eps, (
-        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e} "
+        f"(hermitian={hermitian})"
     )
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
-def test_adjoint_matches_dft_off_zenith(eps: float) -> None:
+@pytest.mark.parametrize("hermitian", [False, True])
+def test_adjoint_matches_dft_off_zenith(eps: float, hermitian: bool) -> None:
+    """Off-zenith adjoint, both Hermitian-fold settings (issue #17).
+
+    The zenith fixture above has a w-range of +-2 m; here it is +-30 m, so the
+    fold moves the plane grid substantially rather than marginally. Both legs
+    hold to ``2 * eps``.
+    """
     rng = np.random.default_rng(13)
     n_l = n_m = 32
     n_rows = 48
@@ -117,13 +138,15 @@ def test_adjoint_matches_dft_off_zenith(eps: float) -> None:
         np.complex128
     )
 
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps, hermitian=hermitian)
+    assert 0 < int((uvw[:, 2] < 0).sum()) < n_rows
     dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis)))
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
     assert err < DFT_TOL_FACTOR * eps, (
-        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e} "
+        f"(hermitian={hermitian})"
     )
 
 
@@ -219,7 +242,17 @@ def test_dot_product_identity(eps: float) -> None:
 
 
 @pytest.mark.parametrize("eps", [1e-6])
-def test_adjoint_weights_match_dft(eps: float) -> None:
+@pytest.mark.parametrize("hermitian", [False, True])
+def test_adjoint_weights_match_dft(eps: float, hermitian: bool) -> None:
+    """Weighted adjoint parity, both Hermitian-fold settings (issue #17).
+
+    Weights are real and multiply the visibilities before gridding, and
+    ``conj(vis) * wgt == conj(vis * wgt)`` for real ``wgt``, so the fold and the
+    weighting commute and the fold must leave the weights entirely alone. The
+    fuller weight coverage under the fold -- mixed magnitudes, an exact zero,
+    all four w-strategies -- is
+    ``tests/test_hermitian.py::test_weights_are_unaffected_by_the_fold``.
+    """
     rng = np.random.default_rng(2)
     n_l = n_m = 32
     n_rows = 32
@@ -235,12 +268,15 @@ def test_adjoint_weights_match_dft(eps: float) -> None:
     )
     weights = rng.uniform(0.1, 1.0, size=(n_rows, 1)).astype(np.float64)
 
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps, hermitian=hermitian)
+    assert 0 < int((uvw[:, 2] < 0).sum()) < n_rows
     dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis), weights=jnp.asarray(weights)))
     dirty_ref = _reference_adjoint(vis, uvw, freq, (n_l, n_m), pixsize, pixsize, weights=weights)
 
     err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
-    assert err < DFT_TOL_FACTOR * eps
+    assert err < DFT_TOL_FACTOR * eps, (
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR * eps:.3e} (hermitian={hermitian})"
+    )
 
 
 def test_adjoint_validates_shapes() -> None:

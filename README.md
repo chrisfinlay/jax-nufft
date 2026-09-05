@@ -165,7 +165,8 @@ Taking `s = nshift = -(max(n-1) + min(n-1)) / 2` centres the shifted range on
 zero, halving `max|n - 1 + s|` for any image containing the phase centre. The
 plane spacing therefore doubles and `n_w_inner` halves &mdash; on the review
 fixtures, MWA_extended at 30 degrees off-zenith goes from 495 to 251 planes at
-`epsilon = 1e-6` &mdash; while the compensating factor in step 6 costs a single
+`epsilon = 1e-6`, and the Hermitian fold below takes the same fixture from 251
+to 134 &mdash; while the compensating factor in step 6 costs a single
 complex multiply per visibility per call, independent of the plane count. The
 adjoint applies the conjugate factor to its *input* visibilities instead. Note
 the adjoint's `1/n` output factor still uses the physical, *unshifted*
@@ -306,7 +307,7 @@ number of forward and adjoint calls.
 
 ## API reference
 
-### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, dtype=jnp.float64, phi_hat_n_fine=4096, phi_hat_oversample=None) -> WGridderPlan`
+### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, dtype=jnp.float64, hermitian=True, phi_hat_n_fine=4096, phi_hat_oversample=None) -> WGridderPlan`
 
 Build the wgridder plan. Inputs are host-side numpy / jnp arrays (planning math
 runs on the host); the resulting plan holds JAX device arrays.
@@ -314,6 +315,24 @@ runs on the host); the resulting plan holds JAX device arrays.
 `dtype` fixes the precision of the whole plan — `uvw` and `freq` are cast to
 it, and the operators accept and return the matching real / complex dtypes.
 See [Precision](#precision) below.
+
+`hermitian=True` (the default) applies the conjugate-symmetry fold. For a real
+sky `V(-u, -v, -w) = conj(V(u, v, w))`, so every row with `w < 0` is stored at
+`(-u, -v, -w)` and its sign recorded in `plan.flip_sign`; the plan's w-range
+becomes `[0, max|w|]` instead of `[min w, max w]`, which halves the w-extent
+and with it the inner w-plane count on any roughly symmetric w-distribution
+(on this repository's MWA_extended off-zenith fixture at `epsilon = 1e-6`,
+`n_w` goes 251 → 134). The operators put the conjugation back per row, so the
+answer is unchanged.
+
+The identity holds for a **real** sky only. `dirty2vis` therefore raises
+`ValueError` on a complex image if the plan was folded, naming `hermitian=False`
+as the fix; the check is on the array's dtype, so a complex array with a zero
+imaginary part is refused too — pass `image.real`. `vis2dirty` has no such
+restriction: its output is the real part, and `Re[v z] == Re[conj(v) conj(z)]`
+identically, so the fold's plane-count saving applies to the adjoint
+unconditionally. Pass `hermitian=False` for a complex sky, or to reproduce the
+pre-fold plan geometry.
 
 `phi_hat_oversample=None` (the default) picks a width-dependent oversample
 suitable for the kernel chosen by `epsilon` (32 for `W <= 4`, 64 for `W <= 8`,
@@ -345,9 +364,10 @@ against a compiled executable, which does not exist at plan time.
 are kept once in metres (`plan.uvw_m`, `(n_rows, 3)`) next to one scalar per
 channel (`plan.inv_lambda = freq / c`), and the per-channel `(u, v)` FINUFFT
 coordinates and `w` in wavelengths are derived inside the JIT. A float64 plan
-is therefore about `28 * n_rows + 8 * n_chan + 32 * n_l * n_m` bytes plus the
+is therefore about `29 * n_rows + 8 * n_chan + 32 * n_l * n_m` bytes plus the
 small `n_w`-sized arrays &mdash; 2.4 MB for 16 channels &times; 10k rows at
-256&sup2;, 31 MB for 64 channels &times; 1M rows. `plan.uvw_lambda`,
+256&sup2;, 32 MB for 64 channels &times; 1M rows. (28 B/row before the
+Hermitian fold's one-byte `plan.flip_sign`.) `plan.uvw_lambda`,
 `plan.n_minus_1` and `plan.w_centers` remain readable as derived properties;
 reading `plan.uvw_lambda` materialises the full `(n_chan, n_rows, 3)` array,
 so it is for introspection, not for hot loops.
@@ -356,7 +376,9 @@ so it is for introspection, not for hot loops.
 
 Forward operator. `image` may be `(n_chan, n_l, n_m)` or `(n_l, n_m)`
 (broadcast across channels), real or complex. Output is complex
-`(n_rows, n_chan)`.
+`(n_rows, n_chan)`. A **complex** image needs a plan built with
+`hermitian=False` &mdash; see `make_plan` above &mdash; and raises `ValueError`
+otherwise.
 
 ### `vis2dirty(plan, vis, *, weights=None, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
 
@@ -500,6 +522,12 @@ like-for-like):
 | MeerKAT off30, 256&sup2;, 600 rows | 19 | 17.2 / 17.9 | 39.4 / 26.2 | 4.9 / 3.3 |
 | GH200_large off30, 2048&sup2;, 50k rows | 43 | 67.9 / 184.8 | 160.5 / 159.2 | 47.6 / 78.8 |
 
+(Measured on the pre-#17 `hermitian=False` geometry, hence the `n_w` column
+of 251 / 19 / 43; the shipped default now builds 134 / 13 / 26 planes on
+these three fixtures and is correspondingly faster — see the upgrade table
+further down. The comparison against ducc0 was not re-run under the fold, so
+these are the numbers as measured, not current-default figures.)
+
 The last column is `dense_vmap` throughout, which is what the heuristic
 picks in five of those six cells but *not* in the sixth: on GH200_large
 off30 the adjoint pick is `windowed_vmap`, so `78.8` is not the number a
@@ -518,7 +546,9 @@ thresholds themselves is a separate question (issue #34).
 
 That table was measured when #46 was filed. Re-run on the same hardware
 against the code this default actually ships with, the shipped default
-against an explicit `dense_scan`, same protocol:
+against an explicit `dense_scan`, same protocol — **on the pre-#17
+`hermitian=False` geometry, which is what the planner produced at the
+time**:
 
 | fixture | `n_w` | `"auto"` resolves to | default | `dense_scan` | speedup |
 |---|---|---|---|---|---|
@@ -526,12 +556,36 @@ against an explicit `dense_scan`, same protocol:
 | MeerKAT off30 | 19 | `dense_vmap` / `dense_vmap` | 4.9 / 3.2 | 40.7 / 26.0 | 8.4x / 8.0x |
 | GH200_large off30 | 43 | `dense_vmap` / `windowed_vmap` | 47.3 / 53.1 | 159.0 / 157.3 | 3.4x / 3.0x |
 
-The picks are the same three the heuristic made in the issue, and the
-`n_w` column is unchanged — 251 / 19 / 43 in both tables, and what the
-current planner still produces on these three fixtures. In particular the
-plane-count halving described under *The wgridder algorithm* above (495
-&rarr; 251 on MWA_extended off30, issue #16) is already reflected in the
-issue's own table, so it is not something that separates these two runs.
+Kept as the historical record of what #46 bought, and labelled as such
+because its `n_w` column no longer describes a default plan: issue #17's
+Hermitian fold halves it, and the same three fixtures now build 134 / 13 /
+26 planes. The picks are unchanged by that — `dense_vmap` / `dense_vmap`,
+`dense_vmap` / `dense_vmap`, `dense_vmap` / `windowed_vmap` on the folded
+geometry too — so the `"auto"`-over-`dense_scan` margins above still stand
+qualitatively; the absolute millisecond columns belong to the unfolded
+geometry and should be read as history.
+
+What a caller receives from the fold itself is a separate comparison, and
+the one that matters for an upgrade: the shipped default on the folded
+geometry against the shipped default on the unfolded one, same GH200, same
+protocol, `epsilon` as marked.
+
+| fixture | eps | `n_w` | forward | adjoint |
+|---|---|---|---|---|
+| GH200_large zenith | 1e-6 | 10 &rarr; 9 | 1.06x | 1.09x |
+| GH200_large zenith | 1e-9 | 13 &rarr; 12 | 1.06x | 1.07x |
+| GH200_large off30 | 1e-6 | 43 &rarr; 26 | 1.26x | 1.52x |
+| GH200_large off30 | 1e-9 | 46 &rarr; 29 | 1.12x | 1.47x |
+| MWA_extended off30 | 1e-6 | 251 &rarr; 134 | 1.78x | 1.64x |
+| MWA_extended off30 | 1e-9 | 254 &rarr; 137 | 1.70x | 1.70x |
+| MeerKAT off30 | 1e-6 | 19 &rarr; 13 | 1.23x | 1.10x |
+| MeerKAT off30 | 1e-9 | 22 &rarr; 16 | 1.19x | 1.13x |
+
+Every cell faster, 1.06x to 1.78x. One pick in that run is imperfect
+rather than wrong: the GH200_large off30 forward at `epsilon = 1e-9`
+resolves to `windowed_vmap` at 43.3 ms where `dense_vmap` would be
+37.6 ms, so the heuristic leaves about 14% there — still a 1.12x gain on
+upgrade, and correcting it means retuning a threshold (issue #34).
 
 One cell of the six shifted between the two runs: the `dense_scan`
 forward on MWA_extended off30 read 653.6 ms against the issue's 501.9 ms,
@@ -547,50 +601,57 @@ six of the re-run's cells, and the smallest margin — 2.96x on the
 GH200_large adjoint, which the table rounds to 3.0x — is one the shifted
 cell has no part in.
 
-On CPU the change is much smaller, and it is not nothing. The forward is
-untouched — the CPU heuristic never picks a windowed forward, so it
-resolves to `dense_scan` on every fixture in this repository, exactly the
-old default. The adjoint does move: at off-zenith pointings the heuristic
-picks `windowed_scan`. That is the strategy v0.1.1 Part 2 measured its
-1.05-1.53x adjoint win on, and that range does not reproduce on current
-code: its two endpoints are MWA_compact off30 (1.53x) and MeerKAT off30
-(1.05x) in the *Part 2 only* column of the v0.1.1 table below, and both
-now come out flat. Only MWA_extended off30, 1.19x then, still shows a win.
+On CPU the strategy change is now almost nothing, and issue #17 is why.
+The forward was always untouched — the CPU heuristic never picks a windowed
+forward, so it resolves to `dense_scan` on every fixture in this
+repository, exactly the old default. The adjoint used to move to
+`windowed_scan` at every off-zenith pointing; folded, it does so only on
+MWA_extended off30. Halving `n_w` halves the `n_w / w_kernel_width` ratio
+the adjoint gate reads, and MWA_compact off30 (2.43 &rarr; 1.71) and
+MeerKAT off30 (2.71 &rarr; 1.86) drop under it. Those are exactly the two
+cells that had stopped paying: v0.1.1 Part 2 measured its 1.05-1.53x
+adjoint win with those two as its endpoints, and both now time flat.
 
-Timed on a 10-core Apple M-series at `epsilon = 1e-6`,
-float64, single channel, with the plan built and warm-ups taken outside
-the timed window and each number the median of 9 `block_until_ready()`
-calls over five interleaved rounds, the new default against an explicit
-`dense_scan`:
+Timed on a 10-core Apple M-series at `epsilon = 1e-6`, float64, single
+channel, with the plan built and warm-ups taken outside the timed window,
+each number the median of 9 `block_until_ready()` calls, over two passes —
+the shipped default against an explicit `dense_scan`, both on the folded
+geometry:
+
+| fixture | `n_w` | adjoint pick | forward | adjoint |
+|---|---|---|---|---|
+| MWA_compact off30 | 12 | `dense_scan` | 0.99x | 0.98-1.00x |
+| MWA_extended off30 | 134 | `windowed_scan` | 0.99-1.00x | 1.03x |
+| MeerKAT off30 | 13 | `dense_scan` | 1.00x | 0.99-1.00x |
+| EDA2 zenith | 11 | `dense_scan` | 0.98-0.99x | 0.98-1.02x |
+| MWA_extended zenith | 11 | `dense_scan` | 0.99-1.03x | 0.99-1.00x |
+
+Every cell is inside this machine's &plusmn;4% noise floor, including the
+one cell that still changes strategy. So on the folded geometry the CPU
+`"auto"` default is, as far as this machine can resolve, a tie with
+`dense_scan` — which is the honest reading, and a change from the
+pre-#17 statement that it bought 1.14-1.24x on MWA_extended off30.
+
+That is a statement about the *strategy*, not about the fold. What the
+fold is worth on the same machine and protocol — shipped default folded
+against shipped default unfolded, i.e. what an upgrading caller receives:
 
 | fixture | `n_w` | forward | adjoint |
 |---|---|---|---|
-| MWA_compact off30 | 17 | 0.99x (both `dense_scan`) | 1.01x (`windowed_scan`) |
-| MWA_extended off30 | 251 | 1.00x (both `dense_scan`) | **1.14-1.24x** (`windowed_scan`) |
-| MeerKAT off30 | 19 | 1.04x (both `dense_scan`) | 1.01x (`windowed_scan`) |
-| EDA2 zenith | 14 | 1.00x (both `dense_scan`) | 1.01x (both `dense_scan`) |
-| MWA_extended zenith | 14 | 0.99x (both `dense_scan`) | 1.01x (both `dense_scan`) |
+| MWA_compact off30 | 17 &rarr; 12 | 1.36-1.39x | 1.34-1.37x |
+| MWA_extended off30 | 251 &rarr; 134 | 1.84-1.85x | 1.67-1.68x |
+| MeerKAT off30 | 19 &rarr; 13 | 1.42-1.45x | 1.44-1.47x |
+| EDA2 zenith | 14 &rarr; 11 | 1.25-1.27x | 1.26-1.28x |
+| MWA_extended zenith | 14 &rarr; 11 | 1.26-1.31x | 1.25-1.26x |
 
-The cells where both arms run the same strategy are controls, and they
-bracket this machine's noise floor at about &plusmn;4%.
+Every cell faster, ranges across the two passes.
 
-The three strategy-changing cells were then re-measured in a second,
-nine-round paired pass: MWA_extended off30 1.14x (301.3 ms against
-344.0 ms, with the windowed arm faster in every one of the nine rounds),
-MWA_compact off30 1.01x, MeerKAT off30 0.99x. That is why MWA_extended
-off30 carries a range; the other two reproduce their first-pass verdict.
-Read against the noise floor, MWA_extended off30 is the only cell showing
-a real adjoint win — the other two change strategy but land inside the
-floor, their `n_w` being under 20. Nothing measured slower than the old
-default *outside* that floor: the worst cell is the MeerKAT off30 adjoint
-at 0.99x, 24.96 ms against 24.72 ms, and it is a strategy-changing cell
-rather than a control, so it is a real 1% that happens to be smaller than
-this machine can resolve — not a demonstrated tie.
-
-In float32 the picture is the same with two more fixtures crossing over to
-`windowed_scan` on the adjoint (EDA2 zenith and MWA_extended zenith): the
-narrower float32 kernel, `W = 5` against `W = 7`, pushes `n_w /
-w_kernel_width` past the cutoff there.
+In float32 the folded picture differs from float64 in one cell: MeerKAT
+off30 keeps `windowed_scan` on the adjoint (ratio 2.2) where its float64
+counterpart falls to 1.86. The narrower float32 kernel, `W = 5` against
+`W = 7`, is the *denominator* of that ratio, so it cannot rescue a halved
+`n_w` — unfolded it pushed two extra fixtures over the cutoff, folded it
+holds one back from falling under.
 
 **Backward compatibility.** `w_strategy="dense_scan"` restores the
 pre-#46 *code path* on both operators: the same strategy, so the same
@@ -626,7 +687,7 @@ pinned; neither choice of `w_strategy` substitutes for it.
 &mdash; relative L2, in the sign convention above &mdash; for every
 `epsilon` from `1e-3` to `1e-12`, forward and adjoint, on the seven telescope
 fixtures of `tests/test_accuracy_sweep.py`. The measured worst cell across
-that 112-cell matrix is `1.47 * epsilon` (MWA_extended off30, `epsilon =
+that 112-cell matrix is `1.48 * epsilon` (MWA_extended off30, `epsilon =
 1e-12`, adjoint). Against `ducc0.wgridder` (with matched `divide_by_n` flags)
 the bound is `3 * epsilon`, the sum of the two implementations' budgets.
 

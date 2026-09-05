@@ -28,6 +28,13 @@ Sign convention: matches ducc's ``explicit_degridder``, i.e.
 
 with the optional ``1/n`` factor applied on the adjoint output (matching ducc's
 ``divide_by_n=True``).
+
+issue #17: a plan built with ``hermitian=True`` (``make_plan``'s default)
+stores every row with ``w < 0`` at ``(-u, -v, -w)``, which halves the w-extent
+and so the plane count. The operators undo that per row from the plan's
+``flip_sign`` leaf -- the forward conjugates its **output**, the adjoint its
+**input** (:func:`_hermitian_conj_rows`) -- and ``dirty2vis`` refuses a complex
+image on such a plan, the fold being valid for a real sky only.
 """
 
 from __future__ import annotations
@@ -310,6 +317,36 @@ def _resolve_nthreads(
 # this cutoff can only take a plan off ``windowed_scan``, which AGENTS.md
 # section 9 measures as the CPU win on exactly the fixtures that approach it.
 #
+# issue #17: every paragraph above is stated on the *unfolded* plan geometry,
+# which is the geometry that existed when #43 was written and is no longer the
+# one that ships. Re-measured on folded plans, the same forty-cell grid reads
+# 1.077 - 2.765 outside MWA_extended off30 (was 1.077 - 3.173) and 4.944 -
+# 5.076 on it (was 5.173 - 5.784); the float32 leg's ten cells agree with the
+# float64 ones to within 0.13% (worst EDA2 off30, 2.6169 against 2.6202; the
+# high-overhead cell itself agrees to 0.04%), against 0.19% unfolded.
+#
+# The constant does not move with them, and the asymmetry is the point. #43
+# changed the metric's *denominator*, so the shipped 5.0 had to be restated on
+# a new scale or it would have started binding; #17 changes neither the metric
+# nor its scale, only where the fixtures sit under an unchanged ruler -- and
+# they all move down. There is no change of units to carry the constant across
+# a second time. What does change is the headroom: 6.0 clears the worst shipped
+# cell by 18.2% where it cleared the unfolded worst by 3.7%.
+#
+# Nor is it re-fitted onto the folded maximum of 5.076, which "the smallest
+# round value that clears the grid" would put near 5.1. That phrase was #43's
+# way of *carrying* a measured cutoff across a change of units, not a rule for
+# calibrating one; applied here it would fit the constant to a single random
+# draw, and the seed sweep says which draw. Folded, MWA_extended off30 at
+# eps 1e-3 spans 5.076 to 6.466 over seeds 0-11 (5.074 to 6.469 on the float32
+# leg) and crosses 6.0 on four of
+# them -- seed 0, the draw the pinned grid happens to use, is the gentlest of
+# the twelve, as it is unfolded too. A 5.1 cutoff would bind on eleven of the
+# twelve, taking the one fixture AGENTS.md section 9 still measures a windowed
+# adjoint win on off ``windowed_scan`` on almost every draw. That seed
+# sensitivity is issue #34; until it is settled the safe direction is the
+# permissive one, for the reason two paragraphs up.
+#
 # Pinned to this exact value by
 # ``tests/test_padding_overhead.py::test_cpu_padding_cutoff_is_six_and_still_gates``,
 # which also exercises the branch on both sides of it: a cutoff raised far
@@ -336,6 +373,23 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 
     The constant-w fast path collapses ``n_w`` to one, so the
     small-``n_w`` branch always picks ``dense_scan`` there.
+
+    **issue #17 moved picks here, and the heuristic was not retuned for
+    it.** The Hermitian fold halves ``n_w`` while leaving ``w_kernel_width``
+    alone, so it halves the ratio in the adjoint gate below and every review
+    fixture whose unfolded ratio sat between 2 and 4 drops under it. On the
+    shipped geometry that is MWA_compact off30 (2.43 -> 1.71) and MeerKAT
+    off30 (2.71 -> 1.86) in float64, plus EDA2 zenith and MWA_extended zenith
+    in float32; all four go from ``windowed_scan`` to ``dense_scan`` on the
+    adjoint. MWA_extended off30, the one fixture AGENTS.md section 9 still
+    measures a windowed adjoint *win* on, keeps ``windowed_scan`` at a ratio
+    of 19.1. The four that moved are the ones that section's own
+    re-measurement found flat inside a +-4% noise floor -- so the fold takes
+    the windowed adjoint off exactly the fixtures where it had stopped paying.
+    That is a description of what was measured, not a claim that the cutoffs
+    were chosen for it; retuning them for the folded geometry is issue #34's
+    business. The literal picks are pinned per geometry in
+    ``tests/test_default_w_strategy.py``.
     """
     if plan.n_w <= plan.w_kernel_width + 2:
         return "dense_scan"
@@ -355,8 +409,9 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 # the windowed_vmap wins only on the GH200_large (50k-row)
 # fixture where dense_vmap's per-plane n_rows*W^2 starts to bite.
 _GPU_LARGE_N_ROWS = 10_000
-# Unmoved by issue #43, unlike ``_CPU_PADDING_CUTOFF`` above -- and that is a
-# measurement, not an omission. The redefinition raises every cell's overhead
+# Unmoved by issue #43 or #17, unlike ``_CPU_PADDING_CUTOFF`` above -- and in
+# both cases that is a measurement, not an omission. The #43 redefinition
+# raises every cell's overhead
 # (by under 0.1% where the windows are wide, by up to 20% where they are
 # narrow),
 # but 3.0 happens to sit in a gap no cell crosses: over the whole calibration
@@ -366,6 +421,17 @@ _GPU_LARGE_N_ROWS = 10_000
 # Every cell keeps the side it was on, on both precision legs, so the GH200
 # sweep this number was fitted to still resolves to the same strategy in all 20
 # of its cells and there is nothing to recalibrate.
+#
+# issue #17's fold moves the whole grid down under this cutoff rather than
+# across it: folded, the two cells that used to sit above 3.0 outside
+# MWA_extended off30 drop below (MWA_compact off30 3.050 -> 2.223, MeerKAT
+# off30 3.172 -> 2.437), the grid maximum outside that fixture becomes 2.765,
+# and no cell crosses in the other direction. So this branch is *less* reachable
+# on the shipped geometry, not differently calibrated. It also cannot change a
+# pick either way on the review fixtures: everything that crosses it has 600
+# rows, and the GPU heuristic's row-count gates send those to ``dense_vmap``
+# before this comparison is reached. The gate that #17 does move is the
+# small-``n_w`` one -- see :func:`_auto_w_strategy_gpu`.
 _GPU_PADDING_CUTOFF = 3.0
 _GPU_FORWARD_RATIO_CUTOFF = 3.0
 
@@ -404,10 +470,96 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     choice on this data would not be a bounded loss; the safety margin
     comes from the picks being right, not from the alternatives being
     close.
+
+    **issue #17 exposed a bug in the small-``n_w`` shortcut, which is fixed
+    below rather than left as a tuning question.** The sweep above was run on
+    unfolded plans -- the only geometry that existed then -- and the fold
+    halves ``n_w``. On ``GH200_large`` at **zenith** that drops ``n_w`` by a
+    single plane onto exactly ``w_kernel_width + 2`` at every epsilon of the
+    calibration grid (7->6 at eps 1e-3, 10->9 at 1e-6, 13->12 at 1e-9, 16->15
+    at 1e-12), so the shortcut began firing on a 50k-row 2048^2 plan and took
+    both directions ``windowed_vmap -> dense_vmap``.
+
+    Re-timed on a GH200 (folded plan, median of 9, ``dense_vmap`` against
+    ``windowed_vmap``): 27.5 vs 16.1 ms forward and 33.4 vs 17.1 ms adjoint at
+    eps 1e-6, 28.0 vs 20.4 and 40.9 vs 26.2 ms at eps 1e-9 -- so the shortcut's
+    pick was 1.37x to 1.95x slower on all four cells. The shortcut's premise
+    ("either dense or windowed is fine") holds for the few-hundred-row plans it
+    was measured on and not for a plan in the large-row regime, so it now
+    carries an ``n_rows < _GPU_LARGE_N_ROWS`` condition and such plans fall
+    through to the size-based windowed gates, which is where the measurement
+    puts them. Scope, stated plainly: four timed cells, one fixture, one
+    GH200 -- enough to reject the shortcut in this regime, not a general
+    result about small ``n_w``. Retuning the thresholds themselves stays with
+    issue #34.
+
+    Two consequences of that condition worth naming. Over both geometries of
+    the whole calibration grid it moves exactly those eight cells (four
+    epsilons x two directions, folded ``GH200_large`` zenith) and nothing
+    else, ``GH200_large`` being the only fixture in the large-row regime and
+    its off-zenith ``n_w`` never reaching the shortcut. And a constant-w plan
+    with a large row count (``n_w == 1``) now falls through to
+    ``windowed_vmap`` as well; that is degenerate rather than a second
+    retune, since the fast path sets ``max_window_size == n_rows`` with every
+    ``window_start`` at zero, so the single "window" is every row and the
+    windowed traversal does the dense traversal's one NUFFT. It is gated as
+    such by
+    ``tests/test_auto_strategy.py::test_gpu_constant_w_large_rows_falls_through_to_a_degenerate_window``.
+
+    Also folded, the off-zenith forward crosses
+    :data:`_GPU_FORWARD_RATIO_CUTOFF` at eps 1e-9 and 1e-12 (n_w 46->29 and
+    49->32 against ``3 * W``), going the other way to ``windowed_vmap``. That
+    one is the heuristic's existing rule reading a changed plan rather than a
+    rule that misfires, and it has now been timed: at eps 1e-9 the picked
+    ``windowed_vmap`` runs 42.8 ms against ``dense_vmap``'s 37.6, so the
+    heuristic leaves about 14% on the table there. It is not a regression --
+    the same cell was 48.4 ms before the fold, so a caller upgrading still
+    gains 1.12x -- and correcting it means moving
+    :data:`_GPU_FORWARD_RATIO_CUTOFF`, which is a threshold retune and so
+    issue #34's, not this change's.
+
+    Nothing in ``tests/test_default_w_strategy.py``'s GPU table moves, under
+    the fold or under this condition: it is at 30 degrees and ``EPSILON``,
+    where all three fixtures resolve identically in both geometries on both
+    precision legs and none of them reaches the shortcut (its comment has the
+    numbers). The rest of the review fixtures are 600-row plans that the
+    ``n_rows >= _GPU_LARGE_N_ROWS`` gates keep on ``dense_vmap`` whatever
+    their w-geometry.
     """
-    if plan.n_w <= plan.w_kernel_width + 2:
-        # Small n_w (incl. constant-w fast path); either dense or
-        # windowed is fine. dense_vmap is simpler and the data agrees.
+    if plan.n_w <= plan.w_kernel_width + 2 and plan.n_rows < _GPU_LARGE_N_ROWS:
+        # Small n_w on a small-row plan; either dense or windowed is fine.
+        # dense_vmap is simpler and the data agrees.
+        #
+        # The row-count condition is issue #17's correction, and it is what
+        # keeps this shortcut from overriding the two size-based windowed
+        # gates below. "Either is fine" was measured on plans of a few
+        # hundred rows, where a w-plane's worth of work is small however it
+        # is traversed; it is false for a 50k-row 2048^2 plan, which is
+        # exactly the regime those gates exist for. Measured on a GH200 --
+        # GH200_large at zenith, folded, median of 9 -- ``dense_vmap``
+        # against ``windowed_vmap`` runs 27.5 vs 16.1 ms forward and 33.4 vs
+        # 17.1 ms adjoint at eps 1e-6 (n_w = 9, W = 7), and 28.0 vs 20.4 /
+        # 40.9 vs 26.2 ms at eps 1e-9 (n_w = 12, W = 10): 1.37x to 1.95x
+        # slower on the pick this branch would make. Large-row plans
+        # therefore fall through and reach the windowed branches on size, as
+        # they did before the fold moved their ``n_w`` down onto
+        # ``w_kernel_width + 2``.
+        #
+        # With that condition this branch is **redundant, and knowingly so**:
+        # both windowed returns below are themselves gated on
+        # ``n_rows >= _GPU_LARGE_N_ROWS``, so every input with fewer rows than
+        # that already reaches ``dense_vmap`` by one path or another and
+        # deleting these two lines would change no answer (checked
+        # exhaustively over ``n_w`` 1-400 x ``W`` 2-16 x padding either side
+        # of the cutoff x six row counts x both directions: zero
+        # disagreements). It is kept for the same reason the window builder
+        # keeps its ``lo - 1`` / ``hi + 1`` clamp -- it states the measured
+        # small-``n_w`` answer at the point the baseline sweep established it,
+        # and it would go on stating it if a later change made a windowed
+        # branch reachable below the row cutoff. Being redundant, it is also
+        # not something a behavioural test can pin, and no test claims to:
+        # ``tests/test_auto_strategy.py`` gates the *condition*, which is
+        # load-bearing, and says so.
         return "dense_vmap"
     if plan.window_padding_overhead > _GPU_PADDING_CUTOFF:
         # Windowed wastes too much per-plane work on padded slices;
@@ -489,6 +641,46 @@ def _cast_to_plan_dtype(
             "jax_enable_x64)."
         )
     return array.astype(target)
+
+
+def _reject_complex_image_on_a_folded_plan(image: Array, plan: WGridderPlan) -> None:
+    """Refuse a complex image on a ``hermitian=True`` plan (issue #17).
+
+    The fold rests on ``V(-u, -v, -w) = conj(V(u, v, w))``, which is a property
+    of a **real** sky. A folded plan cannot be rescued at call time either: its
+    w-planes span ``[0, max|w|]``, so a row restored to a negative w would sit
+    outside every plane's kernel support and be degridded as approximately
+    nothing. That is a silently wrong answer, not a slow one, and the honest
+    alternative -- running the whole operator twice, once per component -- is a
+    2x cost the caller did not ask for and cannot see. So: refuse, and name the
+    one-line fix.
+
+    Two things about *where* this check lives.
+
+    It runs before :func:`_prepare_image`, on the array the caller passed,
+    because that function promotes a real image to ``plan.complex_dtype``:
+    afterwards every image is complex and the question cannot be asked.
+
+    It is a check on the input's **dtype**, never on its values. A
+    complex-dtype image with a zero imaginary part is refused too. That is not
+    a missing convenience -- a value-dependent check (``jnp.any(image.imag)``)
+    is a traced predicate, so it could not be evaluated at all inside
+    ``jax.jit``, where this function must keep working. A caller holding a
+    complex array they know to be real should pass ``image.real``.
+    """
+    if plan.hermitian and jnp.iscomplexobj(image):
+        raise ValueError(
+            "dirty2vis got a complex image, but this plan was built with "
+            "hermitian=True (the default). The Hermitian w-sign fold stores every "
+            "row with w < 0 at (-u, -v, -w), which is the same measurement only for "
+            "a REAL sky (V(-u, -v, -w) = conj(V(u, v, w))), and the folded plan's "
+            "w-planes do not cover the unfolded rows -- so folding a complex image "
+            "would return a silently wrong answer rather than a slow one. Pass a real "
+            "image (image.real if the imaginary part is known to be zero), or rebuild "
+            "the plan with make_plan(..., hermitian=False), which keeps the full "
+            "[min w, max w] plane grid at the cost of roughly twice as many w-planes. "
+            "vis2dirty has no such restriction."
+        )
 
 
 def _prepare_image(image: Array, plan: WGridderPlan) -> Array:
@@ -698,6 +890,40 @@ def _apply_nshift_compensation(
     return vis * jnp.exp((sign * 1j * phase).astype(vis.dtype))
 
 
+def _hermitian_conj_rows(vis: Array, flip_sign: Array, plan: WGridderPlan) -> Array:
+    """Conjugate one channel's visibilities on the rows the plan folded.
+
+    issue #17: a folded row is stored at ``(-u, -v, -w)``, and for a real sky
+    ``V(-u, -v, -w) = conj(V(u, v, w))``. So whatever the plane loop produces
+    for such a row -- forward -- is the conjugate of the answer, and whatever
+    the caller hands in for such a row -- adjoint -- must be conjugated before
+    the folded machinery consumes it.
+
+    **Which side each operator uses is not interchangeable.** The forward
+    conjugates its *output*; the adjoint conjugates its *input*. That is forced
+    by the adjoint relation and not a convention: if the forward is
+    ``A = C . D . N`` (plane loop, then the nshift diagonal, then this
+    conjugation), then ``A^H = N^H . D^H . C^H``, i.e. the conjugation comes
+    *first* on the adjoint side and before the nshift compensation, which is
+    where the call sites put it. Putting both on the same side, or reversing
+    them against ``D``, leaves each operator individually plausible and breaks
+    ``<A x, y> == <x, A^H y>`` (``tests/test_hermitian.py::test_swapping_the_
+    two_conjugation_sides_breaks_adjointness``).
+
+    ``vis`` and ``flip_sign`` must be in the *same* row order, which is why the
+    windowed adjoint passes a ``sort_perm``-gathered copy rather than the leaf.
+
+    ``plan.hermitian`` is static, so the early-out is a trace-time Python
+    branch: an unfolded plan emits no select at all and its graph is
+    bit-for-bit what it was before this issue. ``jnp.where`` rather than a
+    boolean-mask index because ``flip_sign`` is a traced leaf -- masking would
+    fail under ``jit`` and pass everywhere else.
+    """
+    if not plan.hermitian:
+        return vis
+    return jnp.where(flip_sign < 0, jnp.conj(vis), vis)
+
+
 def _channel_forward(
     image_c: Array,
     uvw_m: Array,
@@ -750,7 +976,10 @@ def _channel_forward(
     # issue #16: once per visibility, *after* the plane loop -- the factor is
     # common to every plane, so pulling it out of the sum is both cheaper and
     # exact (the sum is linear in it).
-    return _apply_nshift_compensation(vis_c, w_rel_c, plan, conjugate=False)
+    vis_c = _apply_nshift_compensation(vis_c, w_rel_c, plan, conjugate=False)
+    # issue #17: last, on the output, in input row order (``uvw_m`` is the
+    # unsorted array on this path, so ``plan.flip_sign`` aligns with it).
+    return _hermitian_conj_rows(vis_c, plan.flip_sign, plan)
 
 
 def _channel_forward_windowed(
@@ -837,9 +1066,14 @@ def _channel_forward_windowed(
         # NUFFTs, so it costs nothing and keeps the plan from carrying a
         # second w array for this path alone.
         w_rel_c = jnp.zeros_like(w_rel_sorted).at[plan.sort_perm].set(w_rel_sorted)
-        return _apply_nshift_compensation(
+        vis_c = _apply_nshift_compensation(
             jnp.sum(contributions, axis=0), w_rel_c, plan, conjugate=False
         )
+        # issue #17: ``plane_to_full_rows`` already scattered back to *input*
+        # row order, so the unpermuted ``plan.flip_sign`` is the right
+        # alignment here -- the same reasoning as the ``w_rel_c`` recovery
+        # above, and the reason this path needs its own call site.
+        return _hermitian_conj_rows(vis_c, plan.flip_sign, plan)
 
     # windowed_scan path: keep the carry in sorted-row order so each plane
     # touches only its (max_window_size,)-sized slice. The per-step
@@ -859,7 +1093,12 @@ def _channel_forward_windowed(
     # across it.
     vis_sorted = _apply_nshift_compensation(vis_sorted, w_rel_sorted, plan, conjugate=False)
     # Unsort once: sorted[i] is the contribution for original row sort_perm[i].
-    return jnp.empty_like(vis_sorted).at[plan.sort_perm].set(vis_sorted)
+    vis_c = jnp.empty_like(vis_sorted).at[plan.sort_perm].set(vis_sorted)
+    # issue #17: after the unsort, so ``plan.flip_sign`` (input row order) is
+    # the right alignment. Conjugating before it -- against
+    # ``flip_sign[sort_perm]`` -- is equally correct and equally cheap; doing
+    # it here keeps all three forward call sites reading the same leaf.
+    return _hermitian_conj_rows(vis_c, plan.flip_sign, plan)
 
 
 def _channel_adjoint(
@@ -878,6 +1117,11 @@ def _channel_adjoint(
     cdtype = vis_c.dtype
     u_ft_c, v_ft_c, w_rel_c = _channel_ft_coords(uvw_m, inv_lambda_c, plan)
 
+    # issue #17: first, on the *input*, and before the nshift compensation --
+    # the forward applies these two in the opposite order on its output, and
+    # the adjoint of a composition reverses it (see _hermitian_conj_rows).
+    # Reversing them here would be a phase error on exactly the folded rows.
+    vis_c = _hermitian_conj_rows(vis_c, plan.flip_sign, plan)
     # issue #16: the adjoint of the forward's per-visibility output scaling by
     # exp(-2πi w nshift) is the conjugate scaling on the *input*, applied once
     # here rather than inside the plane loop (see _apply_nshift_compensation).
@@ -1015,6 +1259,16 @@ def dirty2vis(
         precision is the plan's, not the image's: an image narrower than
         ``plan.complex_dtype`` is cast up to it, a wider one raises
         ``TypeError`` (issue #11).
+
+        A **complex** image raises ``ValueError`` on a plan built with
+        ``hermitian=True`` (the default since issue #17): the conjugate-
+        symmetry fold that halves the plane count holds for a real sky only,
+        and the folded plan's ``[0, max|w|]`` plane grid does not cover the
+        unfolded rows, so folding a complex image would be silently wrong
+        rather than slow. The check is on the input's dtype, so a complex array
+        with a zero imaginary part is refused too -- pass ``image.real``, or
+        build the plan with ``make_plan(..., hermitian=False)``.
+        :func:`vis2dirty` has no equivalent restriction.
     w_strategy:
         ``"auto"`` (the shipped default since issue #46) resolves to one of
         the four canonical names before the JIT boundary via
@@ -1076,6 +1330,7 @@ def dirty2vis(
         ``plan.complex_dtype``.
     """
     w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=False)
+    _reject_complex_image_on_a_folded_plan(image, plan)
     image = _prepare_image(image, plan)
     resolved_nthreads = _resolve_nthreads(nthreads, w_strategy, plan.n_rows)
     return _dirty2vis_jit(
@@ -1090,6 +1345,7 @@ def dirty2vis(
 def _channel_adjoint_windowed(
     vis_sorted_c: Array,
     uvw_m_sorted: Array,
+    flip_sign_sorted: Array,
     inv_lambda_c: Array,
     window_start_c: Array,
     plan: WGridderPlan,
@@ -1106,6 +1362,14 @@ def _channel_adjoint_windowed(
     (``windowed_vmap``).
 
     See :func:`_channel_forward_windowed` for the coord-arg convention.
+
+    ``flip_sign_sorted`` is ``plan.flip_sign[plan.sort_perm]`` (issue #17).
+    This is the one path where the fold's per-row sign has to be permuted: the
+    conjugation happens on the incoming visibilities, which arrive here already
+    in sorted-row order, so the unpermuted leaf would conjugate the wrong rows
+    -- a bug invisible to every dense strategy. Gathered by the caller, outside
+    the channel loop, for the same reason ``uvw_m_sorted`` is: the sort key is
+    w in metres, so the permutation is channel-independent.
     """
     two_pi = 2.0 * jnp.pi
     u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)
@@ -1114,6 +1378,9 @@ def _channel_adjoint_windowed(
     max_window_size = plan.max_window_size
     lo_max = max(plan.n_rows - max_window_size, 0)
 
+    # issue #17: on the input, before the nshift compensation, against the
+    # *sorted* signs (see the argument note above and _hermitian_conj_rows).
+    vis_sorted_c = _hermitian_conj_rows(vis_sorted_c, flip_sign_sorted, plan)
     # issue #16: conjugate compensating phase on the input visibilities, once
     # per visibility before the plane loop. Both arrays are in sorted-row
     # order here, so no permutation is involved.
@@ -1189,10 +1456,14 @@ def _vis2dirty_jit(
         # metres, so it is channel-independent).
         vis_sorted_per_chan = vis_per_chan[:, plan.sort_perm]
         uvw_m_sorted = plan.uvw_m[plan.sort_perm]  # (n_rows, 3)
+        # issue #17: the fold's per-row sign in the same sorted order as the
+        # visibilities above. One (n_rows,) int8 gather per call, hoisted out
+        # of the channel loop for the same reason as ``uvw_m_sorted``.
+        flip_sign_sorted = plan.flip_sign[plan.sort_perm]  # (n_rows,)
         if channel_strategy == "vmap":
             dirty_per_chan = jax.vmap(
                 lambda v_s_c, il_c, ws_c: _channel_adjoint_windowed(
-                    v_s_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
+                    v_s_c, uvw_m_sorted, flip_sign_sorted, il_c, ws_c, plan, opts, w_strategy
                 )
             )(vis_sorted_per_chan, plan.inv_lambda, plan.window_start)
         elif channel_strategy == "scan":
@@ -1203,7 +1474,7 @@ def _vis2dirty_jit(
             ) -> tuple[None, Array]:
                 v_s_c, il_c, ws_c = args
                 return None, _channel_adjoint_windowed(
-                    v_s_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
+                    v_s_c, uvw_m_sorted, flip_sign_sorted, il_c, ws_c, plan, opts, w_strategy
                 )
 
             _, dirty_per_chan = jax.lax.scan(
@@ -1287,7 +1558,11 @@ def vis2dirty(
         Complex array of shape ``(n_rows, n_chan)``. As for the image in
         :func:`dirty2vis`, the plan owns the precision: a narrower ``vis``
         (or a real one) is cast up to ``plan.complex_dtype``, a wider one
-        raises ``TypeError`` (issue #11).
+        raises ``TypeError`` (issue #11). Unlike the image there, a complex
+        ``vis`` is fine on a folded plan: the adjoint's output is the real
+        part and ``Re[v z] == Re[conj(v) conj(z)]`` identically, so issue
+        #17's fold applies here unconditionally and the plane-count saving
+        comes for free.
     weights:
         Optional real array of shape ``(n_rows, n_chan)``, multiplied into the
         visibilities before gridding (matches ducc's ``wgt`` argument). Cast
@@ -1304,17 +1579,26 @@ def vis2dirty(
         float64 rather than bit-for-bit. The bare names ``"scan"`` /
         ``"vmap"`` are accepted as deprecated aliases.
 
-        The adjoint is where the new default also changes what a *CPU*
-        caller gets: on the repository's off-zenith fixtures the CPU
-        heuristic picks ``"windowed_scan"`` here where the old default was
-        ``"dense_scan"``. Measured on a 10-core Apple M-series (eps 1e-6,
-        float64, single channel, plan and warm-up outside the timer,
-        median of 9 calls) that is 1.14-1.24x faster on MWA_extended off30
-        (n_w=251) -- a range across two passes, 1.24x over five interleaved
-        rounds and 1.14x over a nine-round paired re-measurement -- and
-        indistinguishable, within a +-4% noise floor, on MWA_compact off30
-        and MeerKAT off30, whose n_w is under 20. The forward is
-        unaffected: the CPU heuristic never picks a windowed forward.
+        The adjoint is where the new default can also change what a *CPU*
+        caller gets, though issue #17 narrowed that to one fixture. On the
+        shipped folded geometry the heuristic picks ``"windowed_scan"``
+        here only on MWA_extended off30 (n_w=134, ratio 19.1); MWA_compact
+        off30 and MeerKAT off30 pick ``"dense_scan"`` again, their halved
+        ``n_w`` having dropped them under the ``n_w / W > 2`` gate. Measured
+        on a 10-core Apple M-series (eps 1e-6, float64, single channel, plan
+        and warm-up outside the timer, median of 9 calls, two passes) the
+        shipped default against an explicit ``dense_scan`` is 1.03x on that
+        one fixture and 0.98-1.00x on the other four timing fixtures -- i.e.
+        the *strategy* choice is now inside this machine's +-4% noise floor
+        everywhere. That is not the fold being neutral; it is the fold
+        having taken the windowed adjoint off the cells where it had stopped
+        paying. What the fold itself is worth on the same machine, shipped
+        default folded against shipped default unfolded, is 1.25-1.85x
+        forward and 1.25-1.68x adjoint across those five fixtures, every
+        cell faster. On GPU the same comparison on one GH200 is 1.06-1.78x
+        forward and 1.07-1.70x adjoint over eight cells. The forward is
+        unaffected by the strategy question either way: the CPU heuristic
+        never picks a windowed forward.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"``.
     nthreads:

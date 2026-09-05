@@ -89,11 +89,32 @@ def _reference_forward(
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6, 1e-8])
+@pytest.mark.parametrize("hermitian", [False, True])
 @pytest.mark.parametrize(
     "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
 )
-def test_forward_matches_dft_single_channel_zenith(eps: float, w_strategy: str) -> None:
-    """Tiny zenith problem: w in metres deliberately non-zero but small."""
+def test_forward_matches_dft_single_channel_zenith(
+    eps: float, w_strategy: str, hermitian: bool
+) -> None:
+    """Tiny zenith problem: w in metres deliberately non-zero but small.
+
+    Parametrised over issue #17's Hermitian w-sign fold, which folds every row
+    with ``w < 0`` onto ``(-u, -v, -w)`` with a conjugated value. The fold is an
+    *exact* identity for a real sky, so both settings must meet the same
+    ``2 * eps`` contract against the exact DFT -- there is no accuracy budget to
+    spend on it, and a fold that were merely "close" would show up here first.
+
+    The image is real, which is the fold's precondition (``hermitian=True``
+    plans refuse a complex image; see
+    ``tests/test_hermitian.py::test_dirty2vis_rejects_a_complex_image_on_a_
+    folded_plan``). Complex-image forward parity is still covered at full
+    strength by ``test_forward_matches_dft_off_zenith`` and
+    ``test_multi_channel_matches_dft_forward_and_adjoint`` below, both of which
+    pin ``hermitian=False`` explicitly.
+
+    ``hermitian`` is passed explicitly in both legs so this test says the same
+    thing whichever way ``make_plan``'s default is set.
+    """
     rng = np.random.default_rng(123)
     n_l = n_m = 16
     n_rows = 24
@@ -105,21 +126,33 @@ def test_forward_matches_dft_single_channel_zenith(eps: float, w_strategy: str) 
     uvw[:, 2] = rng.uniform(-2.0, 2.0, size=n_rows)
     freq = np.array([1.4e9])
 
-    image = rng.standard_normal((1, n_l, n_m)) + 1j * rng.standard_normal((1, n_l, n_m))
+    image = rng.standard_normal((1, n_l, n_m))
 
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps, hermitian=hermitian)
+    # The fixture must give the fold something to do, or the hermitian=True leg
+    # is the hermitian=False leg under another name.
+    assert 0 < int((uvw[:, 2] < 0).sum()) < n_rows
     vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy=w_strategy))
-    vis_ref = _reference_forward(image, uvw, freq, pixsize, pixsize)
+    vis_ref = _reference_forward(image.astype(np.complex128), uvw, freq, pixsize, pixsize)
 
     err = np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref)
     assert err < DFT_TOL_FACTOR * eps, (
-        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+        f"relative error {err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e} "
+        f"(hermitian={hermitian})"
     )
 
 
 @pytest.mark.parametrize("eps", [1e-4, 1e-6])
 def test_forward_matches_dft_off_zenith(eps: float) -> None:
-    """Tilted array so ``w`` and the n-1 phase actually do work."""
+    """Tilted array so ``w`` and the n-1 phase actually do work.
+
+    Complex image, so ``hermitian=False`` is passed explicitly (issue #17: the
+    conjugate-symmetry fold holds for a real sky only, and a folded plan refuses
+    a complex image rather than returning a silently wrong answer). Pinning it
+    here keeps this test meaning the same thing whichever way the default is
+    set, and keeps a full-strength complex-image forward parity check in the
+    suite now that the zenith test above runs on a real image.
+    """
     rng = np.random.default_rng(7)
     n_l = n_m = 32
     n_rows = 48
@@ -133,7 +166,7 @@ def test_forward_matches_dft_off_zenith(eps: float) -> None:
 
     image = rng.standard_normal((1, n_l, n_m)) + 1j * rng.standard_normal((1, n_l, n_m))
 
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps, hermitian=False)
     vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image)))
     vis_ref = _reference_forward(image, uvw, freq, pixsize, pixsize)
 
@@ -216,12 +249,19 @@ def test_multi_channel_matches_dft_forward_and_adjoint(
     sort_perm gather of ``uvw_m`` (shared across channels) and this channel's
     scalar as separate arguments, which is a different composition from the
     dense path's.
+
+    ``hermitian=False`` (issue #17) because this image is complex, which the
+    conjugate-symmetry fold does not apply to; passed explicitly so the test
+    means the same thing whichever way ``make_plan``'s default is set. The
+    multi-channel case *with* the fold is
+    ``tests/test_hermitian.py::test_multi_channel_dft_parity_under_the_fold``,
+    which mirrors these eight strategy combinations on a real image.
     """
     eps = 1e-6
     uvw, image, vis, freq, pixsize = _multi_channel_case()
     n_chan, n_l, n_m = image.shape
 
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps)
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, eps, hermitian=False)
     assert plan.n_chan == n_chan
 
     vis_jax = np.asarray(
@@ -282,7 +322,8 @@ def test_multi_channel_matches_dft_forward_and_adjoint(
 _TRACKING_EPS = [10.0**-k for k in range(3, 13)]
 
 
-def test_accuracy_tracks_epsilon() -> None:
+@pytest.mark.parametrize("hermitian", [False, True])
+def test_accuracy_tracks_epsilon(hermitian: bool) -> None:
     """Error must follow ``epsilon`` down, not plateau (issue #9).
 
     A single test rather than a parametrised one because the interesting
@@ -309,6 +350,15 @@ def test_accuracy_tracks_epsilon() -> None:
     MWA_compact off30 (128 px, 600 rows) is the smallest review fixture with
     real w-content, and the row-loop DFT reference over 128^2 pixels costs a
     fraction of a second, so this stays in the default (non-``--runslow``) run.
+
+    Parametrised over issue #17's Hermitian fold, which cuts ``n_w`` on this
+    fixture from 17 to 12 at eps=1e-6. The plateau this test exists to catch is
+    a *kernel-width* one, and the fold changes the plane count without changing
+    the width -- so if the fold ever bought its planes by under-resolving the
+    w-direction rather than by shrinking the range it covers, the folded leg is
+    where it would show, as an error that stops tracking epsilon while the
+    unfolded leg keeps tracking it. The image is real, which the fold requires;
+    the visibilities are complex, which the adjoint always allows.
     """
     tel = MWA_COMPACT
     uvw = synthetic_uvw(tel, 30.0, seed=0)
@@ -326,18 +376,18 @@ def test_accuracy_tracks_epsilon() -> None:
     dirty_ref = _reference_adjoint(vis, uvw, freq, shape, pix, pix)
 
     for eps in _TRACKING_EPS:
-        plan = make_plan(uvw, freq, shape, pix, pix, eps)
+        plan = make_plan(uvw, freq, shape, pix, pix, eps, hermitian=hermitian)
         vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image)))
         dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis)))
         e_f = float(np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref))
         e_a = float(np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref))
         assert e_f < DFT_TOL_FACTOR * eps, (
             f"forward eps={eps:g}: relative error {e_f:.3e} is {e_f / eps:.2f}x eps "
-            f"(W={plan.w_kernel_width}, n_w={plan.n_w})"
+            f"(W={plan.w_kernel_width}, n_w={plan.n_w}, hermitian={hermitian})"
         )
         assert e_a < DFT_TOL_FACTOR * eps, (
             f"adjoint eps={eps:g}: relative error {e_a:.3e} is {e_a / eps:.2f}x eps "
-            f"(W={plan.w_kernel_width}, n_w={plan.n_w})"
+            f"(W={plan.w_kernel_width}, n_w={plan.n_w}, hermitian={hermitian})"
         )
 
     # The actual plateau guard: kernel_params()[0] (the width W) must step up
