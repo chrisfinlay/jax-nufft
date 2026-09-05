@@ -244,16 +244,57 @@ def test_auto_without_plan_context_raises(resolve_nthreads: _ResolveNthreads) ->
 # -- an explicit nthreads always short-circuits resolution ------------------
 
 
-@pytest.mark.parametrize("explicit", [0, 1, 2, 8])
+# Every ``w_strategy`` an explicit ``nthreads`` can arrive with -- the four
+# canonical names, ``"auto"``, and the two deprecated v0.1 aliases. The
+# pass-through claim is about *all* of them: the explicit branch returns
+# before any strategy handling at all, so a name that could not even be
+# resolved here (``"auto"`` without plan context) or that would warn if it
+# were (``"scan"`` / ``"vmap"``) must still come straight back. Literal
+# strings rather than an import, matching ``_RESOLUTION_GRID`` above and the
+# module docstring's note on deferred imports.
+_PASSTHROUGH_STRATEGIES: tuple[str, ...] = (
+    "dense_scan",
+    "dense_vmap",
+    "windowed_scan",
+    "windowed_vmap",
+    "auto",
+    "scan",
+    "vmap",
+)
+# Literal row counts either side of the 100k cutoff, same convention as
+# ``_RESOLUTION_GRID``: the explicit branch must return before the cutoff is
+# consulted, so both regimes have to be covered to say so.
+_PASSTHROUGH_N_ROWS: tuple[int, ...] = (1, 99_999, 100_000, 10_000_000)
+# Includes 0 (the pre-#24 default, and the documented opt-out), 1 (what the
+# scan family resolves to) and values that are neither, so a rule that
+# happened to return the *right* number for one strategy cannot pass.
+_PASSTHROUGH_VALUES: tuple[int, ...] = (0, 1, 2, 8, 72)
+
+
+@pytest.mark.parametrize("explicit", _PASSTHROUGH_VALUES)
+@pytest.mark.parametrize("n_rows", _PASSTHROUGH_N_ROWS)
+@pytest.mark.parametrize("w_strategy", _PASSTHROUGH_STRATEGIES)
 def test_explicit_nthreads_passes_through_unchanged(
-    resolve_nthreads: _ResolveNthreads, explicit: int
+    resolve_nthreads: _ResolveNthreads, w_strategy: str, n_rows: int, explicit: int
 ) -> None:
     """An explicit nthreads (including 0, i.e. "let FINUFFT decide") is
     never touched by the resolution rule, for any strategy/n_rows
     combination -- this is what makes ``nthreads=0`` still usable as an
-    explicit opt-out of the new default."""
-    assert resolve_nthreads(explicit, "dense_scan", 1) == explicit
-    assert resolve_nthreads(explicit, "windowed_vmap", 10_000_000) == explicit
+    explicit opt-out of the new default.
+
+    The claim is universal, so the parametrisation enumerates it rather than
+    sampling it: every strategy name the function accepts, both sides of the
+    row cutoff, and five explicit values. An earlier revision asserted two
+    hand-picked ``(strategy, n_rows)`` pairs, which left a rule that
+    special-cased any *other* strategy -- e.g. overriding ``windowed_scan``
+    to ``1`` -- passing the entire suite.
+
+    The alias rows carry a second assertion implicitly: the suite runs with
+    ``filterwarnings = ["error"]``, so if the explicit branch ever stopped
+    short-circuiting and canonicalised ``"scan"`` / ``"vmap"`` on the way
+    past, the ``DeprecationWarning`` would fail these cases.
+    """
+    assert resolve_nthreads(explicit, w_strategy, n_rows) == explicit
 
 
 def test_explicit_nthreads_bypasses_auto_resolution_entirely(
@@ -262,6 +303,11 @@ def test_explicit_nthreads_bypasses_auto_resolution_entirely(
     """An explicit nthreads must short-circuit before any strategy
     canonicalisation happens: ``w_strategy="auto"`` with no ``plan`` /
     ``is_adjoint`` must NOT raise when nthreads is given explicitly, unlike
-    the ``nthreads=None`` case above."""
+    the ``nthreads=None`` case above.
+
+    The grid above now covers ``"auto"`` too; this stays as the named
+    statement of the contract, so the failure a wiring regression produces
+    reads as "auto stopped bypassing resolution" rather than as one row of a
+    140-cell table."""
     assert resolve_nthreads(4, "auto", 100) == 4
     assert resolve_nthreads(0, "auto", 10_000_000) == 0

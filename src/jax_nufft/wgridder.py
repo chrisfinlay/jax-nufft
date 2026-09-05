@@ -9,9 +9,18 @@ arrays, and dispatch the wgridder algorithm in pure JAX:
     the optional ``1/n`` factor applied on the output.
 
 Both functions are fully traceable through ``jax.jit``, ``jax.vmap``, and
-``jax.grad``. Channel and w-plane traversal can each be configured to use
-``scan`` (lower memory) or ``vmap`` (potentially faster on GPU). The defaults
-are ``scan`` for both, which is the safer choice for medium-to-large problems.
+``jax.grad``.
+
+Two loops are configurable, and they do not share a default.
+``channel_strategy`` selects how the channel loop runs -- ``"scan"`` (lower
+memory, the default) or ``"vmap"`` (potentially faster on GPU, at
+``n_chan`` x the transient memory). ``w_strategy`` selects how the w-plane
+loop runs and has four canonical values, crossing dense/windowed traversal
+with scan/vmap: ``"dense_scan"``, ``"dense_vmap"``, ``"windowed_scan"``,
+``"windowed_vmap"``. Its default is ``"auto"`` (issue #46), which resolves
+to one of those four before the JIT boundary using the plan and the
+platform -- see :func:`_auto_w_strategy`. Through v0.1.2 the default here
+was ``"dense_scan"``; passing that explicitly restores the same code path.
 
 Sign convention: matches ducc's ``explicit_degridder``, i.e.
 
@@ -37,11 +46,13 @@ from jax_finufft.options import Opts
 from jax_nufft.kernel import phi
 from jax_nufft.planning import WGridderPlan
 
-# Canonical strategy names introduced in v0.1.1. The bare ``scan`` /
-# ``vmap`` names from v0.1 are accepted as deprecated aliases that map
-# to the ``dense_*`` variants (the v0.1 algorithm). A future release
-# will add ``windowed_scan`` / ``windowed_vmap`` for the per-plane
-# windowed path; the dense path stays as the parity baseline.
+# Canonical strategy names introduced in v0.1.1: the dense path (the v0.1
+# algorithm, kept as the parity baseline) and the per-plane windowed path,
+# each in a scan and a vmap variant. ``"auto"`` (v0.1.2, the default since
+# issue #46) is a resolver rather than a fifth strategy -- it never reaches
+# the JIT boundary, having been replaced by one of the four canonical names
+# in the public wrapper. The bare ``scan`` / ``vmap`` names from v0.1 are
+# accepted as deprecated aliases that map to the ``dense_*`` variants.
 WStrategy = Literal[
     "dense_scan",
     "dense_vmap",
@@ -377,9 +388,19 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
         per-plane row-count saving.
 
     The four gates below pick the cell's winner in 20/20 cases on the
-    Part 5.6 baseline, with the runner-up always within the 15%
-    acceptance bar -- so wrong choices are bounded losses, not
-    cliff-edges.
+    Part 5.6 baseline -- recomputed from the committed JSON, on both the
+    ``scan`` and ``vmap`` channel-strategy slices.
+
+    An earlier version of this note added that the runner-up is "always
+    within the 15% acceptance bar", which the same JSON does not support:
+    the runner-up sits 1.07x to 7.36x behind the winner (median 1.86x) and
+    only one of the 20 cells is within 15%. The 15% figure belongs to
+    ``tests/test_auto_strategy_acceptance.py``, which bounds how far the
+    *picked* strategy may fall behind the best one -- a bound the heuristic
+    meets trivially here by picking the best one every time. So a wrong
+    choice on this data would not be a bounded loss; the safety margin
+    comes from the picks being right, not from the alternatives being
+    close.
     """
     if plan.n_w <= plan.w_kernel_width + 2:
         # Small n_w (incl. constant-w fast path); either dense or

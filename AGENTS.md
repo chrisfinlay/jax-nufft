@@ -637,6 +637,14 @@ Stable JSON schema documented in `docs/benchmarks/README.md`.
 (`docs/benchmarks/v0.1.2-baseline-gpu.json`) showed `_scan` variants
 5-30x slower than `_vmap`, `dense_vmap` winning 17/20 cells, and
 `windowed_vmap` winning only the 50k-row `GH200_large` fixture.
+**Correction (issue #46 review):** the last two hold exactly on
+recomputation from the committed JSON, but the `5-30x` does not. The 160
+scan/vmap pairs span 1.448x to 32.660x with a median of 6.096x, and 72 of
+them are below 5x; no subset of the sweep (off-zenith only, excluding
+`GH200_large`, best-of-family per cell) yields a 5-30x range. What the data
+does support -- and what the "never auto-pick a scan strategy on GPU" rule
+actually rests on -- is that the scan family is slower in *every one* of the
+160 pairs.
 `_auto_w_strategy` is now platform-aware (`jax.devices()[0].platform`);
 unknown platforms fall back to the CPU heuristic.
 `tests/test_auto_strategy_acceptance.py` asserts the GPU pick is within

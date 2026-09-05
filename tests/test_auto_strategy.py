@@ -147,11 +147,44 @@ def test_cpu_adjoint_large_n_w_picks_windowed_scan() -> None:
     assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "windowed_scan"
 
 
-def test_cpu_forward_large_n_w_stays_dense_scan() -> None:
+# ``(n_w, w_kernel_width, window_padding_overhead)`` points spanning the CPU
+# forward space, every one of them chosen so the *adjoint* at the same point
+# picks ``windowed_scan``: ratio above 2, padding under the cutoff, n_w past
+# the small-n_w gate. That is what makes them a test of the forward rule
+# rather than of the gates the two directions share -- the assertion below
+# pins that the direction alone decides.
+_CPU_FORWARD_POINTS = [
+    (500, 8, 1.2),
+    (200, 8, 1.4),
+    (17, 8, 1.0),  # just past the ratio cutoff
+    (50, 5, 5.9),  # padding just under _CPU_PADDING_CUTOFF
+    (1000, 2, 1.0),  # narrow kernel, very large n_w
+]
+
+
+@pytest.mark.parametrize(
+    ("n_w", "w_kernel_width", "padding"),
+    _CPU_FORWARD_POINTS,
+    ids=[f"n_w{n}-W{w}-pad{p}" for n, w, p in _CPU_FORWARD_POINTS],
+)
+def test_cpu_forward_large_n_w_stays_dense_scan(
+    n_w: int, w_kernel_width: int, padding: float
+) -> None:
     """The v0.1.1 forward windowed path never beats dense on CPU; the
     heuristic must not auto-pick windowed_scan for ``is_adjoint=False``
-    even at large ``n_w``."""
-    plan = _stub_plan(n_w=500, w_kernel_width=8, window_padding_overhead=1.2)
+    even at large ``n_w``.
+
+    "Never" is a claim about the whole forward space, so this enumerates
+    several points in it rather than one. Each point is paired with an
+    adjoint assertion that *does* come out ``windowed_scan``: without that,
+    a mutant that dropped the ``is_adjoint`` term from the windowed gate
+    would still pass, because every point would be failing some other gate.
+    """
+    plan = _stub_plan(n_w=n_w, w_kernel_width=w_kernel_width, window_padding_overhead=padding)
+    assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "windowed_scan", (
+        "fixture precondition: the adjoint must pick windowed_scan here, or the "
+        "forward assertion below is not testing the direction rule"
+    )
     assert _auto_w_strategy_cpu(plan, is_adjoint=False) == "dense_scan"
 
 
@@ -210,11 +243,29 @@ def test_gpu_high_padding_overhead_forces_dense_vmap(is_adjoint: bool) -> None:
     assert _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint) == "dense_vmap"
 
 
-def test_gpu_adjoint_large_rows_picks_windowed_vmap() -> None:
+# The two pointings the "regardless of pointing" claim is about: a
+# zenith-like low ``n_w`` and an off-zenith-like high ``n_w``, matching the
+# GH200_large_zenith and GH200_large_off30 vis2dirty cells. The forward
+# splits between these two (see the two forward tests below); the adjoint
+# must not.
+_GPU_LARGE_ROW_POINTINGS = [(13, 1.5), (77, 2.5)]
+
+
+@pytest.mark.parametrize(
+    ("n_w", "padding"), _GPU_LARGE_ROW_POINTINGS, ids=["zenith_like", "off30_like"]
+)
+def test_gpu_adjoint_large_rows_picks_windowed_vmap(n_w: int, padding: float) -> None:
     """Adjoint headline win on GH200: large-row plans favour windowed
     regardless of pointing. Matches GH200_large_off30 and
-    GH200_large_zenith vis2dirty cells."""
-    plan = _stub_plan(n_w=77, w_kernel_width=6, window_padding_overhead=2.5, n_rows=50_000)
+    GH200_large_zenith vis2dirty cells.
+
+    "Regardless of pointing" needs both pointings to say anything, so both
+    are parametrised. The high-``n_w`` point is the load-bearing one: it is
+    exactly where the *forward* falls back to ``dense_vmap``, so a mutant
+    that applied the forward's ``n_w`` ratio cutoff to the adjoint as well
+    would pass on the zenith-like point alone.
+    """
+    plan = _stub_plan(n_w=n_w, w_kernel_width=6, window_padding_overhead=padding, n_rows=50_000)
     assert _auto_w_strategy_gpu(plan, is_adjoint=True) == "windowed_vmap"
 
 

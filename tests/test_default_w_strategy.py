@@ -343,8 +343,9 @@ def test_explicit_strategy_is_not_overridden(
     real_dtype: DTypeLike,
     complex_dtype: DTypeLike,
 ) -> None:
-    """Every member of ``WStrategy``, passed explicitly, reaches the JIT
-    boundary unchanged -- ``"dense_scan"`` included, which is the promise
+    """Every *canonical* member of ``WStrategy``, passed explicitly, reaches
+    the JIT boundary unchanged -- ``"dense_scan"`` included, which is the
+    promise
     that an explicit ``dense_scan`` restores the pre-#46 *code path*. (Not
     the pre-#46 numbers: #16, #23 and #43 land in the same release and #16
     moved the numbers on its own, so pinning the strategy removes the
@@ -354,6 +355,12 @@ def test_explicit_strategy_is_not_overridden(
     ``dense_vmap`` for this plan, so an implementation that resolved
     unconditionally (ignoring what the caller passed) differs from a correct
     one on three of the four parametrisations rather than none.
+
+    The other three members of ``WStrategy`` are deliberately not here:
+    ``"auto"`` and the deprecated ``"scan"`` / ``"vmap"`` aliases are
+    *supposed* to be rewritten on the way through, so "unchanged" is not
+    the contract for them. ``test_explicit_auto_matches_the_default`` and
+    ``tests/test_auto_strategy.py`` cover those.
     """
     _patch_platform(monkeypatch, "gpu")
     plan, image, vis = _offzenith_problem(real_dtype, complex_dtype)
