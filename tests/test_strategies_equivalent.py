@@ -85,6 +85,31 @@ N_CHAN = 3
 # behind these two constants.
 STRATEGY_TOL = tol(1e-11, 1.3e-6)
 
+# Why the shipped default (issue #46: ``w_strategy="auto"``) is deliberately
+# *not* an entrant in the net below, though an earlier revision of this module
+# added it as one.
+#
+# ``"auto"`` is resolved by the public wrapper, before the JIT boundary, so by
+# the time any work happens the default call is passing one of the four
+# canonical names as a static arg to the same jitted function the explicit
+# caller uses. Its output is therefore not merely close to that strategy's, it
+# is ``np.array_equal`` to it -- measured on all 18 parametrisations of this
+# module (3 fixtures x 3 eps x 2 precision legs), forward and adjoint, on both
+# channel strategies. An entrant like that contributes exactly 0.0 to
+# ``_pairwise_max_rel_err`` and cannot move the reported worst case: it costs
+# transform time and gates nothing.
+#
+# Nothing is lost by leaving it out, because the promise the issue makes --
+# that the new default agrees with the old to STRATEGY_TOL -- already follows
+# from what this module does test. The default *is* one of the four names by
+# the time it reaches the boundary, and all four are compared pairwise here.
+# The premise that makes that inference sound (resolution happens before the
+# JIT boundary, so the default shares the compiled executable rather than
+# taking a fifth code path) is not this module's to pin, and is pinned by name
+# in ``tests/test_default_w_strategy.py``:
+# ``test_default_shares_the_compiled_executable_with_the_explicit_resolved``,
+# which asserts the JIT cache stays at one entry across both calls.
+
 
 def _per_channel_freq(tel: Telescope) -> np.ndarray:
     """Three distinct channel frequencies spanning +/-5% of the telescope's.
@@ -216,6 +241,10 @@ def test_strategies_agree_pairwise(
     combination is evaluated against *that same input*, so any discrepancy
     is attributable to the strategy implementation, not to random input
     variation.
+
+    The shipped default (``w_strategy="auto"``) is not a ninth participant;
+    see the comment on STRATEGY_TOL above for why adding it would gate
+    nothing.
     """
     tel, zen_deg = short_telescope_pointing
     plan, image, vis = _build_problem(tel, zen_deg, eps, real_dtype, complex_dtype)

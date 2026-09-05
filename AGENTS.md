@@ -316,10 +316,56 @@ If you touch any of these, run `tests/test_planning.py` and
 
 | `w_strategy`      | Per-plane work          | Peak transient memory       | Notes                                          |
 |-------------------|-------------------------|-----------------------------|------------------------------------------------|
-| `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | Default. v0.1 `"scan"` is a deprecated alias.  |
+| `auto`            | resolves to one below   | matches the resolved choice | **The shipped default** (issue #46). Platform-aware heuristic. |
+| `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
 | `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
 | `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
+
+`auto` is resolved by `_auto_w_strategy` in the public wrapper, *before*
+the JIT boundary, so the static arg reaching `_dirty2vis_jit` /
+`_vis2dirty_jit` is always one of the four canonical names and an `auto`
+caller shares a JIT cache entry with the explicit equivalent. An explicit
+`w_strategy` is passed through untouched and overrides the heuristic.
+
+It became the default (issue #46; unreleased — the version the package
+reports is still the v0.1.2 line) because until then it was unreachable
+unless asked for by name, which left the GPU default on the worst of the
+four choices: on one GH200, against ducc0 on the 72 Grace cores of the same
+node, `dense_scan` runs 1.4-5.6x slower than ducc0 on five of the table's
+six cells, where what the heuristic picks runs 1.4-6.3x faster on all six
+(issue #46's table, `epsilon = 1e-6`, float64). The sixth is the GH200_large
+off30 adjoint, where `dense_scan` was about 1.16x faster than ducc0 — still
+2.0x off the `dense_vmap` column of the same table. On CPU the forward is
+unchanged — the heuristic never picks a windowed forward, so it resolves to
+`dense_scan` on every fixture here — while the off-zenith adjoint moves to
+`windowed_scan`. Timed on the review machine (10-core Apple M-series,
+repository timing protocol, against explicit `dense_scan`), that is
+1.14-1.24x faster on MWA_extended off30 — a range across two passes, 1.24x
+over five interleaved rounds and 1.14x over a nine-round paired
+re-measurement — and within a ±4% noise floor on MWA_compact off30 and
+MeerKAT off30, whose `n_w` is under 20; the zenith fixtures keep
+`dense_scan` in float64 and cross over in float32, where the narrower `W =
+5` kernel raises `n_w / w_kernel_width` past the cutoff. Nothing measured
+slower outside that noise floor — the worst cell is the MeerKAT off30
+adjoint at 0.99x, which is a strategy-changing cell rather than a control,
+so it is a real 1% too small for this machine to resolve rather than a
+demonstrated tie. Note also that the 1.05-1.53x range in section 9 does not
+reproduce: its endpoints are MWA_compact off30 and MeerKAT off30, the two
+cells now measured flat.
+
+Two consequences to keep in mind when changing anything here. Retuning the
+heuristic now moves the *shipped* default, so
+`tests/test_default_w_strategy.py` pins the resolved pick for every CPU
+fixture as a literal table that a retune has to edit deliberately. And
+because the strategies differ in w-plane accumulation order, they agree
+only to the 1e-11 strategy-equivalence bound
+(`tests/test_strategies_equivalent.py`) rather than bit-for-bit.
+`w_strategy="dense_scan"` restores the pre-#46 *code path*; it does not
+restore pre-#46 *numbers*, since #16, #23 and #43 land in the same release
+and #16's `nshift` centring moved the DFT worst cell from 0.67x to 1.47x
+`eps` on its own (section 9's accuracy table). Reproducing an older
+release's output needs that release pinned, not the strategy.
 
 The v0.1 names `"scan"` / `"vmap"` are accepted as deprecated aliases
 that emit `DeprecationWarning` and resolve to their `dense_*`
@@ -591,6 +637,14 @@ Stable JSON schema documented in `docs/benchmarks/README.md`.
 (`docs/benchmarks/v0.1.2-baseline-gpu.json`) showed `_scan` variants
 5-30x slower than `_vmap`, `dense_vmap` winning 17/20 cells, and
 `windowed_vmap` winning only the 50k-row `GH200_large` fixture.
+**Correction (issue #46 review):** the last two hold exactly on
+recomputation from the committed JSON, but the `5-30x` does not. The 160
+scan/vmap pairs span 1.448x to 32.660x with a median of 6.096x, and 72 of
+them are below 5x; no subset of the sweep (off-zenith only, excluding
+`GH200_large`, best-of-family per cell) yields a 5-30x range. What the data
+does support -- and what the "never auto-pick a scan strategy on GPU" rule
+actually rests on -- is that the scan family is slower in *every one* of the
+160 pairs.
 `_auto_w_strategy` is now platform-aware (`jax.devices()[0].platform`);
 unknown platforms fall back to the CPU heuristic.
 `tests/test_auto_strategy_acceptance.py` asserts the GPU pick is within

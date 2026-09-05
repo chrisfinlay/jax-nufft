@@ -93,11 +93,19 @@ def test_gpu_auto_within_15pct_of_best(op: str, fixture: str, rows: list[dict]) 
 
 
 def test_gpu_auto_never_picks_a_scan_variant() -> None:
-    """Belt-and-braces: on the GH200 baseline the scan variants are
-    5-30x slower than vmap, so the GPU heuristic must never resolve to
-    a scan strategy on any cell. A scan pick would be a >5x regression
-    that the 15% check above would also catch, but this gives a
-    clearer failure message."""
+    """Belt-and-braces: on the GH200 baseline the scan family is slower
+    than the vmap family in every one of the sweep's 160 scan/vmap pairs,
+    so the GPU heuristic must never resolve to a scan strategy on any cell.
+
+    The rule rests on that gap being *universal*, not on its size. Its size
+    varies widely: recomputed from
+    ``docs/benchmarks/v0.1.2-baseline-gpu.json`` the 160 pairs span 1.45x to
+    32.7x with a median of 6.1x, and 72 of them are below 5x. So a scan pick
+    here is not necessarily the ">5x regression" an earlier version of this
+    docstring claimed -- on the closest cells it would cost about 1.5x. It
+    would still be a regression on every cell of the sweep, and the 15%
+    check above would also catch it; this test exists for the clearer
+    failure message."""
     for op, fixture, rows in _CELLS:
         is_adjoint = op == "vis2dirty"
         picked = _auto_w_strategy_gpu(_plan_stub_from_row(rows[0]), is_adjoint=is_adjoint)

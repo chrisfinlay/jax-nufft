@@ -9,9 +9,18 @@ arrays, and dispatch the wgridder algorithm in pure JAX:
     the optional ``1/n`` factor applied on the output.
 
 Both functions are fully traceable through ``jax.jit``, ``jax.vmap``, and
-``jax.grad``. Channel and w-plane traversal can each be configured to use
-``scan`` (lower memory) or ``vmap`` (potentially faster on GPU). The defaults
-are ``scan`` for both, which is the safer choice for medium-to-large problems.
+``jax.grad``.
+
+Two loops are configurable, and they do not share a default.
+``channel_strategy`` selects how the channel loop runs -- ``"scan"`` (lower
+memory, the default) or ``"vmap"`` (potentially faster on GPU, at
+``n_chan`` x the transient memory). ``w_strategy`` selects how the w-plane
+loop runs and has four canonical values, crossing dense/windowed traversal
+with scan/vmap: ``"dense_scan"``, ``"dense_vmap"``, ``"windowed_scan"``,
+``"windowed_vmap"``. Its default is ``"auto"`` (issue #46), which resolves
+to one of those four before the JIT boundary using the plan and the
+platform -- see :func:`_auto_w_strategy`. Through v0.1.2 the default here
+was ``"dense_scan"``; passing that explicitly restores the same code path.
 
 Sign convention: matches ducc's ``explicit_degridder``, i.e.
 
@@ -37,11 +46,13 @@ from jax_finufft.options import Opts
 from jax_nufft.kernel import phi
 from jax_nufft.planning import WGridderPlan
 
-# Canonical strategy names introduced in v0.1.1. The bare ``scan`` /
-# ``vmap`` names from v0.1 are accepted as deprecated aliases that map
-# to the ``dense_*`` variants (the v0.1 algorithm). A future release
-# will add ``windowed_scan`` / ``windowed_vmap`` for the per-plane
-# windowed path; the dense path stays as the parity baseline.
+# Canonical strategy names introduced in v0.1.1: the dense path (the v0.1
+# algorithm, kept as the parity baseline) and the per-plane windowed path,
+# each in a scan and a vmap variant. ``"auto"`` (v0.1.2, the default since
+# issue #46) is a resolver rather than a fifth strategy -- it never reaches
+# the JIT boundary, having been replaced by one of the four canonical names
+# in the public wrapper. The bare ``scan`` / ``vmap`` names from v0.1 are
+# accepted as deprecated aliases that map to the ``dense_*`` variants.
 WStrategy = Literal[
     "dense_scan",
     "dense_vmap",
@@ -201,7 +212,11 @@ def _resolve_nthreads(
       * otherwise ``w_strategy`` is canonicalised via
         :func:`_canonicalise_w_strategy` (resolving ``"auto"`` and the
         deprecated ``"scan"`` / ``"vmap"`` aliases the same way the
-        strategy dispatch itself does), and:
+        strategy dispatch itself does) *unless it is already one of the
+        four canonical names*, in which case it is used as-is and the
+        canonicalisation is skipped entirely -- see the note below on why
+        that skip is a correctness guarantee rather than an optimisation.
+        Then:
           - if ``n_rows < _NTHREADS_SMALL_N_ROWS``, the plane loop is short
             enough that spinning up a thread pool per call isn't worth it
             regardless of strategy -> ``1`` (this overrides the strategy
@@ -220,10 +235,38 @@ def _resolve_nthreads(
     is the opposite story -- it benefits from threads -- so a flat default of
     ``1`` would regress it; hence the strategy-family split rather than a
     single number.
+
+    One canonicalisation (issue #46)
+    --------------------------------
+    Since ``w_strategy`` also defaults to ``"auto"``, the common path is
+    *both* defaults at once, and :func:`dirty2vis` / :func:`vis2dirty`
+    resolve the strategy in the wrapper and hand the resolved name down to
+    this function. Issue #46 asks for exactly one canonicalisation on that
+    path, so the already-canonical branch below short-circuits rather than
+    calling :func:`_canonicalise_w_strategy` a second time.
+
+    That is a guarantee, not a micro-optimisation. Re-canonicalising a
+    canonical name happens to be a no-op *today* -- the function is a fixed
+    point on those four strings -- but relying on that makes an invariant
+    of what is really an implementation detail of another function: any
+    future change that gave ``_canonicalise_w_strategy`` a plan-dependent
+    branch, or made it re-consult the heuristic, would silently start
+    resolving twice and could disagree with the strategy the wrapper
+    already committed to at the JIT boundary. Skipping the call removes
+    that coupling instead of documenting it.
+
+    Direct callers passing a raw name still work unchanged: ``"auto"`` and
+    the deprecated aliases fall through to the full canonicalisation below,
+    including its ``ValueError`` when ``"auto"`` arrives without ``plan`` /
+    ``is_adjoint`` context.
     """
     if nthreads is not None:
         return nthreads
-    canonical = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=is_adjoint)
+    if w_strategy in _CANONICAL_W_STRATEGIES:
+        # Already resolved (the operators' path): use it as-is.
+        canonical: WStrategy = cast(WStrategy, w_strategy)
+    else:
+        canonical = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=is_adjoint)
     if n_rows < _NTHREADS_SMALL_N_ROWS:
         return 1
     if canonical in ("dense_scan", "windowed_scan"):
@@ -305,8 +348,11 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
 
 # Empirical cutoffs from the v0.1.2 GH200 baseline sweep (160 cells,
 # docs/benchmarks/v0.1.2-baseline-gpu.json). On GPU, scan variants are
-# 5-30x slower than vmap (kernel-launch overhead dominates per-plane
-# work); the windowed_vmap wins only on the GH200_large (50k-row)
+# slower than vmap in every one of that sweep's 160 scan/vmap pairs
+# (kernel-launch overhead dominates per-plane work) -- by 1.45x to 32.7x,
+# median 6.1x, recomputed from the JSON. The "never pick scan on GPU"
+# rule rests on the *universality*, not on the size, of that gap;
+# the windowed_vmap wins only on the GH200_large (50k-row)
 # fixture where dense_vmap's per-plane n_rows*W^2 starts to bite.
 _GPU_LARGE_N_ROWS = 10_000
 # Unmoved by issue #43, unlike ``_CPU_PADDING_CUTOFF`` above -- and that is a
@@ -330,8 +376,9 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     On GH200 (cuFINUFFT on Hopper), the four-way picture across 20
     (operator, fixture) cells is:
 
-      * ``_scan`` variants are always 5-30x slower than ``_vmap``;
-        never auto-pick a scan strategy on GPU.
+      * ``_scan`` variants are always slower than ``_vmap`` -- in all
+        160 scan/vmap pairs of the sweep, by 1.45x to 32.7x (median
+        6.1x); never auto-pick a scan strategy on GPU.
       * ``dense_vmap`` wins everywhere on small-to-medium fixtures
         (MWA, MeerKAT, EDA2).
       * ``windowed_vmap`` wins on the 50k-row ``GH200_large`` fixture
@@ -341,9 +388,22 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
         per-plane row-count saving.
 
     The four gates below pick the cell's winner in 20/20 cases on the
-    Part 5.6 baseline, with the runner-up always within the 15%
-    acceptance bar -- so wrong choices are bounded losses, not
-    cliff-edges.
+    Part 5.6 baseline -- recomputed from the committed JSON, on both the
+    ``scan`` and ``vmap`` channel-strategy slices.
+
+    An earlier version of this note added that the runner-up is "always
+    within the 15% acceptance bar", which the same JSON does not support:
+    the runner-up sits 1.07x to 7.31x behind the winner (median 1.86x) and
+    only one of the 20 cells is within 15%. (Those figures aggregate each
+    strategy by its better channel strategy, which is the population the
+    20/20 above counts; taken as 40 separate per-channel slices the range
+    is 1.07x to 7.36x and two are within 15%.) The 15% figure belongs to
+    ``tests/test_auto_strategy_acceptance.py``, which bounds how far the
+    *picked* strategy may fall behind the best one -- a bound the heuristic
+    meets trivially here by picking the best one every time. So a wrong
+    choice on this data would not be a bounded loss; the safety margin
+    comes from the picks being right, not from the alternatives being
+    close.
     """
     if plan.n_w <= plan.w_kernel_width + 2:
         # Small n_w (incl. constant-w fast path); either dense or
@@ -939,7 +999,7 @@ def dirty2vis(
     plan: WGridderPlan,
     image: Array,
     *,
-    w_strategy: WStrategy = "dense_scan",
+    w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int | None = None,
 ) -> Array:
@@ -956,13 +1016,40 @@ def dirty2vis(
         ``plan.complex_dtype`` is cast up to it, a wider one raises
         ``TypeError`` (issue #11).
     w_strategy:
-        ``"dense_scan"`` (default, low memory) or ``"dense_vmap"`` (potentially
-        faster on GPU but allocates ``n_w * image_size`` peak memory).
-        ``"windowed_scan"`` / ``"windowed_vmap"`` use the per-plane windowed
-        path. ``"auto"`` resolves to a canonical name before the JIT boundary
-        via :func:`_auto_w_strategy` (so cache sharing is preserved); see that
-        helper's docstring for the heuristic. The bare names ``"scan"`` /
-        ``"vmap"`` are accepted as deprecated aliases.
+        ``"auto"`` (the shipped default since issue #46) resolves to one of
+        the four canonical names before the JIT boundary via
+        :func:`_auto_w_strategy` -- so cache sharing is preserved, and see
+        that helper's docstring for the heuristic itself. The canonical
+        names, all of which override the heuristic when passed explicitly,
+        are ``"dense_scan"`` (low memory), ``"dense_vmap"`` (potentially
+        faster on GPU but allocates ``n_w * image_size`` peak memory) and
+        ``"windowed_scan"`` / ``"windowed_vmap"``, which use the per-plane
+        windowed path. The bare names ``"scan"`` / ``"vmap"`` are accepted
+        as deprecated aliases.
+
+        The default was ``"dense_scan"`` through v0.1.2, which left the
+        heuristic unreachable and, on GPU, made the shipped default the
+        worst of the four choices: measured on one GH200 against ducc0 on
+        72 Grace cores of the same node (eps 1e-6, float64, single
+        channel), ``dense_scan`` runs 1.4-5.6x *slower* than ducc0 on five
+        of the six cells of issue #46's table, where what ``"auto"`` picks
+        there runs 1.4-6.3x faster on all six. The exception is the
+        GH200_large off30 adjoint, where the old default was about 1.16x
+        faster than ducc0 -- still 2.0x off the ``dense_vmap`` column of
+        the same table.
+
+        Passing ``w_strategy="dense_scan"`` restores the pre-#46 *code
+        path*: the same strategy, so the same reduction order. It does not
+        restore the pre-#46 *numbers*, because the release carrying #46
+        also carries #16, #23 and #43, and #16's ``nshift`` centring moved
+        the numbers on its own (the worst cell against the exact DFT went
+        from 0.67x to 1.47x ``epsilon``). Scoped to the strategy change
+        alone, the four strategies accumulate the w-planes in a different
+        order and so agree to the strategy-equivalence bound (1e-11 in
+        float64, ``tests/test_strategies_equivalent.py``) rather than
+        bit-for-bit. Pinning ``w_strategy`` removes the strategy from a
+        cross-version comparison and nothing else; reproducing an older
+        release's output needs that release pinned.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"`` for the channel loop.
     nthreads:
@@ -1186,7 +1273,7 @@ def vis2dirty(
     vis: Array,
     *,
     weights: Array | None = None,
-    w_strategy: WStrategy = "dense_scan",
+    w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int | None = None,
 ) -> Array:
@@ -1208,10 +1295,26 @@ def vis2dirty(
         array is rejected with ``TypeError`` rather than silently losing its
         imaginary part.
     w_strategy:
-        ``"dense_scan"`` (default), ``"dense_vmap"``, ``"windowed_scan"``,
-        ``"windowed_vmap"``, or ``"auto"``; same semantics as in
-        :func:`dirty2vis`. The bare names ``"scan"`` / ``"vmap"`` are accepted
-        as deprecated aliases.
+        ``"auto"`` (the shipped default since issue #46), ``"dense_scan"``,
+        ``"dense_vmap"``, ``"windowed_scan"`` or ``"windowed_vmap"``; same
+        semantics as in :func:`dirty2vis`, including that an explicit name
+        overrides the heuristic, that ``"dense_scan"`` restores the pre-#46
+        code path but not the pre-#46 numbers (other changes in the same
+        release moved those), and that the strategies agree to 1e-11 in
+        float64 rather than bit-for-bit. The bare names ``"scan"`` /
+        ``"vmap"`` are accepted as deprecated aliases.
+
+        The adjoint is where the new default also changes what a *CPU*
+        caller gets: on the repository's off-zenith fixtures the CPU
+        heuristic picks ``"windowed_scan"`` here where the old default was
+        ``"dense_scan"``. Measured on a 10-core Apple M-series (eps 1e-6,
+        float64, single channel, plan and warm-up outside the timer,
+        median of 9 calls) that is 1.14-1.24x faster on MWA_extended off30
+        (n_w=251) -- a range across two passes, 1.24x over five interleaved
+        rounds and 1.14x over a nine-round paired re-measurement -- and
+        indistinguishable, within a +-4% noise floor, on MWA_compact off30
+        and MeerKAT off30, whose n_w is under 20. The forward is
+        unaffected: the CPU heuristic never picks a windowed forward.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"``.
     nthreads:
