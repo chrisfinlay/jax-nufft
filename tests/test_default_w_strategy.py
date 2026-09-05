@@ -155,6 +155,14 @@ def _offzenith_problem(real_dtype: DTypeLike, complex_dtype: DTypeLike, seed: in
         pixsize_m=4e-3,
         epsilon=EPSILON,
         dtype=real_dtype,
+        # hermitian=False (issue #17): every literal pick in this module's
+        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
+        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
+        # written in. A folded plan is a different point in the heuristic's
+        # input space, so the tables would have to be re-measured for it.
+        # Pinned here so this module keeps gating what it was calibrated
+        # against whichever way make_plan's default is set.
+        hermitian=False,
     )
     image = jnp.asarray(rng.standard_normal((64, 64)), dtype=real_dtype)
     vis = jnp.asarray(
@@ -188,6 +196,14 @@ def _plan_above_nthreads_cutoff(real_dtype: DTypeLike, complex_dtype: DTypeLike,
         pixsize_m=0.005,
         epsilon=EPSILON,
         dtype=real_dtype,
+        # hermitian=False (issue #17): every literal pick in this module's
+        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
+        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
+        # written in. A folded plan is a different point in the heuristic's
+        # input space, so the tables would have to be re-measured for it.
+        # Pinned here so this module keeps gating what it was calibrated
+        # against whichever way make_plan's default is set.
+        hermitian=False,
     )
     image = jnp.asarray(rng.standard_normal((16, 16)), dtype=real_dtype)
     vis = jnp.asarray(
@@ -232,6 +248,14 @@ def _large_row_windowed_problem(real_dtype: DTypeLike, complex_dtype: DTypeLike,
         pixsize_m=0.004,
         epsilon=EPSILON,
         dtype=real_dtype,
+        # hermitian=False (issue #17): every literal pick in this module's
+        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
+        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
+        # written in. A folded plan is a different point in the heuristic's
+        # input space, so the tables would have to be re-measured for it.
+        # Pinned here so this module keeps gating what it was calibrated
+        # against whichever way make_plan's default is set.
+        hermitian=False,
     )
     image = jnp.asarray(rng.standard_normal((48, 48)), dtype=real_dtype)
     vis = jnp.asarray(
@@ -641,6 +665,14 @@ def test_cpu_default_resolves_to_expected_strategy(
         pixsize_m=telescope.pixsize,
         epsilon=EPSILON,
         dtype=real_dtype,
+        # hermitian=False (issue #17): every literal pick in this module's
+        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
+        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
+        # written in. A folded plan is a different point in the heuristic's
+        # input space, so the tables would have to be re-measured for it.
+        # Pinned here so this module keeps gating what it was calibrated
+        # against whichever way make_plan's default is set.
+        hermitian=False,
     )
     expected = _EXPECTED_CPU_AUTO[(telescope.name, zenith_deg)][1 if is_adjoint else 0]
     resolved = _canonicalise_w_strategy("auto", plan=plan, is_adjoint=is_adjoint)
@@ -699,6 +731,14 @@ def _gpu_plan(tel: Telescope, real_dtype: DTypeLike):
         pixsize_m=tel.pixsize,
         epsilon=EPSILON,
         dtype=real_dtype,
+        # hermitian=False (issue #17): every literal pick in this module's
+        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
+        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
+        # written in. A folded plan is a different point in the heuristic's
+        # input space, so the tables would have to be re-measured for it.
+        # Pinned here so this module keeps gating what it was calibrated
+        # against whichever way make_plan's default is set.
+        hermitian=False,
     )
 
 

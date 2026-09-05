@@ -307,7 +307,12 @@ def test_x64_off_float32_plan_matches_ducc(x64_off_report: dict[str, Any]) -> No
     # plan still fails here: float32 (numerics), int32 (sort_perm / window
     # tables), and complex64 for the one genuinely complex leaf, ``w0_screen``
     # (issue #16 follow-up: the precomputed exp(2i*pi*w0*(n-1)) phase screen).
-    assert x64_off_report["plan_leaf_dtypes"] == ["complex64", "float32", "int32"]
+    # ``int8`` is issue #17's ``flip_sign``, the Hermitian fold's per-row sign:
+    # one byte per row and no more (the exact width is gated in
+    # ``tests/test_hermitian.py::test_flip_sign_leaf_is_one_signed_byte_per_row``;
+    # what this list adds is that it must not drag a wider *floating* leaf into
+    # a float32 plan). Sorted, so "int8" follows "int32".
+    assert x64_off_report["plan_leaf_dtypes"] == ["complex64", "float32", "int32", "int8"]
     assert x64_off_report["vis_dtype"] == "complex64"
     rel = x64_off_report["rel_err_1e_4"]
     assert rel < 3 * 1e-4, f"float32 plan vs ducc0 at eps=1e-4: relative error {rel:.3e}"

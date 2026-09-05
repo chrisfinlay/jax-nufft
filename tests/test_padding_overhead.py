@@ -118,6 +118,14 @@ def _plan_for_uvw(
     pixsize: float,
     epsilon: float,
 ) -> WGridderPlan:
+    # hermitian=False (issue #17). Every measured table in this module -- the
+    # forty-cell calibration grid, the empty-plane counts, the padding-overhead
+    # numbers -- was taken on the UNFOLDED plan geometry, and the Hermitian
+    # w-sign fold halves n_w and re-places every window, so those tables simply
+    # do not describe a folded plan. Pinning the setting here keeps this module
+    # measuring what it was calibrated against whichever way make_plan's default
+    # is set; re-measuring the grid for the folded geometry is a separate piece
+    # of work, not something a default flip should silently demand.
     return make_plan(
         uvw,
         freq,
@@ -126,6 +134,7 @@ def _plan_for_uvw(
         pixsize,
         epsilon=epsilon,
         dtype=_REAL_DTYPE,
+        hermitian=False,
     )
 
 
@@ -617,6 +626,12 @@ def _plan_with_a_row_in_the_margin_band(
         pixsize_m=_MARGIN_FIXTURE_PIXSIZE,
         epsilon=_F32_SAFE_EPSILON,
         dtype=real_dtype,
+        # hermitian=False for the same reason as ``_plan_for_uvw`` above, and
+        # one more specific to this fixture: it plants a row at a chosen
+        # w-in-metres a few ulps below an interior plane edge, and issue #17's
+        # fold would move that row to |w| and re-place every plane, so the
+        # planted value would no longer land in the band it was searched for.
+        hermitian=False,
     )
     probe = build(base_uvw)
     assert probe.n_w > 2, "the fixture must have interior planes to plant a row below"

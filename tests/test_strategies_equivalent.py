@@ -129,12 +129,20 @@ def _build_problem(
     eps: float,
     real_dtype: DTypeLike,
     complex_dtype: DTypeLike,
+    *,
+    hermitian: bool,
 ):
     """Build a plan plus a real per-channel image and complex per-row vis.
 
     ``dtype=real_dtype`` is the load-bearing precision-aware bit: it makes
     the plan (and hence every downstream array) float32 under
     ``JAX_ENABLE_X64=0`` instead of raising ``make_plan``'s x64-off guard.
+
+    ``hermitian`` (issue #17) is passed explicitly rather than left to
+    ``make_plan``'s default, so this module says the same thing whichever way
+    that default is set. The image is real in both legs, which is the fold's
+    precondition on the forward; the visibilities are complex, which the
+    adjoint always allows.
     """
     uvw = synthetic_uvw(tel, zen_deg, seed=0)
     freq = _per_channel_freq(tel)
@@ -151,7 +159,20 @@ def _build_problem(
         else contextlib.nullcontext()
     )
     with warns_ctx:
-        plan = make_plan(uvw, freq, (tel.n_pix, tel.n_pix), pix, pix, eps, dtype=real_dtype)
+        plan = make_plan(
+            uvw,
+            freq,
+            (tel.n_pix, tel.n_pix),
+            pix,
+            pix,
+            eps,
+            dtype=real_dtype,
+            hermitian=hermitian,
+        )
+    # The fold must have something to fold, or the hermitian=True leg is the
+    # hermitian=False leg under another name and this parametrisation is a
+    # doubling of run time that gates nothing.
+    assert 0 < int((uvw[:, 2] < 0).sum()) < tel.n_rows
 
     rng = np.random.default_rng(7)
     # Per-channel images (not a broadcast 2D image): each of the N_CHAN
@@ -228,9 +249,11 @@ def _pairwise_max_rel_err(
 
 
 @pytest.mark.parametrize("eps", EPS_VALUES)
+@pytest.mark.parametrize("hermitian", [False, True])
 def test_strategies_agree_pairwise(
     short_telescope_pointing: tuple[Telescope, float],
     eps: float,
+    hermitian: bool,
     real_dtype: DTypeLike,
     complex_dtype: DTypeLike,
 ) -> None:
@@ -245,9 +268,21 @@ def test_strategies_agree_pairwise(
     The shipped default (``w_strategy="auto"``) is not a ninth participant;
     see the comment on STRATEGY_TOL above for why adding it would gate
     nothing.
+
+    Parametrised over issue #17's Hermitian w-sign fold. The fold adds a
+    per-row conjugation that each strategy applies in a *different row order* --
+    input order in the dense helpers, sorted order in the windowed adjoint,
+    post-scatter in the windowed vmap forward -- so it is exactly the kind of
+    change that can be right in one strategy and wrong in another, and this net
+    is where that shows. The bound is unchanged: ``hermitian`` is fixed within
+    each parametrisation, so the eight entrants remain the same operator summed
+    in different orders. (Folded vs unfolded is a different comparison and a
+    different bound -- see ``tests/test_hermitian.py``.)
     """
     tel, zen_deg = short_telescope_pointing
-    plan, image, vis = _build_problem(tel, zen_deg, eps, real_dtype, complex_dtype)
+    plan, image, vis = _build_problem(
+        tel, zen_deg, eps, real_dtype, complex_dtype, hermitian=hermitian
+    )
 
     forward: dict[tuple[WStrategy, ChannelStrategy], np.ndarray] = {}
     adjoint: dict[tuple[WStrategy, ChannelStrategy], np.ndarray] = {}
@@ -259,7 +294,7 @@ def test_strategies_agree_pairwise(
             vis2dirty(plan, vis, w_strategy=w_strategy, channel_strategy=channel_strategy)
         )
 
-    case_id = f"{tel.name} zen={zen_deg:g} eps={eps:g}"
+    case_id = f"{tel.name} zen={zen_deg:g} eps={eps:g} hermitian={hermitian}"
 
     fwd_err, fwd_pair = _pairwise_max_rel_err(forward, label=f"{case_id} forward")
     assert fwd_err < STRATEGY_TOL, (

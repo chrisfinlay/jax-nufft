@@ -32,7 +32,15 @@ def _setup_with_n_rows(n_rows: int, seed: int = 0):
     uvw[:, 1] = rng.uniform(-50.0, 50.0, size=n_rows)
     uvw[:, 2] = rng.uniform(-3.0, 3.0, size=n_rows)
     freq = np.array([1.4e9])
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-6)
+    # hermitian=False (issue #17): the image below is complex, which the
+    # conjugate-symmetry fold does not apply to -- a folded plan refuses a
+    # complex image rather than returning a silently wrong answer. These tests
+    # are about jit/vmap/grad plumbing and the nthreads resolution, not about
+    # the fold, so they keep their complex image and pin the setting explicitly
+    # rather than depending on make_plan's default. Traceability of the FOLDED
+    # operators is covered by
+    # tests/test_hermitian.py::test_folded_operators_stay_traceable.
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-6, hermitian=False)
     image = rng.standard_normal((1, n_l, n_m)) + 1j * rng.standard_normal((1, n_l, n_m))
     vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
         np.complex128
@@ -51,7 +59,15 @@ def _tiny_setup(seed: int = 0):
     uvw[:, 1] = rng.uniform(-50.0, 50.0, size=n_rows)
     uvw[:, 2] = rng.uniform(-3.0, 3.0, size=n_rows)
     freq = np.array([1.4e9])
-    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-6)
+    # hermitian=False (issue #17): the image below is complex, which the
+    # conjugate-symmetry fold does not apply to -- a folded plan refuses a
+    # complex image rather than returning a silently wrong answer. These tests
+    # are about jit/vmap/grad plumbing and the nthreads resolution, not about
+    # the fold, so they keep their complex image and pin the setting explicitly
+    # rather than depending on make_plan's default. Traceability of the FOLDED
+    # operators is covered by
+    # tests/test_hermitian.py::test_folded_operators_stay_traceable.
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-6, hermitian=False)
     image = rng.standard_normal((1, n_l, n_m)) + 1j * rng.standard_normal((1, n_l, n_m))
     vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
         np.complex128
