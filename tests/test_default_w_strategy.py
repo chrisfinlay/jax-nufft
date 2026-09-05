@@ -197,6 +197,50 @@ def _plan_above_nthreads_cutoff(real_dtype: DTypeLike, complex_dtype: DTypeLike,
     return plan, image, vis
 
 
+def _large_row_windowed_problem(real_dtype: DTypeLike, complex_dtype: DTypeLike, seed: int = 11):
+    """A plan the GPU heuristic resolves to ``windowed_vmap``.
+
+    Reaching that name through the *public wrapper* needs all three of the
+    GPU heuristic's windowed gates at once: ``n_rows >= _GPU_LARGE_N_ROWS``
+    (10k), ``n_w > w_kernel_width + 2`` so the small-``n_w`` gate does not
+    fire first, and ``window_padding_overhead <= _GPU_PADDING_CUTOFF`` (3.0).
+    Neither ``_offzenith_problem`` (192 rows) nor
+    ``_plan_above_nthreads_cutoff`` (``n_w`` under the small-``n_w`` gate)
+    does, which is why ``windowed_vmap`` was for a long time the one
+    canonical name no *default* call was ever observed forwarding.
+
+    The uniform ``w`` spread is what keeps the padding low while ``n_w``
+    clears the gate. Measured on this fixture: float64 ``n_w=11 W=7
+    pad=1.57``, float32 ``n_w=9 W=5 pad=1.80`` -- both comfortably inside
+    the cutoffs, so the pick is the same on both precision legs and
+    ``_EXPECTED_BOUNDARY`` needs no precision key.
+
+    The image stays small (48^2): every test using this stubs the JIT call
+    out, so the plan is built but no transform runs.
+    """
+    rng = np.random.default_rng(seed)
+    n_rows = 10_000
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-60.0, 60.0, size=n_rows)
+    uvw[:, 1] = rng.uniform(-60.0, 60.0, size=n_rows)
+    uvw[:, 2] = rng.uniform(-20.0, 20.0, size=n_rows)
+    plan = make_plan(
+        uvw=uvw,
+        freq=np.array([1.4e9]),
+        image_shape=(48, 48),
+        pixsize_l=0.004,
+        pixsize_m=0.004,
+        epsilon=EPSILON,
+        dtype=real_dtype,
+    )
+    image = jnp.asarray(rng.standard_normal((48, 48)), dtype=real_dtype)
+    vis = jnp.asarray(
+        rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1)),
+        dtype=complex_dtype,
+    )
+    return plan, image, vis
+
+
 def _spy_jit(monkeypatch: pytest.MonkeyPatch, jit_name: str) -> list[dict]:
     """Replace ``jax_nufft.wgridder.<jit_name>`` with a stub recording every
     call's kwargs (``w_strategy`` and ``nthreads`` among them, both
@@ -393,6 +437,113 @@ def test_explicit_auto_matches_the_default(
     assert len(calls) == 2
     assert calls[0]["w_strategy"] == calls[1]["w_strategy"]
     assert calls[0]["nthreads"] == calls[1]["nthreads"]
+
+
+# -- 2b. every canonical name, across the wrapper --------------------------
+#
+# Round-4 review enumerated the *values* each property is claimed over.
+# This closes the other half: which values are ever carried by the
+# *integration* path, i.e. actually observed crossing the public wrapper on
+# a defaulted call. Until this test, that path only ever carried three of
+# the four canonical names -- ``dense_scan`` and ``windowed_scan`` from the
+# CPU-pinned direction test, ``dense_vmap`` from every GPU-pinned test.
+# ``windowed_vmap`` was reached only by calling ``_canonicalise_w_strategy``
+# directly, so a wrapper that mangled or dropped it would not have failed
+# anything.
+#
+# ``(problem, platform, op) -> the name the wrapper must forward``. Literal,
+# like the CPU and GPU tables above, and verified on both precision legs, so
+# a heuristic retune has to edit it rather than silently move what the
+# integration path covers.
+_BOUNDARY_PROBLEMS = {
+    "offzenith": _offzenith_problem,
+    "large_rows": _large_row_windowed_problem,
+}
+_EXPECTED_BOUNDARY: list[tuple[str, str, str, str]] = [
+    ("offzenith", "cpu", "dirty2vis", "dense_scan"),
+    ("offzenith", "cpu", "vis2dirty", "windowed_scan"),
+    ("offzenith", "gpu", "dirty2vis", "dense_vmap"),
+    ("offzenith", "gpu", "vis2dirty", "dense_vmap"),
+    ("large_rows", "cpu", "dirty2vis", "dense_scan"),
+    ("large_rows", "cpu", "vis2dirty", "dense_scan"),
+    ("large_rows", "gpu", "dirty2vis", "windowed_vmap"),
+    ("large_rows", "gpu", "vis2dirty", "windowed_vmap"),
+]
+
+
+def test_boundary_grid_covers_every_canonical_name() -> None:
+    """Guard on the table below: it is only worth what it covers.
+
+    If a heuristic change made some canonical name unreachable through the
+    grid, the parametrised test would still pass on every row while quietly
+    testing less. Fail here instead, and say which name went missing.
+    """
+    covered = {expected for _, _, _, expected in _EXPECTED_BOUNDARY}
+    assert covered == set(CANONICAL), (
+        f"the JIT-boundary grid reaches {sorted(covered)}, not all of "
+        f"{sorted(CANONICAL)}; missing {sorted(set(CANONICAL) - covered)}. Add a "
+        "(problem, platform, op) row that resolves to the missing name rather than "
+        "letting the integration path silently stop covering it."
+    )
+
+
+@pytest.mark.parametrize(
+    ("problem", "platform", "op", "expected"),
+    _EXPECTED_BOUNDARY,
+    ids=[f"{p}-{pl}-{o}-{e}" for p, pl, o, e in _EXPECTED_BOUNDARY],
+)
+def test_default_forwards_every_canonical_name_across_the_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+    platform: str,
+    op: str,
+    expected: str,
+    real_dtype: DTypeLike,
+    complex_dtype: DTypeLike,
+) -> None:
+    """Each canonical name, resolved from the default and observed at the
+    JIT boundary.
+
+    The other boundary-spy tests in this module each pin one platform and
+    one fixture, so between them they only ever watched three of the four
+    names cross the wrapper. This is the same assertion made over a grid
+    chosen so all four do, ``windowed_vmap`` included.
+
+    ``nthreads`` is asserted alongside, because it is the other static arg
+    the wrapper derives from the resolved strategy: a wrapper that forwarded
+    the right name but computed threads from something else would otherwise
+    pass. Both problems sit below ``_NTHREADS_SMALL_N_ROWS``, so the
+    expected value is ``1`` throughout -- the strategy-family split is
+    covered above and in ``tests/test_nthreads_resolution.py``.
+    """
+    _patch_platform(monkeypatch, platform)
+    plan, image, vis = _BOUNDARY_PROBLEMS[problem](real_dtype, complex_dtype)
+    _, jit_name, is_adjoint = _OPERATORS[op]
+
+    # Precondition, not a restatement: if the heuristic no longer resolves
+    # this row to `expected`, the table is stale and must be re-measured
+    # rather than the assertion below quietly testing a different name.
+    resolved = _auto_w_strategy(plan, is_adjoint=is_adjoint)
+    assert resolved == expected, (
+        f"{problem}/{platform}/{op}: the heuristic now resolves to {resolved!r}, but "
+        f"this table says {expected!r} (n_w={plan.n_w}, W={plan.w_kernel_width}, "
+        f"n_rows={plan.n_rows}, padding_overhead={plan.window_padding_overhead:.4f}). "
+        "Re-measure and update the table."
+    )
+
+    calls = _spy_jit(monkeypatch, jit_name)
+    _call(op, plan, image, vis)
+    assert len(calls) == 1
+    assert calls[0]["w_strategy"] == expected, (
+        f"{problem}/{platform}/{op} at its default forwarded "
+        f"{calls[0]['w_strategy']!r} to the JIT boundary, not the resolved "
+        f"{expected!r}. The wrapper must pass the resolved strategy through "
+        "unchanged for every canonical name, not just the ones other tests reach."
+    )
+    assert calls[0]["nthreads"] == 1, (
+        f"{problem}/{platform}/{op}: nthreads={calls[0]['nthreads']}, expected 1 "
+        f"(n_rows={plan.n_rows} is below the small-n_rows cutoff)"
+    )
 
 
 # -- 3. what "auto" resolves to on the repository CPU fixtures --------------
@@ -601,8 +752,9 @@ def test_gpu_default_resolves_to_the_expected_strategy(
             f"padding_overhead={plan.window_padding_overhead:.4f}): the GPU default "
             f"resolved to {resolved!r}, but this table says {expected!r}. A scan-family "
             "answer is slower than every vmap answer in all 160 pairs of the GH200 "
-            "sweep (1.45-32.7x); the other vmap answer is a "
-            "bounded loss but still not what was measured. If the heuristic was "
+            "sweep (1.45-32.7x). The other vmap answer is not a small miss either: "
+            "across the sweep's 20 cells the runner-up trails the winner by 1.07x to "
+            "7.36x (median 1.86x), and only one cell is within 15%. If the heuristic was "
             "retuned on purpose (issue #34), update the table with the measurement."
         )
 
