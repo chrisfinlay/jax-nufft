@@ -70,6 +70,16 @@ Two consequences this module pins:
   upward, since the corrected metric reads above the shipped ``5.0`` on the
   MWA_extended off-zenith cells where AGENTS.md section 9 records the windowed
   adjoint as the measured CPU win.
+
+**Two plan geometries (issue #17).** The Hermitian w-sign fold halves
+``w_extent``, hence ``n_w``, hence the whole window layout, so every measured
+number here belongs to one geometry or the other. The default is the folded
+one, because that is what ``make_plan`` builds for a caller who says nothing;
+the unfolded leg is kept where it is cheap (the calibration grid and the
+empty-plane table are swept in both) and is *required* by the two equivalence
+tests, whose subject is the v0.1.2 rule against the shipped one -- a comparison
+between two rules that were both calibrated on the unfolded geometry. Which
+setting each call site takes, and why, is recorded at ``_plan_for_uvw``.
 """
 
 from __future__ import annotations
@@ -117,15 +127,27 @@ def _plan_for_uvw(
     image_shape: tuple[int, int],
     pixsize: float,
     epsilon: float,
+    *,
+    hermitian: bool,
 ) -> WGridderPlan:
-    # hermitian=False (issue #17). Every measured table in this module -- the
-    # forty-cell calibration grid, the empty-plane counts, the padding-overhead
-    # numbers -- was taken on the UNFOLDED plan geometry, and the Hermitian
-    # w-sign fold halves n_w and re-places every window, so those tables simply
-    # do not describe a folded plan. Pinning the setting here keeps this module
-    # measuring what it was calibrated against whichever way make_plan's default
-    # is set; re-measuring the grid for the folded geometry is a separate piece
-    # of work, not something a default flip should silently demand.
+    """Build a plan at this module's precision leg.
+
+    ``hermitian`` (issue #17) has no default here on purpose. The fold halves
+    ``w_extent``, hence ``n_w``, hence ``max_window_size`` and the whole window
+    layout, so every measured number in this module belongs to one geometry or
+    the other and no call site may leave the question open. The two geometries
+    it selects between are:
+
+    * ``True`` -- what ships. The calibration grid's overhead bands, the
+      empty-plane table and every structural identity below are measured on
+      this one, because it is what a caller who does not pass ``hermitian``
+      gets.
+    * ``False`` -- the pre-#17 geometry. Kept where the *subject* of the test
+      is issue #43's change of metric rather than the plan the library builds:
+      the two equivalence tests compare the v0.1.2 rule against the shipped
+      one, and both were written against the unfolded geometry (see the note
+      above ``test_calibration_grid_auto_picks_survive_the_redefinition``).
+    """
     return make_plan(
         uvw,
         freq,
@@ -134,7 +156,7 @@ def _plan_for_uvw(
         pixsize,
         epsilon=epsilon,
         dtype=_REAL_DTYPE,
-        hermitian=False,
+        hermitian=hermitian,
     )
 
 
@@ -142,18 +164,32 @@ def _uvw_and_freq(telescope: Telescope, zenith_angle_deg: float) -> tuple[np.nda
     return synthetic_uvw(telescope, zenith_angle_deg, seed=0), np.array([telescope.freq_hz])
 
 
-def _plan_for(telescope: Telescope, zenith_angle_deg: float, epsilon: float) -> WGridderPlan:
+def _plan_for(
+    telescope: Telescope, zenith_angle_deg: float, epsilon: float, *, hermitian: bool = True
+) -> WGridderPlan:
+    """A review-fixture plan; ``hermitian`` defaults to the shipped geometry."""
     uvw, freq = _uvw_and_freq(telescope, zenith_angle_deg)
-    return _plan_for_uvw(uvw, freq, (telescope.n_pix, telescope.n_pix), telescope.pixsize, epsilon)
+    return _plan_for_uvw(
+        uvw,
+        freq,
+        (telescope.n_pix, telescope.n_pix),
+        telescope.pixsize,
+        epsilon,
+        hermitian=hermitian,
+    )
 
 
-# The calibration grid builds 40 plans and two tests sweep it (one of them
-# twice, forward and adjoint). GH200_large's plan holds ~135 MB of 2048^2
-# leaves, so the cache is deliberately tiny: it exists to collapse the
+# The calibration grid builds 40 plans per geometry and three tests sweep it
+# (one of them twice, forward and adjoint). GH200_large's plan holds ~135 MB of
+# 2048^2 leaves, so the cache is deliberately tiny: it exists to collapse the
 # immediately-repeated build of the *same* cell, not to hold the grid.
+# ``hermitian`` is part of the key, not a default, for the reason
+# ``_plan_for_uvw`` gives.
 @lru_cache(maxsize=2)
-def _cached_plan(telescope: Telescope, zenith_angle_deg: float, epsilon: float) -> WGridderPlan:
-    return _plan_for(telescope, zenith_angle_deg, epsilon)
+def _cached_plan(
+    telescope: Telescope, zenith_angle_deg: float, epsilon: float, hermitian: bool
+) -> WGridderPlan:
+    return _plan_for(telescope, zenith_angle_deg, epsilon, hermitian=hermitian)
 
 
 # --- independent references --------------------------------------------------
@@ -363,18 +399,37 @@ def _pre_43_auto_picks(plan: WGridderPlan, *, is_adjoint: bool) -> tuple[str, st
 
 
 # --- the identity ------------------------------------------------------------
+#
+# ``(zenith_angle_deg, hermitian)`` cells for the identity test below. Three,
+# not four: MWA_extended *zenith* at eps 1e-3 loses its strict-subset windows
+# under issue #17's fold (n_w 11 -> 8 against W = 4, i.e. n_w_inner drops to
+# exactly W, so every plane's window spans every row and ``max_window_size ==
+# n_rows``). That is precisely the degenerate regime the test's own
+# non-vacuity precondition exists to exclude, so the cell is not run -- and the
+# premise for not running it is asserted, not assumed, by
+# ``test_the_two_denominator_guards_pin_their_geometry_for_a_reason``.
+_IDENTITY_CELLS = [
+    pytest.param(0.0, False, id="za0-unfolded"),
+    pytest.param(30.0, False, id="za30-unfolded"),
+    pytest.param(30.0, True, id="za30-folded"),
+]
 
 
-@pytest.mark.parametrize("zenith_angle_deg", [0.0, 30.0])
-def test_padding_overhead_is_windowed_work_over_live_work(zenith_angle_deg: float) -> None:
+@pytest.mark.parametrize(("zenith_angle_deg", "hermitian"), _IDENTITY_CELLS)
+def test_padding_overhead_is_windowed_work_over_live_work(
+    zenith_angle_deg: float, hermitian: bool
+) -> None:
     """``window_padding_overhead == n_chan * n_w * max_window_size / live_row_count``.
 
     The denominator is taken from :func:`_independent_live_sizes`, not from
     ``plan.live_row_count``, so this is a check of the number and not a
     restatement of the formula. ``epsilon=1e-3`` so it runs on both precision
     legs.
+
+    Swept over both plan geometries where both are non-degenerate (issue #17);
+    see ``_IDENTITY_CELLS`` for the one cell that is not.
     """
-    plan = _plan_for(MWA_EXTENDED, zenith_angle_deg, _F32_SAFE_EPSILON)
+    plan = _plan_for(MWA_EXTENDED, zenith_angle_deg, _F32_SAFE_EPSILON, hermitian=hermitian)
     live_sizes = _independent_live_sizes(plan)
     expected_live = int(live_sizes.sum())
 
@@ -458,6 +513,7 @@ def test_accumulators_sum_over_every_channel() -> None:
         (MWA_EXTENDED.n_pix, MWA_EXTENDED.n_pix),
         MWA_EXTENDED.pixsize,
         _F32_SAFE_EPSILON,
+        hermitian=True,
     )
     live_sizes = _independent_live_sizes(plan)
 
@@ -512,9 +568,22 @@ def test_padding_rows_are_excluded_from_the_denominator() -> None:
     of ~218 and the same padding is 0.5% -- too small a signal to gate
     anything, which is why that pointing is covered by the identity test above
     and not here.
+
+    ``hermitian=False`` (issue #17), and for a reason about *signal* rather
+    than about legacy: the padding is two clamp rows per (channel, plane), so
+    the gap this test measures scales with ``n_w`` -- which the fold halves.
+    On the folded plan the same fixture reads 2654 padded against 2400 live,
+    a 10.6% gap, against 20% unfolded, and the preconditions below (and the
+    1.15x separation of the two ratios) are sized for the larger one. The
+    quantity being guarded -- which rows count as irreducible -- is a property
+    of the builder and not of the geometry, so the guard belongs on whichever
+    review fixture shows it most loudly. That the folded gap really is 10.6%
+    is asserted by
+    ``test_the_two_denominator_guards_pin_their_geometry_for_a_reason`` rather
+    than left as a claim in this docstring.
     """
     telescope, zenith_angle_deg = MWA_EXTENDED, 30.0
-    plan = _plan_for(telescope, zenith_angle_deg, _F32_SAFE_EPSILON)
+    plan = _plan_for(telescope, zenith_angle_deg, _F32_SAFE_EPSILON, hermitian=False)
 
     live_sizes = _independent_live_sizes(plan)
     padded_sizes = _independent_padded_sizes(plan)
@@ -543,6 +612,53 @@ def test_padding_rows_are_excluded_from_the_denominator() -> None:
         f"the padded-denominator value ({padded_overhead:.4f}); the "
         f"boundary_margin / +-1 clamp rows are back in the denominator"
     )
+
+
+def test_the_two_denominator_guards_pin_their_geometry_for_a_reason() -> None:
+    """Both premises the two guards above rest on, asserted rather than claimed.
+
+    Those guards are the only tests in this module that do *not* run on the
+    shipped folded geometry, and each has a stated reason. A stated reason that
+    nothing checks is a comment that goes stale silently, so both are measured
+    here. If either stops holding -- because a plane count moves, or because
+    the fold changes -- this fails and the two guards can be moved onto the
+    folded geometry, which is where they would rather be.
+
+    1. ``test_padding_overhead_is_windowed_work_over_live_work`` has no
+       ``(zenith, folded)`` cell because the fold takes MWA_extended zenith at
+       eps 1e-3 down to ``n_w_inner == W``: every plane's window then spans
+       every row, which is exactly the degeneracy its non-vacuity precondition
+       excludes.
+    2. ``test_padding_rows_are_excluded_from_the_denominator`` stays unfolded
+       because the padded-to-live gap it needs is two clamp rows per
+       ``(channel, plane)``, so it shrinks with ``n_w``: 20% unfolded, 10.6%
+       folded, against a 1.15x precondition.
+
+    ``epsilon=1e-3`` throughout, so this runs on both precision legs.
+    """
+    # (1) the folded zenith plan has no strict-subset windows.
+    zenith_folded = _plan_for(MWA_EXTENDED, 0.0, _F32_SAFE_EPSILON, hermitian=True)
+    assert zenith_folded.n_w - zenith_folded.w_kernel_width <= zenith_folded.w_kernel_width, (
+        f"MWA_extended zenith folded now has n_w_inner="
+        f"{zenith_folded.n_w - zenith_folded.w_kernel_width} against W="
+        f"{zenith_folded.w_kernel_width}: the windows may be strict subsets again, so the "
+        "identity test can take its (zenith, folded) cell back"
+    )
+    assert zenith_folded.max_window_size == zenith_folded.n_rows
+
+    # (2) the folded off30 plan carries less than the 15% padding signal the
+    # exclusion guard's preconditions are sized for.
+    off30_folded = _plan_for(MWA_EXTENDED, 30.0, _F32_SAFE_EPSILON, hermitian=True)
+    live = int(_independent_live_sizes(off30_folded).sum())
+    padded = int(_independent_padded_sizes(off30_folded).sum())
+    assert 0 < padded - live < 0.15 * live, (
+        f"MWA_extended off30 folded now carries {padded} padded rows against {live} live "
+        f"({padded / live:.3f}x): if that has grown past 1.15x the exclusion guard can move "
+        "onto the shipped geometry"
+    )
+    # It must still be a real gap: the two clamp rows per (channel, plane) are
+    # there on the folded plan too, just half as many of them.
+    assert padded - live == pytest.approx(2 * off30_folded.n_w * off30_folded.n_chan, rel=0.05)
 
 
 # --- the margin exclusion, on a fixture that carries a margin row ------------
@@ -807,22 +923,39 @@ def test_empty_planes_are_counted_even_though_the_clamp_hides_them() -> None:
     assert int(np.count_nonzero(padded_sizes == 0)) == 0
 
 
+# ``empty_plane_count`` on MWA_extended off30, float64, by geometry and epsilon.
+# Measured on this branch; see the test below for what the two columns say.
+_EXPECTED_EMPTY_PLANES: dict[bool, dict[float, int]] = {
+    False: {1e-3: 87, 1e-6: 62, 1e-9: 45, 1e-12: 32},
+    True: {1e-3: 31, 1e-6: 18, 1e-9: 9, 1e-12: 3},
+}
+
+
 @requires_x64
-@pytest.mark.parametrize(
-    ("epsilon", "expected_empty"), [(1e-3, 87), (1e-6, 62), (1e-9, 45), (1e-12, 32)]
-)
-def test_empty_plane_count_matches_the_measured_table(epsilon: float, expected_empty: int) -> None:
+@pytest.mark.parametrize("hermitian", [False, True], ids=["unfolded", "folded"])
+@pytest.mark.parametrize("epsilon", [1e-3, 1e-6, 1e-9, 1e-12])
+def test_empty_plane_count_matches_the_measured_table(epsilon: float, hermitian: bool) -> None:
     """The measured empty-plane table on the issue's worst fixture.
 
     ``requires_x64``: epsilon below ~1e-5 cannot be asked of a float32 plan
     without a warning, and ``filterwarnings = error`` makes that a failure.
     The float32 leg covers the same fixture at ``_F32_SAFE_EPSILON`` above,
-    where it reads 90 rather than 87 -- rows on a support boundary land on
-    the other side once ``inv_lambda`` is single precision, which is why this
-    exact table is float64-only.
+    where it reads 90 unfolded and 30 folded rather than 87 and 31 -- rows on a
+    support boundary land on the other side once ``inv_lambda`` is single
+    precision, which is why this exact table is float64-only.
+
+    Both geometries (issue #17). The folded column is what ships and the
+    unfolded one is the pre-#17 measurement, kept because the *shape* of the
+    two columns is the interesting part: folding roughly halves ``n_w`` on this
+    fixture but cuts the empty planes by far more than half (87 -> 31, 32 -> 3),
+    because the emptiness was concentrated in the tail of planes covering the
+    sparse negative-w wing that the fold reflects onto the positive one. An
+    implementation that halved ``n_w`` without actually merging the two wings
+    would keep the unfolded proportion of empty planes and fail here.
     """
-    plan = _plan_for(MWA_EXTENDED, 30.0, epsilon)
-    assert plan.empty_plane_count == expected_empty
+    expected = _EXPECTED_EMPTY_PLANES[hermitian][epsilon]
+    plan = _plan_for(MWA_EXTENDED, 30.0, epsilon, hermitian=hermitian)
+    assert plan.empty_plane_count == expected
     assert plan.empty_plane_count == int(np.count_nonzero(_independent_live_sizes(plan) == 0))
 
 
@@ -840,7 +973,7 @@ def test_padding_overhead_lower_bound_is_attained() -> None:
     uvw = np.zeros((128, 3))
     uvw[:, :2] = rng.uniform(-100.0, 100.0, size=(128, 2))
     freq = np.array([1.4e9, 1.5e9])
-    plan = _plan_for_uvw(uvw, freq, (64, 64), 2e-3, _F32_SAFE_EPSILON)
+    plan = _plan_for_uvw(uvw, freq, (64, 64), 2e-3, _F32_SAFE_EPSILON, hermitian=True)
 
     assert plan.n_w == 1
     assert plan.max_window_size == plan.n_rows
@@ -862,27 +995,50 @@ def test_padding_overhead_is_never_below_one() -> None:
 # --- the calibration grid ----------------------------------------------------
 #
 # The grid the CPU and GPU padding cutoffs are calibrated on: five review
-# fixtures x two pointings x four epsilons. Corrected-metric measurements on
-# this grid (float64; the float32 leg agrees to <0.3% at eps=1e-3):
+# fixtures x two pointings x four epsilons. Swept in **both** plan geometries
+# (issue #17), because the fold moves every cell and only one of the two is
+# what ships.
 #
-#   * every cell except MWA_extended off30 reads 1.077 - 3.173;
-#   * MWA_extended off30 reads 5.173 (eps 1e-12) to 5.784 (eps 1e-3), against
-#     4.712 - 4.933 on the padded denominator -- an understatement of up to
-#     16.9%, worst where the windows are narrowest.
+# Corrected-metric measurements, float64 (the float32 leg, ten cells at
+# eps 1e-3, agrees to <0.3% unfolded and to <0.05% folded):
 #
-# That last row is what moves ``_CPU_PADDING_CUTOFF``. The shipped 5.0 sat
-# just above the padded-scale maximum of 4.933; on the corrected scale the
-# same cells read up to 5.784 (5.791 on the float32 leg), so leaving the
-# cutoff at 5.0 would flip the four MWA_extended off30 adjoint cells from
-# ``windowed_scan`` to ``dense_scan`` -- contradicting the measured CPU win
-# in AGENTS.md section 9. 6.0 is the smallest value that both clears the grid
-# and preserves the old cutoff's proportional headroom: 5.0 times the worst
-# measured padded->live inflation on the grid (5.784 / 4.809 = 1.203) is
-# 6.014.
+#                        every cell except      MWA_extended off30
+#                        MWA_extended off30
+#   hermitian=False        1.077 - 3.173          5.173 - 5.784
+#   hermitian=True         1.077 - 2.765          4.944 - 5.076
 #
-# ``_GPU_PADDING_CUTOFF`` does *not* move: no cell crosses 3.0 in either
-# direction (the three cells near it -- MWA_compact off30, MeerKAT off30 at
-# eps 1e-3 -- are above it on both scales, and EDA2 off30 is below on both).
+# The unfolded column is what moved ``_CPU_PADDING_CUTOFF`` in issue #43. The
+# shipped 5.0 sat just above the padded-scale maximum of 4.933; on the
+# corrected scale the same cells read up to 5.784 (5.791 on the float32 leg),
+# so leaving the cutoff at 5.0 would have flipped the four MWA_extended off30
+# adjoint cells from ``windowed_scan`` to ``dense_scan`` -- contradicting the
+# measured CPU win in AGENTS.md section 9. 6.0 is the smallest value that both
+# cleared that grid and preserved the old cutoff's proportional headroom:
+# 5.0 times the worst measured padded->live inflation (5.784 / 4.809 = 1.203)
+# is 6.014.
+#
+# The folded column is the shipped geometry and it does **not** move the
+# cutoff. #43 changed the metric's *denominator*, which is why 5.0 had to be
+# restated on the new scale; #17 changes neither the metric nor its scale, only
+# where the fixtures sit under it -- and they all move down, so 6.0 goes from
+# clearing the worst cell by 3.7% to clearing it by 18.2%. Re-fitting it onto
+# the folded maximum would be a fresh calibration on one draw rather than a
+# restatement, and the seed sweep at the bottom of this file is why that would
+# be a bad one: folded, MWA_extended off30 at eps 1e-3 spans 5.075 to 6.466
+# over seeds 0-11 and crosses 6.0 on four of the twelve, so a cutoff fitted to
+# the seed-0 draw (the gentlest of the twelve, as it is unfolded too) would
+# bind on a third of them -- on exactly the fixture AGENTS.md section 9
+# measures the windowed adjoint win on. See the derivation comment on
+# ``_CPU_PADDING_CUTOFF`` in ``wgridder.py``.
+#
+# ``_GPU_PADDING_CUTOFF`` does not move either, and on the folded grid it stops
+# being reachable at all: unfolded, three cells sit above 3.0 (MWA_compact
+# off30 3.050 and MeerKAT off30 3.172 at eps 1e-3, plus the MWA_extended off30
+# column); folded, the maximum outside MWA_extended off30 is 2.765, so only
+# that one fixture is above the cutoff. Both cells that cross are on plans of
+# 600 rows, which the GPU heuristic sends to ``dense_vmap`` on the row-count
+# gate before the padding branch is consulted, so no GPU pick depends on it
+# either way.
 
 _FIXTURES = [EDA2, MWA_COMPACT, MWA_EXTENDED, MEERKAT, GH200_LARGE]
 _POINTINGS = [0.0, 30.0]
@@ -909,9 +1065,12 @@ _GRID = [
 _HIGH_OVERHEAD_FIXTURE = MWA_EXTENDED.name
 _HIGH_OVERHEAD_POINTING = 30.0
 # Measured min/max over the grid with a little rounding room -- not a
-# tolerance on a converging quantity.
-_ORDINARY_OVERHEAD_RANGE = (1.0, 3.3)
-_HIGH_OVERHEAD_RANGE = (5.0, 5.9)
+# tolerance on a converging quantity. Keyed by ``hermitian`` (issue #17): the
+# fold is not a perturbation of these numbers, it moves the high band down by
+# roughly 0.7 and pulls the ordinary band's ceiling from 3.17 to 2.77, so one
+# pair of bands wide enough for both geometries would gate neither.
+_ORDINARY_OVERHEAD_RANGE = {False: (1.0, 3.3), True: (1.0, 2.9)}
+_HIGH_OVERHEAD_RANGE = {False: (5.0, 5.9), True: (4.8, 5.2)}
 
 
 def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
@@ -920,16 +1079,24 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     Stated as its own test so the number is auditable without running the
     forty-cell sweep. Two halves, and the second is the one that matters:
 
-    * **6.0 exactly.** The corrected metric reaches 5.784 (float64) / 5.792
-      (float32) on MWA_extended off30, so anything at or below that flips the
-      measured CPU win to ``dense_scan``. That is a *lower* bound, and a lower
-      bound alone is satisfied by 100.0 -- which would clear the grid by
-      switching the guard off. The upper bound is the derivation: the worst
-      padded-to-live inflation on the grid is 5.7843 / 4.8089 = 1.2028, so
-      carrying the shipped 5.0 across the change of scale gives 6.014, and 6.0
-      is that rounded down to the nearest tenth. The construction yields
-      6.014, not 6.0; 6.0 is the round number just below it, which is what
-      keeps the restatement from loosening the cutoff.
+    * **6.0 exactly.** On the *unfolded* geometry the corrected metric reaches
+      5.784 (float64) / 5.792 (float32) on MWA_extended off30, so anything at
+      or below that flips the measured CPU win to ``dense_scan``. That is a
+      *lower* bound, and a lower bound alone is satisfied by 100.0 -- which
+      would clear the grid by switching the guard off. The upper bound is the
+      derivation: the worst padded-to-live inflation on the grid is
+      5.7843 / 4.8089 = 1.2028, so carrying the shipped 5.0 across the change
+      of scale gives 6.014, and 6.0 is that rounded down to the nearest tenth.
+      The construction yields 6.014, not 6.0; 6.0 is the round number just
+      below it, which is what keeps the restatement from loosening the cutoff.
+
+      Issue #17's fold does not re-open that derivation, and the reason is
+      that #43 changed the metric's *denominator* while #17 changes only the
+      geometry measured under it: there is no change of scale to restate
+      across a second time. What it does change is the headroom -- the folded
+      grid's maximum is 5.076, so 6.0 now clears the worst shipped cell by
+      18.2% where it cleared the unfolded one by 3.7%. See the grid comment
+      above for why that headroom is not re-fitted onto 5.076.
     * **It still gates.** A constant no branch can reach is not a cutoff, so
       exercise the branch on both sides of the value rather than trusting that
       the comparison is still wired up.
@@ -940,9 +1107,11 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     assert _GPU_PADDING_CUTOFF == 3.0
 
     # A real plan that clears every earlier branch, so the padding comparison
-    # is what decides: n_w = 248 against W = 4, i.e. past both `W + 2` and the
-    # adjoint's `n_w / W > 2`. Only the overhead is substituted, so this is a
-    # test of the branch and not of the fixture.
+    # is what decides: on the shipped folded geometry n_w = 131 against W = 4,
+    # i.e. past both `W + 2` and the adjoint's `n_w / W > 2` (it was 248
+    # unfolded, so the fold halves the margin over those gates without coming
+    # close to closing it). Only the overhead is substituted, so this is a test
+    # of the branch and not of the fixture.
     plan = _plan_for(MWA_EXTENDED, _HIGH_OVERHEAD_POINTING, _F32_SAFE_EPSILON)
     assert plan.n_w > plan.w_kernel_width + 2
     assert plan.n_w / plan.w_kernel_width > 2.0
@@ -955,24 +1124,38 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     assert _auto_w_strategy_cpu(above, is_adjoint=True) == "dense_scan"
 
 
+@pytest.mark.parametrize("hermitian", [False, True], ids=["unfolded", "folded"])
 @pytest.mark.parametrize(("telescope", "zenith_angle_deg", "epsilon"), _GRID)
 def test_calibration_grid_padding_overhead(
-    telescope: Telescope, zenith_angle_deg: float, epsilon: float
+    telescope: Telescope, zenith_angle_deg: float, epsilon: float, hermitian: bool
 ) -> None:
     """Each grid cell's corrected overhead sits in its measured band.
 
-    The bands are what changed: on the padded denominator the MWA_extended
-    off30 cells read 4.71 - 4.93 and would miss ``_HIGH_OVERHEAD_RANGE``
-    entirely.
+    Two things the bands pin, and both directions matter:
+
+    * on the padded denominator the MWA_extended off30 cells read 4.71 - 4.93
+      and would miss ``_HIGH_OVERHEAD_RANGE[False]`` entirely -- that is issue
+      #43's redefinition;
+    * the ``True`` leg is the shipped geometry (issue #17). Its bands are
+      *narrower* and lower, so they are a real re-measurement rather than the
+      unfolded ones with slack added: the folded high band is 4.944 - 5.076
+      against an unfolded 5.173 - 5.784, and a plan that silently stopped
+      folding would read outside it.
+
+    Both legs are swept because the grid is cheap (host-side plan building
+    only) and because the cutoff derivation quotes numbers from each.
     """
-    plan = _cached_plan(telescope, zenith_angle_deg, epsilon)
+    plan = _cached_plan(telescope, zenith_angle_deg, epsilon, hermitian)
     overhead = plan.window_padding_overhead
 
     is_high = (
         telescope.name == _HIGH_OVERHEAD_FIXTURE and zenith_angle_deg == _HIGH_OVERHEAD_POINTING
     )
-    lo, hi = _HIGH_OVERHEAD_RANGE if is_high else _ORDINARY_OVERHEAD_RANGE
-    assert lo <= overhead <= hi, f"{overhead:.4f} outside the measured band ({lo}, {hi})"
+    band = _HIGH_OVERHEAD_RANGE if is_high else _ORDINARY_OVERHEAD_RANGE
+    lo, hi = band[hermitian]
+    assert lo <= overhead <= hi, (
+        f"{overhead:.4f} outside the measured band ({lo}, {hi}) for hermitian={hermitian}"
+    )
 
     # The guard is a guard: no cell of *this* grid reaches it at any epsilon.
     # Scoped to the grid deliberately -- other draws of these same fixtures do
@@ -999,8 +1182,30 @@ def test_calibration_grid_auto_picks_survive_the_redefinition(
     MWA_extended off30 adjoint cells: their corrected overhead is 5.17 - 5.79
     against a padded 4.71 - 4.93, so any ``_CPU_PADDING_CUTOFF`` at or below
     5.79 flips them to ``dense_scan`` and this fails.
+
+    **``hermitian=False``, and this is the one place in the module where that
+    is the right geometry rather than a legacy one.** What is compared here is
+    two *rules*: the one v0.1.2 shipped and the one this repository ships. The
+    v0.1.2 rule was written, and its 5.0 measured, on the unfolded plan
+    geometry -- the only geometry that existed then -- and #43 restated it onto
+    the corrected denominator on that same geometry. Running the comparison on
+    plans neither rule was calibrated against would not be a stronger test of
+    the redefinition; it would be a test of a rule pair on data neither was
+    fitted to, which is a different (and unasserted) claim.
+
+    That the two rules do come apart off that geometry is worth recording
+    rather than leaving implicit. Measured on folded plans over seeds 0-11 of
+    MWA_extended off30 at eps 1e-3, they disagree on the adjoint pick for five
+    of the twelve: the padded-to-live inflation the 5.0 -> 6.0 restatement was
+    built on is 1.20 unfolded but only 1.11 folded, so the proportional
+    restatement stops being equivalence-preserving. Every one of those five
+    disagreements is the shipped rule keeping ``windowed_scan`` where the
+    v0.1.2 rule would have taken it to ``dense_scan`` -- the direction AGENTS.md
+    section 9 measures as the CPU win on that exact fixture. The forty-cell
+    folded grid shows no disagreement at all (checked; seed 0 is below both
+    cutoffs on every cell).
     """
-    plan = _cached_plan(telescope, zenith_angle_deg, epsilon)
+    plan = _cached_plan(telescope, zenith_angle_deg, epsilon, False)
     expected_cpu, expected_gpu = _pre_43_auto_picks(plan, is_adjoint=is_adjoint)
 
     assert _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint) == expected_cpu
@@ -1033,6 +1238,13 @@ def test_auto_picks_survive_the_redefinition_across_seeds() -> None:
     Cheap enough for the fast leg (twelve 600-row plans) and precision-
     independent: the two rules agree on all twelve seeds in float64 and in
     float32, so no ``requires_x64``.
+
+    ``hermitian=False`` for the reason given at
+    ``test_calibration_grid_auto_picks_survive_the_redefinition`` -- both rules
+    being compared were calibrated on the unfolded geometry -- and that comment
+    also records what the same sweep measures on folded plans (the two rules
+    part company on five of the twelve, always in the direction of keeping the
+    windowed adjoint).
     """
     fired_new = fired_old = 0
     for seed in _EQUIVALENCE_SEEDS:
@@ -1043,6 +1255,7 @@ def test_auto_picks_survive_the_redefinition_across_seeds() -> None:
             (MWA_EXTENDED.n_pix, MWA_EXTENDED.n_pix),
             MWA_EXTENDED.pixsize,
             _F32_SAFE_EPSILON,
+            hermitian=False,
         )
         fired_new += plan.window_padding_overhead > _CPU_PADDING_CUTOFF
         fired_old += _pre_43_padded_overhead(plan) > _PREVIOUS_CPU_PADDING_CUTOFF

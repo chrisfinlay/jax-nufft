@@ -8,7 +8,14 @@ Planning is a one-shot, *non-traced* preprocessing step that turns
   * the ``phi_hat_n`` correction (precomputed via :class:`PhiHatTable`);
   * the w-plane centres, relative to the w-range midpoint ``w0``;
   * the baselines in metres (``uvw_m``) and the per-channel inverse
-    wavelength ``inv_lambda = freq / c``.
+    wavelength ``inv_lambda = freq / c``;
+  * the Hermitian fold's per-row sign ``flip_sign`` (issue #17).
+
+issue #17: with ``hermitian=True`` (the default) every row with ``w < 0`` is
+stored at ``(-u, -v, -w)``, which is the same measurement for a real sky
+(``V(-u, -v, -w) = conj(V(u, v, w))``). The whole of the rest of this module
+then works on a w-range of ``[0, max|w|]`` without knowing it, and the
+operators undo the fold per row via ``flip_sign``.
 
 These quantities are bundled into :class:`WGridderPlan`, which is a frozen
 dataclass registered as a JAX pytree. The numerical fields (``uvw_m``,
@@ -266,6 +273,21 @@ class WGridderPlan:
     # plan-side without re-tracing.
     w_extent: float
     is_constant_w: bool
+    # issue #17: whether this plan applied the Hermitian w-sign fold. For a real
+    # sky ``V(-u, -v, -w) = conj(V(u, v, w))`` ([TMS2017] ch. 3; [Arras+2021]
+    # sec. 2 eq. 19), so every row with ``w < 0`` can be stored at
+    # ``(-u, -v, -w)`` with its value conjugated. The stored w-range becomes
+    # ``[0, max|w|]`` instead of ``[min w, max w]``, which halves ``w_extent``
+    # -- and with it ``n_w_inner`` -- on any roughly symmetric w-distribution.
+    #
+    # Static, and it has to be: it changes the operator, not merely the order
+    # the same operator sums in. The plane grid moves (different ``n_w``,
+    # different centres, different windows) *and* a data-dependent subset of
+    # rows is conjugated, so a folded and an unfolded plan over the same inputs
+    # must not share a JIT cache entry. It is also read by ``dirty2vis`` before
+    # the JIT boundary to refuse a complex image, which a traced value could
+    # not be.
+    hermitian: bool
     # issue #11 precision metadata: the dtype the plan was *requested* with
     # (``make_plan(dtype=...)``), not one inferred from the uvw/freq inputs.
     # ``real_dtype`` is the dtype of every floating plan leaf and of the
@@ -288,6 +310,14 @@ class WGridderPlan:
     # were ever read; they are gone. Measured on a 16-channel, 10k-row plan at
     # 256 pixels that is 12.98 MB of leaves down to 2.42 MB; at 64 channels x
     # 1M rows it is 3.9 GB down to 31 MB, against 23 MB of inputs.
+    #
+    # issue #17: "the baselines" here means the baselines *as planned*, i.e.
+    # after the Hermitian fold when ``hermitian`` is True -- row ``r`` is
+    # ``flip_sign[r] * uvw[r]``, all three columns, so the stored w is
+    # non-negative. Everything downstream (the w-range, ``sort_perm``, the
+    # window boundaries, the FINUFFT coordinates) is built from this array and
+    # therefore sees the folded geometry; the caller's row order is untouched,
+    # and ``flip_sign`` is what puts the conjugation back at call time.
     uvw_m: Array = field()  # (n_rows, 3) — metres, input row order
     # ``freq / c``, i.e. one over the wavelength: the per-channel factor that
     # turns metres into wavelengths. Stored rather than ``freq`` so the divide
@@ -329,8 +359,27 @@ class WGridderPlan:
     # sort is by w in metres, so the permutation is channel-independent and the
     # windowed helpers gather ``uvw_m[sort_perm]`` once per call (issue #23;
     # v0.1.2 already did this for ``u_finufft`` / ``v_finufft``).
-    sort_perm: Array = field()  # (n_rows,) int — argsort(uvw[:, 2]) ascending
+    sort_perm: Array = field()  # (n_rows,) int — argsort(uvw_m[:, 2]) ascending
     window_start: Array = field()  # (n_chan, n_w) int — start idx in sorted array
+    # issue #17: the Hermitian fold's per-row sign, ``+1`` for a row stored as
+    # given and ``-1`` for one stored at ``(-u, -v, -w)`` with a conjugated
+    # value. All ``+1`` when ``hermitian`` is False.
+    #
+    # ``int8``, and per *row* rather than per (channel, row), for the reason
+    # issue #23 exists: the sign of ``w`` is frequency-independent
+    # (``inv_lambda = freq / c > 0`` is monotonic, so every channel folds the
+    # same rows), so a channel axis here would carry no information while
+    # costing ``n_chan`` bytes per row -- reintroducing exactly the
+    # per-(channel, row) allocation that change deleted. One signed byte per
+    # row takes the plan from 28 B/row to 29 B/row, which is the whole memory
+    # budget of this issue and is gated in
+    # ``tests/test_planning.py::test_plan_footprint`` and
+    # ``tests/test_hermitian.py``.
+    #
+    # A leaf and not aux data: it is per-row *data*, consumed inside the JIT by
+    # ``wgridder._hermitian_conj_rows``, and it must not become part of the
+    # cache key.
+    flip_sign: Array = field()  # (n_rows,) int8, values in {+1, -1}
 
     @property
     def image_shape(self) -> tuple[int, int]:
@@ -450,6 +499,7 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.empty_plane_count,
         plan.w_extent,
         plan.is_constant_w,
+        plan.hermitian,
         plan.real_dtype,
         plan.complex_dtype,
     )
@@ -476,6 +526,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         empty_plane_count,
         w_extent,
         is_constant_w,
+        hermitian,
         real_dtype,
         complex_dtype,
     ) = aux
@@ -488,6 +539,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         phi_hat_n,
         sort_perm,
         window_start,
+        flip_sign,
     ) = children
     return WGridderPlan(
         n_l=n_l,
@@ -509,6 +561,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         empty_plane_count=empty_plane_count,
         w_extent=w_extent,
         is_constant_w=is_constant_w,
+        hermitian=hermitian,
         real_dtype=real_dtype,
         complex_dtype=complex_dtype,
         uvw_m=uvw_m,
@@ -519,6 +572,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         phi_hat_n=phi_hat_n,
         sort_perm=sort_perm,
         window_start=window_start,
+        flip_sign=flip_sign,
     )
 
 
@@ -534,6 +588,7 @@ jax.tree_util.register_pytree_node(
             p.phi_hat_n,
             p.sort_perm,
             p.window_start,
+            p.flip_sign,
         ),
         _plan_aux(p),
     ),
@@ -789,6 +844,7 @@ def make_plan(
     epsilon: float,
     *,
     dtype: DTypeLike = jnp.float64,
+    hermitian: bool = True,
     phi_hat_n_fine: int = 4096,
     phi_hat_oversample: int | None = None,
     _force_generic: bool = False,
@@ -806,6 +862,20 @@ def make_plan(
     matching real/complex dtypes (see ``plan.real_dtype`` /
     ``plan.complex_dtype``). float64 requires ``jax_enable_x64``; float32
     warns for ``epsilon < 1e-5``, which single precision cannot reach.
+
+    ``hermitian`` (issue #17, ``True`` by default) applies the conjugate-
+    symmetry fold: every row with ``w < 0`` is stored at ``(-u, -v, -w)`` and
+    its sign recorded in ``plan.flip_sign``, so the plan's w-range is
+    ``[0, max|w|]`` rather than ``[min w, max w]``. On any roughly symmetric
+    w-distribution that halves ``w_extent`` and the inner plane count -- on
+    MWA_extended off30 at ``epsilon = 1e-6``, ``n_w`` goes 251 -> 134. The
+    identity it rests on, ``V(-u, -v, -w) = conj(V(u, v, w))``, holds for a
+    **real sky only**: :func:`jax_nufft.dirty2vis` therefore refuses a complex
+    image on a folded plan and points at ``hermitian=False``, while
+    :func:`jax_nufft.vis2dirty` is unrestricted (its output is the real part,
+    and ``Re[v z] == Re[conj(v) conj(z)]`` identically). Pass
+    ``hermitian=False`` for a complex sky, or to reproduce the pre-#17 plan
+    geometry.
 
     ``_force_generic`` is a private test-only escape hatch that skips the
     v0.1.2 constant-w fast path even when ``w_extent == 0``, building the
@@ -834,6 +904,48 @@ def make_plan(
     # before ``jnp.asarray`` gets a chance to truncate anything.
     real_dtype, complex_dtype = _resolve_plan_dtypes(dtype)
     uvw_arr, freq_arr = _coerce_uvw_freq_dtype(uvw, freq, real_dtype)
+
+    # --- issue #17: the Hermitian w-sign fold ---
+    # For a real sky the visibility function is conjugate-symmetric,
+    #
+    #     V(-u, -v, -w) = conj(V(u, v, w))
+    #
+    # ([TMS2017] ch. 3; [Arras+2021] sec. 2 eq. 19 states it for the w-stacking
+    # measurement equation), so a row measured at ``w < 0`` carries exactly the
+    # information of its reflection at ``-w`` and may be *stored* there. Fold
+    # every such row and the plan's w-range becomes ``[0, max|w|]`` instead of
+    # ``[min w, max w]``: for any roughly symmetric w-distribution (every
+    # fixture here, and any full track) that halves ``w_extent``, hence
+    # ``n_w_inner = ceil(w_extent * max|n-1+nshift| / x0)``, hence the plane
+    # loop. It composes with issue #16's ``nshift`` -- that halves the second
+    # factor, this the first -- and the two together are the 4x separating
+    # ducc0's plane count from v0.1.2's on MWA_extended off30.
+    #
+    # All three columns flip. Negating ``w`` alone is a different (and wrong)
+    # operator that would still halve the w-extent and still pass every
+    # plane-count gate, so this is stated as one multiply by a per-row sign.
+    #
+    # This happens *here*, immediately after the dtype coercion and before
+    # anything reads a coordinate, precisely so that nothing below has to know
+    # about it: ``w_min_all`` / ``w_max_all``, ``w0``, ``nshift``'s companion
+    # ``max_abs_nm1`` (image-side, untouched), the plane centres, ``sort_perm``
+    # and every window boundary are computed from the folded baselines as a
+    # matter of course. The one thing that must not be folded is the caller's
+    # row *order*: ``flip_sign`` stays aligned with the input rows so the
+    # operators can put the conjugation back per row.
+    #
+    # The sign is read off the *cast* array, not the caller's: it is the stored
+    # w that has to come out non-negative, and a value that underflows to -0.0
+    # in a float32 plan is not a row the fold can usefully move.
+    if hermitian:
+        flip_sign_np = np.where(uvw_arr[:, 2] < 0, -1, 1).astype(np.int8)
+        # Exact: multiplication by +-1 is exact in IEEE arithmetic, so the
+        # stored baselines are the input's own bits with a sign flipped, and no
+        # accuracy is spent on the fold.
+        uvw_arr = uvw_arr * flip_sign_np[:, None].astype(real_dtype)
+    else:
+        flip_sign_np = np.ones(uvw_arr.shape[0], dtype=np.int8)
+
     n_rows = uvw_arr.shape[0]
     n_chan = freq_arr.shape[0]
 
@@ -1322,6 +1434,7 @@ def make_plan(
         # over constant-w data, this stays False so downstream selectors
         # (Part 4 auto, etc.) see the actual structure of this plan.
         is_constant_w=use_fast_path,
+        hermitian=bool(hermitian),
         real_dtype=real_dtype,
         complex_dtype=complex_dtype,
         uvw_m=jnp.asarray(uvw_arr),
@@ -1332,6 +1445,7 @@ def make_plan(
         phi_hat_n=jnp.asarray(phi_hat_n_np),
         sort_perm=jnp.asarray(sort_perm_np),
         window_start=jnp.asarray(window_start_np),
+        flip_sign=jnp.asarray(flip_sign_np),
     )
 
 

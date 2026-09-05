@@ -46,6 +46,14 @@ the ducc parity tests — and `vis2dirty` also takes an optional
 `weights` arg (`(n_rows, n_chan)` real) that is multiplied into
 visibilities before gridding (matches ducc's `wgt`).
 
+Since issue #17 `make_plan` also takes `hermitian=True/False`
+(defaulting to `True`): with the fold on, rows with `w < 0` are stored
+at `(-u, -v, -w)` with the conjugation put back per row at call time,
+which halves the w-extent and the inner plane count. It is valid for a
+**real** sky only, so `dirty2vis` refuses a complex image on a folded
+plan and names `hermitian=False` in the message; `vis2dirty` is
+unrestricted, its output being the real part.
+
 ---
 
 ## 2. Five-minute tour
@@ -146,7 +154,7 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale, nshift, w0,
   max_window_size, window_padding_overhead, live_row_count,
   empty_plane_count, w_extent,
-  is_constant_w, real_dtype, complex_dtype`) live in the pytree
+  is_constant_w, hermitian, real_dtype, complex_dtype`) live in the pytree
   aux_data and become part of the JIT cache key. This list must
   match `_plan_aux` in `planning.py` exactly — drift here is the
   most common source of "silent pytree corruption" bugs.
@@ -159,9 +167,15 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   follow-up) is the w-range midpoint: the plane loop works in
   `delta = w - w0` so no phase it exponentiates scales with the
   absolute w, and the constant part leaves as the `w0_screen` leaf.
+  `hermitian` (issue #17) records whether the plan applied the
+  conjugate-symmetry fold; it changes the plane grid *and* conjugates a
+  subset of rows, so a folded and an unfolded plan over the same inputs
+  are different operators and must not share a cache entry. It is also
+  read before the JIT boundary, by `dirty2vis`, to refuse a complex
+  image.
 * Plan **traced fields** (`uvw_m, inv_lambda, w_centers_rel,
-  n_minus_1_shifted, w0_screen, phi_hat_n, sort_perm, window_start`
-  — 8 leaves, in that flatten order) are JAX device arrays.
+  n_minus_1_shifted, w0_screen, phi_hat_n, sort_perm, window_start,
+  flip_sign` — 9 leaves, in that flatten order) are JAX device arrays.
   `uvw_m` is `(n_rows, 3)` in **metres**, in input row order, and
   `inv_lambda` is `(n_chan,)` = `freq / c` (issue #23). Nothing per
   `(channel, row)` is stored: the per-channel FINUFFT coordinates and
@@ -177,6 +191,17 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   the sort is by w in metres, so the permutation is
   channel-independent and the windowed helpers gather
   `uvw_m[sort_perm]` once per call.
+  `flip_sign` (issue #17) is `(n_rows,)` **int8** in `{+1, -1}`, `-1`
+  marking a row the Hermitian fold stored at `(-u, -v, -w)`; `uvw_m` is
+  the folded array, so everything downstream of it — the w-range, `w0`,
+  `sort_perm`, the windows — sees the folded geometry as a matter of
+  course. One signed byte per row and no channel axis: `freq/c > 0` is
+  monotonic, so the sign of `w` is frequency-independent and a
+  `(n_chan, n_rows)` form would carry no information while
+  reintroducing the per-`(channel, row)` allocation issue #23 deleted.
+  The operators put the conjugation back per row: the forward on its
+  **output**, the adjoint on its **input**, and the windowed adjoint
+  against `flip_sign[sort_perm]` because its visibilities arrive sorted.
   `n_minus_1_shifted` (issue #16) is `n_minus_1 + nshift` and is the
   grid the per-plane phase and the `phi_hat` argument are evaluated
   on; the adjoint's `1/n` output factor must keep using the *unshifted*
@@ -204,8 +229,11 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   diagnostic and kept them **scalars** for the same reason — two static
   ints is the whole budget, and reintroducing a `(n_chan, n_w)` array
   in any form would undo #23. `tests/test_planning.py` pins the leaf
-  set at eight entries, which is what makes that a checked constraint
-  rather than an intention.
+  set at nine entries (eight before issue #17), which is what makes that
+  a checked constraint rather than an intention; the float64 plan's
+  row-proportional cost is 29 B/row (`uvw_m` 24 + `sort_perm` 4 +
+  `flip_sign` 1) and `tests/test_hermitian.py` gates the per-row and
+  per-channel slopes separately.
 * This split is **load-bearing**: changing which fields are static vs
   traced affects JIT cache behaviour, error messages, and trace
   reuse. If you add a field, decide aux vs leaf deliberately and
@@ -222,11 +250,13 @@ benchmark numbers in the README reflect this steady-state regime.
 The windowed strategies rely on a contract between
 `planning.make_plan` and `wgridder._channel_*_windowed`:
 
-* `plan.sort_perm` is `argsort(uvw[:, 2])` (ascending, stable). The
-  sort key is w in *metres*, so the same permutation serves every
-  channel (`freq[c]/c > 0` is monotonic) — which is why no sorted
-  coordinate array is stored and the helpers gather
-  `plan.uvw_m[plan.sort_perm]` once per call (issue #23).
+* `plan.sort_perm` is `argsort(plan.uvw_m[:, 2])` (ascending, stable) —
+  the baselines **as stored**, i.e. after issue #17's fold on a
+  `hermitian=True` plan, not the caller's raw `uvw`. The sort key is w
+  in *metres*, so the same permutation serves every channel
+  (`freq[c]/c > 0` is monotonic) — which is why no sorted coordinate
+  array is stored and the helpers gather `plan.uvw_m[plan.sort_perm]`
+  once per call (issue #23).
 * `plan.window_start[c, k]` is the start index in the sorted array
   for the rows inside `[w_centers[k] - W/2 * dw, w_centers[k] + W/2 * dw]`.
   **Invariant: every window contains every row the dense path gives a
@@ -354,10 +384,28 @@ demonstrated tie. Note also that the 1.05-1.53x range in section 9 does not
 reproduce: its endpoints are MWA_compact off30 and MeerKAT off30, the two
 cells now measured flat.
 
+**Issue #17 narrowed which CPU fixtures reach `windowed_scan`, and the
+heuristic was not retuned for it.** The Hermitian fold halves `n_w` while
+leaving `w_kernel_width` alone, so it halves the ratio in the adjoint gate
+`n_w / W > 2` and every fixture whose unfolded ratio sat between 2 and 4
+drops under it. On the shipped geometry the float64 adjoint keeps
+`windowed_scan` only on MWA_extended off30 (ratio 19.1, `n_w` 251 → 134);
+MWA_compact off30 (2.43 → 1.71) and MeerKAT off30 (2.71 → 1.86) go back to
+`dense_scan`, as do EDA2 zenith and MWA_extended zenith on the float32 leg.
+Those are exactly the cells the paragraph above records as timing flat, so
+the fold removes the windowed adjoint where it had stopped paying and
+leaves it where it still pays — a measurement, not a design intent. On GPU
+the picks in `tests/test_default_w_strategy.py`'s table are unmoved; the
+one pick that does move is `GH200_large` at *zenith*, whose `n_w` lands on
+`W + 2` and so takes the small-`n_w` gate to `dense_vmap` where the GH200
+sweep measured `windowed_vmap` — see `_auto_w_strategy_gpu`'s docstring,
+and re-time it before trusting it.
+
 Two consequences to keep in mind when changing anything here. Retuning the
 heuristic now moves the *shipped* default, so
 `tests/test_default_w_strategy.py` pins the resolved pick for every CPU
-fixture as a literal table that a retune has to edit deliberately. And
+fixture as a literal table — keyed by plan geometry since issue #17 — that
+a retune has to edit deliberately. And
 because the strategies differ in w-plane accumulation order, they agree
 only to the 1e-11 strategy-equivalence bound
 (`tests/test_strategies_equivalent.py`) rather than bit-for-bit.
@@ -403,10 +451,11 @@ pixi run -e dev typecheck              # mypy (best-effort)
 
   | Comparison                                   | Bound          | Measured (this repo, 2026-09 review)       |
   |-----------------------------------------------|----------------|---------------------------------------------|
-  | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; `0.67x eps` worst cell after it; `1.47x eps` worst cell after #16's nshift centring (MWA_extended off30, eps=1e-12, adjoint) -- still inside the contract, but the headroom is now ~1.4x, not ~3x |
+  | vs. exact DFT (forward + adjoint)              | `err < 2 * eps`  | ~4x eps at `1e-6..1e-8` before #9's width-rule fix; `0.67x eps` worst cell after it; `1.47x eps` worst cell after #16's nshift centring (MWA_extended off30, eps=1e-12, adjoint) -- still inside the contract, but the headroom is now ~1.4x, not ~3x; `1.48x eps` on the same cell after #17's Hermitian fold, i.e. the fold is an exact identity and spends none of that headroom |
   | vs. ducc0 (forward + adjoint, constant-w fast path) | `err < 3 * eps`  | ducc0 lands at `~0.1 * eps` against the DFT; the `3 * eps` gap is dominated by our own `2 * eps` budget |
   | Strategy equivalence (`w_strategy` x `channel_strategy`, `tests/test_strategies_equivalent.py`) | `err < 1e-11` (float64), `err < 1.3e-6` (float32) | worst pairwise difference between any two of the eight combinations, 3 short fixtures x eps in {1e-4,1e-6,1e-8}: float64 2.0e-13 (MWA_compact off30, eps=1e-6); float32 1.21e-7 (MWA_compact off30, eps=1e-8) -- float32 bound is ~10x that measurement, see the module docstring |
   | Adjointness (dot-product identity, dense-vs-windowed adjoint) | `err < 1e-11`  | dot-product residual 1e-16 .. 7e-13 (ducc0 itself: 1e-14 .. 8e-11, for comparison only) |
+  | `hermitian=True` vs `hermitian=False` (issue #17, `tests/test_hermitian.py`) | `err < 4 * eps` | 2.15x eps worst case over 7 review fixtures x eps in {1e-4,1e-6,1e-8,1e-10}, forward and adjoint (MWA_extended off30 at eps 1e-10). **Not** an eps-independent bound: the two settings are different *discretisations* (251 planes against 134, at different centres), not different summation orders, so what applies is the triangle inequality on the `2 * eps` DFT contract each of them meets separately -- see the row above and the module docstring. The 1e-11 row does apply across the four `w_strategy` values at a *fixed* `hermitian`. |
 
   The DFT bound is an accuracy *contract*, not a comparison -- the DFT is
   the definition of the answer, whereas ducc0 is a second implementation

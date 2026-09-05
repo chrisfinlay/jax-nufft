@@ -306,7 +306,7 @@ number of forward and adjoint calls.
 
 ## API reference
 
-### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, dtype=jnp.float64, phi_hat_n_fine=4096, phi_hat_oversample=None) -> WGridderPlan`
+### `make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, epsilon, *, dtype=jnp.float64, hermitian=True, phi_hat_n_fine=4096, phi_hat_oversample=None) -> WGridderPlan`
 
 Build the wgridder plan. Inputs are host-side numpy / jnp arrays (planning math
 runs on the host); the resulting plan holds JAX device arrays.
@@ -314,6 +314,24 @@ runs on the host); the resulting plan holds JAX device arrays.
 `dtype` fixes the precision of the whole plan — `uvw` and `freq` are cast to
 it, and the operators accept and return the matching real / complex dtypes.
 See [Precision](#precision) below.
+
+`hermitian=True` (the default) applies the conjugate-symmetry fold. For a real
+sky `V(-u, -v, -w) = conj(V(u, v, w))`, so every row with `w < 0` is stored at
+`(-u, -v, -w)` and its sign recorded in `plan.flip_sign`; the plan's w-range
+becomes `[0, max|w|]` instead of `[min w, max w]`, which halves the w-extent
+and with it the inner w-plane count on any roughly symmetric w-distribution
+(on this repository's MWA_extended off-zenith fixture at `epsilon = 1e-6`,
+`n_w` goes 251 → 134). The operators put the conjugation back per row, so the
+answer is unchanged.
+
+The identity holds for a **real** sky only. `dirty2vis` therefore raises
+`ValueError` on a complex image if the plan was folded, naming `hermitian=False`
+as the fix; the check is on the array's dtype, so a complex array with a zero
+imaginary part is refused too — pass `image.real`. `vis2dirty` has no such
+restriction: its output is the real part, and `Re[v z] == Re[conj(v) conj(z)]`
+identically, so the fold's plane-count saving applies to the adjoint
+unconditionally. Pass `hermitian=False` for a complex sky, or to reproduce the
+pre-fold plan geometry.
 
 `phi_hat_oversample=None` (the default) picks a width-dependent oversample
 suitable for the kernel chosen by `epsilon` (32 for `W <= 4`, 64 for `W <= 8`,
@@ -345,9 +363,10 @@ against a compiled executable, which does not exist at plan time.
 are kept once in metres (`plan.uvw_m`, `(n_rows, 3)`) next to one scalar per
 channel (`plan.inv_lambda = freq / c`), and the per-channel `(u, v)` FINUFFT
 coordinates and `w` in wavelengths are derived inside the JIT. A float64 plan
-is therefore about `28 * n_rows + 8 * n_chan + 32 * n_l * n_m` bytes plus the
+is therefore about `29 * n_rows + 8 * n_chan + 32 * n_l * n_m` bytes plus the
 small `n_w`-sized arrays &mdash; 2.4 MB for 16 channels &times; 10k rows at
-256&sup2;, 31 MB for 64 channels &times; 1M rows. `plan.uvw_lambda`,
+256&sup2;, 32 MB for 64 channels &times; 1M rows. (28 B/row before the
+Hermitian fold's one-byte `plan.flip_sign`.) `plan.uvw_lambda`,
 `plan.n_minus_1` and `plan.w_centers` remain readable as derived properties;
 reading `plan.uvw_lambda` materialises the full `(n_chan, n_rows, 3)` array,
 so it is for introspection, not for hot loops.
@@ -356,7 +375,9 @@ so it is for introspection, not for hot loops.
 
 Forward operator. `image` may be `(n_chan, n_l, n_m)` or `(n_l, n_m)`
 (broadcast across channels), real or complex. Output is complex
-`(n_rows, n_chan)`.
+`(n_rows, n_chan)`. A **complex** image needs a plan built with
+`hermitian=False` &mdash; see `make_plan` above &mdash; and raises `ValueError`
+otherwise.
 
 ### `vis2dirty(plan, vis, *, weights=None, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
 

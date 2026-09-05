@@ -155,14 +155,14 @@ def _offzenith_problem(real_dtype: DTypeLike, complex_dtype: DTypeLike, seed: in
         pixsize_m=4e-3,
         epsilon=EPSILON,
         dtype=real_dtype,
-        # hermitian=False (issue #17): every literal pick in this module's
-        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
-        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
-        # written in. A folded plan is a different point in the heuristic's
-        # input space, so the tables would have to be re-measured for it.
-        # Pinned here so this module keeps gating what it was calibrated
-        # against whichever way make_plan's default is set.
-        hermitian=False,
+        # hermitian=True (issue #17): the shipped geometry, passed explicitly
+        # so this fixture says the same thing whichever way make_plan's default
+        # is set. Re-measured on this branch: the fold takes n_w from 56 to 33
+        # in float64 and from 54 to 31 in float32, and moves no pick on either
+        # platform or precision leg -- so the three distinct answers this
+        # fixture exists to produce are the same ones, on the plan the library
+        # actually builds.
+        hermitian=True,
     )
     image = jnp.asarray(rng.standard_normal((64, 64)), dtype=real_dtype)
     vis = jnp.asarray(
@@ -196,14 +196,13 @@ def _plan_above_nthreads_cutoff(real_dtype: DTypeLike, complex_dtype: DTypeLike,
         pixsize_m=0.005,
         epsilon=EPSILON,
         dtype=real_dtype,
-        # hermitian=False (issue #17): every literal pick in this module's
-        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
-        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
-        # written in. A folded plan is a different point in the heuristic's
-        # input space, so the tables would have to be re-measured for it.
-        # Pinned here so this module keeps gating what it was calibrated
-        # against whichever way make_plan's default is set.
-        hermitian=False,
+        # hermitian=True (issue #17): the shipped geometry, passed explicitly.
+        # This plan's w spans +-3 m, so n_w is at make_plan's one-interior-step
+        # floor with or without the fold (8 in float64, 6 in float32) and the
+        # fold changes nothing here at all -- which is the point: what this
+        # fixture is for is the thread-default rule, and it should exercise it
+        # on the plan a caller who says nothing gets.
+        hermitian=True,
     )
     image = jnp.asarray(rng.standard_normal((16, 16)), dtype=real_dtype)
     vis = jnp.asarray(
@@ -248,13 +247,23 @@ def _large_row_windowed_problem(real_dtype: DTypeLike, complex_dtype: DTypeLike,
         pixsize_m=0.004,
         epsilon=EPSILON,
         dtype=real_dtype,
-        # hermitian=False (issue #17): every literal pick in this module's
-        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
-        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
-        # written in. A folded plan is a different point in the heuristic's
-        # input space, so the tables would have to be re-measured for it.
-        # Pinned here so this module keeps gating what it was calibrated
-        # against whichever way make_plan's default is set.
+        # hermitian=False (issue #17), and unlike the two fixtures above this
+        # one cannot simply move to the shipped geometry. Its entire purpose is
+        # to be the one plan in the suite that the GPU heuristic resolves to
+        # ``windowed_vmap``, which needs ``n_w > w_kernel_width + 2``; the fold
+        # halves the w-extent, taking n_w from 11 to 9 in float64 and from 9 to
+        # 7 in float32 -- exactly ``W + 2`` in both -- so a folded version of
+        # this fixture resolves to ``dense_vmap`` and ``windowed_vmap`` becomes
+        # unreachable through the public wrapper (which
+        # ``test_boundary_grid_covers_every_canonical_name`` exists to forbid).
+        # The uvw spread could be doubled to restore it, but that would move
+        # every number in this fixture's docstring for no gain: what the
+        # boundary grid checks is that the wrapper forwards the resolved name
+        # unchanged, which is a property of the wrapper and not of the plan
+        # geometry. Note the pick is still asserted rather than assumed -- if
+        # this plan stops resolving to ``windowed_vmap``,
+        # ``test_default_forwards_every_canonical_name_across_the_wrapper``
+        # fails rather than silently covering one name fewer.
         hermitian=False,
     )
     image = jnp.asarray(rng.standard_normal((48, 48)), dtype=real_dtype)
@@ -578,17 +587,41 @@ def test_default_forwards_every_canonical_name_across_the_wrapper(
 # because ``eps`` (1e-6 vs 1e-4) and ``dtype`` change ``n_w`` and
 # ``w_kernel_width``, which are the heuristic's inputs.
 #
+# Keyed by ``hermitian`` too (issue #17), because the fold is not a small
+# perturbation of these picks: it halves ``n_w``, which is the numerator of the
+# adjoint gate ``n_w / w_kernel_width > 2``, and four of the fourteen
+# (fixture, direction) cells cross that gate as a result.
+#
 # Measured on this branch with the platform pinned to CPU:
-#   float64/1e-6: EDA2 zen n_w=14 W=7 pad=2.00, MWA_compact zen n_w=8 pad=1.14,
-#     MWA_compact off30 n_w=17 pad=2.37, MWA_extended zen n_w=14 pad=2.00,
-#     MWA_extended off30 n_w=251 pad=5.26, MeerKAT zen n_w=8 pad=1.14,
-#     MeerKAT off30 n_w=19 pad=2.61.
-#   float32/1e-4: same fixtures at W=5, n_w 12/6/15/12/249/6/17.
-# The pattern in both legs: the forward never leaves ``dense_scan`` (the CPU
-# heuristic has no forward windowed win to claim -- v0.1.1 Part 2 measured
-# "~flat on forward"), and the adjoint switches to ``windowed_scan`` where the
-# w-extent is large enough for the windowed slice to pay
-# (n_w / w_kernel_width > 2).
+#   float64/1e-6, hermitian=False: EDA2 zen n_w=14 W=7 pad=2.00,
+#     MWA_compact zen n_w=8 pad=1.14, MWA_compact off30 n_w=17 pad=2.37,
+#     MWA_extended zen n_w=14 pad=2.00, MWA_extended off30 n_w=251 pad=5.26,
+#     MeerKAT zen n_w=8 pad=1.14, MeerKAT off30 n_w=19 pad=2.61.
+#   float64/1e-6, hermitian=True: n_w 11/8/12/11/134/8/13, pad
+#     1.57/1.14/1.71/1.57/4.94/1.14/1.86.
+#   float32/1e-4, hermitian=False: same fixtures at W=5, n_w 12/6/15/12/249/6/17.
+#   float32/1e-4, hermitian=True: W=5, n_w 9/6/10/9/132/6/11.
+# The pattern in both legs and both geometries: the forward never leaves
+# ``dense_scan`` (the CPU heuristic has no forward windowed win to claim --
+# v0.1.1 Part 2 measured "~flat on forward"), and the adjoint switches to
+# ``windowed_scan`` where the w-extent is large enough for the windowed slice
+# to pay (n_w / w_kernel_width > 2).
+#
+# What the fold changes is how many fixtures clear that ratio, and it is a
+# consistent story rather than four unrelated flips: halving ``n_w`` while
+# leaving ``W`` alone halves the ratio, so every fixture whose unfolded ratio
+# sat between 2 and 4 drops below the gate. In float64 those are MWA_compact
+# off30 (2.43 -> 1.71) and MeerKAT off30 (2.71 -> 1.86); in float32, EDA2
+# zenith (2.4 -> 1.8), MWA_compact off30 (3.0 -> 2.0, the strict ``>``
+# rejecting the tie) and MWA_extended zenith (2.4 -> 1.8). MWA_extended off30
+# keeps ``windowed_scan`` on both legs by a wide margin (35.9 -> 19.1 in
+# float64), and it is the only fixture AGENTS.md section 9 still measures a
+# windowed adjoint win on -- the other two that move here, MWA_compact off30
+# and MeerKAT off30, are the two that section 9's own re-measurement found
+# flat to within a +-4% noise floor. So the fold takes ``windowed_scan`` off
+# exactly the fixtures where it had stopped paying, which is the direction a
+# retune would have wanted anyway; it is recorded here as a measurement, not
+# claimed as a design intent.
 #
 # What that switch is worth on current code is *smaller* than the 1.05-1.53x
 # AGENTS.md section 9 records for v0.1.1 Part 2, and that range should not be
@@ -609,29 +642,63 @@ _CPU_FIXTURES: list[tuple[Telescope, float]] = [
     (MEERKAT, 30.0),
 ]
 
-_EXPECTED_CPU_AUTO_F64: dict[tuple[str, float], tuple[str, str]] = {
-    # (telescope name, zenith angle) -> (forward pick, adjoint pick)
-    ("EDA2", 0.0): ("dense_scan", "dense_scan"),
-    ("MWA_compact", 0.0): ("dense_scan", "dense_scan"),
-    ("MWA_compact", 30.0): ("dense_scan", "windowed_scan"),
-    ("MWA_extended", 0.0): ("dense_scan", "dense_scan"),
-    ("MWA_extended", 30.0): ("dense_scan", "windowed_scan"),
-    ("MeerKAT", 0.0): ("dense_scan", "dense_scan"),
-    ("MeerKAT", 30.0): ("dense_scan", "windowed_scan"),
+_EXPECTED_CPU_AUTO_F64: dict[bool, dict[tuple[str, float], tuple[str, str]]] = {
+    # hermitian -> (telescope name, zenith angle) -> (forward, adjoint)
+    False: {
+        ("EDA2", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_compact", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_compact", 30.0): ("dense_scan", "windowed_scan"),
+        ("MWA_extended", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_extended", 30.0): ("dense_scan", "windowed_scan"),
+        ("MeerKAT", 0.0): ("dense_scan", "dense_scan"),
+        ("MeerKAT", 30.0): ("dense_scan", "windowed_scan"),
+    },
+    # The shipped geometry. MWA_compact off30 (ratio 2.43 -> 1.71) and MeerKAT
+    # off30 (2.71 -> 1.86) fall below the adjoint's ``n_w / W > 2`` gate; the
+    # only fixture still on ``windowed_scan`` is MWA_extended off30, which
+    # clears it 19.1 to 2.
+    True: {
+        ("EDA2", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_compact", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_compact", 30.0): ("dense_scan", "dense_scan"),
+        ("MWA_extended", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_extended", 30.0): ("dense_scan", "windowed_scan"),
+        ("MeerKAT", 0.0): ("dense_scan", "dense_scan"),
+        ("MeerKAT", 30.0): ("dense_scan", "dense_scan"),
+    },
 }
-_EXPECTED_CPU_AUTO_F32: dict[tuple[str, float], tuple[str, str]] = {
-    # Only EDA2 zenith and MWA_extended zenith differ from the float64 leg:
-    # the kernel width is the *denominator* of the heuristic's ratio, so the
-    # narrower float32 kernel (W=5 against 7) raises n_w / w_kernel_width past
-    # the adjoint's cutoff of 2 at those two fixtures -- 14/7 = 2.0 in float64,
-    # which the strict ``>`` rejects, against 12/5 = 2.4 in float32.
-    ("EDA2", 0.0): ("dense_scan", "windowed_scan"),
-    ("MWA_compact", 0.0): ("dense_scan", "dense_scan"),
-    ("MWA_compact", 30.0): ("dense_scan", "windowed_scan"),
-    ("MWA_extended", 0.0): ("dense_scan", "windowed_scan"),
-    ("MWA_extended", 30.0): ("dense_scan", "windowed_scan"),
-    ("MeerKAT", 0.0): ("dense_scan", "dense_scan"),
-    ("MeerKAT", 30.0): ("dense_scan", "windowed_scan"),
+_EXPECTED_CPU_AUTO_F32: dict[bool, dict[tuple[str, float], tuple[str, str]]] = {
+    # Unfolded: only EDA2 zenith and MWA_extended zenith differ from the
+    # float64 leg -- the kernel width is the *denominator* of the heuristic's
+    # ratio, so the narrower float32 kernel (W=5 against 7) raises
+    # n_w / w_kernel_width past the adjoint's cutoff of 2 at those two fixtures
+    # (14/7 = 2.0 in float64, which the strict ``>`` rejects, against
+    # 12/5 = 2.4 in float32).
+    False: {
+        ("EDA2", 0.0): ("dense_scan", "windowed_scan"),
+        ("MWA_compact", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_compact", 30.0): ("dense_scan", "windowed_scan"),
+        ("MWA_extended", 0.0): ("dense_scan", "windowed_scan"),
+        ("MWA_extended", 30.0): ("dense_scan", "windowed_scan"),
+        ("MeerKAT", 0.0): ("dense_scan", "dense_scan"),
+        ("MeerKAT", 30.0): ("dense_scan", "windowed_scan"),
+    },
+    # Folded, the same narrower kernel now works the other way: it is the
+    # *denominator*, so it cannot rescue a halved ``n_w``. EDA2 zenith
+    # (2.4 -> 1.8), MWA_compact off30 (3.0 -> 2.0, the tie rejected by the
+    # strict ``>``) and MWA_extended zenith (2.4 -> 1.8) all drop below the
+    # gate; MeerKAT off30 keeps ``windowed_scan`` at 2.2 where its float64
+    # counterpart falls to 1.86, which is the one cell where the two precision
+    # legs still differ on this geometry.
+    True: {
+        ("EDA2", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_compact", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_compact", 30.0): ("dense_scan", "dense_scan"),
+        ("MWA_extended", 0.0): ("dense_scan", "dense_scan"),
+        ("MWA_extended", 30.0): ("dense_scan", "windowed_scan"),
+        ("MeerKAT", 0.0): ("dense_scan", "dense_scan"),
+        ("MeerKAT", 30.0): ("dense_scan", "windowed_scan"),
+    },
 }
 _EXPECTED_CPU_AUTO = _EXPECTED_CPU_AUTO_F64 if X64 else _EXPECTED_CPU_AUTO_F32
 
@@ -642,11 +709,13 @@ _EXPECTED_CPU_AUTO = _EXPECTED_CPU_AUTO_F64 if X64 else _EXPECTED_CPU_AUTO_F32
     ids=[f"{t.name}_{'zenith' if a == 0 else f'off{int(a)}'}" for t, a in _CPU_FIXTURES],
 )
 @pytest.mark.parametrize("is_adjoint", [False, True], ids=["forward", "adjoint"])
+@pytest.mark.parametrize("hermitian", [False, True], ids=["unfolded", "folded"])
 def test_cpu_default_resolves_to_expected_strategy(
     monkeypatch: pytest.MonkeyPatch,
     telescope: Telescope,
     zenith_deg: float,
     is_adjoint: bool,
+    hermitian: bool,
     real_dtype: DTypeLike,
 ) -> None:
     """The resolved default for every repository CPU fixture, both directions.
@@ -654,6 +723,14 @@ def test_cpu_default_resolves_to_expected_strategy(
     Host-side only (``make_plan`` plus the heuristic, no transform), which is
     why this is not gated behind ``--runslow`` even for the long-baseline
     fixtures: nothing here runs FINUFFT.
+
+    Both plan geometries (issue #17), passed explicitly so the table says the
+    same thing whichever way ``make_plan``'s default is set. The ``folded`` leg
+    is the shipped one and is what a caller who says nothing gets; the
+    ``unfolded`` leg is kept because it is free here and because the two
+    columns together show *why* the picks move -- the fold halves ``n_w``, the
+    numerator of the adjoint's ratio gate, and nothing else the heuristic reads
+    changes.
     """
     _patch_platform(monkeypatch, "cpu")
     uvw = synthetic_uvw(telescope, zenith_deg, seed=0)
@@ -665,19 +742,13 @@ def test_cpu_default_resolves_to_expected_strategy(
         pixsize_m=telescope.pixsize,
         epsilon=EPSILON,
         dtype=real_dtype,
-        # hermitian=False (issue #17): every literal pick in this module's
-        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
-        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
-        # written in. A folded plan is a different point in the heuristic's
-        # input space, so the tables would have to be re-measured for it.
-        # Pinned here so this module keeps gating what it was calibrated
-        # against whichever way make_plan's default is set.
-        hermitian=False,
+        hermitian=hermitian,
     )
-    expected = _EXPECTED_CPU_AUTO[(telescope.name, zenith_deg)][1 if is_adjoint else 0]
+    assert plan.hermitian is hermitian
+    expected = _EXPECTED_CPU_AUTO[hermitian][(telescope.name, zenith_deg)][1 if is_adjoint else 0]
     resolved = _canonicalise_w_strategy("auto", plan=plan, is_adjoint=is_adjoint)
     assert resolved == expected, (
-        f"{telescope.name} zen={zenith_deg:g} "
+        f"{telescope.name} zen={zenith_deg:g} hermitian={hermitian} "
         f"{'adjoint' if is_adjoint else 'forward'} (n_w={plan.n_w}, "
         f"W={plan.w_kernel_width}, padding_overhead="
         f"{plan.window_padding_overhead:.4f}): the default now resolves to "
@@ -698,31 +769,64 @@ def test_cpu_default_resolves_to_expected_strategy(
 # Measured on a real GH200 (issue #46's hardware) and reproduced here from
 # the plan alone, which is host-side and therefore checkable off-GPU:
 #
-#   MWA_extended off30  n_w=251  fwd dense_vmap  adj dense_vmap
-#   MeerKAT off30       n_w=19   fwd dense_vmap  adj dense_vmap
-#   GH200_large off30   n_w=43   fwd dense_vmap  adj windowed_vmap
+#   fixture             n_w off/on   fwd           adj
+#   MWA_extended off30    251 / 134  dense_vmap    dense_vmap
+#   MeerKAT off30          19 /  13  dense_vmap    dense_vmap
+#   GH200_large off30      43 /  26  dense_vmap    windowed_vmap
 #
 # GH200_large is the interesting row and the reason it is worth its size: it
 # is the only fixture where the two directions *disagree*, so it is what pins
 # the ``is_adjoint and n_rows >= _GPU_LARGE_N_ROWS -> windowed_vmap`` gate.
 # Without it nothing in the suite reaches that branch on real hardware.
 #
+# Issue #17's fold halves every ``n_w`` in that table and moves **no pick** --
+# on either precision leg. That is not luck on all three rows: MWA_extended
+# and MeerKAT are 600-row plans, which the ``n_rows >= 10_000`` gate sends to
+# ``dense_vmap`` whatever their w-geometry, so only GH200_large can move at
+# all. It stays because 26 planes still clears ``W + 2`` (9) comfortably and
+# its padding overhead is 2.739 against the 3.0 cutoff (2.782 in float32,
+# against 2.685 unfolded -- the one cell here the fold nudges *up*, since
+# ``max_window_size`` falls more slowly than ``n_w``).
+#
+# The one GPU pick in the repository that the fold *does* move is not in this
+# table: GH200_large at **zenith**, where ``n_w`` drops by exactly one plane
+# onto ``W + 2`` at every epsilon of ``tests/test_padding_overhead.py``'s
+# calibration grid (7->6 at eps 1e-3, 10->9 at 1e-6, 13->12 at 1e-9, 16->15 at
+# 1e-12), so the small-``n_w`` gate fires and both directions go
+# ``windowed_vmap -> dense_vmap``. The GH200 baseline sweep measured
+# ``windowed_vmap`` as the winner for that fixture's zenith adjoint, so this is
+# a pick worth re-timing on hardware rather than one to assume is still right;
+# ``_auto_w_strategy_gpu``'s docstring records it. The forward at off30 also
+# crosses ``n_w <= 3 * W`` at eps 1e-9 and 1e-12 (46->29, 49->32), going the
+# other way to ``windowed_vmap``. Neither epsilon nor pointing is reachable
+# through this table, which is at ``EPSILON`` and 30 degrees.
+#
 # The picks are the same on both precision legs (float64/eps 1e-6 and
-# float32/eps 1e-4), so unlike the CPU table this one is not precision-keyed.
-# The cell closest to a boundary is MeerKAT off30 in float32, whose padding
-# overhead reads 2.992 against a 3.0 cutoff; crossing it would send the
-# adjoint to ``dense_vmap``, which is what this table already expects, so
-# even that crossing would not silently change an answer here.
-_EXPECTED_GPU_AUTO: list[tuple[Telescope, str, str]] = [
-    # telescope (all at 30 deg off-zenith) -> (forward pick, adjoint pick)
-    (MWA_EXTENDED, "dense_vmap", "dense_vmap"),
-    (MEERKAT, "dense_vmap", "dense_vmap"),
-    (GH200_LARGE, "dense_vmap", "windowed_vmap"),
+# float32/eps 1e-4) in both geometries, so unlike the CPU table this one is
+# not precision-keyed. The cell closest to a boundary is MeerKAT off30
+# unfolded in float32, whose padding overhead reads 2.992 against a 3.0
+# cutoff; crossing it would send the adjoint to ``dense_vmap``, which is what
+# this table already expects, so even that crossing would not silently change
+# an answer here. Folded, the same cell reads 2.174 and is no longer near it.
+_EXPECTED_GPU_AUTO: list[tuple[Telescope, bool, str, str]] = [
+    # telescope (all at 30 deg off-zenith), hermitian -> (forward, adjoint)
+    (MWA_EXTENDED, False, "dense_vmap", "dense_vmap"),
+    (MWA_EXTENDED, True, "dense_vmap", "dense_vmap"),
+    (MEERKAT, False, "dense_vmap", "dense_vmap"),
+    (MEERKAT, True, "dense_vmap", "dense_vmap"),
+    (GH200_LARGE, False, "dense_vmap", "windowed_vmap"),
+    (GH200_LARGE, True, "dense_vmap", "windowed_vmap"),
 ]
 
 
-def _gpu_plan(tel: Telescope, real_dtype: DTypeLike):
-    """Plan for ``tel`` at 30 deg off-zenith. Host-side numpy only."""
+def _gpu_plan(tel: Telescope, real_dtype: DTypeLike, *, hermitian: bool):
+    """Plan for ``tel`` at 30 deg off-zenith. Host-side numpy only.
+
+    ``hermitian`` is explicit (issue #17) so the table above says the same
+    thing whichever way ``make_plan``'s default is set, and both geometries are
+    swept: the folded one because it is what ships, the unfolded one because
+    the pair is the evidence that the fold moves no pick here.
+    """
     return make_plan(
         uvw=synthetic_uvw(tel, 30.0, seed=0),
         freq=np.array([tel.freq_hz]),
@@ -731,25 +835,19 @@ def _gpu_plan(tel: Telescope, real_dtype: DTypeLike):
         pixsize_m=tel.pixsize,
         epsilon=EPSILON,
         dtype=real_dtype,
-        # hermitian=False (issue #17): every literal pick in this module's
-        # tables was measured on the UNFOLDED plan geometry, and the Hermitian
-        # w-sign fold halves n_w -- the quantity the heuristic's cutoffs are
-        # written in. A folded plan is a different point in the heuristic's
-        # input space, so the tables would have to be re-measured for it.
-        # Pinned here so this module keeps gating what it was calibrated
-        # against whichever way make_plan's default is set.
-        hermitian=False,
+        hermitian=hermitian,
     )
 
 
 @pytest.mark.runbench_gpu
 @pytest.mark.parametrize(
-    ("telescope", "expected_forward", "expected_adjoint"),
+    ("telescope", "hermitian", "expected_forward", "expected_adjoint"),
     _EXPECTED_GPU_AUTO,
-    ids=[t.name for t, _, _ in _EXPECTED_GPU_AUTO],
+    ids=[f"{t.name}-{'folded' if h else 'unfolded'}" for t, h, _, _ in _EXPECTED_GPU_AUTO],
 )
 def test_gpu_default_resolves_to_the_expected_strategy(
     telescope: Telescope,
+    hermitian: bool,
     expected_forward: str,
     expected_adjoint: str,
     real_dtype: DTypeLike,
@@ -783,11 +881,12 @@ def test_gpu_default_resolves_to_the_expected_strategy(
     check below deliberately uses only the small fixture.
     """
     assert jax.default_backend() == "gpu", "the runbench_gpu gate should guarantee this"
-    plan = _gpu_plan(telescope, real_dtype)
+    plan = _gpu_plan(telescope, real_dtype, hermitian=hermitian)
     for is_adjoint, expected in ((False, expected_forward), (True, expected_adjoint)):
         resolved = _canonicalise_w_strategy("auto", plan=plan, is_adjoint=is_adjoint)
         assert resolved == expected, (
-            f"{telescope.name} off30 {'adjoint' if is_adjoint else 'forward'} "
+            f"{telescope.name} off30 hermitian={hermitian} "
+            f"{'adjoint' if is_adjoint else 'forward'} "
             f"(n_w={plan.n_w}, W={plan.w_kernel_width}, n_rows={plan.n_rows}, "
             f"padding_overhead={plan.window_padding_overhead:.4f}): the GPU default "
             f"resolved to {resolved!r}, but this table says {expected!r}. A scan-family "
@@ -809,11 +908,16 @@ def test_gpu_default_matches_the_explicit_resolved_end_to_end(
     The resolution test above is host-side; this runs the real transform so
     there is one end-to-end statement about the GPU path rather than only a
     statement about the heuristic. Uses ``MWA_extended`` off30 alone -- the
-    headline row of the issue's table (n_w=251) at 256^2 and 600 rows, so
-    four transforms here are cheap; ``GH200_large`` is deliberately excluded.
+    headline row of the issue's table (n_w=134 folded, 251 unfolded) at 256^2
+    and 600 rows, so four transforms here are cheap; ``GH200_large`` is
+    deliberately excluded.
+
+    ``hermitian=True``: the shipped geometry, and the one whose per-row
+    conjugation (issue #17) the GPU path has never been exercised on. The image
+    below is real, which a folded plan requires of ``dirty2vis``.
     """
     assert jax.default_backend() == "gpu", "the runbench_gpu gate should guarantee this"
-    plan = _gpu_plan(MWA_EXTENDED, real_dtype)
+    plan = _gpu_plan(MWA_EXTENDED, real_dtype, hermitian=True)
     rng = np.random.default_rng(0)
     image = jnp.asarray(
         rng.standard_normal((MWA_EXTENDED.n_pix, MWA_EXTENDED.n_pix)), dtype=real_dtype
