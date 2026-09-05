@@ -999,8 +999,11 @@ def test_padding_overhead_is_never_below_one() -> None:
 # (issue #17), because the fold moves every cell and only one of the two is
 # what ships.
 #
-# Corrected-metric measurements, float64 (the float32 leg, ten cells at
-# eps 1e-3, agrees to <0.3% unfolded and to <0.05% folded):
+# Corrected-metric measurements, float64. The float32 leg runs ten of these
+# cells (eps 1e-3) and agrees with the float64 figures to within 0.19%
+# unfolded (worst EDA2 zenith) and 0.13% folded (worst EDA2 off30, 2.6169
+# against 2.6202); the high-overhead cell agrees to 0.13% unfolded and 0.04%
+# folded, which is why the bands below are per-geometry but not per-precision:
 #
 #                        every cell except      MWA_extended off30
 #                        MWA_extended off30
@@ -1024,8 +1027,9 @@ def test_padding_overhead_is_never_below_one() -> None:
 # clearing the worst cell by 3.7% to clearing it by 18.2%. Re-fitting it onto
 # the folded maximum would be a fresh calibration on one draw rather than a
 # restatement, and the seed sweep at the bottom of this file is why that would
-# be a bad one: folded, MWA_extended off30 at eps 1e-3 spans 5.075 to 6.466
-# over seeds 0-11 and crosses 6.0 on four of the twelve, so a cutoff fitted to
+# be a bad one: folded, MWA_extended off30 at eps 1e-3 spans 5.076 to 6.466
+# over seeds 0-11 in float64 (5.074 to 6.469 in float32) and crosses 6.0 on
+# four of the twelve in both legs, so a cutoff fitted to
 # the seed-0 draw (the gentlest of the twelve, as it is unfolded too) would
 # bind on a third of them -- on exactly the fixture AGENTS.md section 9
 # measures the windowed adjoint win on. See the derivation comment on

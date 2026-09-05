@@ -321,8 +321,9 @@ def _resolve_nthreads(
 # which is the geometry that existed when #43 was written and is no longer the
 # one that ships. Re-measured on folded plans, the same forty-cell grid reads
 # 1.077 - 2.765 outside MWA_extended off30 (was 1.077 - 3.173) and 4.944 -
-# 5.076 on it (was 5.173 - 5.784); the float32 leg's ten cells agree to under
-# 0.05%.
+# 5.076 on it (was 5.173 - 5.784); the float32 leg's ten cells agree with the
+# float64 ones to within 0.13% (worst EDA2 off30, 2.6169 against 2.6202; the
+# high-overhead cell itself agrees to 0.04%), against 0.19% unfolded.
 #
 # The constant does not move with them, and the asymmetry is the point. #43
 # changed the metric's *denominator*, so the shipped 5.0 had to be restated on
@@ -337,7 +338,8 @@ def _resolve_nthreads(
 # way of *carrying* a measured cutoff across a change of units, not a rule for
 # calibrating one; applied here it would fit the constant to a single random
 # draw, and the seed sweep says which draw. Folded, MWA_extended off30 at
-# eps 1e-3 spans 5.075 to 6.466 over seeds 0-11 and crosses 6.0 on four of
+# eps 1e-3 spans 5.076 to 6.466 over seeds 0-11 (5.074 to 6.469 on the float32
+# leg) and crosses 6.0 on four of
 # them -- seed 0, the draw the pinned grid happens to use, is the gentlest of
 # the twelve, as it is unfolded too. A 5.1 cutoff would bind on eleven of the
 # twelve, taking the one fixture AGENTS.md section 9 still measures a windowed
@@ -508,7 +510,13 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     :data:`_GPU_FORWARD_RATIO_CUTOFF` at eps 1e-9 and 1e-12 (n_w 46->29 and
     49->32 against ``3 * W``), going the other way to ``windowed_vmap``. That
     one is the heuristic's existing rule reading a changed plan rather than a
-    rule that misfires, and it is untimed.
+    rule that misfires, and it has now been timed: at eps 1e-9 the picked
+    ``windowed_vmap`` runs 42.8 ms against ``dense_vmap``'s 37.6, so the
+    heuristic leaves about 14% on the table there. It is not a regression --
+    the same cell was 48.4 ms before the fold, so a caller upgrading still
+    gains 1.12x -- and correcting it means moving
+    :data:`_GPU_FORWARD_RATIO_CUTOFF`, which is a threshold retune and so
+    issue #34's, not this change's.
 
     Nothing in ``tests/test_default_w_strategy.py``'s GPU table moves, under
     the fold or under this condition: it is at 30 degrees and ``EPSILON``,
@@ -1571,17 +1579,26 @@ def vis2dirty(
         float64 rather than bit-for-bit. The bare names ``"scan"`` /
         ``"vmap"`` are accepted as deprecated aliases.
 
-        The adjoint is where the new default also changes what a *CPU*
-        caller gets: on the repository's off-zenith fixtures the CPU
-        heuristic picks ``"windowed_scan"`` here where the old default was
-        ``"dense_scan"``. Measured on a 10-core Apple M-series (eps 1e-6,
-        float64, single channel, plan and warm-up outside the timer,
-        median of 9 calls) that is 1.14-1.24x faster on MWA_extended off30
-        (n_w=251) -- a range across two passes, 1.24x over five interleaved
-        rounds and 1.14x over a nine-round paired re-measurement -- and
-        indistinguishable, within a +-4% noise floor, on MWA_compact off30
-        and MeerKAT off30, whose n_w is under 20. The forward is
-        unaffected: the CPU heuristic never picks a windowed forward.
+        The adjoint is where the new default can also change what a *CPU*
+        caller gets, though issue #17 narrowed that to one fixture. On the
+        shipped folded geometry the heuristic picks ``"windowed_scan"``
+        here only on MWA_extended off30 (n_w=134, ratio 19.1); MWA_compact
+        off30 and MeerKAT off30 pick ``"dense_scan"`` again, their halved
+        ``n_w`` having dropped them under the ``n_w / W > 2`` gate. Measured
+        on a 10-core Apple M-series (eps 1e-6, float64, single channel, plan
+        and warm-up outside the timer, median of 9 calls, two passes) the
+        shipped default against an explicit ``dense_scan`` is 1.03x on that
+        one fixture and 0.98-1.00x on the other four timing fixtures -- i.e.
+        the *strategy* choice is now inside this machine's +-4% noise floor
+        everywhere. That is not the fold being neutral; it is the fold
+        having taken the windowed adjoint off the cells where it had stopped
+        paying. What the fold itself is worth on the same machine, shipped
+        default folded against shipped default unfolded, is 1.25-1.85x
+        forward and 1.25-1.68x adjoint across those five fixtures, every
+        cell faster. On GPU the same comparison on one GH200 is 1.06-1.78x
+        forward and 1.07-1.70x adjoint over eight cells. The forward is
+        unaffected by the strategy question either way: the CPU heuristic
+        never picks a windowed forward.
     channel_strategy:
         ``"scan"`` (default) or ``"vmap"``.
     nthreads:

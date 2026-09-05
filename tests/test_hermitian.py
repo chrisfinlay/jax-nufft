@@ -45,10 +45,17 @@ Three things about the fold shape every test in this module:
   (``freq/c > 0``), so a per-channel flip array is both redundant and a
   regression of issue #23.
 
-Nothing in this module depends on what ``make_plan``'s ``hermitian`` **default**
-is: every plan is built with the argument passed explicitly. The one test that
-does touch the default -- ``test_default_plan_is_never_silently_wrong_on_a_
-complex_image`` -- accepts either policy and only forbids the unsafe outcome.
+Every plan below is built with ``hermitian`` passed explicitly, so with two
+deliberate exceptions nothing here depends on what ``make_plan``'s **default**
+is. The exceptions:
+
+* ``test_default_plan_is_never_silently_wrong_on_a_complex_image`` accepts
+  either policy and only forbids the unsafe outcome (an O(1)-wrong answer);
+* ``test_make_plan_defaults_to_the_fold`` pins the default *at* ``True``. That
+  is issue #17's shipped decision rather than an implementation detail -- the
+  fold is what the plane-count reduction buys and it only reaches a caller who
+  says nothing if the default carries it -- and until that test existed,
+  flipping the default to ``False`` left the entire suite green.
 
 The DFT references below are deliberately *not* imported from
 ``tests/test_against_dft.py`` / ``tests/test_adjoint.py``: both of those call
@@ -1533,3 +1540,96 @@ def test_folded_operators_stay_traceable() -> None:
 
     g2 = jax.grad(adj_loss, holomorphic=False)(y.real)
     assert np.all(np.isfinite(np.asarray(g2)))
+
+
+# ---------------------------------------------------------------------------
+# 6. the shipped default
+# ---------------------------------------------------------------------------
+
+
+@requires_x64
+def test_make_plan_defaults_to_the_fold() -> None:
+    """``make_plan`` with no ``hermitian`` argument folds (issue #17).
+
+    The one test in this module that depends on the default, and it exists
+    because every other test in the repository is default-agnostic by
+    construction: measured, flipping ``make_plan``'s default to ``False``
+    left all 935 tests of the fast suite passing. That is the failure mode
+    this closes -- the fold is issue #17's whole deliverable, and it reaches a
+    caller who says nothing only if the default carries it, so "the fold
+    works when you ask for it" is not the same claim as "the library folds".
+
+    Four things, because the default being ``True`` is not one fact but the
+    conjunction of the plan flag, the data, the geometry and the guard:
+
+      * ``plan.hermitian is True`` -- the flag itself, which is also what
+        ``dirty2vis`` reads to decide whether to refuse a complex image;
+      * ``flip_sign`` marks exactly the ``w < 0`` rows, so the default plan
+        has really folded rather than merely recording that it might;
+      * the plane count and w-extent equal an explicit ``hermitian=True``
+        plan's and are strictly better than an explicit ``hermitian=False``
+        plan's -- the deliverable, not just the flag;
+      * a complex image on the default plan raises. This is the sharp edge of
+        the decision: with the default folded, every existing complex-image
+        caller in the repository has to be told rather than silently given an
+        O(1)-wrong answer. ``test_default_plan_is_never_silently_wrong_on_a_
+        complex_image`` above allows either policy on purpose; this pins which
+        one shipped.
+
+    ``is`` rather than ``==`` on the flag: ``1 == True`` in Python, and a
+    truthy non-bool leaking into a static pytree field would change the JIT
+    cache key's type without changing any behaviour a looser check could see.
+    """
+    n_rows = 96
+    rng = np.random.default_rng(1717)
+    uvw = rng.normal(scale=250.0, size=(n_rows, 3))
+    freq = np.array([1.4e9])
+    shape = (32, 32)
+    kw = (uvw, freq, shape, 3e-3, 3e-3, _REVIEW_EPS)
+
+    n_negative = int((uvw[:, 2] < 0).sum())
+    assert 0 < n_negative < n_rows, "fixture must have mixed-sign w for this to say anything"
+
+    default = make_plan(*kw)
+    folded = make_plan(*kw, hermitian=True)
+    unfolded = make_plan(*kw, hermitian=False)
+
+    assert default.hermitian is True, (
+        "make_plan's hermitian default is not True. Issue #17 ships the Hermitian w-sign "
+        "fold ON: it halves the w-extent and the inner plane count for every caller who "
+        "does not ask, which is the entire point of the change. Flipping this default is a "
+        "deliberate decision, not a refactor -- if it is being made, this test is where it "
+        "gets recorded."
+    )
+
+    # The fold actually happened, on exactly the rows it should have.
+    np.testing.assert_array_equal(
+        np.asarray(default.flip_sign),
+        np.where(uvw[:, 2] < 0, -1, 1).astype(np.int8),
+        err_msg="the default plan's flip_sign does not mark the w < 0 rows",
+    )
+    assert int(_folded_rows(default).sum()) == n_negative
+    assert np.all(np.asarray(default.uvw_m)[:, 2] >= 0.0)
+
+    # ...and bought the geometry, not merely the flag.
+    assert (default.n_w, default.w_extent) == (folded.n_w, folded.w_extent), (
+        "the default plan's geometry differs from an explicit hermitian=True plan's"
+    )
+    assert default.n_w < unfolded.n_w, (
+        f"the default plan has n_w={default.n_w} against {unfolded.n_w} unfolded: no plane "
+        "count was saved, so whatever the flag says, the default is not folding"
+    )
+    assert default.w_extent < unfolded.w_extent
+    # Strict improvement, deliberately not the 0.55x gate: that magnitude is a
+    # property of the review fixtures' near-symmetric w-distributions and is
+    # asserted on them in ``test_plane_count_halves_on_review_fixtures``. This
+    # fixture is 96 Gaussian rows and reaches 0.567x, which is correct
+    # behaviour for it -- restating the review number here would gate the
+    # fixture's symmetry rather than the default.
+
+    # The guard the decision forces on every complex-image caller.
+    complex_image = jnp.asarray(
+        rng.standard_normal((1, *shape)) + 1j * rng.standard_normal((1, *shape))
+    )
+    with pytest.raises(ValueError, match="hermitian=False"):
+        dirty2vis(default, complex_image)
