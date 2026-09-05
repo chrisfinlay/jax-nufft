@@ -788,18 +788,22 @@ def test_cpu_default_resolves_to_expected_strategy(
 # against 2.685 unfolded -- the one cell here the fold nudges *up*, since
 # ``max_window_size`` falls more slowly than ``n_w``).
 #
-# The one GPU pick in the repository that the fold *does* move is not in this
-# table: GH200_large at **zenith**, where ``n_w`` drops by exactly one plane
-# onto ``W + 2`` at every epsilon of ``tests/test_padding_overhead.py``'s
+# The one GPU pick in the repository the fold moved is not in this table, and
+# it turned out to be a bug in the heuristic rather than a new answer:
+# GH200_large at **zenith**, where ``n_w`` drops by exactly one plane onto
+# ``W + 2`` at every epsilon of ``tests/test_padding_overhead.py``'s
 # calibration grid (7->6 at eps 1e-3, 10->9 at 1e-6, 13->12 at 1e-9, 16->15 at
-# 1e-12), so the small-``n_w`` gate fires and both directions go
-# ``windowed_vmap -> dense_vmap``. The GH200 baseline sweep measured
-# ``windowed_vmap`` as the winner for that fixture's zenith adjoint, so this is
-# a pick worth re-timing on hardware rather than one to assume is still right;
-# ``_auto_w_strategy_gpu``'s docstring records it. The forward at off30 also
-# crosses ``n_w <= 3 * W`` at eps 1e-9 and 1e-12 (46->29, 49->32), going the
-# other way to ``windowed_vmap``. Neither epsilon nor pointing is reachable
-# through this table, which is at ``EPSILON`` and 30 degrees.
+# 1e-12), which started the small-``n_w`` shortcut firing on a 50k-row 2048^2
+# plan and answering ``dense_vmap``. Re-timed on a GH200, that pick is
+# 1.37-1.95x slower than ``windowed_vmap``, so the shortcut now carries an
+# ``n_rows < _GPU_LARGE_N_ROWS`` condition and those cells resolve to
+# ``windowed_vmap`` again -- see ``_auto_w_strategy_gpu``'s docstring for the
+# numbers and ``tests/test_auto_strategy.py`` for the gate. The forward at
+# off30 also crosses ``n_w <= 3 * W`` at eps 1e-9 and 1e-12 (46->29, 49->32),
+# going to ``windowed_vmap`` by the heuristic's existing rule. Neither epsilon
+# nor pointing is reachable through this table, which is at ``EPSILON`` and 30
+# degrees -- and none of its three fixtures reaches the shortcut in either
+# geometry, so the row condition leaves every row of it unchanged too.
 #
 # The picks are the same on both precision legs (float64/eps 1e-6 and
 # float32/eps 1e-4) in both geometries, so unlike the CPU table this one is

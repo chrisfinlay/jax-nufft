@@ -394,12 +394,22 @@ MWA_compact off30 (2.43 → 1.71) and MeerKAT off30 (2.71 → 1.86) go back to
 `dense_scan`, as do EDA2 zenith and MWA_extended zenith on the float32 leg.
 Those are exactly the cells the paragraph above records as timing flat, so
 the fold removes the windowed adjoint where it had stopped paying and
-leaves it where it still pays — a measurement, not a design intent. On GPU
-the picks in `tests/test_default_w_strategy.py`'s table are unmoved; the
-one pick that does move is `GH200_large` at *zenith*, whose `n_w` lands on
-`W + 2` and so takes the small-`n_w` gate to `dense_vmap` where the GH200
-sweep measured `windowed_vmap` — see `_auto_w_strategy_gpu`'s docstring,
-and re-time it before trusting it.
+leaves it where it still pays — a measurement, not a design intent.
+
+On GPU the picks in `tests/test_default_w_strategy.py`'s table are unmoved,
+but the fold did expose a bug in `_auto_w_strategy_gpu`'s small-`n_w`
+shortcut, fixed in the same PR. Halving `n_w` put `GH200_large` at *zenith*
+— 50k rows, 2048² — onto exactly `w_kernel_width + 2`, so the shortcut began
+firing on it and answered `dense_vmap`; re-timed on a GH200 (median of 9)
+that pick is 1.37-1.95x slower than `windowed_vmap` across four cells
+(27.5 vs 16.1 ms forward and 33.4 vs 17.1 ms adjoint at eps 1e-6, 28.0 vs
+20.4 and 40.9 vs 26.2 at eps 1e-9). The shortcut's "either dense or windowed
+is fine" premise was measured on plans of a few hundred rows and is false in
+the large-row regime, so it now carries an `n_rows < _GPU_LARGE_N_ROWS`
+condition and such plans reach the size-based windowed gates instead. That
+is four timed cells on one fixture on one GH200 — enough to reject the
+shortcut in that regime, not a general result, and the broader retune stays
+with #34.
 
 Two consequences to keep in mind when changing anything here. Retuning the
 heuristic now moves the *shipped* default, so

@@ -469,33 +469,89 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     comes from the picks being right, not from the alternatives being
     close.
 
-    **issue #17 moves one of those picks, and it has not been re-timed.**
-    The sweep above was run on unfolded plans -- the only geometry that
-    existed then -- and the fold halves ``n_w``. On the fixtures this
-    repository can check host-side that matters in exactly one place:
-    ``GH200_large`` at **zenith**, whose ``n_w`` drops by a single plane onto
-    ``w_kernel_width + 2`` at every epsilon of the calibration grid (7->6 at
-    eps 1e-3, 10->9 at 1e-6, 13->12 at 1e-9, 16->15 at 1e-12), so the
-    small-``n_w`` gate below fires and both directions go
-    ``windowed_vmap -> dense_vmap``. The sweep measured ``windowed_vmap`` as
-    that fixture's zenith winner, and this gate's "either is fine" rationale
-    was written for plans well inside the branch rather than for ones sitting
-    on its boundary, so the folded zenith pick is the one number here worth
-    re-timing on a GH200 before it is trusted. The off-zenith forward also
-    crosses :data:`_GPU_FORWARD_RATIO_CUTOFF` at eps 1e-9 and 1e-12 (n_w
-    46->29 and 49->32 against ``3 * W``), going the other way to
-    ``windowed_vmap``.
+    **issue #17 exposed a bug in the small-``n_w`` shortcut, which is fixed
+    below rather than left as a tuning question.** The sweep above was run on
+    unfolded plans -- the only geometry that existed then -- and the fold
+    halves ``n_w``. On ``GH200_large`` at **zenith** that drops ``n_w`` by a
+    single plane onto exactly ``w_kernel_width + 2`` at every epsilon of the
+    calibration grid (7->6 at eps 1e-3, 10->9 at 1e-6, 13->12 at 1e-9, 16->15
+    at 1e-12), so the shortcut began firing on a 50k-row 2048^2 plan and took
+    both directions ``windowed_vmap -> dense_vmap``.
 
-    Nothing in ``tests/test_default_w_strategy.py``'s GPU table moves: it is
-    at 30 degrees and ``EPSILON``, where all three fixtures resolve
-    identically folded and unfolded on both precision legs (its comment has
-    the numbers). The rest of the review fixtures are 600-row plans that the
+    Re-timed on a GH200 (folded plan, median of 9, ``dense_vmap`` against
+    ``windowed_vmap``): 27.5 vs 16.1 ms forward and 33.4 vs 17.1 ms adjoint at
+    eps 1e-6, 28.0 vs 20.4 and 40.9 vs 26.2 ms at eps 1e-9 -- so the shortcut's
+    pick was 1.37x to 1.95x slower on all four cells. The shortcut's premise
+    ("either dense or windowed is fine") holds for the few-hundred-row plans it
+    was measured on and not for a plan in the large-row regime, so it now
+    carries an ``n_rows < _GPU_LARGE_N_ROWS`` condition and such plans fall
+    through to the size-based windowed gates, which is where the measurement
+    puts them. Scope, stated plainly: four timed cells, one fixture, one
+    GH200 -- enough to reject the shortcut in this regime, not a general
+    result about small ``n_w``. Retuning the thresholds themselves stays with
+    issue #34.
+
+    Two consequences of that condition worth naming. Over both geometries of
+    the whole calibration grid it moves exactly those eight cells (four
+    epsilons x two directions, folded ``GH200_large`` zenith) and nothing
+    else, ``GH200_large`` being the only fixture in the large-row regime and
+    its off-zenith ``n_w`` never reaching the shortcut. And a constant-w plan
+    with a large row count (``n_w == 1``) now falls through to
+    ``windowed_vmap`` as well; that is degenerate rather than a second
+    retune, since the fast path sets ``max_window_size == n_rows`` with every
+    ``window_start`` at zero, so the single "window" is every row and the
+    windowed traversal does the dense traversal's one NUFFT. It is gated as
+    such by
+    ``tests/test_auto_strategy.py::test_gpu_constant_w_large_rows_falls_through_to_a_degenerate_window``.
+
+    Also folded, the off-zenith forward crosses
+    :data:`_GPU_FORWARD_RATIO_CUTOFF` at eps 1e-9 and 1e-12 (n_w 46->29 and
+    49->32 against ``3 * W``), going the other way to ``windowed_vmap``. That
+    one is the heuristic's existing rule reading a changed plan rather than a
+    rule that misfires, and it is untimed.
+
+    Nothing in ``tests/test_default_w_strategy.py``'s GPU table moves, under
+    the fold or under this condition: it is at 30 degrees and ``EPSILON``,
+    where all three fixtures resolve identically in both geometries on both
+    precision legs and none of them reaches the shortcut (its comment has the
+    numbers). The rest of the review fixtures are 600-row plans that the
     ``n_rows >= _GPU_LARGE_N_ROWS`` gates keep on ``dense_vmap`` whatever
     their w-geometry.
     """
-    if plan.n_w <= plan.w_kernel_width + 2:
-        # Small n_w (incl. constant-w fast path); either dense or
-        # windowed is fine. dense_vmap is simpler and the data agrees.
+    if plan.n_w <= plan.w_kernel_width + 2 and plan.n_rows < _GPU_LARGE_N_ROWS:
+        # Small n_w on a small-row plan; either dense or windowed is fine.
+        # dense_vmap is simpler and the data agrees.
+        #
+        # The row-count condition is issue #17's correction, and it is what
+        # keeps this shortcut from overriding the two size-based windowed
+        # gates below. "Either is fine" was measured on plans of a few
+        # hundred rows, where a w-plane's worth of work is small however it
+        # is traversed; it is false for a 50k-row 2048^2 plan, which is
+        # exactly the regime those gates exist for. Measured on a GH200 --
+        # GH200_large at zenith, folded, median of 9 -- ``dense_vmap``
+        # against ``windowed_vmap`` runs 27.5 vs 16.1 ms forward and 33.4 vs
+        # 17.1 ms adjoint at eps 1e-6 (n_w = 9, W = 7), and 28.0 vs 20.4 /
+        # 40.9 vs 26.2 ms at eps 1e-9 (n_w = 12, W = 10): 1.37x to 1.95x
+        # slower on the pick this branch would make. Large-row plans
+        # therefore fall through and reach the windowed branches on size, as
+        # they did before the fold moved their ``n_w`` down onto
+        # ``w_kernel_width + 2``.
+        #
+        # With that condition this branch is **redundant, and knowingly so**:
+        # both windowed returns below are themselves gated on
+        # ``n_rows >= _GPU_LARGE_N_ROWS``, so every input with fewer rows than
+        # that already reaches ``dense_vmap`` by one path or another and
+        # deleting these two lines would change no answer (checked
+        # exhaustively over ``n_w`` 1-400 x ``W`` 2-16 x padding either side
+        # of the cutoff x six row counts x both directions: zero
+        # disagreements). It is kept for the same reason the window builder
+        # keeps its ``lo - 1`` / ``hi + 1`` clamp -- it states the measured
+        # small-``n_w`` answer at the point the baseline sweep established it,
+        # and it would go on stating it if a later change made a windowed
+        # branch reachable below the row cutoff. Being redundant, it is also
+        # not something a behavioural test can pin, and no test claims to:
+        # ``tests/test_auto_strategy.py`` gates the *condition*, which is
+        # load-bearing, and says so.
         return "dense_vmap"
     if plan.window_padding_overhead > _GPU_PADDING_CUTOFF:
         # Windowed wastes too much per-plane work on padded slices;

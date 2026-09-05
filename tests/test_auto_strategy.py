@@ -31,6 +31,7 @@ import pytest
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft.wgridder import (
     _CPU_PADDING_CUTOFF,
+    _GPU_LARGE_N_ROWS,
     _auto_w_strategy,
     _auto_w_strategy_cpu,
     _auto_w_strategy_gpu,
@@ -221,7 +222,12 @@ def test_cpu_padding_overhead_boundary_is_strict() -> None:
 def test_gpu_small_n_w_picks_dense_vmap(is_adjoint: bool) -> None:
     """Small/constant-w plans favour dense_vmap on GPU; either choice
     is roughly equivalent at this size, picking dense keeps things
-    simple. Matches the MWA_compact_zenith / EDA2_zenith cells."""
+    simple. Matches the MWA_compact_zenith / EDA2_zenith cells.
+
+    ``_stub_plan``'s default ``n_rows`` is 600, i.e. below
+    ``_GPU_LARGE_N_ROWS``, and since issue #17 that is load-bearing rather
+    than incidental -- see
+    ``test_gpu_large_rows_do_not_take_the_small_n_w_shortcut``."""
     plan = _stub_plan(n_w=7, w_kernel_width=6)
     assert _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint) == "dense_vmap"
 
@@ -229,7 +235,13 @@ def test_gpu_small_n_w_picks_dense_vmap(is_adjoint: bool) -> None:
 @pytest.mark.parametrize("is_adjoint", [False, True])
 def test_gpu_constant_w_fast_path_picks_dense_vmap(is_adjoint: bool) -> None:
     """The constant-w fast path collapses ``n_w`` to one; pick dense
-    on GPU same as on CPU."""
+    on GPU same as on CPU.
+
+    On a *small-row* plan (``_stub_plan``'s 600). A constant-w plan with a
+    large row count falls through to ``windowed_vmap`` since issue #17, which
+    is degenerate rather than a different answer --
+    ``test_gpu_constant_w_large_rows_falls_through_to_a_degenerate_window``
+    is where that is established."""
     plan = _stub_plan(n_w=1, w_kernel_width=6)
     assert _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint) == "dense_vmap"
 
@@ -302,6 +314,119 @@ def test_gpu_n_rows_boundary_is_inclusive() -> None:
     assert _auto_w_strategy_gpu(plan, is_adjoint=True) == "windowed_vmap"
     plan = _stub_plan(n_w=20, w_kernel_width=6, window_padding_overhead=1.5, n_rows=9_999)
     assert _auto_w_strategy_gpu(plan, is_adjoint=True) == "dense_vmap"
+
+
+# The small-``n_w`` shortcut must not override the size-based windowed gates.
+# ``n_w`` is swept over the whole range the shortcut covers -- its boundary
+# ``W + 2``, one below it, and the ``n_w == 1`` floor -- because the regression
+# this guards against arrived when a real fixture's ``n_w`` landed *on* the
+# boundary, and a test at an interior point alone would not have caught the
+# off-by-one variant of the fix.
+_GPU_SHORTCUT_N_W = [8, 7, 1]
+
+
+@pytest.mark.parametrize("n_w", _GPU_SHORTCUT_N_W, ids=lambda n: f"n_w{n}")
+@pytest.mark.parametrize("is_adjoint", [False, True], ids=["forward", "adjoint"])
+def test_gpu_large_rows_do_not_take_the_small_n_w_shortcut(n_w: int, is_adjoint: bool) -> None:
+    """A large-row plan with small ``n_w`` reaches the windowed branches.
+
+    Issue #17 made this reachable and a GH200 measurement made it a bug. The
+    fold halves ``n_w``, which put ``GH200_large`` at zenith -- 50k rows,
+    2048^2 -- onto exactly ``w_kernel_width + 2`` at every epsilon of the
+    calibration grid, so the small-``n_w`` shortcut started firing on it and
+    answered ``dense_vmap``. Timed on a GH200 against ``windowed_vmap``
+    (median of 9): 27.5 vs 16.1 ms forward and 33.4 vs 17.1 ms adjoint at
+    eps 1e-6, 28.0 vs 20.4 and 40.9 vs 26.2 ms at eps 1e-9 -- 1.37x to 1.95x
+    slower. The shortcut's "either dense or windowed is fine" premise was
+    measured on plans of a few hundred rows and is false in the large-row
+    regime, which is precisely the regime the two gates it was pre-empting
+    exist for.
+
+    What this pins is the *condition*, and the control below -- the same plan
+    one row under the cutoff -- pins that the small-row answer is still
+    ``dense_vmap``. Note what that control does and does not catch: with the
+    row condition in place the shortcut is redundant (both windowed returns
+    are themselves gated on ``n_rows >= _GPU_LARGE_N_ROWS``, so a small-row
+    plan reaches ``dense_vmap`` either way), so deleting the shortcut outright
+    is a semantically *equivalent* program and passes here, as it should. The
+    bug this file can and does catch is the condition going missing, which
+    changes six answers below.
+    """
+    large = _stub_plan(
+        n_w=n_w, w_kernel_width=6, window_padding_overhead=1.5, n_rows=_GPU_LARGE_N_ROWS
+    )
+    assert large.n_w <= large.w_kernel_width + 2, "the fixture must be inside the shortcut's range"
+    assert _auto_w_strategy_gpu(large, is_adjoint=is_adjoint) == "windowed_vmap", (
+        f"a {large.n_rows}-row plan with n_w={n_w} (W={large.w_kernel_width}) took the "
+        "small-n_w shortcut to dense_vmap. Measured on a GH200, that pick is 1.37-1.95x "
+        "slower than windowed_vmap on exactly this shape of plan; the shortcut is only "
+        "valid below _GPU_LARGE_N_ROWS"
+    )
+
+    small = _stub_plan(
+        n_w=n_w, w_kernel_width=6, window_padding_overhead=1.5, n_rows=_GPU_LARGE_N_ROWS - 1
+    )
+    assert _auto_w_strategy_gpu(small, is_adjoint=is_adjoint) == "dense_vmap", (
+        "below the row cutoff the answer must stay dense_vmap -- it is what the baseline "
+        "sweep measures for every small-row fixture in it, and the fix is to condition the "
+        "shortcut on the row count, not to move the small-row answer"
+    )
+
+
+def test_gpu_constant_w_large_rows_falls_through_to_a_degenerate_window() -> None:
+    """...and where a constant-w large-row plan lands is degenerate, not a retune.
+
+    The row-count condition above means ``n_w == 1`` no longer short-circuits
+    on a large-row plan either, so the constant-w fast path now resolves to
+    ``windowed_vmap`` there. That is safe for a structural reason rather than a
+    measured one, and the structure is what this asserts: the fast path sets
+    ``max_window_size == n_rows`` with every ``window_start`` at zero, so the
+    single plane's "window" is the entire row set and the windowed traversal
+    performs the dense traversal's one NUFFT over the same rows. The two
+    strategies are therefore the same work, which the output comparison
+    confirms rather than assumes.
+
+    A real ``make_plan`` plan, not a stub, because the claim is about what the
+    constant-w branch builds. ``n_rows`` is exactly ``_GPU_LARGE_N_ROWS`` and
+    the image is small, so the two transforms cost milliseconds.
+    """
+    n_rows = _GPU_LARGE_N_ROWS
+    rng = np.random.default_rng(1717)
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, :2] = rng.uniform(-200.0, 200.0, size=(n_rows, 2))
+    uvw[:, 2] = 250.0  # constant w, and non-zero so the w-phase is real work
+    plan = make_plan(uvw, np.array([1.4e9]), (32, 32), 3e-3, 3e-3, epsilon=1e-6)
+
+    assert plan.is_constant_w and plan.n_w == 1, "the fixture must take the constant-w fast path"
+    assert plan.n_rows >= _GPU_LARGE_N_ROWS
+
+    for is_adjoint in (False, True):
+        assert _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint) == "windowed_vmap"
+
+    # The window is every row: that is what makes the pick a no-op.
+    assert plan.max_window_size == plan.n_rows
+    assert np.all(np.asarray(plan.window_start) == 0)
+
+    image = jnp.asarray(rng.standard_normal((32, 32)))
+    vis = jnp.asarray(
+        (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+            np.complex128
+        )
+    )
+    np.testing.assert_allclose(
+        np.asarray(dirty2vis(plan, image, w_strategy="windowed_vmap")),
+        np.asarray(dirty2vis(plan, image, w_strategy="dense_vmap")),
+        rtol=1e-13,
+        atol=0,
+        err_msg="windowed and dense disagree on a single-plane plan, so the window is not "
+        "in fact spanning every row",
+    )
+    np.testing.assert_allclose(
+        np.asarray(vis2dirty(plan, vis, w_strategy="windowed_vmap")),
+        np.asarray(vis2dirty(plan, vis, w_strategy="dense_vmap")),
+        rtol=1e-13,
+        atol=0,
+    )
 
 
 # -- Part 6.3: platform dispatcher ------------------------------------------
