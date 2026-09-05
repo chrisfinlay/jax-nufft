@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import itertools
 import math
 
@@ -1593,6 +1594,18 @@ def test_make_plan_defaults_to_the_fold() -> None:
     default = make_plan(*kw)
     folded = make_plan(*kw, hermitian=True)
     unfolded = make_plan(*kw, hermitian=False)
+
+    # The *signature* default, not only what the plan stores: ``make_plan``
+    # normalises with ``bool(hermitian)``, so a declared default of integer 1
+    # would reach the plan as True and this test would pass while the public
+    # API advertised the wrong type.
+    declared = inspect.signature(make_plan).parameters["hermitian"].default
+    assert declared is True, (
+        f"make_plan's declared hermitian default is {declared!r}, not True. "
+        "It must be the bool itself: the plan normalises with bool(), so a "
+        "truthy non-bool is invisible downstream while still being wrong in "
+        "the public signature and in any static-field cache key built from it."
+    )
 
     assert default.hermitian is True, (
         "make_plan's hermitian default is not True. Issue #17 ships the Hermitian w-sign "

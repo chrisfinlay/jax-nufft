@@ -627,7 +627,10 @@ def test_default_forwards_every_canonical_name_across_the_wrapper(
 # AGENTS.md section 9 records for v0.1.1 Part 2, and that range should not be
 # quoted here: its endpoints are MWA_compact off30 (1.53x) and MeerKAT off30
 # (1.05x), and both now time flat (1.01x and 0.99x, inside a +-4% noise
-# floor). Only MWA_extended off30 still shows a win, 1.14-1.24x. See the
+# floor). MWA_extended off30 showed 1.14-1.24x before #17; folded -- the
+# geometry that now ships -- it times 1.03x, also inside that floor, so on
+# current code no CPU fixture shows a measurable strategy win at all. The
+# 1.14-1.24x and 1.05-1.53x figures are both pre-#17 history. See the
 # README's `w_strategy="auto"` section for the measurement. None of that
 # changes what this table asserts -- which strategy is picked, not what it
 # earns -- but a reader should not take the pick as evidence of the old

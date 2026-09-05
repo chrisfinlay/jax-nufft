@@ -687,7 +687,7 @@ pinned; neither choice of `w_strategy` substitutes for it.
 &mdash; relative L2, in the sign convention above &mdash; for every
 `epsilon` from `1e-3` to `1e-12`, forward and adjoint, on the seven telescope
 fixtures of `tests/test_accuracy_sweep.py`. The measured worst cell across
-that 112-cell matrix is `1.47 * epsilon` (MWA_extended off30, `epsilon =
+that 112-cell matrix is `1.48 * epsilon` (MWA_extended off30, `epsilon =
 1e-12`, adjoint). Against `ducc0.wgridder` (with matched `divide_by_n` flags)
 the bound is `3 * epsilon`, the sum of the two implementations' budgets.
 
