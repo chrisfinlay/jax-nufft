@@ -150,6 +150,19 @@ and the recommendation.
 `n = sqrt(1 - l^2 - m^2)` here is always the *physical* `n` on the unshifted
 grid, never the `nshift`-centred one the w-phase is evaluated on (issue #16).
 
+**One deliberate deviation from ducc0, on the unit circle itself.** The disc
+mask is `n > 0` strictly, so a pixel with `n == 0` exactly is excluded and
+returned as `0`; ducc0 divides there and returns `inf`. `1/n` is undefined on
+the circle, so neither is more correct as arithmetic, but a finite `0` is what
+keeps values *and gradients* finite, and this library is built to be
+differentiated. Everywhere else the two agree: on a grid deliberately built
+with two such pixels (`n_pix · pixsize == 2`, dyadic pixsize — a 2-radian field
+on a power-of-two grid), `vis2dirty(divide_by_n=True)` matches ducc0 to
+3.39e-07 relative over the other 4094 pixels. A whole-image parity check at
+that geometry returns `nan`, which is ducc0's `inf`, not a disagreement about
+the other pixels. No such pixel arises unless the grid is constructed to have
+one; the repository's other fixtures reach `min|n|` of 0.026 to 0.95.
+
 ### The wgridder algorithm
 
 Direct evaluation of the visibility integral is `O(n_rows * n_l * n_m)` per
@@ -297,7 +310,10 @@ same fixture `Re<A x, y> == <n x, A^H y>` is off by **0.273**. The entire
 failure lives in the **1155 of 4096 pixels outside the unit disc**, where the
 forward at its default evaluates the analytic extension while the adjoint at
 its default zeroes them &mdash; restrict the image to the disc and the mixed
-pair is adjoint again, to **4.105e-16**.
+pair satisfies the `n x` identity again, to **4.105e-16**. That is the `n`-
+corrected form specifically: masked to the disc, the *plain* identity still
+reads 7.306e-01, because the mixed pair differs from an adjoint pair by the
+factor of `n` whether or not the image runs past the circle.
 
 Narrow fields hide it, because they have no outside-disc pixels at all: on
 MWA_compact the mixed pair's `n x` residual is 1.1794e-14 at zenith and
@@ -522,7 +538,8 @@ real `(n_rows, n_chan)`. Output is real `(n_chan, n_l, n_m)`.
 
 `divide_by_n` (keyword-only, static) defaults to `True` here &mdash; the `1/n`
 factor applied on the output, matching ducc's `divide_by_n=True`, with pixels
-outside the unit disc returned as exactly 0. `False` returns the
+outside the unit disc returned as exactly 0 — and pixels exactly *on* it
+returned as 0 too, where ducc0 returns `inf`. See *The `1/n` factor* above. `False` returns the
 analytic-extension result with neither the division nor the mask.
 
 The two defaults are deliberately different (ducc0's pairing) and are

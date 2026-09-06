@@ -1355,7 +1355,10 @@ def dirty2vis(
         ``n x`` correction, the whole of it coming from the 1155 of 4096
         pixels outside the disc, where this operator uses the analytic
         extension while the adjoint's default zeroes them. Restricted to the
-        disc the mixed pair is adjoint again, to 4.1e-16.
+        disc the mixed pair satisfies the ``n x`` identity again, to 4.1e-16 --
+        that form specifically: masked to the disc the *plain* identity still
+        reads 7.3e-01, the mixed pair differing from an adjoint pair by the
+        factor of ``n`` whether or not the image runs past the circle.
 
         For imaging, and for anything that differentiates through the pair,
         pass ``divide_by_n=True`` to **both** operators.
@@ -1637,7 +1640,21 @@ def _vis2dirty_jit(
 
     # ``divide_by_n=True`` (the default, matching ducc's flag of the same
     # name): apply 1/n on the output and take the real part to land in real
-    # space. Same masked division as the forward's, against the same
+    # space.
+    #
+    # The mask is ``n > 0`` **strictly**, and that is where this library
+    # deliberately differs from ducc0. A pixel exactly on the unit circle has
+    # ``n == 0``; ducc0 divides there and returns ``inf``, while this returns
+    # ``0``. Neither is more correct as arithmetic -- ``1/n`` is undefined on
+    # the circle -- but ``0`` is what keeps the output *and its gradient*
+    # finite, which is the point of this library. It also needs ``safe_n`` to
+    # be 1.0 off-mask rather than the raw ``n``: inside a ``jnp.where`` the
+    # untaken branch still contributes to reverse mode, so an unguarded
+    # division would leave every primal finite and NaN the gradient alone.
+    # Both halves are pinned by ``tests/test_divide_by_n.py``'s
+    # ``test_pixels_exactly_on_the_unit_circle_stay_finite_in_value_and_
+    # gradient``, on a grid built to have such pixels; no ordinary fixture
+    # has one. Same masked division as the forward's, against the same
     # ``_disc_mask_and_safe_n`` ingredients -- the diagonal has to be
     # identical on the two sides or the pair is only approximately adjoint.
     #
@@ -1684,7 +1701,12 @@ def vis2dirty(
         [Arras+2021] §2). ``True`` -- the default, unchanged since v0.1 --
         divides by ``n`` inside the unit disc and returns exactly ``0``
         outside it, where ``n < 0`` on the analytic extension and ``1/n`` is
-        not a gain the measurement equation defines. ``False`` returns the
+        not a gain the measurement equation defines. The disc is ``n > 0``
+        strictly, so a pixel lying exactly *on* the circle comes back as ``0``
+        as well; ducc0 returns ``inf`` there. That is the one place the two
+        libraries disagree, and it is what keeps the value and the gradient
+        finite -- everywhere else they agree to 3.4e-07 relative on a grid
+        built to contain such pixels. ``False`` returns the
         analytic-extension result *without* the division and without the
         mask, so the outside-disc pixels carry their (large) values instead
         of zeros.

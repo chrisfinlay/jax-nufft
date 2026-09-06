@@ -109,7 +109,7 @@ bound varying per cell):
     quantity              CPU        GPU x64    GPU x32    bound   binds
     dft_all       f64   8.740e-07  8.807e-07      --       2e-06   GPU   2.27x
     dft_outside   f64   5.325e-07  5.575e-07      --       2e-06   GPU   3.59x
-    ducc (28)     f64     24.40%     24.66%       --       3*eps   GPU   4.06x
+    ducc (28)     f64     24.43%     24.66%       --       3*eps   GPU   4.06x
     identity sec2 f64   1.936e-12  5.506e-15      --       1e-11   CPU   5.2x
     identity sec6 f64   6.574e-13  2.567e-15      --       1e-11   CPU  15.2x
     strategy_err  f64   1.299e-13  1.667e-16      --       1e-11   CPU  77.0x
@@ -128,28 +128,47 @@ The rows fall into two kinds, and at *equal headroom* they are not equally
 worth worrying about:
 
 **Approximation-gap rows** -- ``dft_all``, ``dft_outside``, ``ducc``,
-``fold_err``. These measure a real, deterministic approximation error against
-an exact or independent reference: the w-kernel width and plane count against
-an exact DFT, this library against ducc0, a folded plan against an unfolded
-one. What sets them is the algorithm's own accuracy at the requested epsilon,
-which reduction order does not touch. Measured on both backends they move by
-under 5%:
+``fold_err``, and ``oracle`` in float32. These are dominated by a real,
+deterministic approximation error against an exact or independent reference:
+the w-kernel width and plane count against an exact DFT, this library against
+ducc0, a folded plan against an unfolded one. What sets them is the
+algorithm's own accuracy at the requested epsilon rather than the order of any
+sum. Measured on both backends they move by at most 6%:
 
     dft_all      8.740e-07 CPU / 8.807e-07 GPU    0.8%
     dft_outside  5.325e-07 CPU / 5.575e-07 GPU    4.7%
-    ducc (28)    24.40%    CPU / 24.66%     GPU    1.1%
+    ducc (28)    24.43%    CPU / 24.66%     GPU    0.9%
     fold_err f64 1.070e-06 CPU / 1.070e-06 GPU    identical to 4 figures
     fold_err f32 9.132e-06 CPU / 9.185e-06 GPU    0.6%
+    oracle   f32 1.839e-07 CPU / 1.949e-07 GPU    6.0%
 
-For these, the measured headroom is the whole story. ``dft_all`` at 2.27x is
-the **tightest bound in this module on both backends**, and that is a stable
-margin rather than a sample of one: it would move if epsilon, the kernel or
-the geometry changed, not because the hardware did.
+``oracle`` belongs here in float32 and in the round-off group in float64,
+which looks inconsistent and is not: the two legs are dominated by different
+things. The oracle compares the operators' float32 diagonal against
+:func:`_independent_one_over_n`, which is always float64, so most of the
+float32 residual is that deterministic construction gap rather than summation
+noise -- substituting the plan's own float32 grid for the independent one on
+the adjoint leg drops it from 1.381e-07 to 2.655e-08, i.e. ~81% of it is the
+grid difference. In float64 the two constructions agree to 7.6e-16 and nothing
+is left but round-off. ``GUARD_TOL_F32`` bounds exactly that gap, and says so.
+
+For these, the measured headroom is close to the whole story. ``dft_all`` at
+2.27x is the **tightest bound in this module on both backends**, and that is a
+stable margin rather than a sample of one.
+
+Stated carefully, though: the ground for calling it stable is that two
+backends agree to 0.8%, not that the taxonomy guarantees they must. A GPU is
+not merely the CPU with the sums reordered -- jax-finufft dispatches to
+cuFINUFFT there, a different spreader implementation, which could in principle
+move an approximation-gap quantity as easily as a round-off one. It did not,
+on this pair of backends, for any of the six rows above. The taxonomy explains
+the measurements and predicts where to look first; it does not replace them.
 
 **Round-off rows** -- the two ``identity`` populations, ``strategy_err``,
-``oracle``, ``same-exec``. These measure floating-point noise in relations
-that are exact on paper, so reduction order is the entire quantity, and it is
-exactly what changes between backends. They move by 8x to 780x:
+``oracle`` in float64, ``same-exec``. These measure floating-point noise in
+relations that are exact on paper, so the arithmetic's own ordering is the
+entire quantity, and it is what a change of backend disturbs. They move by 8x
+to 780x:
 
     identity sec2 f32   1.775e-07 CPU / 1.456e-06 GPU x32     8.2x
     identity sec2 f64   1.936e-12 CPU / 5.506e-15 GPU       ~350x
@@ -256,7 +275,7 @@ ORACLE_TOL_F32 = 1e-5
 #
 #                     CPU        GPU x64    GPU x32     binds
 #   sec2 float64   1.936e-12   5.506e-15      --        CPU     5.2x
-#   sec6 float64   6.574e-13   2.384e-15      --        CPU    15.2x
+#   sec6 float64   6.574e-13   2.567e-15      --        CPU    15.2x
 #   sec2 float32   1.775e-07   7.482e-07  1.456e-06     GPU     3.4x
 #   sec6 float32   4.222e-07   4.375e-07  4.013e-07     GPU    11.4x
 #
@@ -490,6 +509,7 @@ def _problem(
     n_chan: int = 1,
     pixsize_m_ratio: float = 1.0,
     shape: tuple[int, int] | None = None,
+    pixsize_l: float | None = None,
 ) -> _Problem:
     """Build (and cache) a plan plus a real image and complex visibilities.
 
@@ -521,14 +541,15 @@ def _problem(
         n_chan,
         pixsize_m_ratio,
         shape,
+        pixsize_l,
     )
     hit = _CACHE.get(key)
     if hit is not None:
         return hit
     uvw = synthetic_uvw(tel, zenith_angle_deg, seed=uvw_seed)
     freq = tel.freq_hz * np.asarray(_CHANNEL_FREQ_RATIOS[:n_chan], dtype=np.float64)
-    pixsize_l = tel.pixsize
-    pixsize_m = tel.pixsize * pixsize_m_ratio
+    pixsize_l = tel.pixsize if pixsize_l is None else pixsize_l
+    pixsize_m = pixsize_l * pixsize_m_ratio
     shape = (tel.n_pix, tel.n_pix) if shape is None else shape
     rng = np.random.default_rng(data_seed)
     image = rng.standard_normal(shape if n_chan == 1 else (n_chan, *shape)).astype(real_dtype)
@@ -1309,6 +1330,115 @@ def test_the_two_adjoint_flag_values_differ_by_exactly_one_over_n_inside_the_dis
     )
 
 
+# The pixel size that puts grid points exactly ON the unit circle.
+#
+# ``n_pix * pixsize == 2`` with a dyadic pixsize -- a 2-radian field over a
+# power-of-two grid, the natural full-hemisphere convention -- makes
+# ``l = -1.0`` land exactly on the grid, so ``rho2 == 1.0``, ``n == 0.0``
+# exactly, in float32 as well as float64. On 64^2 that is two pixels,
+# ``(0, 32)`` and ``(32, 0)``.
+#
+# No other fixture in this repository has one. Measured ``min|n|``: 0.0436
+# (EDA2 zenith), 0.0257 (the anisotropic plan), 0.9512 (MWA_compact) -- not a
+# single pixel with ``n == 0`` anywhere. That is the fifth axis this module
+# held constant, and it is the one that hides the division-safety machinery:
+# both halves of ``_disc_mask_and_safe_n`` are unfalsifiable without it.
+#
+#   * ``mask = n_grid >= 0.0`` (instead of ``> 0.0``) divides by zero and NaNs
+#     the *primal*;
+#   * ``return mask, n_grid`` (dropping the ``jnp.where`` that makes ``safe_n``
+#     safe) leaves every primal path finite and NaNs only the **gradient** --
+#     the standard JAX "where" trap, where the untaken branch's ``inf``
+#     multiplies by zero in reverse mode.
+#
+# Both pass the whole 1272-test suite on every other fixture. The second is the
+# dangerous one: issue #21's ``custom_vjp`` is built on gradients through this
+# pair, and a defect that breaks only gradients while passing every primal test
+# is exactly what its contract has to cover.
+_BOUNDARY_PIXSIZE = 1.0 / 32.0
+
+
+@pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
+def test_pixels_exactly_on_the_unit_circle_stay_finite_in_value_and_gradient(
+    dtype: DTypeLike, eps: float, _dot_tol: float
+) -> None:
+    """``n == 0`` exactly: no division by it, in the primal or the gradient.
+
+    ``1/n`` is undefined on the unit circle, and the implementation's answer is
+    to exclude it -- the disc mask is ``n > 0``, strictly -- and to divide by a
+    ``safe_n`` that is 1.0 wherever the mask is false, so the untaken branch of
+    the ``jnp.where`` never contains an infinity for reverse mode to turn into
+    a NaN. Neither half of that is exercised by any other fixture here, because
+    no other fixture has a pixel on the circle (see ``_BOUNDARY_PIXSIZE``).
+
+    Three assertions, catching different mutations:
+
+      * the boundary pixels come back **exactly zero** from the adjoint --
+        catches ``mask = n_grid >= 0.0`` semantically, since a mask that
+        includes them would produce ``x / 0``;
+      * both operators' outputs are finite -- catches the same mutation as a
+        NaN, and would catch any other route to dividing by zero;
+      * ``jax.grad`` through both is finite -- the only assertion that catches
+        ``safe_n = n_grid``, which leaves both primals finite and NaNs the
+        gradient alone.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, pixsize_l=_BOUNDARY_PIXSIZE)
+    n_grid = _n_grid(problem.plan)
+    on_circle = n_grid == 0.0
+    n_on = int(on_circle.sum())
+    assert n_on > 0, (
+        f"this fixture has no pixel with n == 0 exactly (min|n| = "
+        f"{np.abs(n_grid).min():.3e}), so it cannot falsify the division-safety "
+        "machinery and every assertion below is vacuous"
+    )
+    assert int((n_grid > 0.0).sum()) > 0 and int((n_grid < 0.0).sum()) > 0, (
+        "the fixture must still straddle the disc, or this is not the boundary case"
+    )
+
+    image = jnp.asarray(problem.image)
+    vis = jnp.asarray(problem.vis)
+    fwd = np.asarray(dirty2vis(problem.plan, image, divide_by_n=True))
+    adj = np.asarray(vis2dirty(problem.plan, vis, divide_by_n=True))
+
+    np.testing.assert_array_equal(
+        adj[0][on_circle],
+        np.zeros(n_on, dtype=adj.dtype),
+        err_msg=(
+            f"vis2dirty(divide_by_n=True) did not return exactly 0 at the {n_on} pixels "
+            "with n == 0. The disc mask is n > 0 strictly: 1/n is undefined on the "
+            "circle, so those pixels are excluded rather than divided. A mask of "
+            "n >= 0 would divide by zero here."
+        ),
+    )
+    assert np.all(np.isfinite(fwd)), (
+        f"dirty2vis(divide_by_n=True) returned non-finite visibilities on a plan with "
+        f"{n_on} pixels exactly on the unit circle"
+    )
+    assert np.all(np.isfinite(adj)), (
+        f"vis2dirty(divide_by_n=True) returned non-finite pixels on a plan with {n_on} "
+        "pixels exactly on the unit circle"
+    )
+
+    grad_fwd = np.asarray(
+        jax.grad(lambda im: jnp.sum(jnp.abs(dirty2vis(problem.plan, im, divide_by_n=True)) ** 2))(
+            image
+        )
+    )
+    grad_adj = np.asarray(
+        jax.grad(lambda v: jnp.sum(vis2dirty(problem.plan, v, divide_by_n=True) ** 2))(vis.real)
+    )
+    n_nan = int((~np.isfinite(grad_fwd)).sum()) + int((~np.isfinite(grad_adj)).sum())
+    assert n_nan == 0, (
+        f"{n_nan} non-finite entries in the gradients on a plan with {n_on} pixels "
+        "exactly on the unit circle, while both primals are finite. That is the "
+        "signature of dividing by an unguarded n inside a jnp.where: the select "
+        "discards the infinity but reverse mode multiplies it by zero and gets NaN. "
+        "_disc_mask_and_safe_n must return a safe_n that is 1.0 outside the mask. "
+        "Issue #21's custom_vjp is built on exactly these gradients."
+    )
+    assert float(np.linalg.norm(grad_fwd.astype(np.float64))) > 0.0
+
+
 # ---------------------------------------------------------------------------
 # 5. ducc0 parity for the two new flag combinations (black-box oracle)
 # ---------------------------------------------------------------------------
@@ -1603,8 +1733,12 @@ GUARD_TOL_F32 = 1e-5
 
 
 @pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
+@pytest.mark.parametrize(
+    "geometry",
+    [pytest.param({}, id="square_isotropic"), *_ANISO_GEOMETRIES],
+)
 def test_the_independent_one_over_n_matches_the_plans_own_grid(
-    dtype: DTypeLike, eps: float, _dot_tol: float
+    geometry: dict[str, Any], dtype: DTypeLike, eps: float, _dot_tol: float
 ) -> None:
     """Guard on the oracle: the two constructions must agree before it is used.
 
@@ -1625,8 +1759,17 @@ def test_the_independent_one_over_n_matches_the_plans_own_grid(
     two genuinely differ (3.380e-07 measured, against 7.622e-16 in float64).
     Skipping the float32 leg would leave the oracle's 32 float32 cells running
     against an unchecked factor -- the precise mismatch this guard is for.
+
+    Run on **all three geometries** for the same reason: the anisotropic and
+    non-square plans are where the oracle does its axis-assignment work, and
+    the oracle is only an oracle where this guard has been run. Guarding the
+    square isotropic plan alone would leave
+    ``test_the_diagonal_is_indexed_l_by_m_and_not_m_by_l`` resting on an
+    unchecked ``_independent_one_over_n`` -- and those are precisely the grids
+    whose l/m handling is not symmetric, so a construction error there could
+    not cancel itself the way it would on a symmetric grid.
     """
-    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, n_chan=_MATRIX_N_CHAN)
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, n_chan=_MATRIX_N_CHAN, **geometry)
     independent = _independent_one_over_n(problem)
     n_grid = _n_grid(problem.plan)
     inside_plan = n_grid > 0.0
