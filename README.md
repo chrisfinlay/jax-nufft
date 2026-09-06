@@ -349,13 +349,18 @@ channel blocks are `+3.9e3` and `−3.8e3` on this fixture, so summing them
 first leaves ~1.9% and would inflate the residual ~50x, forcing a bound loose
 enough to hide a uniform 5e-5 one-sided error.
 
-Bounds: `1e-11` in float64 (measured 8.1e-16 … 1.9e-12 on CPU) and `5e-6` in
-float32 (`epsilon = 1e-5`). The float32 identity bound is **backend-dependent
-and set from two backends**, not from CPU alone: the same population measures
-up to 4.2e-7 on CPU but 1.1e-6 on a GH200, because reduction order differs
-between them and this residual is pure round-off in an identity that is exact
-on paper. What fixes the value is not headroom but detection — a uniform 5e-5
-one-sided error still fails it by 10x.
+Bounds: `1e-11` in float64 and `5e-6` in float32 (`epsilon = 1e-5`). Both are
+justified against **two backends — CPU (macOS arm64) and one NVIDIA GH200** —
+rather than against whichever was to hand, because this residual is pure
+round-off in a relation that is exact on paper, and round-off is what reduction
+order changes. That matters more than it sounds: on CPU the float32 identity
+measures 1.8e-7, and on the GPU's `JAX_ENABLE_X64=0` leg 1.5e-6, so CPU
+evidence alone overstates the margin by 8x in exactly the population that looks
+safest. In float64 the CPU is the worse backend instead, by 350x. What fixes
+the float32 value is not headroom but detection — a uniform 5e-5 one-sided
+error still fails it by 34x at the worst measured cell. The per-bound
+measurements for both backends are tabulated in `tests/test_divide_by_n.py`'s
+module docstring.
 
 Two comparisons of a call against itself (the no-argument call against the
 explicit default, and `divide_by_n=True` against a perturbation outside the

@@ -67,13 +67,51 @@ traceability check and **all three section-6 tests** are parametrised over both
 legs via ``_PRECISIONS``; the float64 entry carries ``requires_x64`` so
 ``JAX_ENABLE_X64=0`` skips it rather than failing, and the float32 entry runs
 in both legs. Float32 plans are built with ``dtype=jnp.float32`` and
-``epsilon = 1e-5``. The identity is gated at ``IDENTITY_TOL_F32`` in both
-populations that use it -- a **backend-dependent** bound, set from the worst of
-a CPU and a GH200 measurement rather than from the CPU alone; see that constant
-for both populations and for the defect margin that fixes its value. Two
-comparisons of one executable against itself are held at
-``SAME_EXECUTABLE_TOL_*`` rather than at bit-equality, for the same reason:
-XLA:GPU reductions are not run-to-run deterministic.
+``epsilon = 1e-5``.
+
+Backends
+--------
+
+**Every tolerance below is justified against two backends: CPU (macOS arm64,
+10-core) and one NVIDIA GH200.** That is two machines, not a general claim
+about GPUs -- another accelerator, or another XLA version, may sit elsewhere,
+and a bound whose binding case is the GH200 is the one to re-measure first if
+that changes. Measured maxima, with the binding backend in the last column:
+
+    quantity              CPU        GPU x64    GPU x32    bound   binds
+    identity sec2 f64   1.936e-12  5.506e-15      --       1e-11   CPU   5.2x
+    identity sec6 f64   6.574e-13  2.384e-15      --       1e-11   CPU  15.2x
+    strategy_err  f64   1.299e-13  1.667e-16      --       1e-11   CPU  77.0x
+    fold_err      f64   1.070e-06  1.070e-06      --       4e-06   both  3.7x
+    oracle        f64   3.338e-15  3.983e-16      --       1e-12   CPU 299.6x
+    same-exec     f64   0.000e+00  1.604e-16      --       1e-11   GPU  6.2e4x
+    identity sec2 f32   1.775e-07  7.482e-07  1.456e-06    5e-06   GPU   3.4x
+    identity sec6 f32   4.222e-07  4.375e-07  4.013e-07    5e-06   GPU  11.4x
+    strategy_err  f32   9.901e-08  7.894e-08  7.819e-08    1e-06   CPU  10.1x
+    fold_err      f32   9.132e-06  9.185e-06  9.185e-06    4e-05   GPU   4.4x
+    oracle        f32   1.839e-07  1.949e-07  1.949e-07    1e-05   GPU  51.3x
+    same-exec     f32   0.000e+00  7.931e-08  7.634e-08    1e-04   GPU  1.3e3x
+
+Read that table before touching any constant in it, because **CPU evidence
+alone ranks these bounds close to backwards**:
+
+  * the tightest margin in the module is ``identity sec2`` in float32, at
+    **3.4x** on the GPU's ``JAX_ENABLE_X64=0`` leg -- the population that looks
+    *roomiest* on CPU, at 28.2x. The two disagree by 8x. A bound fitted to CPU
+    would have been set near 2e-6 and this leg would fail it;
+  * ``fold_err`` looks like the risk at 3.7x, and is in fact the safest entry
+    here: it measures 1.070e-06 on **both** backends, agreeing to four
+    significant figures (9.185e-06 against 9.132e-06 in float32). The quantity
+    does not move between backends, so its headroom is the whole story rather
+    than a sample of one;
+  * the float64 identity's 5.2x is the **CPU** being the worse backend by 350x
+    (1.9e-12 against 5.5e-15), not a latent GPU risk.
+
+The two same-executable comparisons are the reason the ``same-exec`` row
+exists: they are held at ``SAME_EXECUTABLE_TOL_*`` rather than at bit-equality
+because XLA:GPU reductions are not run-to-run deterministic. CPU measures
+exactly 0.0 there and the GPU does not, which is precisely the shape of
+assumption that CPU-only evidence cannot test.
 
 Only three things stay float64-only, and they say so with ``requires_x64``:
 the ducc0 parity comparison, the exact-DFT comparison and the mixed-default
@@ -111,14 +149,23 @@ from tests.conftest import EDA2, MWA_COMPACT, Telescope, requires_x64, synthetic
 # exact on paper and runs several times larger and backend-dependent. Sharing
 # one constant would drag whichever is tighter up to the other's level for a
 # reason that does not apply to it.
+#
+# Binding case: **CPU** on both legs -- 1.299e-13 float64 and 9.901e-08
+# float32, against a GH200's 1.667e-16 and 7.894e-08. Reordering a reduction is
+# what this quantity measures, so it is mildly surprising that the GPU is the
+# quieter of the two; the reason is that it is a comparison *within* one
+# backend, so the backend's own reduction order largely cancels. 77x and 10.1x
+# of headroom respectively.
 DOT_TOL_F64 = 1e-11
 DOT_TOL_F32 = 1e-6
 # The section-6 semantic oracle's bounds: ``divide_by_n=True`` against the
 # *other* flag fed an image (or output) scaled by an independently built masked
-# ``1/n``. Measured over its 64 cells: 3.1e-16 .. 3.3e-15 in float64 and
-# 1.3e-7 .. 1.8e-7 in float32. Same numbers as section 4's inline bounds, which
-# make the same comparison on one strategy; named here because section 6 makes
-# it 64 times and the two should not drift apart.
+# ``1/n``. Measured maxima over its 64 cells: 3.338e-15 (CPU) / 3.983e-16 (GPU)
+# in float64, and 1.839e-07 (CPU) / 1.949e-07 (GPU) in float32. The GPU binds
+# on the float32 leg, by 6%; both legs keep 50x or more of headroom, so this is
+# among the least backend-sensitive bounds here. Same numbers as section 4's
+# inline bounds, which make the same comparison on one strategy; named here
+# because section 6 makes it 64 times and the two should not drift apart.
 ORACLE_TOL_F64 = 1e-12
 ORACLE_TOL_F32 = 1e-5
 # The dot-product identity's own bounds, kept separate from the
@@ -127,22 +174,40 @@ ORACLE_TOL_F32 = 1e-5
 #
 # The identity is exact on paper, so its residual is pure round-off in the
 # operators' own reductions -- and reduction order is exactly what changes
-# between backends. Measured maxima over this module's float32 identity
-# population (six section-2 cases + 32 section-6 two-channel cells, scored per
-# channel): 4.222e-07 on CPU and 1.051e-06 on one GH200, the GPU worst being
-# MWA_compact off30 with divide_by_n=True. The CPU-fitted 1e-6 failed that cell
-# by 5%.
+# between backends. Measured maxima over this module's two identity
+# populations (six section-2 cases; 32 section-6 two-channel cells, scored per
+# channel):
 #
-# 5e-6 clears the measured GPU maximum by 4.8x and the CPU one by 11.8x. It is
-# NOT chosen for headroom alone: the constraint that decides it is that the
-# uniform 5e-5 one-sided scaling defect of ``MUT-E`` must keep failing, which
-# it does by 10x. A bound is only honest here if a defect of the size this test
-# exists to catch still fails it with margin, and 5e-5/5e-6 is that margin.
+#                     CPU        GPU x64    GPU x32     binds
+#   sec2 float64   1.936e-12   5.506e-15      --        CPU     5.2x
+#   sec6 float64   6.574e-13   2.384e-15      --        CPU    15.2x
+#   sec2 float32   1.775e-07   7.482e-07  1.456e-06     GPU     3.4x
+#   sec6 float32   4.222e-07   4.375e-07  4.013e-07     GPU    11.4x
+#
+# Two things in that table are worth the space they take.
+#
+# The **float32 binding case is the GPU's x32 leg at 1.456e-06**, in the
+# population whose CPU number (1.775e-07) is the roomiest in the module. CPU
+# and GPU disagree by 8x there, in the direction that matters. An earlier
+# version of this constant was 1e-6, fitted to CPU, and the GH200 exceeded it
+# by 5%; fitted to CPU evidence *including* that correction it would have
+# landed near 2e-6, and this leg would still fail. 5e-6 covers it with 3.4x --
+# the tightest margin in this module, and the entry to re-measure first on new
+# hardware.
+#
+# The **float64 binding case is the CPU**, by 350x (1.936e-12 against
+# 5.506e-15). Its 5.2x is therefore not a latent GPU risk but the worse of two
+# backends already measured, and 1e-11 stands.
+#
+# What fixes the float32 value is detection, not headroom: the uniform 5e-5
+# one-sided scaling defect (``MUT-E``) must keep failing, and it exceeds even
+# the worst measured cell by 34x. A bound is only honest here if a defect of
+# the size this test exists to catch still fails it with margin.
 #
 # The strategy-equivalence use in section 6's composition test deliberately
 # does NOT move to this number: it compares two runs at the same precision
-# differing only in reduction order, measures 9.9e-8 on CPU, and giving it a
-# 5e-6 bound would loosen a tight quantity for a reason that belongs to another.
+# differing only in reduction order, measures 9.9e-8, and giving it a 5e-6
+# bound would loosen a tight quantity for a reason that belongs to another.
 IDENTITY_TOL_F64 = 1e-11
 IDENTITY_TOL_F32 = 5e-6
 
@@ -159,6 +224,14 @@ IDENTITY_TOL_F32 = 5e-6
 # declared default rather than somewhere else -- is gated separately and
 # exactly, at the JIT boundary, where it is a property of the dispatch rather
 # than of the arithmetic.
+#
+# Measured maxima over the module's three same-executable comparisons: CPU
+# **exactly 0.000e+00** on both legs, against a GH200's 1.604e-16 (float64) and
+# 7.931e-08 (float32). The GPU binds trivially, with 6.2e4x and 1.3e3x of
+# headroom. That CPU column is the whole lesson of this constant: a backend
+# that is bit-reproducible cannot distinguish "deterministic by construction"
+# from "deterministic here", so no amount of CPU evidence could have shown the
+# bit-equality assertion these bounds replaced to be unsound.
 SAME_EXECUTABLE_TOL_F64 = 1e-11
 SAME_EXECUTABLE_TOL_F32 = 1e-4
 # ...and however tight that bound is in absolute terms, it must stay far below
@@ -173,6 +246,17 @@ DFT_TOL_FACTOR = 2.0
 # Folded vs unfolded agreement, mirroring
 # tests/test_hermitian.py::CROSS_PATH_TOL_FACTOR (issue #17): the triangle
 # inequality on the 2*eps DFT contract each path meets separately.
+#
+# The 3.7x headroom this gives in float64 (1.070e-06 against 4e-06) is the
+# smallest number in the module docstring's table, and it is nonetheless the
+# entry least in need of watching: it is **measured identical on both
+# backends** -- 1.070e-06 on CPU and on a GH200, agreeing to four significant
+# figures, and 9.132e-06 against 9.185e-06 in float32. Folded and unfolded
+# plans are two approximations of the same operator, and the gap between them
+# is set by the w-plane geometry rather than by reduction order, so it does not
+# move with the backend. Its headroom is therefore the whole story, not a
+# sample of one; contrast the float32 identity above it, whose CPU headroom
+# overstates the truth by 8x.
 CROSS_PATH_TOL_FACTOR = 4.0
 
 W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
