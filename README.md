@@ -345,22 +345,27 @@ tests, none of which gates the claim alone:
    is shared by the reference too.
 
 The identity is scored **per channel**, not on the channel sum: the two
-channel blocks are `+3.9e3` and `−3.8e3` on this fixture, so summing them
-first leaves ~1.9% and would inflate the residual ~50x, forcing a bound loose
-enough to hide a uniform 5e-5 one-sided error.
+channel blocks are `+3909.9` and `−3837.0` on this fixture, so summing them
+first leaves 1.86%, and the bound that then has to accommodate the inflation
+is one whose honesty rests on a headroom judgement unrelated to the operators
+— the one actually chosen that way passed a uniform 5e-5 one-sided error.
 
-Bounds: `1e-11` in float64 and `5e-6` in float32 (`epsilon = 1e-5`). Both are
-justified against **two backends — CPU (macOS arm64) and one NVIDIA GH200** —
-rather than against whichever was to hand, because this residual is pure
-round-off in a relation that is exact on paper, and round-off is what reduction
-order changes. That matters more than it sounds: on CPU the float32 identity
-measures 1.8e-7, and on the GPU's `JAX_ENABLE_X64=0` leg 1.5e-6, so CPU
-evidence alone overstates the margin by 8x in exactly the population that looks
-safest. In float64 the CPU is the worse backend instead, by 350x. What fixes
-the float32 value is not headroom but detection — a uniform 5e-5 one-sided
-error still fails it by 34x at the worst measured cell. The per-bound
-measurements for both backends are tabulated in `tests/test_divide_by_n.py`'s
-module docstring.
+Bounds: `1e-11` in float64 and `5e-6` in float32 (`epsilon = 1e-5`). **Every
+tolerance in the test module is measured on two backends — CPU (macOS arm64)
+and one NVIDIA GH200** — rather than on whichever was to hand, and the reason
+is that they are not all the same kind of number. Bounds that measure a real
+approximation gap against an exact or independent reference (the DFT and ducc0
+contracts, folded-vs-unfolded agreement) are backend-stable, agreeing to under
+5% across the two machines. Bounds that measure round-off in a relation exact
+on paper — this identity among them — are reduction order and nothing else,
+and move by 8x to 780x. So on CPU the float32 identity measures 1.8e-7 and on
+the GPU's `JAX_ENABLE_X64=0` leg 1.5e-6: CPU evidence alone overstates the
+margin by 8x in exactly the population that looks safest. In float64 the CPU is
+the worse backend instead, by 350x. What fixes the float32 value is not
+headroom but detection — a uniform 5e-5 one-sided error still fails it by 34x
+at the worst measured cell. The per-bound measurements for both backends, and
+which kind each bound is, are tabulated in `tests/test_divide_by_n.py`'s module
+docstring.
 
 Two comparisons of a call against itself (the no-argument call against the
 explicit default, and `divide_by_n=True` against a perturbation outside the

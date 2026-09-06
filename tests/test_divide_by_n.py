@@ -100,16 +100,18 @@ Backends
 **Every tolerance in the table below is justified against two backends: CPU
 (macOS arm64, 10-core) and one NVIDIA GH200.** That is two machines, not a
 general claim about GPUs -- another accelerator, or another XLA version, may
-sit elsewhere, and a bound whose binding case is the GH200 is the one to
-re-measure first if that changes. Measured maxima, with the binding backend in
-the last column:
+sit elsewhere. Which row to re-measure first when that happens is *not* simply
+the one with the least headroom; see the two-kinds split below the table.
+Measured maxima, with the binding backend in the last column (the ``ducc`` row
+is a fraction of its own ``3 * eps`` bound rather than an absolute error, that
+bound varying per cell):
 
     quantity              CPU        GPU x64    GPU x32    bound   binds
-    dft_all       f64   8.740e-07      ?          --       2e-06   ?     2.29x
-    dft_outside   f64   5.325e-07      ?          --       2e-06   ?     3.76x
-    ducc (28)     f64   24.4% of bd    ?          --       3*eps   ?     4.09x
+    dft_all       f64   8.740e-07  8.807e-07      --       2e-06   GPU   2.27x
+    dft_outside   f64   5.325e-07  5.575e-07      --       2e-06   GPU   3.59x
+    ducc (28)     f64     24.40%     24.66%       --       3*eps   GPU   4.06x
     identity sec2 f64   1.936e-12  5.506e-15      --       1e-11   CPU   5.2x
-    identity sec6 f64   6.574e-13  2.384e-15      --       1e-11   CPU  15.2x
+    identity sec6 f64   6.574e-13  2.567e-15      --       1e-11   CPU  15.2x
     strategy_err  f64   1.299e-13  1.667e-16      --       1e-11   CPU  77.0x
     fold_err      f64   1.070e-06  1.070e-06      --       4e-06   both  3.7x
     oracle        f64   3.338e-15  3.983e-16      --       1e-12   CPU 299.6x
@@ -121,16 +123,52 @@ the last column:
     oracle        f32   1.839e-07  1.949e-07  1.949e-07    1e-05   GPU  51.3x
     same-exec     f32   0.000e+00  7.931e-08  7.634e-08    1e-04   GPU  1.3e3x
 
-The first three rows carry ``?`` because they are **not yet measured on the
-GH200**: ``DFT_TOL_FACTOR`` and ``DUCC_TOL_FACTOR`` are ``requires_x64``, so
-they run on that machine's float64 leg and nobody has read the numbers off it.
-They run device code like every other row and belong here; until those cells
-are filled, their CPU figures are one backend's evidence and should be read as
-such. **``dft_all`` at 2.29x is the tightest bound in this module and the entry
-to re-measure first on new hardware.**
+Headroom is not the same as risk, and this table is the evidence for that.
+The rows fall into two kinds, and at *equal headroom* they are not equally
+worth worrying about:
 
-Read that table before touching any constant in it, because **CPU evidence
-alone ranks these bounds close to backwards**:
+**Approximation-gap rows** -- ``dft_all``, ``dft_outside``, ``ducc``,
+``fold_err``. These measure a real, deterministic approximation error against
+an exact or independent reference: the w-kernel width and plane count against
+an exact DFT, this library against ducc0, a folded plan against an unfolded
+one. What sets them is the algorithm's own accuracy at the requested epsilon,
+which reduction order does not touch. Measured on both backends they move by
+under 5%:
+
+    dft_all      8.740e-07 CPU / 8.807e-07 GPU    0.8%
+    dft_outside  5.325e-07 CPU / 5.575e-07 GPU    4.7%
+    ducc (28)    24.40%    CPU / 24.66%     GPU    1.1%
+    fold_err f64 1.070e-06 CPU / 1.070e-06 GPU    identical to 4 figures
+    fold_err f32 9.132e-06 CPU / 9.185e-06 GPU    0.6%
+
+For these, the measured headroom is the whole story. ``dft_all`` at 2.27x is
+the **tightest bound in this module on both backends**, and that is a stable
+margin rather than a sample of one: it would move if epsilon, the kernel or
+the geometry changed, not because the hardware did.
+
+**Round-off rows** -- the two ``identity`` populations, ``strategy_err``,
+``oracle``, ``same-exec``. These measure floating-point noise in relations
+that are exact on paper, so reduction order is the entire quantity, and it is
+exactly what changes between backends. They move by 8x to 780x:
+
+    identity sec2 f32   1.775e-07 CPU / 1.456e-06 GPU x32     8.2x
+    identity sec2 f64   1.936e-12 CPU / 5.506e-15 GPU       ~350x
+    strategy_err  f64   1.299e-13 CPU / 1.667e-16 GPU       ~780x
+    same-exec     f64   0.000e+00 CPU / 1.604e-16 GPU     unbounded
+
+They also vary run to run on one machine: two GH200 runs read ``identity sec2
+f64`` at 5.506e-15 and 3.754e-15, and ``identity sec6 f64`` at 2.384e-15 and
+2.567e-15 (the worse of each pair is what the table records), while
+``fold_err`` read identically to four figures both times.
+
+So the entry to re-measure first on new hardware is **not** the one with the
+smallest number in the last column. It is whichever round-off row is tightest
+-- currently ``identity sec2 f32`` at 3.4x -- because that is the kind of bound
+whose headroom a new backend can actually consume. ``dft_all``'s 2.27x sits
+below it and is the safer of the two.
+
+Read the table before touching any constant in it, because within the
+round-off rows **CPU evidence alone ranks the bounds close to backwards**:
 
   * of the rows measured on both backends, the tightest is ``identity sec2`` in
     float32, at **3.4x** on the GPU's ``JAX_ENABLE_X64=0`` leg -- the
@@ -278,15 +316,22 @@ SAME_EXECUTABLE_TOL_F32 = 1e-4
 # fixture instead of trusting two independently chosen constants.
 SAME_EXECUTABLE_SEPARATION = 1e3
 # ducc0 parity contract, mirroring tests/test_against_ducc.py::DUCC_TOL_FACTOR.
-# Worst of this module's 28 ducc cells on CPU: 24.4% of the bound (4.09x).
-# Not yet measured on the GH200 -- see the module docstring's table.
+# Worst of this module's 28 ducc cells: 24.4% of the bound on CPU and 24.66% on
+# a GH200 (4.06x) -- the two agree to about 1%, this being an approximation-gap
+# quantity rather than a round-off one. See the module docstring's table.
 DUCC_TOL_FACTOR = 3.0
 # Exact-DFT contract, mirroring tests/test_adjoint.py::DFT_TOL_FACTOR.
-# CPU: 8.740e-07 whole-image (2.29x) and 5.325e-07 outside-disc (3.76x) against
-# 2*eps at eps=1e-6. The whole-image leg is the **tightest bound in this
-# module** -- tighter than anything in the two-backend table -- and it too is
-# unmeasured on the GH200. Both are ``requires_x64``, which is why they were
-# absent from that table for a round; running device code, they belong in it.
+# Whole-image leg 8.740e-07 CPU / 8.807e-07 GH200 (2.27x); outside-disc leg
+# 5.325e-07 / 5.575e-07 (3.59x), both against 2*eps at eps=1e-6.
+#
+# The whole-image leg is the **tightest bound in this module on both
+# backends**, and that is deliberately not flagged as the module's biggest
+# risk. It measures the w-kernel's approximation gap against an exact DFT, so
+# the two backends agree to 0.8% and the margin is stable under a change of
+# hardware -- it would move if epsilon, the kernel or the geometry changed, not
+# because the machine did. A round-off-dominated bound at the same headroom
+# would be the more fragile of the two; see the module docstring for the
+# split and the 8x-780x spread on the other side of it.
 DFT_TOL_FACTOR = 2.0
 # Folded vs unfolded agreement, mirroring
 # tests/test_hermitian.py::CROSS_PATH_TOL_FACTOR (issue #17): the triangle
@@ -302,9 +347,10 @@ DFT_TOL_FACTOR = 2.0
 # 4.4x margin), not on the derivation -- worth knowing before treating the
 # float32 bound as principled rather than empirical.
 #
-# The 3.7x headroom this gives in float64 (1.070e-06 against 4e-06) is the
-# smallest number in the module docstring's table, and it is nonetheless the
-# entry least in need of watching: it is **measured identical on both
+# The 3.7x headroom this gives in float64 (1.070e-06 against 4e-06) is among
+# the smallest numbers in the module docstring's table, and it is nonetheless
+# one of the entries least in need of watching -- an **approximation-gap** row
+# in that table's classification. It is **measured identical on both
 # backends** -- 1.070e-06 on CPU and on a GH200, agreeing to four significant
 # figures, and 9.132e-06 against 9.185e-06 in float32. Folded and unfolded
 # plans are two approximations of the same operator, and the gap between them
