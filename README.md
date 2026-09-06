@@ -304,8 +304,7 @@ MWA_compact the mixed pair's `n x` residual is 1.20e-14 at zenith and 1.94e-12
 at 30&deg;.
 
 **Recommendation: pass `divide_by_n=True` to both operators.** It is the
-factor the measurement equation actually carries, it gives the best-conditioned
-of the two adjoint pairs (1.3e-15 against 1.3e-13), and it is what any
+factor the measurement equation actually carries, and it is what any
 gradient-based use of the pair needs:
 
 ```python
@@ -313,12 +312,31 @@ vis = dirty2vis(plan, image, divide_by_n=True)
 dirty = vis2dirty(plan, vis, divide_by_n=True)     # exactly A^H of the above
 ```
 
+Both equal-flag pairs are adjoint to far inside any tolerance in this library,
+and the recommendation does **not** rest on which residual is smaller. Read
+across the precisions, the ordering reverses: in float64 `True` measures
+1.3e-15 against `False`'s 1.3e-13 on EDA2 full-sky, but in float32 `True` is
+the *larger* residual on every fixture measured (7.2e-8 / 1.1e-7 / 1.8e-7
+against 1.8e-8 / 2.9e-8 / 2.0e-8 on EDA2 zenith, MWA_compact zenith and
+MWA_compact off30). That is what one would expect from a `1/n` diagonal, which
+amplifies pixels near the horizon where `n -> 0` and so widens the dynamic
+range a single-precision sum has to carry. These are dot-product residuals —
+round-off in an identity that is exact on paper — and not a measurement of
+either operator's conditioning; neither ordering should be read as one.
+
 The defaults are left as they are for ducc0 compatibility and because moving
 them would silently change every existing caller's answer by a factor of `n`.
-The residuals above come from `tests/test_divide_by_n.py`, which gates the
-equal-flag identity at an eps-independent `1e-11` over both flag values, all
-four `w_strategy` values, both `hermitian` settings and both precision legs
-(float32 at `epsilon = 1e-5` measures 1.8e-8 &hellip; 7.2e-8, gated at `1e-6`).
+
+The residuals above come from `tests/test_divide_by_n.py`. Its section-6
+matrices enumerate every axis the operators dispatch on — both flag values,
+all four `w_strategy` values, both `channel_strategy` values, both `hermitian`
+settings and both precision legs, on a two-channel plan — in two complementary
+tests: the dot-product identity, and a strategy/fold comparison whose
+reference stays pinned to `(dense_scan, scan)`. Both are needed, because a
+defect applied consistently to both operators leaves the pair adjoint and is
+invisible to the identity. Bounds: `1e-11` in float64; in float32 (`epsilon =
+1e-5`) the single-channel identity measures 1.8e-8 &hellip; 1.8e-7 against a
+`1e-6` bound, and the two-channel matrix 2.7e-7 &hellip; 1.2e-5 against `1e-4`.
 
 ### Kernel choice
 

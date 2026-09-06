@@ -24,6 +24,18 @@ eps-independent ``1e-11`` bound this module gates it at -- the same bound
 Issue #21's ``custom_vjp`` needs exactly that pair, so these tests are its
 contract too.
 
+Because it is #21's contract, section 6 enumerates **every axis the operators
+dispatch on**: 4 ``w_strategy`` x 2 ``channel_strategy`` x 2 ``hermitian`` x 2
+flag values x 2 precisions, on a two-channel plan. The channel axis is the one
+that has to be built rather than merely parametrised -- at ``n_chan == 1`` the
+scan and vmap channel loops both run their body once, so a single-channel plan
+cannot falsify anything about them however many times it is re-run. The two
+section-6 tests are a **pair** and neither gates the claim alone: the identity
+cannot see a defect applied consistently to *both* operators (that is just the
+other flag's pair, and still perfectly adjoint), which is why the composition
+test beside it holds its reference fixed at ``(dense_scan, scan)`` while the
+cell moves.
+
 What each flag means, asserted separately from the identity in section 4:
 
   * forward with ``divide_by_n=True`` multiplies the image by ``1/n`` inside
@@ -37,17 +49,22 @@ Both are checked against ducc0 (public API only, black-box oracle) at the
 repo's ``3 * eps`` bound in section 5, and the outside-disc values against an
 exact DFT in the repo's sign convention.
 
-Precision: the identity, the default check, both flag-semantics checks and
-the traceability check are parametrised over both legs via ``_PRECISIONS``;
-the float64 entry carries ``requires_x64`` so ``JAX_ENABLE_X64=0`` skips it
-rather than failing, and the float32 entry runs in both legs. Float32 plans
-are built with ``dtype=jnp.float32`` and ``epsilon = 1e-5``, and the identity
-is gated at ``1e-6`` there (measured 1.8e-8 .. 7.2e-8). The remaining tests
-are float64-only and say so with ``requires_x64``: the signature checks carry
-no precision at all, while the ducc0 and exact-DFT comparisons and the
-strategy / fold matrices are stated against bounds (``3 * eps`` at eps=1e-6,
-``2 * eps``, and the 1e-11 strategy-equivalence bound) that single precision
-cannot reach -- restating them at a float32 tolerance would gate nothing.
+Precision: the identity, the default check, both flag-semantics checks, the
+traceability check and **both section-6 matrices** are parametrised over both
+legs via ``_PRECISIONS`` / ``_MATRIX_PRECISIONS``; the float64 entry carries
+``requires_x64`` so ``JAX_ENABLE_X64=0`` skips it rather than failing, and the
+float32 entry runs in both legs. Float32 plans are built with
+``dtype=jnp.float32`` and ``epsilon = 1e-5``. The section-2 identity is gated
+at ``1e-6`` there (measured 1.8e-8 .. 1.8e-7 over its six float32 cases); the
+section-6 identity matrix is a two-channel population and is gated separately
+at ``1e-4`` (measured 2.7e-7 .. 1.2e-5) -- see ``DOT_TOL_F32_MULTI_CHAN`` for
+why a wider problem has more round-off in an identity that is exact on paper.
+
+Only three things stay float64-only, and they say so with ``requires_x64``:
+the ducc0 parity comparison, the exact-DFT comparison and the mixed-default
+measurements, whose bounds (``3 * eps`` at eps=1e-6 and ``2 * eps``) single
+precision cannot reach, so restating them at a float32 tolerance would gate
+nothing. The signature checks carry no precision at all.
 """
 
 from __future__ import annotations
@@ -70,8 +87,38 @@ from tests.conftest import EDA2, MWA_COMPACT, Telescope, requires_x64, synthetic
 # The dot-product bound, matching tests/test_adjoint.py (issue #10). Measured
 # residual under equal flags on these fixtures: 1.3e-15 .. 1.9e-12.
 DOT_TOL_F64 = 1e-11
-# Single precision: measured 1.8e-8 .. 7.2e-8 on EDA2 full-sky.
+# Single precision, single channel: measured 2.3e-10 .. 8.6e-8 over the 32
+# single-channel float32 cells of the strategy x fold x flag enumeration on
+# EDA2 full-sky (and 1.8e-8 .. 1.8e-7 over the section-2 identity fixtures,
+# which include the two narrow MWA_compact pointings).
 DOT_TOL_F32 = 1e-6
+# Single precision on the **two-channel** matrix of section 6, which is a
+# different population and needs its own number rather than a reused one.
+#
+# Measured 2.7e-7 .. 1.2e-5 over that matrix's 32 float32 cells; 1e-4 is the
+# round value above it, 8.1x the worst. Three things make it larger than the
+# single-channel bound above, none of them a defect:
+#
+#   * the dot-product identity is *exact* mathematically -- it holds whatever
+#     the operator's epsilon, since it only asks that A^H be the adjoint of A
+#     -- so what this residual measures is pure floating-point round-off, and
+#     round-off is what a wider problem has more of;
+#   * the second channel sits at 1.25x the first's frequency, so its baselines
+#     in wavelengths, its phases and the plan's w-extent are all larger;
+#   * ``divide_by_n=True`` amplifies pixels near the horizon, where n -> 0, so
+#     the `1/n` diagonal widens the dynamic range the float32 sum has to carry.
+#     That shows in the split: over those 32 cells the ``True`` half reaches
+#     1.2e-5 against the ``False`` half's 1.4e-6. Stated as what it is -- the
+#     residuals measured on this population, in this precision. It is *not* a
+#     conditioning result for either operator, and the ordering does not carry
+#     across precisions: the same matrix in float64 reverses it (1.5e-13 True
+#     against 6.8e-13 False).
+#
+# Still a real gate, not a formality: the flag ignored on *one* operator lands
+# at ~6e-1 -- the mixed-pair residual this whole module is about -- which is
+# 3.8 orders of magnitude above this bound. (Ignored on *both* it stays
+# adjoint, and is caught by the pinned-reference test instead, not here.)
+DOT_TOL_F32_MULTI_CHAN = 1e-4
 # ducc0 parity contract, mirroring tests/test_against_ducc.py::DUCC_TOL_FACTOR.
 DUCC_TOL_FACTOR = 3.0
 # Exact-DFT contract, mirroring tests/test_adjoint.py::DFT_TOL_FACTOR.
@@ -82,7 +129,25 @@ DFT_TOL_FACTOR = 2.0
 CROSS_PATH_TOL_FACTOR = 4.0
 
 W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
+CHANNEL_STRATEGIES = ("scan", "vmap")
 FLAG_VALUES = (False, True)
+
+# The channel count and per-channel frequencies the section-6 matrices use.
+#
+# One channel cannot falsify anything about the channel loop: with ``n_chan ==
+# 1`` the scan and the vmap path both run their body exactly once, so a defect
+# conditioned on ``channel_strategy`` produces identical output either way. Two
+# channels is the smallest count that makes the two loops structurally
+# different, and the frequencies are deliberately *distinct* -- at equal
+# frequencies the channels are the same problem twice and a defect that
+# mishandled the loop's ordering or its carry would still cancel.
+#
+# 1.25 rather than something wilder: the ratio multiplies every baseline in
+# wavelengths, so it drives ``n_w`` and the runtime of a 64-cell matrix. The
+# section-6 tests assert adjointness and cross-path agreement, neither of which
+# is an accuracy claim about the second channel, so a modest ratio is enough.
+_MATRIX_N_CHAN = 2
+_CHANNEL_FREQ_RATIOS = (1.0, 1.25)
 
 # Both precision legs. The float64 entry is skipped (not failed) under
 # JAX_ENABLE_X64=0; the float32 entry runs in *both* legs, since a float32
@@ -90,6 +155,19 @@ FLAG_VALUES = (False, True)
 _PRECISIONS = [
     pytest.param(jnp.float64, 1e-6, DOT_TOL_F64, id="float64", marks=requires_x64),
     pytest.param(jnp.float32, 1e-5, DOT_TOL_F32, id="float32"),
+]
+
+# As ``_PRECISIONS``, but carrying the two-channel float32 dot-product bound
+# for the section-6 identity matrix. Only that one test needs it: the
+# composition matrix next to it compares two runs at the *same* precision that
+# differ only in reduction order, a far tighter quantity, and its float32 cells
+# measure 9.9e-8 against ``DOT_TOL_F32`` (10x headroom) and 9.1e-6 against
+# ``4 * eps`` (4.4x), so it stays on ``_PRECISIONS``. The float64 entry is
+# unchanged at 1e-11 -- the multi-channel plan measures 6.9e-14 .. 6.8e-13
+# there, so double precision needs no separate number.
+_MATRIX_PRECISIONS = [
+    pytest.param(jnp.float64, 1e-6, DOT_TOL_F64, id="float64", marks=requires_x64),
+    pytest.param(jnp.float32, 1e-5, DOT_TOL_F32_MULTI_CHAN, id="float32"),
 ]
 
 
@@ -105,8 +183,14 @@ class _Problem:
     freq: np.ndarray
     pixsize: float
     shape: tuple[int, int]
-    image: np.ndarray  # (n_l, n_m) real, in the plan's real dtype
-    vis: np.ndarray  # (n_rows, 1) complex, in the plan's complex dtype
+    # (n_l, n_m) real at ``n_chan == 1``; (n_chan, n_l, n_m) above it. The
+    # multi-channel image is deliberately *not* the 2-D broadcast form: a 2-D
+    # image makes the forward a map from one plane to ``n_chan`` visibility
+    # columns, whose adjoint sums over channels, so it is a different operator
+    # from the one ``vis2dirty`` implements and the dot-product identity below
+    # would not even be shape-compatible with it.
+    image: np.ndarray
+    vis: np.ndarray  # (n_rows, n_chan) complex, in the plan's complex dtype
     eps: float
 
 
@@ -122,28 +206,44 @@ def _problem(
     hermitian: bool = True,
     uvw_seed: int = 0,
     data_seed: int = 7,
+    n_chan: int = 1,
 ) -> _Problem:
     """Build (and cache) a plan plus a real image and complex visibilities.
 
     Cached because several tests below want the same plan and building one is
     pure host work; the arrays handed out are read-only by convention (every
     caller that modifies one takes a copy first).
+
+    ``n_chan`` defaults to 1, which reproduces the single-channel fixture
+    exactly -- same frequency (``tel.freq_hz * 1.0``), same 2-D image, same
+    ``(n_rows, 1)`` visibilities, same draws in the same order from the same
+    generator. Above 1 the frequencies come from ``_CHANNEL_FREQ_RATIOS`` and
+    the image gains a leading channel axis.
     """
     real_dtype = np.dtype(jnp.dtype(dtype))
     complex_dtype = np.complex64 if real_dtype == np.float32 else np.complex128
-    key = (tel.name, zenith_angle_deg, eps, real_dtype.name, hermitian, uvw_seed, data_seed)
+    key = (
+        tel.name,
+        zenith_angle_deg,
+        eps,
+        real_dtype.name,
+        hermitian,
+        uvw_seed,
+        data_seed,
+        n_chan,
+    )
     hit = _CACHE.get(key)
     if hit is not None:
         return hit
     uvw = synthetic_uvw(tel, zenith_angle_deg, seed=uvw_seed)
-    freq = np.array([tel.freq_hz])
+    freq = tel.freq_hz * np.asarray(_CHANNEL_FREQ_RATIOS[:n_chan], dtype=np.float64)
     pix = tel.pixsize
     shape = (tel.n_pix, tel.n_pix)
     rng = np.random.default_rng(data_seed)
-    image = rng.standard_normal(shape).astype(real_dtype)
-    vis = (rng.standard_normal((tel.n_rows, 1)) + 1j * rng.standard_normal((tel.n_rows, 1))).astype(
-        complex_dtype
-    )
+    image = rng.standard_normal(shape if n_chan == 1 else (n_chan, *shape)).astype(real_dtype)
+    vis = (
+        rng.standard_normal((tel.n_rows, n_chan)) + 1j * rng.standard_normal((tel.n_rows, n_chan))
+    ).astype(complex_dtype)
     plan = make_plan(uvw, freq, shape, pix, pix, eps, dtype=dtype, hermitian=hermitian)
     problem = _Problem(
         plan=plan,
@@ -744,103 +844,220 @@ def test_ducc_parity_for_the_new_flag_combinations(
 # ---------------------------------------------------------------------------
 
 
-@requires_x64
+def _matrix_run(
+    op: str,
+    problem: _Problem,
+    w_strategy: str,
+    channel_strategy: str,
+    divide_by_n: bool,
+) -> np.ndarray:
+    """One operator call in the section-6 matrix, widened to float64.
+
+    Widened *after* the call, never before: the plan's own precision does the
+    arithmetic, and the comparison is done in float64 so the test's own
+    subtraction and norms are not what the tolerance is measuring.
+    """
+    if op == "dirty2vis":
+        return _forward(
+            problem,
+            problem.image,
+            divide_by_n=divide_by_n,
+            w_strategy=w_strategy,
+            channel_strategy=channel_strategy,
+        ).astype(np.complex128)
+    return _adjoint(
+        problem,
+        divide_by_n=divide_by_n,
+        w_strategy=w_strategy,
+        channel_strategy=channel_strategy,
+    ).astype(np.float64)
+
+
+_REFERENCE_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _matrix_reference(
+    op: str,
+    problem: _Problem,
+    divide_by_n: bool,
+    hermitian: bool,
+    dtype: DTypeLike,
+    eps: float,
+) -> np.ndarray:
+    """The ``(dense_scan, scan)`` reference for a section-6 cell, memoised.
+
+    **Pinned on both strategy axes.** The cell varies ``w_strategy`` and
+    ``channel_strategy``; the reference does not. That is the whole point: a
+    reference computed with the cell's own strategies would move with any
+    defect conditioned on them and the comparison would be vacuous -- which is
+    precisely how a channel-strategy-specific defect passed the pre-existing
+    matrix.
+
+    Memoised because 128 cells share only 16 distinct references (2 operators
+    x 2 flags x 2 fold settings x 2 precisions), and recomputing each one
+    eight times is the difference between a fast module and a slow one. The
+    cache key names every input the reference depends on; ``hermitian`` and
+    ``dtype`` are in it even though they are already implied by ``problem``,
+    because a stale entry here would silently weaken every cell that read it.
+    """
+    key = (op, divide_by_n, hermitian, np.dtype(jnp.dtype(dtype)).name, eps, problem.plan.n_chan)
+    hit = _REFERENCE_CACHE.get(key)
+    if hit is None:
+        hit = _matrix_run(op, problem, "dense_scan", "scan", divide_by_n)
+        _REFERENCE_CACHE[key] = hit
+    return hit
+
+
+@pytest.mark.parametrize("dtype, eps, dot_tol", _PRECISIONS)
 @pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
 @pytest.mark.parametrize("hermitian", [False, True])
+@pytest.mark.parametrize("channel_strategy", CHANNEL_STRATEGIES)
 @pytest.mark.parametrize("w_strategy", W_STRATEGIES)
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
 def test_both_flag_values_compose_with_every_strategy_and_fold_setting(
-    op: str, w_strategy: str, hermitian: bool, divide_by_n: bool
+    op: str,
+    w_strategy: str,
+    channel_strategy: str,
+    hermitian: bool,
+    divide_by_n: bool,
+    dtype: DTypeLike,
+    eps: float,
+    dot_tol: float,
 ) -> None:
-    """All four ``w_strategy`` values x both ``hermitian`` values x both flags.
+    """Both loops x both fold settings x both flags x both precisions.
 
-    Enumerated, not sampled: the sets are ``W_STRATEGIES`` (four) and
-    ``hermitian`` (both), because "the flag composes with the w_strategy
+    Enumerated, not sampled, on every axis: ``W_STRATEGIES`` (four),
+    ``CHANNEL_STRATEGIES`` (both), ``hermitian`` (both), the flag (both) and
+    ``_PRECISIONS`` (both), because "the flag composes with the strategy
     family" is a universally quantified claim and one witness would not gate
-    it.
+    it. 128 cells per run; the plans are cached and the two reference outputs
+    are memoised across cells (:func:`_matrix_reference`), so the marginal
+    cost of a cell is the one call it is actually about.
 
-    Two references, because the two axes are different kinds of equivalence
-    and the repo already prices them differently:
+    Three references, because the three axes are different kinds of
+    equivalence and the repo already prices them differently:
 
-      * against ``dense_scan`` **at the same fold setting**: the four
-        strategies are the same operator in a different accumulation order, so
-        the 1e-11 strategy-equivalence bound applies
-        (``tests/test_strategies_equivalent.py``);
+      * against ``dense_scan`` **at the same fold setting and the same
+        precision**: the four strategies are the same operator in a different
+        accumulation order, so the 1e-11 strategy-equivalence bound applies in
+        float64 (``tests/test_strategies_equivalent.py``); the float32 leg
+        cannot reach that and is held at ``DOT_TOL_F32``;
+      * the **same reference for both channel strategies**: the reference is
+        pinned to ``channel_strategy="scan"`` whatever the cell uses, so a
+        defect that mishandles the vmap channel loop cannot hide by moving the
+        reference with it. This is the check that makes the channel axis
+        independently falsifiable, and it is the *only* one that catches a
+        defect applied consistently to both operators (which stays adjoint,
+        and so is invisible to the identity matrix below);
       * against ``dense_scan`` on an ``hermitian=False`` plan: folded and
         unfolded are different approximations of the same operator and agree
         to ``4 * eps``, the triangle inequality on the ``2 * eps`` DFT
         contract each meets (``tests/test_hermitian.py``,
         ``CROSS_PATH_TOL_FACTOR``).
 
-    Both are needed. A flag ignored on *every* folded strategy would keep the
-    first check green (the same-fold reference is wrong in the same way) and
-    is caught only by the second; a flag mishandled by one strategy is caught
-    only by the first. The fold is the interesting axis: it conjugates the
-    forward's *output* and the adjoint's *input*, while ``divide_by_n`` acts
-    on the image end of both.
+    All are needed. A flag ignored on *every* folded strategy would keep the
+    same-fold check green (the reference is wrong in the same way) and is
+    caught only by the cross-fold one; a flag mishandled by one strategy or
+    one channel loop is caught only by the same-fold one. The fold is the
+    interesting geometric axis -- it conjugates the forward's *output* and the
+    adjoint's *input*, while ``divide_by_n`` acts on the image end of both --
+    and the channel loop is the interesting structural one, being the only
+    axis on which a defect can be introduced without touching the maths.
+
+    Two channels (``_MATRIX_N_CHAN``): at one channel the scan and vmap
+    channel loops both run their body once and the axis is vacuous.
     """
-    eps = 1e-6
-    unfolded = _problem(EDA2, 0.0, eps=eps, hermitian=False)
-    problem = _problem(EDA2, 0.0, eps=eps, hermitian=hermitian)
+    unfolded = _problem(EDA2, 0.0, eps=eps, dtype=dtype, hermitian=False, n_chan=_MATRIX_N_CHAN)
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, hermitian=hermitian, n_chan=_MATRIX_N_CHAN)
     assert problem.plan.hermitian is hermitian
+    assert problem.plan.n_chan == _MATRIX_N_CHAN and problem.image.ndim == 3, (
+        "the channel axis must be real: a single-channel plan runs both channel "
+        "strategies' bodies exactly once and cannot falsify anything about them"
+    )
     n_negative = int((problem.uvw[:, 2] < 0).sum())
     assert 0 < n_negative < problem.uvw.shape[0], (
         "the fixture must have mixed-sign w or the hermitian=True leg is the "
         "hermitian=False leg under another name"
     )
-    if op == "dirty2vis":
 
-        def run(p: _Problem, strategy: str) -> np.ndarray:
-            return _forward(p, p.image, divide_by_n=divide_by_n, w_strategy=strategy).astype(
-                np.complex128
-            )
-    else:
+    got = _matrix_run(op, problem, w_strategy, channel_strategy, divide_by_n)
+    # Reference pinned to (dense_scan, scan) on *both* strategy axes.
+    same_fold = _matrix_reference(op, problem, divide_by_n, hermitian, dtype, eps)
+    cross_fold = _matrix_reference(op, unfolded, divide_by_n, False, dtype, eps)
 
-        def run(p: _Problem, strategy: str) -> np.ndarray:
-            return _adjoint(p, divide_by_n=divide_by_n, w_strategy=strategy).astype(np.float64)
-
-    got = run(problem, w_strategy)
-    same_fold = run(problem, "dense_scan")
-    cross_fold = run(unfolded, "dense_scan")
-
-    label = f"{op} w_strategy={w_strategy} hermitian={hermitian} divide_by_n={divide_by_n}"
+    label = (
+        f"{op} w_strategy={w_strategy} channel_strategy={channel_strategy} "
+        f"hermitian={hermitian} divide_by_n={divide_by_n} "
+        f"dtype={np.dtype(jnp.dtype(dtype)).name}"
+    )
     strategy_err = np.linalg.norm(got - same_fold) / np.linalg.norm(same_fold)
-    assert strategy_err < DOT_TOL_F64, (
-        f"{label}: relative difference {strategy_err:.3e} against dense_scan on the same "
-        f"plan exceeds the {DOT_TOL_F64:.1e} strategy-equivalence bound -- divide_by_n "
-        "must compose with every w_strategy, not just the dense ones."
+    assert strategy_err < dot_tol, (
+        f"{label}: relative difference {strategy_err:.3e} against (dense_scan, scan) on "
+        f"the same plan exceeds the {dot_tol:.1e} strategy-equivalence bound -- "
+        "divide_by_n must compose with every w_strategy AND every channel_strategy, not "
+        "just the dense scan ones."
     )
     fold_err = np.linalg.norm(got - cross_fold) / np.linalg.norm(cross_fold)
     fold_bound = CROSS_PATH_TOL_FACTOR * eps
     assert fold_err < fold_bound, (
-        f"{label}: relative difference {fold_err:.3e} against dense_scan on an unfolded "
-        f"plan exceeds {fold_bound:.3e} ({CROSS_PATH_TOL_FACTOR:g}*eps) -- the flag must "
-        "mean the same thing on a folded plan as on an unfolded one, and be applied on "
-        "the image side of the fold's per-row conjugation rather than skipped there."
+        f"{label}: relative difference {fold_err:.3e} against (dense_scan, scan) on an "
+        f"unfolded plan exceeds {fold_bound:.3e} ({CROSS_PATH_TOL_FACTOR:g}*eps) -- the "
+        "flag must mean the same thing on a folded plan as on an unfolded one, and be "
+        "applied on the image side of the fold's per-row conjugation rather than skipped "
+        "there."
     )
 
 
-@requires_x64
+@pytest.mark.parametrize("dtype, eps, dot_tol", _MATRIX_PRECISIONS)
 @pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
 @pytest.mark.parametrize("hermitian", [False, True])
+@pytest.mark.parametrize("channel_strategy", CHANNEL_STRATEGIES)
 @pytest.mark.parametrize("w_strategy", W_STRATEGIES)
 def test_the_pair_stays_adjoint_for_every_strategy_and_fold_setting(
-    w_strategy: str, hermitian: bool, divide_by_n: bool
+    w_strategy: str,
+    channel_strategy: str,
+    hermitian: bool,
+    divide_by_n: bool,
+    dtype: DTypeLike,
+    eps: float,
+    dot_tol: float,
 ) -> None:
     """The identity itself, over the full strategy x fold x flag enumeration.
 
-    Section 2 gates the identity on the shipped defaults for those two axes;
-    this gates it everywhere, which is what issue #21 needs -- a ``custom_vjp``
-    is chosen per call, and a caller who passes ``windowed_vmap`` on a folded
-    plan must get the same guarantee as one who passes nothing.
+    Section 2 gates the identity on the shipped defaults for those axes; this
+    gates it everywhere, which is what issue #21 needs -- a ``custom_vjp`` is
+    chosen per call, and a caller who passes ``windowed_vmap`` with
+    ``channel_strategy="vmap"`` on a folded float32 plan must get the same
+    guarantee as one who passes nothing.
+
+    64 cells: 4 ``w_strategy`` x 2 ``channel_strategy`` x 2 ``hermitian`` x 2
+    flags x 2 precisions, on a two-channel plan. Every axis the operators
+    dispatch on is enumerated, because "the pair is adjoint" is the claim
+    issue #21 builds on and it is stated without qualification.
+
+    **This matrix is necessary but not sufficient on its own**, and the reason
+    is worth stating where the next reader will look for it: a defect applied
+    *consistently to both operators* -- say, both silently ignoring
+    ``divide_by_n`` on one channel strategy -- leaves the pair perfectly
+    adjoint, because it is then simply the other flag's pair. The identity
+    cannot see it by construction. What catches it is the pinned-reference
+    check in ``test_both_flag_values_compose_with_every_strategy_and_fold_
+    setting`` above, whose reference stays on ``(dense_scan, scan)`` while the
+    cell moves. The two tests are a pair; neither alone gates the claim.
     """
-    problem = _problem(EDA2, 0.0, eps=1e-6, hermitian=hermitian)
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, hermitian=hermitian, n_chan=_MATRIX_N_CHAN)
+    assert problem.plan.n_chan == _MATRIX_N_CHAN and problem.image.ndim == 3
     residual, lhs, rhs = _dot_product_residual(
-        problem, divide_by_n=divide_by_n, w_strategy=w_strategy
+        problem,
+        divide_by_n=divide_by_n,
+        w_strategy=w_strategy,
+        channel_strategy=channel_strategy,
     )
-    assert residual < DOT_TOL_F64, (
-        f"w_strategy={w_strategy} hermitian={hermitian} divide_by_n={divide_by_n}: "
-        f"dot-product residual {residual:.3e} exceeds {DOT_TOL_F64:.1e} "
+    assert residual < dot_tol, (
+        f"w_strategy={w_strategy} channel_strategy={channel_strategy} "
+        f"hermitian={hermitian} divide_by_n={divide_by_n} "
+        f"dtype={np.dtype(jnp.dtype(dtype)).name}: "
+        f"dot-product residual {residual:.3e} exceeds {dot_tol:.1e} "
         f"(lhs={lhs!r}, rhs={rhs!r})"
     )
 
