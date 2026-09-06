@@ -330,13 +330,27 @@ them would silently change every existing caller's answer by a factor of `n`.
 The residuals above come from `tests/test_divide_by_n.py`. Its section-6
 matrices enumerate every axis the operators dispatch on — both flag values,
 all four `w_strategy` values, both `channel_strategy` values, both `hermitian`
-settings and both precision legs, on a two-channel plan — in two complementary
-tests: the dot-product identity, and a strategy/fold comparison whose
-reference stays pinned to `(dense_scan, scan)`. Both are needed, because a
-defect applied consistently to both operators leaves the pair adjoint and is
-invisible to the identity. Bounds: `1e-11` in float64; in float32 (`epsilon =
-1e-5`) the single-channel identity measures 1.8e-8 &hellip; 1.8e-7 against a
-`1e-6` bound, and the two-channel matrix 2.7e-7 &hellip; 1.2e-5 against `1e-4`.
+settings and both precision legs, on a two-channel plan — across **three**
+tests, none of which gates the claim alone:
+
+1. the **dot-product identity**, which cannot see a defect applied
+   consistently to both operators (that is just the other flag's pair, and
+   still exactly adjoint);
+2. a **strategy/fold comparison** whose reference stays pinned to
+   `(dense_scan, scan)`, which catches such a defect only when the reference
+   is spared by it;
+3. a per-cell **semantic oracle** — `divide_by_n=True` against the same call
+   with the flag off and a `1/n` built from `(l, m)` alone applied by hand —
+   which is the only one that can fail when a wrong-but-self-adjoint diagonal
+   is shared by the reference too.
+
+The identity is scored **per channel**, not on the channel sum: the two
+channel blocks are `+3.9e3` and `−3.8e3` on this fixture, so summing them
+first leaves ~1.9% and would inflate the residual ~50x, forcing a bound loose
+enough to hide a uniform 5e-5 one-sided error. Bounds: `1e-11` in float64
+(measured 8.1e-16 … 6.6e-13); in float32 (`epsilon = 1e-5`) `1e-6`, against a
+measured 1.8e-8 … 1.8e-7 single-channel and 5.5e-8 … 4.2e-7 on the
+two-channel matrix.
 
 ### Kernel choice
 

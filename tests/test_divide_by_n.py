@@ -18,23 +18,36 @@ flags the pair is exactly adjoint:
 
     Re<A x, y> = <x, A^H y>                       (both flags, any field)
 
-measured at 1.3e-15 .. 1.9e-12 across the fixtures below, hence the
-eps-independent ``1e-11`` bound this module gates it at -- the same bound
-``tests/test_adjoint.py`` uses for the reduction-order comparison it makes.
+measured at 1.3e-15 .. 1.9e-12 over the **single-channel float64** fixtures of
+section 2, hence the eps-independent ``1e-11`` bound this module gates that
+population at -- the same bound ``tests/test_adjoint.py`` uses for the
+reduction-order comparison it makes. Other populations in this module read
+differently and are scoped where they are stated: the section-6 two-channel
+matrix measures 8.1e-16 .. 6.6e-13 in float64 and 5.5e-8 .. 4.2e-7 in float32.
 Issue #21's ``custom_vjp`` needs exactly that pair, so these tests are its
 contract too.
 
 Because it is #21's contract, section 6 enumerates **every axis the operators
-dispatch on**: 4 ``w_strategy`` x 2 ``channel_strategy`` x 2 ``hermitian`` x 2
-flag values x 2 precisions, on a two-channel plan. The channel axis is the one
-that has to be built rather than merely parametrised -- at ``n_chan == 1`` the
-scan and vmap channel loops both run their body once, so a single-channel plan
-cannot falsify anything about them however many times it is re-run. The two
-section-6 tests are a **pair** and neither gates the claim alone: the identity
-cannot see a defect applied consistently to *both* operators (that is just the
-other flag's pair, and still perfectly adjoint), which is why the composition
-test beside it holds its reference fixed at ``(dense_scan, scan)`` while the
-cell moves.
+dispatch on** -- 4 ``w_strategy`` x 2 ``channel_strategy`` x 2 ``hermitian`` x
+2 flag values x 2 precisions, on a two-channel plan -- across **three**
+mutually non-redundant tests, none of which gates the claim alone:
+
+  * the **identity** cannot see a defect applied consistently to *both*
+    operators: that is just the other flag's pair, and still perfectly
+    adjoint;
+  * the **composition** test catches such a defect only when its pinned
+    ``(dense_scan, scan)`` reference is spared by it. A symmetric defect the
+    reference *shares* -- both paths using the same wrong but self-adjoint
+    diagonal -- leaves every cell agreeing with an equally wrong reference,
+    and passes;
+  * so a per-cell **semantic oracle** states what the diagonal actually is,
+    against a ``1/n`` built from ``(l, m)`` alone in this file. It shares no
+    construction with ``src/``, which is what makes it able to fail when both
+    of the others cannot.
+
+The identity is also scored **per channel** rather than on the channel sum;
+see :func:`_dot_product_residual` for why summing the blocks first would hide
+one-sided defects behind a cancellation between them.
 
 What each flag means, asserted separately from the identity in section 4:
 
@@ -50,15 +63,13 @@ repo's ``3 * eps`` bound in section 5, and the outside-disc values against an
 exact DFT in the repo's sign convention.
 
 Precision: the identity, the default check, both flag-semantics checks, the
-traceability check and **both section-6 matrices** are parametrised over both
-legs via ``_PRECISIONS`` / ``_MATRIX_PRECISIONS``; the float64 entry carries
-``requires_x64`` so ``JAX_ENABLE_X64=0`` skips it rather than failing, and the
-float32 entry runs in both legs. Float32 plans are built with
-``dtype=jnp.float32`` and ``epsilon = 1e-5``. The section-2 identity is gated
-at ``1e-6`` there (measured 1.8e-8 .. 1.8e-7 over its six float32 cases); the
-section-6 identity matrix is a two-channel population and is gated separately
-at ``1e-4`` (measured 2.7e-7 .. 1.2e-5) -- see ``DOT_TOL_F32_MULTI_CHAN`` for
-why a wider problem has more round-off in an identity that is exact on paper.
+traceability check and **all three section-6 tests** are parametrised over both
+legs via ``_PRECISIONS``; the float64 entry carries ``requires_x64`` so
+``JAX_ENABLE_X64=0`` skips it rather than failing, and the float32 entry runs
+in both legs. Float32 plans are built with ``dtype=jnp.float32`` and
+``epsilon = 1e-5``, and the identity is gated at ``1e-6`` in both populations
+that use it -- see ``DOT_TOL_F32`` for the two measured ranges and why one
+constant covers both once the residual is scored per channel.
 
 Only three things stay float64-only, and they say so with ``requires_x64``:
 the ducc0 parity comparison, the exact-DFT comparison and the mixed-default
@@ -87,38 +98,29 @@ from tests.conftest import EDA2, MWA_COMPACT, Telescope, requires_x64, synthetic
 # The dot-product bound, matching tests/test_adjoint.py (issue #10). Measured
 # residual under equal flags on these fixtures: 1.3e-15 .. 1.9e-12.
 DOT_TOL_F64 = 1e-11
-# Single precision, single channel: measured 2.3e-10 .. 8.6e-8 over the 32
-# single-channel float32 cells of the strategy x fold x flag enumeration on
-# EDA2 full-sky (and 1.8e-8 .. 1.8e-7 over the section-2 identity fixtures,
-# which include the two narrow MWA_compact pointings).
+# Single precision. Measured 1.8e-8 .. 1.8e-7 over the six float32 cases of
+# the section-2 identity (worst MWA_compact off30, divide_by_n=True), and
+# 5.5e-8 .. 4.2e-7 over the 32 float32 cells of the section-6 two-channel
+# matrix (2.4x headroom, the tightest margin in this module).
+#
+# One constant covers both populations because section 6 scores the identity
+# **per channel** (see ``_dot_product_residual``). Scored on the channel sum
+# instead, the same matrix reads 2.7e-7 .. 1.2e-5 and would appear to need a
+# bound near 1e-4 -- but that is cancellation between the two channel blocks
+# (+3.9e3 and -3.8e3, of which 1.86% survives), not operator error, and a 1e-4
+# bound is blind to a uniform 5e-5 one-sided scaling defect, which is exactly
+# what this matrix exists to catch. The cancellation is an artefact of how the
+# residual is scored, so it is fixed in the scoring rather than absorbed by the
+# bound.
 DOT_TOL_F32 = 1e-6
-# Single precision on the **two-channel** matrix of section 6, which is a
-# different population and needs its own number rather than a reused one.
-#
-# Measured 2.7e-7 .. 1.2e-5 over that matrix's 32 float32 cells; 1e-4 is the
-# round value above it, 8.1x the worst. Three things make it larger than the
-# single-channel bound above, none of them a defect:
-#
-#   * the dot-product identity is *exact* mathematically -- it holds whatever
-#     the operator's epsilon, since it only asks that A^H be the adjoint of A
-#     -- so what this residual measures is pure floating-point round-off, and
-#     round-off is what a wider problem has more of;
-#   * the second channel sits at 1.25x the first's frequency, so its baselines
-#     in wavelengths, its phases and the plan's w-extent are all larger;
-#   * ``divide_by_n=True`` amplifies pixels near the horizon, where n -> 0, so
-#     the `1/n` diagonal widens the dynamic range the float32 sum has to carry.
-#     That shows in the split: over those 32 cells the ``True`` half reaches
-#     1.2e-5 against the ``False`` half's 1.4e-6. Stated as what it is -- the
-#     residuals measured on this population, in this precision. It is *not* a
-#     conditioning result for either operator, and the ordering does not carry
-#     across precisions: the same matrix in float64 reverses it (1.5e-13 True
-#     against 6.8e-13 False).
-#
-# Still a real gate, not a formality: the flag ignored on *one* operator lands
-# at ~6e-1 -- the mixed-pair residual this whole module is about -- which is
-# 3.8 orders of magnitude above this bound. (Ignored on *both* it stays
-# adjoint, and is caught by the pinned-reference test instead, not here.)
-DOT_TOL_F32_MULTI_CHAN = 1e-4
+# The section-6 semantic oracle's bounds: ``divide_by_n=True`` against the
+# *other* flag fed an image (or output) scaled by an independently built masked
+# ``1/n``. Measured over its 64 cells: 3.1e-16 .. 3.3e-15 in float64 and
+# 1.3e-7 .. 1.8e-7 in float32. Same numbers as section 4's inline bounds, which
+# make the same comparison on one strategy; named here because section 6 makes
+# it 64 times and the two should not drift apart.
+ORACLE_TOL_F64 = 1e-12
+ORACLE_TOL_F32 = 1e-5
 # ducc0 parity contract, mirroring tests/test_against_ducc.py::DUCC_TOL_FACTOR.
 DUCC_TOL_FACTOR = 3.0
 # Exact-DFT contract, mirroring tests/test_adjoint.py::DFT_TOL_FACTOR.
@@ -134,18 +136,25 @@ FLAG_VALUES = (False, True)
 
 # The channel count and per-channel frequencies the section-6 matrices use.
 #
-# One channel cannot falsify anything about the channel loop: with ``n_chan ==
-# 1`` the scan and the vmap path both run their body exactly once, so a defect
-# conditioned on ``channel_strategy`` produces identical output either way. Two
-# channels is the smallest count that makes the two loops structurally
-# different, and the frequencies are deliberately *distinct* -- at equal
-# frequencies the channels are the same problem twice and a defect that
-# mishandled the loop's ordering or its carry would still cancel.
+# What two channels actually buy, stated narrowly. A *single*-channel plan can
+# already expose plenty: with ``channel_strategy`` parametrised it exercises
+# both branches of the dispatch and both lowerings, and it would catch MUT-C
+# (the symmetric channel-strategy defect) on its own. What one channel cannot
+# exercise is anything depending on the channel *axis* having extent --
+# cross-channel indexing, and the association of ``inv_lambda[c]`` with image
+# plane ``c`` and visibility column ``c``. A transposed or off-by-one
+# association is invisible at ``n_chan == 1`` because there is only one thing
+# to associate. That, and only that, is why the matrices use two.
+#
+# The frequencies are distinct for the same narrow reason: at equal
+# frequencies every channel shares one ``inv_lambda``, so a mis-association
+# still lands on the right value and the axis goes untested. Equal-frequency
+# channels would *not* be vacuous in general -- their images and visibilities
+# still differ -- but they cannot test the association, which is what a second
+# channel is here for.
 #
 # 1.25 rather than something wilder: the ratio multiplies every baseline in
-# wavelengths, so it drives ``n_w`` and the runtime of a 64-cell matrix. The
-# section-6 tests assert adjointness and cross-path agreement, neither of which
-# is an accuracy claim about the second channel, so a modest ratio is enough.
+# wavelengths, so it drives ``n_w`` and the runtime of a 64-cell matrix.
 _MATRIX_N_CHAN = 2
 _CHANNEL_FREQ_RATIOS = (1.0, 1.25)
 
@@ -156,20 +165,6 @@ _PRECISIONS = [
     pytest.param(jnp.float64, 1e-6, DOT_TOL_F64, id="float64", marks=requires_x64),
     pytest.param(jnp.float32, 1e-5, DOT_TOL_F32, id="float32"),
 ]
-
-# As ``_PRECISIONS``, but carrying the two-channel float32 dot-product bound
-# for the section-6 identity matrix. Only that one test needs it: the
-# composition matrix next to it compares two runs at the *same* precision that
-# differ only in reduction order, a far tighter quantity, and its float32 cells
-# measure 9.9e-8 against ``DOT_TOL_F32`` (10x headroom) and 9.1e-6 against
-# ``4 * eps`` (4.4x), so it stays on ``_PRECISIONS``. The float64 entry is
-# unchanged at 1e-11 -- the multi-channel plan measures 6.9e-14 .. 6.8e-13
-# there, so double precision needs no separate number.
-_MATRIX_PRECISIONS = [
-    pytest.param(jnp.float64, 1e-6, DOT_TOL_F64, id="float64", marks=requires_x64),
-    pytest.param(jnp.float32, 1e-5, DOT_TOL_F32_MULTI_CHAN, id="float32"),
-]
-
 
 # ---------------------------------------------------------------------------
 # fixtures / helpers
@@ -274,6 +269,44 @@ def _outside_disc(plan: Any) -> np.ndarray:
     return _n_grid(plan) <= 0.0
 
 
+def _independent_one_over_n(problem: _Problem) -> np.ndarray:
+    """``1/n`` inside the unit disc and ``0`` outside, from ``(l, m)`` alone.
+
+    The oracle for section 6's semantic check, and the point of it is what it
+    does **not** touch: not ``plan.n_minus_1``, not ``plan.real_dtype``, not
+    any helper in ``src/``. Only the image geometry the caller passed to
+    ``make_plan`` -- the pixel size and the ``(i - n/2) * pixsize`` grid
+    convention documented in the README -- and ``n = sqrt(1 - l^2 - m^2)``
+    straight from the measurement equation. Always float64, whatever the plan's
+    precision, so the oracle is not limited by the thing it is checking.
+
+    Why an independent construction rather than ``_n_grid(plan)``, which is
+    right there and cheaper: the two other section-6 tests are both blind to a
+    diagonal that is *wrong but self-adjoint and shared*. The identity cannot
+    see it (a real diagonal applied to both operators keeps the pair adjoint
+    whatever it contains), and the composition test cannot see it either once
+    its pinned reference has the same defect -- every cell then agrees with an
+    equally wrong reference. Only a statement of what the diagonal should
+    actually *be*, built from something the implementation does not supply, can
+    fail there. Reading the factor off the plan would reintroduce exactly the
+    shared-source problem, one level down.
+
+    ``test_the_independent_one_over_n_matches_the_plans_own_grid`` pins that
+    this construction and the operators' own disc mask agree, so a boundary
+    pixel disagreeing shows up as one clear failure rather than as noise
+    spread over 64 cells.
+    """
+    n_l, n_m = problem.shape
+    ll = (np.arange(n_l) - n_l // 2) * problem.pixsize
+    mm = (np.arange(n_m) - n_m // 2) * problem.pixsize
+    lgrid, mgrid = np.meshgrid(ll, mm, indexing="ij")
+    rho2 = lgrid**2 + mgrid**2
+    inside = rho2 < 1.0
+    n_grid = np.sqrt(np.where(inside, 1.0 - rho2, 0.0))
+    ok = inside & (n_grid > 0.0)
+    return np.where(ok, 1.0 / np.where(ok, n_grid, 1.0), 0.0)
+
+
 def _forward(problem: _Problem, image: np.ndarray, **kwargs: Any) -> np.ndarray:
     return np.asarray(dirty2vis(problem.plan, jnp.asarray(image), **kwargs))
 
@@ -289,21 +322,50 @@ def _dot_product_residual(
     image_rhs: np.ndarray | None = None,
     **kwargs: Any,
 ) -> tuple[float, float, float]:
-    """Relative residual of ``Re<A x, y> == <x_rhs, A^H y>``.
+    """Worst **per-channel** relative residual of ``Re<A x, y> == <x_rhs, A^H y>``.
+
+    Scored channel by channel and reduced with ``max``, never summed over the
+    channel axis first. That is a correctness requirement, not extra detail.
+
+    Both operators are block-diagonal over channels -- channel ``c`` sees only
+    ``inv_lambda[c]`` and its own image plane and visibility column -- so the
+    identity holds per block, and the aggregate is just the sum of the blocks.
+    But the blocks carry opposite signs and nearly equal magnitudes: on the
+    two-channel EDA2 fixture they are about ``+3.9e3`` and ``-3.8e3``, so only
+    ~1% of either survives the sum. Scoring the sum divides an error that
+    scales with 3.9e3 by a denominator of order 7e1, inflating the residual by
+    ~50x and -- far worse -- making the bound that has to accommodate it blind
+    to real one-sided defects. A uniform 5e-5 scaling error on the forward is
+    invisible to a bound loose enough to absorb that cancellation.
+
+    Per-channel scoring removes the cancellation entirely: each block is
+    divided by its own magnitude, so the residual measures the operators
+    rather than how nearly the blocks annihilate. At ``n_chan == 1`` it is
+    bit-identical to the aggregate form it replaces, so nothing single-channel
+    moved.
 
     ``image_rhs`` defaults to ``image``: passing a different array is how the
     mixed-default tests state the ``n x`` correction on the right-hand side
     only. Everything is accumulated in float64 so the residual measures the
     operators, not the test's own summation.
+
+    Returns the worst channel's ``(residual, lhs, rhs)``.
     """
     x = problem.image if image is None else image
     rhs_x = x if image_rhs is None else image_rhs
-    vis = problem.vis
-    ax = _forward(problem, x, **kwargs).astype(np.complex128)
-    ay = _adjoint(problem, **kwargs).astype(np.float64)
-    lhs = complex(np.vdot(ax.ravel(), vis.astype(np.complex128).ravel())).real
-    rhs = float(np.vdot(np.asarray(rhs_x, dtype=np.float64).ravel(), ay.ravel()))
-    return abs(lhs - rhs) / max(abs(lhs), abs(rhs)), lhs, rhs
+    ax = _forward(problem, x, **kwargs).astype(np.complex128)  # (n_rows, n_chan)
+    ay = _adjoint(problem, **kwargs).astype(np.float64)  # (n_chan, n_l, n_m)
+    vis = problem.vis.astype(np.complex128)  # (n_rows, n_chan)
+    rhs_arr = np.broadcast_to(np.asarray(rhs_x, dtype=np.float64), ay.shape)
+
+    worst = (-1.0, 0.0, 0.0)
+    for c in range(ay.shape[0]):
+        lhs_c = float(np.vdot(ax[:, c], vis[:, c]).real)
+        rhs_c = float(np.vdot(rhs_arr[c].ravel(), ay[c].ravel()))
+        residual_c = abs(lhs_c - rhs_c) / max(abs(lhs_c), abs(rhs_c))
+        if residual_c > worst[0]:
+            worst = (residual_c, lhs_c, rhs_c)
+    return worst
 
 
 def _reference_adjoint_no_divide(
@@ -363,7 +425,11 @@ def _assert_outside_disc_is_loaded(problem: _Problem) -> np.ndarray:
         f"fixture has {n_out} of {outside.size} pixels outside the unit disc: this test "
         "says nothing unless the outside-disc region is non-empty and not the whole image"
     )
-    signal = float(np.linalg.norm(np.asarray(problem.image, dtype=np.float64)[outside]))
+    # ``[..., outside]`` rather than ``[outside]``: the mask is (n_l, n_m) and
+    # must land on the image's trailing two axes, which is the whole array for
+    # a 2-D image and every channel of a 3-D one. Indexed from the front, a
+    # multi-channel image would raise instead.
+    signal = float(np.linalg.norm(np.asarray(problem.image, dtype=np.float64)[..., outside]))
     assert signal > 0.0, "the outside-disc pixels must carry signal, not zeros"
     return outside
 
@@ -1008,7 +1074,114 @@ def test_both_flag_values_compose_with_every_strategy_and_fold_setting(
     )
 
 
-@pytest.mark.parametrize("dtype, eps, dot_tol", _MATRIX_PRECISIONS)
+@requires_x64
+def test_the_independent_one_over_n_matches_the_plans_own_grid() -> None:
+    """Guard on the oracle: the two constructions must agree before it is used.
+
+    :func:`_independent_one_over_n` is built from ``(l, m)`` alone while the
+    operators build their diagonal from ``plan.n_minus_1``. They should be the
+    same function of the same geometry, but they are computed by different code
+    along different paths, and the interesting place is the disc boundary --
+    one pixel where a tiny positive ``n`` in one construction is a zero in the
+    other would turn ``1/n`` into a large number on one side and a zero on the
+    other.
+
+    Pinned here, once, rather than discovered as unexplained noise spread over
+    the oracle's 64 cells. Failing here means the *oracle* needs looking at;
+    failing there means the implementation does.
+    """
+    problem = _problem(EDA2, 0.0, eps=1e-6, n_chan=_MATRIX_N_CHAN)
+    independent = _independent_one_over_n(problem)
+    n_grid = _n_grid(problem.plan)
+    inside_plan = n_grid > 0.0
+
+    np.testing.assert_array_equal(
+        independent > 0.0,
+        inside_plan,
+        err_msg=(
+            "the (l, m)-only disc mask and the operators' n > 0 mask disagree, so the "
+            "oracle would be scoring a different set of pixels than the implementation "
+            "divides"
+        ),
+    )
+    assert 0 < int(inside_plan.sum()) < inside_plan.size
+    from_plan = np.where(inside_plan, 1.0 / np.where(inside_plan, n_grid, 1.0), 0.0)
+    rel = np.abs(independent - from_plan)[inside_plan] / np.abs(from_plan)[inside_plan]
+    assert float(rel.max()) < 1e-13, (
+        f"the two 1/n constructions differ by {float(rel.max()):.3e} relative inside the "
+        "disc; the oracle is only an oracle while it agrees with the geometry the plan "
+        "was built from"
+    )
+
+
+@pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
+@pytest.mark.parametrize("hermitian", [False, True])
+@pytest.mark.parametrize("channel_strategy", CHANNEL_STRATEGIES)
+@pytest.mark.parametrize("w_strategy", W_STRATEGIES)
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_every_cell_applies_the_documented_one_over_n_diagonal(
+    op: str,
+    w_strategy: str,
+    channel_strategy: str,
+    hermitian: bool,
+    dtype: DTypeLike,
+    eps: float,
+    _dot_tol: float,
+) -> None:
+    """Per cell: the flag applies *this* diagonal, not merely a self-adjoint one.
+
+    The third of section 6's three tests, and the only one that can fail when
+    the other two cannot. Both of those are relational -- the identity relates
+    the two operators to each other, the composition test relates a cell to a
+    reference cell -- so a diagonal that is wrong in the same way everywhere
+    satisfies both. Concretely: replace ``1/n`` with ``1/n^2`` on both
+    operators and the pair is still exactly adjoint (a real diagonal is
+    self-adjoint whatever it contains) *and* every cell still agrees with a
+    reference that shares the substitution. Nothing above notices.
+
+    So this states the flag's meaning directly, per cell, against a ``1/n``
+    built from ``(l, m)`` in :func:`_independent_one_over_n`:
+
+      * forward: ``dirty2vis(x, True) == dirty2vis(x * (1/n), False)``
+      * adjoint: ``vis2dirty(v, True) == (1/n) * vis2dirty(v, False)``
+
+    Both sides use the *same* ``w_strategy`` and ``channel_strategy``, so the
+    two runs differ only in where the factor is applied -- which is what makes
+    this a statement about the flag rather than about the strategy. Section 4
+    makes the same comparison on the default strategy and single channel; this
+    is that check lifted onto every cell of the matrix, which is where a
+    strategy- or channel-conditioned substitution would live.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, hermitian=hermitian, n_chan=_MATRIX_N_CHAN)
+    _assert_outside_disc_is_loaded(problem)
+    factor = _independent_one_over_n(problem)
+    kwargs: dict[str, Any] = {"w_strategy": w_strategy, "channel_strategy": channel_strategy}
+
+    if op == "dirty2vis":
+        got = _forward(problem, problem.image, divide_by_n=True, **kwargs).astype(np.complex128)
+        # Scaled in float64 and narrowed once, so the comparison is not limited
+        # by the test's own arithmetic on a float32 plan.
+        scaled = (np.asarray(problem.image, dtype=np.float64) * factor).astype(problem.image.dtype)
+        want = _forward(problem, scaled, divide_by_n=False, **kwargs).astype(np.complex128)
+    else:
+        got = _adjoint(problem, divide_by_n=True, **kwargs).astype(np.float64)
+        want = factor * _adjoint(problem, divide_by_n=False, **kwargs).astype(np.float64)
+
+    is_f64 = np.dtype(jnp.dtype(dtype)) == np.float64
+    tol = ORACLE_TOL_F64 if is_f64 else ORACLE_TOL_F32
+    err = np.linalg.norm(got - want) / np.linalg.norm(want)
+    assert err < tol, (
+        f"{op} w_strategy={w_strategy} channel_strategy={channel_strategy} "
+        f"hermitian={hermitian} dtype={np.dtype(jnp.dtype(dtype)).name}: "
+        f"divide_by_n=True differs by {err:.3e} (tol {tol:.1e}) from the same call with "
+        "the flag off and an independently built masked 1/n applied by hand. The flag "
+        "must apply exactly that diagonal -- a different but still self-adjoint one "
+        "(1/n^2, 1/(n+c), the shifted grid) passes both other section-6 tests and fails "
+        "only here."
+    )
+
+
+@pytest.mark.parametrize("dtype, eps, dot_tol", _PRECISIONS)
 @pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
 @pytest.mark.parametrize("hermitian", [False, True])
 @pytest.mark.parametrize("channel_strategy", CHANNEL_STRATEGIES)
