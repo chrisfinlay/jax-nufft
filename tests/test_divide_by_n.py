@@ -67,9 +67,13 @@ traceability check and **all three section-6 tests** are parametrised over both
 legs via ``_PRECISIONS``; the float64 entry carries ``requires_x64`` so
 ``JAX_ENABLE_X64=0`` skips it rather than failing, and the float32 entry runs
 in both legs. Float32 plans are built with ``dtype=jnp.float32`` and
-``epsilon = 1e-5``, and the identity is gated at ``1e-6`` in both populations
-that use it -- see ``DOT_TOL_F32`` for the two measured ranges and why one
-constant covers both once the residual is scored per channel.
+``epsilon = 1e-5``. The identity is gated at ``IDENTITY_TOL_F32`` in both
+populations that use it -- a **backend-dependent** bound, set from the worst of
+a CPU and a GH200 measurement rather than from the CPU alone; see that constant
+for both populations and for the defect margin that fixes its value. Two
+comparisons of one executable against itself are held at
+``SAME_EXECUTABLE_TOL_*`` rather than at bit-equality, for the same reason:
+XLA:GPU reductions are not run-to-run deterministic.
 
 Only three things stay float64-only, and they say so with ``requires_x64``:
 the ducc0 parity comparison, the exact-DFT comparison and the mixed-default
@@ -91,27 +95,23 @@ import numpy as np
 import pytest
 from jax.typing import DTypeLike
 
-from jax_nufft import dirty2vis, make_plan, vis2dirty
+from jax_nufft import dirty2vis, make_plan, vis2dirty, wgridder
 from jax_nufft._utils import SPEED_OF_LIGHT
 from tests.conftest import EDA2, MWA_COMPACT, Telescope, requires_x64, synthetic_uvw
 
-# The dot-product bound, matching tests/test_adjoint.py (issue #10). Measured
-# residual under equal flags on these fixtures: 1.3e-15 .. 1.9e-12.
-DOT_TOL_F64 = 1e-11
-# Single precision. Measured 1.8e-8 .. 1.8e-7 over the six float32 cases of
-# the section-2 identity (worst MWA_compact off30, divide_by_n=True), and
-# 5.5e-8 .. 4.2e-7 over the 32 float32 cells of the section-6 two-channel
-# matrix (2.4x headroom, the tightest margin in this module).
+# The **strategy-equivalence** bound: how far two runs of the operators that
+# differ only in reduction order (w_strategy, channel_strategy) may sit apart.
+# Matches tests/test_strategies_equivalent.py and tests/test_adjoint.py's
+# reduction-order comparison (issue #10).
 #
-# One constant covers both populations because section 6 scores the identity
-# **per channel** (see ``_dot_product_residual``). Scored on the channel sum
-# instead, the same matrix reads 2.7e-7 .. 1.2e-5 and would appear to need a
-# bound near 1e-4 -- but that is cancellation between the two channel blocks
-# (+3.9e3 and -3.8e3, of which 1.86% survives), not operator error, and a 1e-4
-# bound is blind to a uniform 5e-5 one-sided scaling defect, which is exactly
-# what this matrix exists to catch. The cancellation is an artefact of how the
-# residual is scored, so it is fixed in the scoring rather than absorbed by the
-# bound.
+# Kept distinct from IDENTITY_TOL_* below, which used to share these constants.
+# The two are different quantities: this one compares the operators to
+# themselves under a reordering and measures 9.9e-8 in float32 on the section-6
+# matrix, while the identity residual measures round-off in a relation that is
+# exact on paper and runs several times larger and backend-dependent. Sharing
+# one constant would drag whichever is tighter up to the other's level for a
+# reason that does not apply to it.
+DOT_TOL_F64 = 1e-11
 DOT_TOL_F32 = 1e-6
 # The section-6 semantic oracle's bounds: ``divide_by_n=True`` against the
 # *other* flag fed an image (or output) scaled by an independently built masked
@@ -121,6 +121,51 @@ DOT_TOL_F32 = 1e-6
 # it 64 times and the two should not drift apart.
 ORACLE_TOL_F64 = 1e-12
 ORACLE_TOL_F32 = 1e-5
+# The dot-product identity's own bounds, kept separate from the
+# strategy-equivalence ones above because they are a different quantity with a
+# different backend sensitivity, not the same quantity on a different fixture.
+#
+# The identity is exact on paper, so its residual is pure round-off in the
+# operators' own reductions -- and reduction order is exactly what changes
+# between backends. Measured maxima over this module's float32 identity
+# population (six section-2 cases + 32 section-6 two-channel cells, scored per
+# channel): 4.222e-07 on CPU and 1.051e-06 on one GH200, the GPU worst being
+# MWA_compact off30 with divide_by_n=True. The CPU-fitted 1e-6 failed that cell
+# by 5%.
+#
+# 5e-6 clears the measured GPU maximum by 4.8x and the CPU one by 11.8x. It is
+# NOT chosen for headroom alone: the constraint that decides it is that the
+# uniform 5e-5 one-sided scaling defect of ``MUT-E`` must keep failing, which
+# it does by 10x. A bound is only honest here if a defect of the size this test
+# exists to catch still fails it with margin, and 5e-5/5e-6 is that margin.
+#
+# The strategy-equivalence use in section 6's composition test deliberately
+# does NOT move to this number: it compares two runs at the same precision
+# differing only in reduction order, measures 9.9e-8 on CPU, and giving it a
+# 5e-6 bound would loosen a tight quantity for a reason that belongs to another.
+IDENTITY_TOL_F64 = 1e-11
+IDENTITY_TOL_F32 = 5e-6
+
+# Two calls that route to the *same* JIT cache entry are not bit-identical on
+# every backend. XLA:GPU reductions are not run-to-run deterministic, so the
+# same executable on the same inputs can differ in the last bits -- measured on
+# a GH200 at 1.137e-13 absolute on values of order 10 (~1e-14 relative) for a
+# float64 adjoint, across 37% of pixels. An earlier version of this module
+# asserted bit-equality here and passed everywhere on CPU while being wrong
+# about what it was entitled to assume.
+#
+# So the *numeric* half of a same-executable comparison is held at round-off,
+# and the claim it used to carry -- that the no-argument call routes to the
+# declared default rather than somewhere else -- is gated separately and
+# exactly, at the JIT boundary, where it is a property of the dispatch rather
+# than of the arithmetic.
+SAME_EXECUTABLE_TOL_F64 = 1e-11
+SAME_EXECUTABLE_TOL_F32 = 1e-4
+# ...and however tight that bound is in absolute terms, it must stay far below
+# the contrast the same test measures between the two flag values, or the
+# comparison stops discriminating. Asserted as a ratio so it scales with the
+# fixture instead of trusting two independently chosen constants.
+SAME_EXECUTABLE_SEPARATION = 1e3
 # ducc0 parity contract, mirroring tests/test_against_ducc.py::DUCC_TOL_FACTOR.
 DUCC_TOL_FACTOR = 3.0
 # Exact-DFT contract, mirroring tests/test_adjoint.py::DFT_TOL_FACTOR.
@@ -133,6 +178,15 @@ CROSS_PATH_TOL_FACTOR = 4.0
 W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
 CHANNEL_STRATEGIES = ("scan", "vmap")
 FLAG_VALUES = (False, True)
+
+# As ``_PRECISIONS``, but carrying the identity's own bounds. Used by every
+# test that asserts ``Re<A x, y> == <x, A^H y>``; ``_PRECISIONS`` stays with
+# the tests that compare two runs of the operators to each other.
+_IDENTITY_PRECISIONS = [
+    pytest.param(jnp.float64, 1e-6, IDENTITY_TOL_F64, id="float64", marks=requires_x64),
+    pytest.param(jnp.float32, 1e-5, IDENTITY_TOL_F32, id="float32"),
+]
+
 
 # The channel count and per-channel frequencies the section-6 matrices use.
 #
@@ -313,6 +367,17 @@ def _forward(problem: _Problem, image: np.ndarray, **kwargs: Any) -> np.ndarray:
 
 def _adjoint(problem: _Problem, **kwargs: Any) -> np.ndarray:
     return np.asarray(vis2dirty(problem.plan, jnp.asarray(problem.vis), **kwargs))
+
+
+def _relative_difference(a: np.ndarray, b: np.ndarray) -> float:
+    """Relative L2 difference ``||a - b|| / ||b||``, in float64.
+
+    The scale-free form both same-executable comparisons use, in place of the
+    bit-equality they used to assert. See ``SAME_EXECUTABLE_TOL_F64``.
+    """
+    a64 = np.asarray(a, dtype=np.complex128 if np.iscomplexobj(a) else np.float64)
+    b64 = np.asarray(b, dtype=np.complex128 if np.iscomplexobj(b) else np.float64)
+    return float(np.linalg.norm(a64 - b64) / np.linalg.norm(b64))
 
 
 def _dot_product_residual(
@@ -502,6 +567,75 @@ def test_the_declared_defaults_are_not_swapped() -> None:
     assert fwd is False and adj is True
 
 
+def _spy_jit(monkeypatch: pytest.MonkeyPatch, jit_name: str) -> list[dict]:
+    """Record the kwargs reaching ``wgridder.<jit_name>``; return a dummy array.
+
+    The pattern ``tests/test_jax_integration.py`` and
+    ``tests/test_default_w_strategy.py`` use for the same purpose. Both public
+    wrappers return the JIT function's result unchanged, so any return value
+    does.
+    """
+    calls: list[dict] = []
+
+    def stub(*args: object, **kwargs: object) -> jax.Array:
+        calls.append(kwargs)
+        return jnp.zeros(())
+
+    monkeypatch.setattr(wgridder, jit_name, stub)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "op, jit_name, declared",
+    [
+        ("dirty2vis", "_dirty2vis_jit", False),
+        ("vis2dirty", "_vis2dirty_jit", True),
+    ],
+)
+def test_the_no_argument_call_routes_the_declared_default_to_the_jit_boundary(
+    monkeypatch: pytest.MonkeyPatch, op: str, jit_name: str, declared: bool
+) -> None:
+    """The routing half of the default check, gated exactly and without arithmetic.
+
+    The numeric test below can only say the no-argument call produces *nearly*
+    the same answer as the explicit default, because two runs of one executable
+    are not bit-identical on every backend (see ``SAME_EXECUTABLE_TOL_F64``).
+    That leaves a gap a numeric comparison cannot close on its own: a call that
+    routed to a different-but-similar path would also land inside any tolerance
+    loose enough to absorb backend round-off.
+
+    So the routing is asserted where it is exact -- the value handed to the JIT
+    boundary -- and asserted with ``is``, which additionally pins the *type*.
+    ``divide_by_n`` is a static argument, so an int ``1`` in place of ``True``
+    would behave identically downstream while occupying a separate JIT cache
+    entry; the signature tests in this section pin the declaration, and this
+    pins what the wrapper actually forwards.
+
+    Backend-independent by construction: no transform runs at all, the JIT
+    function being stubbed out.
+    """
+    problem = _problem(EDA2, 0.0, eps=1e-5, dtype=jnp.float32)
+    calls = _spy_jit(monkeypatch, jit_name)
+
+    if op == "dirty2vis":
+        dirty2vis(problem.plan, jnp.asarray(problem.image))
+        dirty2vis(problem.plan, jnp.asarray(problem.image), divide_by_n=declared)
+    else:
+        vis2dirty(problem.plan, jnp.asarray(problem.vis))
+        vis2dirty(problem.plan, jnp.asarray(problem.vis), divide_by_n=declared)
+
+    assert len(calls) == 2, f"expected two {jit_name} calls, saw {len(calls)}"
+    from_default, from_explicit = calls[0]["divide_by_n"], calls[1]["divide_by_n"]
+    assert from_default is declared, (
+        f"{op} with no divide_by_n forwarded {from_default!r} to {jit_name}, not the "
+        f"declared default {declared!r}. The signature can say one thing and the wrapper "
+        "forward another; this is the half that catches that."
+    )
+    assert from_explicit is declared, (
+        f"{op} with divide_by_n={declared!r} forwarded {from_explicit!r} to {jit_name}"
+    )
+
+
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
 @pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
 def test_omitting_the_flag_reproduces_the_declared_default(
@@ -527,16 +661,25 @@ def test_omitting_the_flag_reproduces_the_declared_default(
         default = _adjoint(problem)
         same = _adjoint(problem, divide_by_n=True)
         other = _adjoint(problem, divide_by_n=False)
-    np.testing.assert_array_equal(
-        default,
-        same,
-        err_msg=f"{op} with no divide_by_n differs from the explicit declared default",
+    is_f64 = np.dtype(jnp.dtype(dtype)) == np.float64
+    same_path = _relative_difference(default, same)
+    same_path_tol = SAME_EXECUTABLE_TOL_F64 if is_f64 else SAME_EXECUTABLE_TOL_F32
+    assert same_path < same_path_tol, (
+        f"{op} with no divide_by_n differs by {same_path:.3e} from the explicit declared "
+        f"default (tol {same_path_tol:.1e}) -- more than two runs of one executable can "
+        "differ by, so the no-argument call is reaching different arithmetic"
     )
     contrast = np.linalg.norm(default - other) / np.linalg.norm(other)
     assert contrast > 1e-2, (
         f"{op}'s two divide_by_n values differ by only {contrast:.3e} on EDA2 full-sky: "
         "either the flag is being ignored or this fixture cannot tell the two apart, and "
-        "the equality assertion above is then vacuous"
+        "the agreement asserted above is then vacuous"
+    )
+    assert same_path * SAME_EXECUTABLE_SEPARATION < contrast, (
+        f"{op}: the no-argument call sits {same_path:.3e} from the declared default while "
+        f"the two flag values sit {contrast:.3e} apart -- less than "
+        f"{SAME_EXECUTABLE_SEPARATION:g}x of separation, so this fixture can no longer "
+        "tell 'same path' from 'other path' and the tolerance above is doing nothing"
     )
 
 
@@ -555,7 +698,7 @@ _IDENTITY_FIXTURES = [
 
 @pytest.mark.parametrize("tel, zenith_deg, has_outside_disc", _IDENTITY_FIXTURES)
 @pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
-@pytest.mark.parametrize("dtype, eps, dot_tol", _PRECISIONS)
+@pytest.mark.parametrize("dtype, eps, dot_tol", _IDENTITY_PRECISIONS)
 def test_dot_product_identity_under_equal_flags(
     tel: Telescope,
     zenith_deg: float,
@@ -621,7 +764,7 @@ def test_the_mixed_default_pair_is_not_an_adjoint_pair_on_the_full_sky() -> None
     )
     for flag in FLAG_VALUES:
         equal, _, _ = _dot_product_residual(problem, divide_by_n=flag)
-        assert equal < DOT_TOL_F64, (
+        assert equal < IDENTITY_TOL_F64, (
             f"equal flags divide_by_n={flag} on the same fixture: residual {equal:.3e}"
         )
 
@@ -665,9 +808,9 @@ def test_mixed_default_pair_keeps_the_documented_n_correction(
             f"{tel.name} was expected to lie entirely inside the unit disc"
         )
     residual, lhs, rhs = _dot_product_residual(problem, image=image, image_rhs=image * n_grid)
-    assert residual < DOT_TOL_F64, (
+    assert residual < IDENTITY_TOL_F64, (
         f"{tel.name} zen={zenith_deg}: default-pair residual {residual:.3e} in the n*x form "
-        f"exceeds {DOT_TOL_F64:.1e} (lhs={lhs!r}, rhs={rhs!r}). The defaults' documented "
+        f"exceeds {IDENTITY_TOL_F64:.1e} (lhs={lhs!r}, rhs={rhs!r}). The defaults' documented "
         "behaviour has changed."
     )
 
@@ -697,19 +840,31 @@ def test_forward_with_divide_by_n_ignores_every_pixel_outside_the_disc(
 
     with_flag = _forward(problem, problem.image, divide_by_n=True)
     with_flag_perturbed = _forward(problem, perturbed, divide_by_n=True)
-    np.testing.assert_array_equal(
-        with_flag,
-        with_flag_perturbed,
-        err_msg=(
-            "dirty2vis(divide_by_n=True) changed when only the pixels OUTSIDE the unit "
-            "disc changed. Those pixels must be multiplied by zero (n < 0 there, so 1/n "
-            "is not a gain the measurement equation defines); leaving them at the "
-            "analytic extension is what breaks the adjoint pair on wide fields."
-        ),
+    # Same-executable comparison, so held at round-off rather than bit-for-bit:
+    # the two calls run one executable on two images that the mask makes
+    # identical, and on a nondeterministic backend that still does not
+    # guarantee identical bits. The claim survives intact because the control
+    # leg below moves by more than 1e-2 on exactly the same perturbation -- the
+    # discriminating power is in the ratio, not in the exactness.
+    is_f64 = np.dtype(jnp.dtype(dtype)) == np.float64
+    insensitivity = _relative_difference(with_flag_perturbed, with_flag)
+    tol = SAME_EXECUTABLE_TOL_F64 if is_f64 else SAME_EXECUTABLE_TOL_F32
+    assert insensitivity < tol, (
+        f"dirty2vis(divide_by_n=True) moved by {insensitivity:.3e} (tol {tol:.1e}) when "
+        "only the pixels OUTSIDE the unit disc changed. Those pixels must be multiplied "
+        "by zero (n < 0 there, so 1/n is not a gain the measurement equation defines); "
+        "leaving them at the analytic extension is what breaks the adjoint pair on wide "
+        "fields."
     )
     without_flag = _forward(problem, problem.image, divide_by_n=False)
     without_flag_perturbed = _forward(problem, perturbed, divide_by_n=False)
     contrast = np.linalg.norm(without_flag - without_flag_perturbed) / np.linalg.norm(without_flag)
+    assert insensitivity * SAME_EXECUTABLE_SEPARATION < contrast, (
+        f"divide_by_n=True moved {insensitivity:.3e} under the perturbation while "
+        f"divide_by_n=False moved {contrast:.3e} -- less than "
+        f"{SAME_EXECUTABLE_SEPARATION:g}x apart, so 'insensitive' and 'sensitive' are no "
+        "longer distinguishable on this fixture"
+    )
     assert contrast > 1e-2, (
         f"the control leg moved by only {contrast:.3e}: divide_by_n=False must stay "
         "sensitive to the outside-disc pixels (it uses the analytic extension there), "
@@ -1181,7 +1336,7 @@ def test_every_cell_applies_the_documented_one_over_n_diagonal(
     )
 
 
-@pytest.mark.parametrize("dtype, eps, dot_tol", _PRECISIONS)
+@pytest.mark.parametrize("dtype, eps, dot_tol", _IDENTITY_PRECISIONS)
 @pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
 @pytest.mark.parametrize("hermitian", [False, True])
 @pytest.mark.parametrize("channel_strategy", CHANNEL_STRATEGIES)

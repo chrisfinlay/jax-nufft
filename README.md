@@ -347,10 +347,24 @@ tests, none of which gates the claim alone:
 The identity is scored **per channel**, not on the channel sum: the two
 channel blocks are `+3.9e3` and `−3.8e3` on this fixture, so summing them
 first leaves ~1.9% and would inflate the residual ~50x, forcing a bound loose
-enough to hide a uniform 5e-5 one-sided error. Bounds: `1e-11` in float64
-(measured 8.1e-16 … 6.6e-13); in float32 (`epsilon = 1e-5`) `1e-6`, against a
-measured 1.8e-8 … 1.8e-7 single-channel and 5.5e-8 … 4.2e-7 on the
-two-channel matrix.
+enough to hide a uniform 5e-5 one-sided error.
+
+Bounds: `1e-11` in float64 (measured 8.1e-16 … 1.9e-12 on CPU) and `5e-6` in
+float32 (`epsilon = 1e-5`). The float32 identity bound is **backend-dependent
+and set from two backends**, not from CPU alone: the same population measures
+up to 4.2e-7 on CPU but 1.1e-6 on a GH200, because reduction order differs
+between them and this residual is pure round-off in an identity that is exact
+on paper. What fixes the value is not headroom but detection — a uniform 5e-5
+one-sided error still fails it by 10x.
+
+Two comparisons of a call against itself (the no-argument call against the
+explicit default, and `divide_by_n=True` against a perturbation outside the
+disc) are held at round-off rather than bit-equality for the same reason:
+XLA:GPU reductions are not run-to-run deterministic, so one executable run
+twice on identical inputs need not give identical bits. The exact claim those
+comparisons used to carry — that the no-argument call routes to the declared
+default — is asserted at the JIT boundary instead, where it is a property of
+the dispatch rather than of the arithmetic.
 
 ### Kernel choice
 
