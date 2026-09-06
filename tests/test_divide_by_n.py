@@ -27,10 +27,10 @@ matrix measures 8.1e-16 .. 6.6e-13 in float64 and 5.5e-8 .. 4.2e-7 in float32.
 Issue #21's ``custom_vjp`` needs exactly that pair, so these tests are its
 contract too.
 
-Because it is #21's contract, section 6 enumerates **every axis the operators
-dispatch on** -- 4 ``w_strategy`` x 2 ``channel_strategy`` x 2 ``hermitian`` x
-2 flag values x 2 precisions, on a two-channel plan -- across **three**
-mutually non-redundant tests, none of which gates the claim alone:
+Because it is #21's contract, section 6 enumerates the axes that select the
+operators' **numerical path** -- 4 ``w_strategy`` x 2 ``channel_strategy`` x 2
+``hermitian`` x 2 flag values x 2 precisions, on a two-channel plan -- across
+**three** mutually non-redundant tests, none of which gates the claim alone:
 
   * the **identity** cannot see a defect applied consistently to *both*
     operators: that is just the other flag's pair, and still perfectly
@@ -45,8 +45,33 @@ mutually non-redundant tests, none of which gates the claim alone:
     construction with ``src/``, which is what makes it able to fail when both
     of the others cannot.
 
-The identity is also scored **per channel** rather than on the channel sum;
-see :func:`_dot_product_residual` for why summing the blocks first would hide
+That is the *numerical-path* enumeration, and it is not the same thing as
+"every argument either operator takes". Four things the operators dispatch or
+branch on are deliberately **outside** it, listed so the claim is not read
+wider than it is:
+
+  * ``nthreads`` -- a static argument, and ``_resolve_nthreads`` returns ``1``
+    for every fixture in this module, so nothing here would notice a defect
+    gated on ``nthreads != 1``. One cell covers it
+    (``test_the_diagonal_survives_an_explicit_nthreads``) rather than another
+    factor of two across the matrix; it changes FINUFFT's threading, not the
+    arithmetic ``divide_by_n`` participates in.
+  * ``weights`` -- multiplied into the visibilities, i.e. on the far side of
+    the operator from this image-side diagonal. ``tests/test_against_ducc.py``
+    covers it at the defaults.
+  * complex images on ``hermitian=False`` plans -- ``divide_by_n`` multiplies a
+    complex image by a real diagonal either way, and the fold restriction is
+    issue #17's contract, pinned in ``tests/test_hermitian.py``.
+  * the 2-D broadcast image -- deliberately unused here, since it makes the
+    forward a different operator from the one ``vis2dirty`` adjoints (see
+    ``_Problem.image``). Sections 1-5 exercise it at ``n_chan == 1``.
+
+Also outside section 6, and covered separately because it is a property of the
+plan's *geometry* rather than of dispatch: the diagonal's l/m axis assignment,
+which no square isotropic fixture can falsify. See ``_ANISO_PIXSIZE_M_RATIO``.
+
+The identity is scored **per channel** rather than on the channel sum; see
+:func:`_dot_product_residual` for why summing the blocks first would hide
 one-sided defects behind a cancellation between them.
 
 What each flag means, asserted separately from the identity in section 4:
@@ -72,13 +97,17 @@ in both legs. Float32 plans are built with ``dtype=jnp.float32`` and
 Backends
 --------
 
-**Every tolerance below is justified against two backends: CPU (macOS arm64,
-10-core) and one NVIDIA GH200.** That is two machines, not a general claim
-about GPUs -- another accelerator, or another XLA version, may sit elsewhere,
-and a bound whose binding case is the GH200 is the one to re-measure first if
-that changes. Measured maxima, with the binding backend in the last column:
+**Every tolerance in the table below is justified against two backends: CPU
+(macOS arm64, 10-core) and one NVIDIA GH200.** That is two machines, not a
+general claim about GPUs -- another accelerator, or another XLA version, may
+sit elsewhere, and a bound whose binding case is the GH200 is the one to
+re-measure first if that changes. Measured maxima, with the binding backend in
+the last column:
 
     quantity              CPU        GPU x64    GPU x32    bound   binds
+    dft_all       f64   8.740e-07      ?          --       2e-06   ?     2.29x
+    dft_outside   f64   5.325e-07      ?          --       2e-06   ?     3.76x
+    ducc (28)     f64   24.4% of bd    ?          --       3*eps   ?     4.09x
     identity sec2 f64   1.936e-12  5.506e-15      --       1e-11   CPU   5.2x
     identity sec6 f64   6.574e-13  2.384e-15      --       1e-11   CPU  15.2x
     strategy_err  f64   1.299e-13  1.667e-16      --       1e-11   CPU  77.0x
@@ -92,13 +121,22 @@ that changes. Measured maxima, with the binding backend in the last column:
     oracle        f32   1.839e-07  1.949e-07  1.949e-07    1e-05   GPU  51.3x
     same-exec     f32   0.000e+00  7.931e-08  7.634e-08    1e-04   GPU  1.3e3x
 
+The first three rows carry ``?`` because they are **not yet measured on the
+GH200**: ``DFT_TOL_FACTOR`` and ``DUCC_TOL_FACTOR`` are ``requires_x64``, so
+they run on that machine's float64 leg and nobody has read the numbers off it.
+They run device code like every other row and belong here; until those cells
+are filled, their CPU figures are one backend's evidence and should be read as
+such. **``dft_all`` at 2.29x is the tightest bound in this module and the entry
+to re-measure first on new hardware.**
+
 Read that table before touching any constant in it, because **CPU evidence
 alone ranks these bounds close to backwards**:
 
-  * the tightest margin in the module is ``identity sec2`` in float32, at
-    **3.4x** on the GPU's ``JAX_ENABLE_X64=0`` leg -- the population that looks
-    *roomiest* on CPU, at 28.2x. The two disagree by 8x. A bound fitted to CPU
-    would have been set near 2e-6 and this leg would fail it;
+  * of the rows measured on both backends, the tightest is ``identity sec2`` in
+    float32, at **3.4x** on the GPU's ``JAX_ENABLE_X64=0`` leg -- the
+    population that looks *roomiest* on CPU, at 28.2x. The two disagree by 8x.
+    A bound fitted to CPU would have been set near 2e-6 and this leg would fail
+    it;
   * ``fold_err`` looks like the risk at 3.7x, and is in fact the safest entry
     here: it measures 1.070e-06 on **both** backends, agreeing to four
     significant figures (9.185e-06 against 9.132e-06 in float32). The quantity
@@ -240,12 +278,29 @@ SAME_EXECUTABLE_TOL_F32 = 1e-4
 # fixture instead of trusting two independently chosen constants.
 SAME_EXECUTABLE_SEPARATION = 1e3
 # ducc0 parity contract, mirroring tests/test_against_ducc.py::DUCC_TOL_FACTOR.
+# Worst of this module's 28 ducc cells on CPU: 24.4% of the bound (4.09x).
+# Not yet measured on the GH200 -- see the module docstring's table.
 DUCC_TOL_FACTOR = 3.0
 # Exact-DFT contract, mirroring tests/test_adjoint.py::DFT_TOL_FACTOR.
+# CPU: 8.740e-07 whole-image (2.29x) and 5.325e-07 outside-disc (3.76x) against
+# 2*eps at eps=1e-6. The whole-image leg is the **tightest bound in this
+# module** -- tighter than anything in the two-backend table -- and it too is
+# unmeasured on the GH200. Both are ``requires_x64``, which is why they were
+# absent from that table for a round; running device code, they belong in it.
 DFT_TOL_FACTOR = 2.0
 # Folded vs unfolded agreement, mirroring
 # tests/test_hermitian.py::CROSS_PATH_TOL_FACTOR (issue #17): the triangle
 # inequality on the 2*eps DFT contract each path meets separately.
+#
+# That derivation holds only in **float64** in this repository. The suites that
+# establish the 2*eps DFT contract and the folded/unfolded agreement
+# (``test_against_dft.py``, ``test_adjoint.py``, ``test_hermitian.py``) are in
+# ``conftest.collect_ignore`` for the ``JAX_ENABLE_X64=0`` leg, so in single
+# precision there is no such contract for the triangle inequality to be applied
+# to. The float32 use of this factor therefore rests on the measurement in the
+# module docstring's table (9.132e-06 CPU / 9.185e-06 GH200 against 4e-05, a
+# 4.4x margin), not on the derivation -- worth knowing before treating the
+# float32 bound as principled rather than empirical.
 #
 # The 3.7x headroom this gives in float64 (1.070e-06 against 4e-06) is the
 # smallest number in the module docstring's table, and it is nonetheless the
@@ -269,6 +324,45 @@ FLAG_VALUES = (False, True)
 _IDENTITY_PRECISIONS = [
     pytest.param(jnp.float64, 1e-6, IDENTITY_TOL_F64, id="float64", marks=requires_x64),
     pytest.param(jnp.float32, 1e-5, IDENTITY_TOL_F32, id="float32"),
+]
+
+
+# The geometries that can falsify the ``divide_by_n`` diagonal's **axis
+# assignment**, and the reason they have to exist.
+#
+# ``divide_by_n`` puts a geometry-indexed diagonal into both operators, and
+# ``n = sqrt(1 - l^2 - m^2)`` is symmetric under swapping l and m exactly when
+# the grid is. Every fixture in this repository is square with isotropic
+# pixels, and on such a plan ``plan.n_minus_1`` is transpose-symmetric
+# *bit-for-bit* -- ``max|nm1 - nm1.T| == 0.0``, not merely to round-off. So
+# ``n_grid.T`` in place of ``n_grid`` is a literal no-op there, and every test
+# in this module passed with that mutation in place: the identity (both
+# operators transposed alike, so still adjoint), the composition matrix (the
+# pinned reference transposed too), and even the ``(l, m)``-built oracle, which
+# inherits the blindness structurally because a single scalar pixel size cannot
+# express an asymmetric grid.
+#
+# It is not a harmless mutation. On the anisotropic plan below,
+# ``vis2dirty(divide_by_n=True)`` against ducc0 goes from 3.5e-07 -- inside the
+# repo's 3*eps contract -- to 1.0e+00.
+#
+# Two geometries, because they fail a transposed diagonal in different ways:
+#
+#   * ``_ANISO_SQUARE`` keeps ``n_l == n_m`` and makes the *pixel sizes*
+#     differ, so a transpose stays shape-valid and has to be caught
+#     numerically. This is the sharp one.
+#   * ``_ANISO_NONSQUARE`` makes the shape itself asymmetric, where a
+#     transposed diagonal cannot even broadcast. Cheaper to catch, and it
+#     covers an axis-swap that a square grid would hide behind broadcasting.
+#
+# Deliberately the minimum needed to falsify *this* diagonal. Systematic
+# odd / non-square / anisotropic coverage is issue #14's scope, not this one's.
+_ANISO_PIXSIZE_M_RATIO = 0.6
+_ANISO_SQUARE: dict[str, Any] = {"pixsize_m_ratio": _ANISO_PIXSIZE_M_RATIO}
+_ANISO_NONSQUARE: dict[str, Any] = {"shape": (48, 64)}
+_ANISO_GEOMETRIES = [
+    pytest.param(_ANISO_SQUARE, id="square_pixsize_m_0.6"),
+    pytest.param(_ANISO_NONSQUARE, id="nonsquare_48x64"),
 ]
 
 
@@ -314,7 +408,15 @@ class _Problem:
     plan: Any
     uvw: np.ndarray
     freq: np.ndarray
-    pixsize: float
+    # Separate per-axis pixel sizes, and ``shape`` may be non-square. Both
+    # exist for one reason: ``divide_by_n`` puts a *geometry-indexed* diagonal
+    # into both operators, and ``n = sqrt(1 - l^2 - m^2)`` is symmetric in l
+    # and m exactly when the grid is. On every square isotropic fixture in this
+    # repository ``plan.n_minus_1`` is bit-for-bit transpose-symmetric
+    # (``max|nm1 - nm1.T| == 0.0``), so transposing the diagonal is a no-op and
+    # the axis assignment is unfalsifiable. See ``_ANISO`` below.
+    pixsize_l: float
+    pixsize_m: float
     shape: tuple[int, int]
     # (n_l, n_m) real at ``n_chan == 1``; (n_chan, n_l, n_m) above it. The
     # multi-channel image is deliberately *not* the 2-D broadcast form: a 2-D
@@ -340,6 +442,8 @@ def _problem(
     uvw_seed: int = 0,
     data_seed: int = 7,
     n_chan: int = 1,
+    pixsize_m_ratio: float = 1.0,
+    shape: tuple[int, int] | None = None,
 ) -> _Problem:
     """Build (and cache) a plan plus a real image and complex visibilities.
 
@@ -352,6 +456,11 @@ def _problem(
     ``(n_rows, 1)`` visibilities, same draws in the same order from the same
     generator. Above 1 the frequencies come from ``_CHANNEL_FREQ_RATIOS`` and
     the image gains a leading channel axis.
+
+    ``pixsize_m_ratio`` and ``shape`` likewise default to the square isotropic
+    fixture. Passing either builds a plan whose ``n`` grid is *not*
+    transpose-symmetric, which is the only way to falsify the l/m axis
+    assignment of the ``divide_by_n`` diagonal -- see ``_ANISO``.
     """
     real_dtype = np.dtype(jnp.dtype(dtype))
     complex_dtype = np.complex64 if real_dtype == np.float32 else np.complex128
@@ -364,25 +473,29 @@ def _problem(
         uvw_seed,
         data_seed,
         n_chan,
+        pixsize_m_ratio,
+        shape,
     )
     hit = _CACHE.get(key)
     if hit is not None:
         return hit
     uvw = synthetic_uvw(tel, zenith_angle_deg, seed=uvw_seed)
     freq = tel.freq_hz * np.asarray(_CHANNEL_FREQ_RATIOS[:n_chan], dtype=np.float64)
-    pix = tel.pixsize
-    shape = (tel.n_pix, tel.n_pix)
+    pixsize_l = tel.pixsize
+    pixsize_m = tel.pixsize * pixsize_m_ratio
+    shape = (tel.n_pix, tel.n_pix) if shape is None else shape
     rng = np.random.default_rng(data_seed)
     image = rng.standard_normal(shape if n_chan == 1 else (n_chan, *shape)).astype(real_dtype)
     vis = (
         rng.standard_normal((tel.n_rows, n_chan)) + 1j * rng.standard_normal((tel.n_rows, n_chan))
     ).astype(complex_dtype)
-    plan = make_plan(uvw, freq, shape, pix, pix, eps, dtype=dtype, hermitian=hermitian)
+    plan = make_plan(uvw, freq, shape, pixsize_l, pixsize_m, eps, dtype=dtype, hermitian=hermitian)
     problem = _Problem(
         plan=plan,
         uvw=uvw,
         freq=freq,
-        pixsize=pix,
+        pixsize_l=pixsize_l,
+        pixsize_m=pixsize_m,
         shape=shape,
         image=image,
         vis=vis,
@@ -435,8 +548,8 @@ def _independent_one_over_n(problem: _Problem) -> np.ndarray:
     spread over 64 cells.
     """
     n_l, n_m = problem.shape
-    ll = (np.arange(n_l) - n_l // 2) * problem.pixsize
-    mm = (np.arange(n_m) - n_m // 2) * problem.pixsize
+    ll = (np.arange(n_l) - n_l // 2) * problem.pixsize_l
+    mm = (np.arange(n_m) - n_m // 2) * problem.pixsize_m
     lgrid, mgrid = np.meshgrid(ll, mm, indexing="ij")
     rho2 = lgrid**2 + mgrid**2
     inside = rho2 < 1.0
@@ -479,13 +592,28 @@ def _dot_product_residual(
     Both operators are block-diagonal over channels -- channel ``c`` sees only
     ``inv_lambda[c]`` and its own image plane and visibility column -- so the
     identity holds per block, and the aggregate is just the sum of the blocks.
-    But the blocks carry opposite signs and nearly equal magnitudes: on the
-    two-channel EDA2 fixture they are about ``+3.9e3`` and ``-3.8e3``, so only
-    ~1% of either survives the sum. Scoring the sum divides an error that
-    scales with 3.9e3 by a denominator of order 7e1, inflating the residual by
-    ~50x and -- far worse -- making the bound that has to accommodate it blind
-    to real one-sided defects. A uniform 5e-5 scaling error on the forward is
-    invisible to a bound loose enough to absorb that cancellation.
+    But the blocks can carry opposite signs and nearly equal magnitudes: on the
+    two-channel EDA2 fixture they are ``+3909.9`` and ``-3837.0``, so **1.86%**
+    of either survives the sum. Scoring the sum then divides an error that
+    scales with 3.9e3 by a denominator of order 7e1.
+
+    How much that inflates the residual depends on the cell, and the spread is
+    too wide for a single figure -- measured aggregate-over-per-channel across
+    the 32-cell matrix: 0.63x .. 1.04x (float64, ``divide_by_n=False``),
+    27.5x .. 107.3x (float64, ``True``), 2.90x .. 4.46x (float32, ``False``),
+    2.24x .. 86.9x (float32, ``True``). The ``True`` legs are where it bites,
+    consistent with the ``1/n`` factor being what makes the two blocks nearly
+    cancel in the first place.
+
+    The consequence is *not* that any cancellation-absorbing bound is blind to
+    a one-sided defect; that overstates it. Under aggregate scoring this
+    population reaches 1.229e-05, so a bound must clear that, and set tightly
+    at 2e-05 it would still catch ``MUT-E``'s uniform 5e-5 error (5.766e-05
+    aggregate) by 2.9x. What is true, and is what actually happened, is
+    narrower: the bound chosen on that scoring was 1e-4 and ``MUT-E`` passed
+    it. Absorbing the cancellation turns a 50x detection margin into a
+    single-digit one and makes the bound's honesty rest on a headroom
+    judgement that has nothing to do with the operators.
 
     Per-channel scoring removes the cancellation entirely: each block is
     divided by its own magnitude, so the residual measures the operators
@@ -522,7 +650,8 @@ def _reference_adjoint_no_divide(
     uvw: np.ndarray,
     freq: np.ndarray,
     shape: tuple[int, int],
-    pixsize: float,
+    pixsize_l: float,
+    pixsize_m: float,
 ) -> np.ndarray:
     """Exact DFT adjoint **without** the ``1/n`` and without the disc mask.
 
@@ -534,8 +663,8 @@ def _reference_adjoint_no_divide(
     a restatement.
     """
     n_l, n_m = shape
-    ll = (np.arange(n_l) - n_l // 2) * pixsize
-    mm = (np.arange(n_m) - n_m // 2) * pixsize
+    ll = (np.arange(n_l) - n_l // 2) * pixsize_l
+    mm = (np.arange(n_m) - n_m // 2) * pixsize_m
     lgrid, mgrid = np.meshgrid(ll, mm, indexing="ij")
     rho2 = lgrid**2 + mgrid**2
     inside = rho2 <= 1.0
@@ -960,6 +1089,57 @@ def test_forward_with_divide_by_n_ignores_every_pixel_outside_the_disc(
 
 
 @pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
+def test_the_forward_selects_the_zero_rather_than_multiplying_by_one(
+    dtype: DTypeLike, eps: float, _dot_tol: float
+) -> None:
+    """Outside the disc the image is *selected away*, not scaled to zero.
+
+    ``_dirty2vis_jit`` writes ``jnp.where(inside, image / safe_n, 0.0)`` and
+    its comment says the ``where`` is there so the zeros are exact "regardless
+    of what the caller put there". That reason was stated and never tested:
+    multiplying by a zeroed reciprocal passes every other test in this module,
+    because on finite input ``x * 0.0`` and ``select(False, ..., 0.0)`` agree
+    exactly.
+
+    They differ on non-finite input, which is the whole claim. With the
+    outside-disc pixels set to NaN a select returns finite visibilities -- the
+    NaNs never enter the transform -- while a multiply returns NaN everywhere,
+    since ``NaN * 0.0`` is NaN and the NUFFT spreads it across every output.
+    A caller handing in a padded image with NaN outside the field is doing
+    nothing unreasonable, and under ``divide_by_n=True`` those pixels are
+    documented as ignored.
+
+    Compared against the same call on a zero-filled image at
+    ``SAME_EXECUTABLE_TOL_*`` rather than bit-for-bit: two runs of one
+    executable are not bit-identical on every backend.
+    """
+    problem = _eda2_full_sky(dtype=dtype, eps=eps)
+    outside = _assert_outside_disc_is_loaded(problem)
+
+    with_nan = np.array(problem.image, copy=True)
+    with_nan[..., outside] = np.nan
+    zero_filled = np.array(problem.image, copy=True)
+    zero_filled[..., outside] = 0.0
+
+    got = _forward(problem, with_nan, divide_by_n=True)
+    assert np.all(np.isfinite(np.asarray(got))), (
+        "dirty2vis(divide_by_n=True) returned non-finite visibilities for an image "
+        "carrying NaN OUTSIDE the unit disc. Those pixels are multiplied by zero by "
+        "contract, so they must be selected away (jnp.where) rather than scaled away "
+        "(image * zeroed_reciprocal) -- NaN * 0.0 is NaN, and the NUFFT then spreads it "
+        "over every output visibility."
+    )
+    want = _forward(problem, zero_filled, divide_by_n=True)
+    is_f64 = np.dtype(jnp.dtype(dtype)) == np.float64
+    tol = SAME_EXECUTABLE_TOL_F64 if is_f64 else SAME_EXECUTABLE_TOL_F32
+    diff = _relative_difference(got, want)
+    assert diff < tol, (
+        f"the NaN-outside image gave visibilities {diff:.3e} from the zero-filled one "
+        f"(tol {tol:.1e}): the outside-disc pixels are reaching the transform"
+    )
+
+
+@pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
 def test_forward_with_divide_by_n_applies_one_over_n_inside_the_disc(
     dtype: DTypeLike, eps: float, _dot_tol: float
 ) -> None:
@@ -982,7 +1162,7 @@ def test_forward_with_divide_by_n_applies_one_over_n_inside_the_disc(
     got = _forward(problem, problem.image, divide_by_n=True).astype(np.complex128)
     want = _forward(problem, scaled, divide_by_n=False).astype(np.complex128)
     err = np.linalg.norm(got - want) / np.linalg.norm(want)
-    tol = 1e-12 if np.dtype(jnp.dtype(dtype)) == np.float64 else 1e-5
+    tol = ORACLE_TOL_F64 if np.dtype(jnp.dtype(dtype)) == np.float64 else ORACLE_TOL_F32
     assert err < tol, (
         f"dirty2vis(divide_by_n=True) differs by {err:.3e} from dirty2vis on an image "
         f"pre-multiplied by the masked 1/n (tol {tol:.1e}). The flag must apply 1/n to the "
@@ -1040,7 +1220,7 @@ def test_adjoint_without_divide_by_n_matches_the_exact_dft_outside_the_disc() ->
 
     got = _adjoint(problem, divide_by_n=False)[0]
     want = _reference_adjoint_no_divide(
-        problem.vis, problem.uvw, problem.freq, problem.shape, problem.pixsize
+        problem.vis, problem.uvw, problem.freq, problem.shape, problem.pixsize_l, problem.pixsize_m
     )
     err_out = np.linalg.norm(got[outside] - want[outside]) / np.linalg.norm(want[outside])
     assert err_out < DFT_TOL_FACTOR * eps, (
@@ -1075,7 +1255,7 @@ def test_the_two_adjoint_flag_values_differ_by_exactly_one_over_n_inside_the_dis
     got = undivided[inside] / n_grid[inside]
     want = divided[inside]
     err = np.linalg.norm(got - want) / np.linalg.norm(want)
-    tol = 1e-12 if np.dtype(jnp.dtype(dtype)) == np.float64 else 1e-5
+    tol = ORACLE_TOL_F64 if np.dtype(jnp.dtype(dtype)) == np.float64 else ORACLE_TOL_F32
     assert err < tol, (
         f"inside the disc, vis2dirty(divide_by_n=False)/n differs from "
         f"vis2dirty(divide_by_n=True) by {err:.3e} (tol {tol:.1e}): the flag changed more "
@@ -1110,12 +1290,11 @@ def test_ducc_parity_for_the_new_flag_combinations(
     ducc0_wgridder = pytest.importorskip("ducc0.wgridder")
     tel, zen_deg = short_telescope_pointing
     problem = _problem(tel, zen_deg, eps=eps, uvw_seed=0, data_seed=7)
-    pix = problem.pixsize
     common = dict(
         uvw=problem.uvw,
         freq=problem.freq,
-        pixsize_x=pix,
-        pixsize_y=pix,
+        pixsize_x=problem.pixsize_l,
+        pixsize_y=problem.pixsize_m,
         epsilon=eps,
         do_wgridding=True,
         nthreads=1,
@@ -1141,6 +1320,60 @@ def test_ducc_parity_for_the_new_flag_combinations(
         f"{tel.name} zen={zen_deg} eps={eps:g} {w_strategy} {op}: relative error {err:.3e} "
         f"exceeds {DUCC_TOL_FACTOR:g}*eps={DUCC_TOL_FACTOR * eps:.3e} for the new "
         "divide_by_n combination"
+    )
+
+
+@requires_x64
+@pytest.mark.parametrize("geometry", _ANISO_GEOMETRIES)
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_ducc_parity_on_an_asymmetric_grid(op: str, geometry: dict[str, Any]) -> None:
+    """ducc0 parity with ``divide_by_n=True`` where ``n`` is not symmetric.
+
+    The oracle above is an internal consistency statement -- ``True`` against
+    ``False`` plus a factor this file builds. This is the external one, and it
+    is what turns "the two flags agree with each other" into "the diagonal is
+    the one ducc0 computes". Both operators run with ``divide_by_n=True``,
+    since that is the setting that uses the diagonal at all; the adjoint's
+    ``False`` path applies no factor and would pass a transposed one.
+
+    Measured on the square anisotropic plan: a diagonal indexed ``[m, l]``
+    takes ``vis2dirty(divide_by_n=True)`` from 3.5e-07 against ducc0 -- inside
+    the repo's ``3 * eps`` contract -- to 1.0e+00.
+    """
+    ducc0_wgridder = pytest.importorskip("ducc0.wgridder")
+    eps = 1e-6
+    problem = _problem(EDA2, 0.0, eps=eps, **geometry)
+    common = dict(
+        uvw=problem.uvw,
+        freq=problem.freq,
+        pixsize_x=problem.pixsize_l,
+        pixsize_y=problem.pixsize_m,
+        epsilon=eps,
+        do_wgridding=True,
+        nthreads=1,
+    )
+    if op == "dirty2vis":
+        got = _forward(problem, problem.image, divide_by_n=True)
+        want = ducc0_wgridder.dirty2vis(
+            dirty=np.ascontiguousarray(problem.image, dtype=np.float64),
+            divide_by_n=True,
+            **common,
+        )
+    else:
+        got = _adjoint(problem, divide_by_n=True)[0]
+        want = ducc0_wgridder.vis2dirty(
+            vis=problem.vis,
+            npix_x=problem.shape[0],
+            npix_y=problem.shape[1],
+            divide_by_n=True,
+            **common,
+        )
+    err = np.linalg.norm(got - want) / np.linalg.norm(want)
+    assert err < DUCC_TOL_FACTOR * eps, (
+        f"{op} shape={problem.shape} pixsize_l={problem.pixsize_l:.6g} "
+        f"pixsize_m={problem.pixsize_m:.6g}: relative error {err:.3e} exceeds "
+        f"{DUCC_TOL_FACTOR:g}*eps={DUCC_TOL_FACTOR * eps:.3e} against ducc0 at the same "
+        "asymmetric geometry"
     )
 
 
@@ -1313,8 +1546,20 @@ def test_both_flag_values_compose_with_every_strategy_and_fold_setting(
     )
 
 
-@requires_x64
-def test_the_independent_one_over_n_matches_the_plans_own_grid() -> None:
+# The guard's own bound. float64 measures 7.622e-16; float32 measures 3.380e-07,
+# which is not round-off in the comparison but the plan's grid genuinely being
+# float32 while ``_independent_one_over_n`` is always float64 -- a difference of
+# order the float32 epsilon, amplified near the disc edge where n -> 0. That
+# mismatch is exactly what this guard exists to bound, so the float32 leg is
+# the one that matters and it must not be skipped.
+GUARD_TOL_F64 = 1e-13
+GUARD_TOL_F32 = 1e-5
+
+
+@pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
+def test_the_independent_one_over_n_matches_the_plans_own_grid(
+    dtype: DTypeLike, eps: float, _dot_tol: float
+) -> None:
     """Guard on the oracle: the two constructions must agree before it is used.
 
     :func:`_independent_one_over_n` is built from ``(l, m)`` alone while the
@@ -1328,8 +1573,14 @@ def test_the_independent_one_over_n_matches_the_plans_own_grid() -> None:
     Pinned here, once, rather than discovered as unexplained noise spread over
     the oracle's 64 cells. Failing here means the *oracle* needs looking at;
     failing there means the implementation does.
+
+    Run on **both** precision legs, and the float32 one is the point: there the
+    plan's grid is float32 while this file's construction is float64, so the
+    two genuinely differ (3.380e-07 measured, against 7.622e-16 in float64).
+    Skipping the float32 leg would leave the oracle's 32 float32 cells running
+    against an unchecked factor -- the precise mismatch this guard is for.
     """
-    problem = _problem(EDA2, 0.0, eps=1e-6, n_chan=_MATRIX_N_CHAN)
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, n_chan=_MATRIX_N_CHAN)
     independent = _independent_one_over_n(problem)
     n_grid = _n_grid(problem.plan)
     inside_plan = n_grid > 0.0
@@ -1346,7 +1597,9 @@ def test_the_independent_one_over_n_matches_the_plans_own_grid() -> None:
     assert 0 < int(inside_plan.sum()) < inside_plan.size
     from_plan = np.where(inside_plan, 1.0 / np.where(inside_plan, n_grid, 1.0), 0.0)
     rel = np.abs(independent - from_plan)[inside_plan] / np.abs(from_plan)[inside_plan]
-    assert float(rel.max()) < 1e-13, (
+    is_f64 = np.dtype(jnp.dtype(dtype)) == np.float64
+    guard_tol = GUARD_TOL_F64 if is_f64 else GUARD_TOL_F32
+    assert float(rel.max()) < guard_tol, (
         f"the two 1/n constructions differ by {float(rel.max()):.3e} relative inside the "
         "disc; the oracle is only an oracle while it agrees with the geometry the plan "
         "was built from"
@@ -1417,6 +1670,102 @@ def test_every_cell_applies_the_documented_one_over_n_diagonal(
         "must apply exactly that diagonal -- a different but still self-adjoint one "
         "(1/n^2, 1/(n+c), the shifted grid) passes both other section-6 tests and fails "
         "only here."
+    )
+
+
+@requires_x64
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_the_diagonal_survives_an_explicit_nthreads(op: str) -> None:
+    """The oracle relation once at ``nthreads=0``, the value nothing else uses.
+
+    ``nthreads`` is a static argument on the same JIT boundary as
+    ``divide_by_n``, and ``_resolve_nthreads`` returns ``1`` for every fixture
+    in this module (all are far below ``_NTHREADS_SMALL_N_ROWS``). So a defect
+    conditioned on ``nthreads != 1`` would pass every other test here. This is
+    one cell rather than a fifth axis across the matrix: threading changes how
+    FINUFFT accumulates, not the image-side diagonal, so the interesting
+    question is whether the flag survives a different value at all -- not
+    whether it survives one per strategy.
+
+    ``0`` means "let FINUFFT decide" and is the one other value
+    ``_resolve_nthreads`` can return.
+    """
+    problem = _eda2_full_sky()
+    _assert_outside_disc_is_loaded(problem)
+    factor = _independent_one_over_n(problem)
+    kwargs: dict[str, Any] = {"nthreads": 0}
+
+    if op == "dirty2vis":
+        got = _forward(problem, problem.image, divide_by_n=True, **kwargs).astype(np.complex128)
+        scaled = (np.asarray(problem.image, dtype=np.float64) * factor).astype(problem.image.dtype)
+        want = _forward(problem, scaled, divide_by_n=False, **kwargs).astype(np.complex128)
+    else:
+        got = _adjoint(problem, divide_by_n=True, **kwargs).astype(np.float64)
+        want = factor * _adjoint(problem, divide_by_n=False, **kwargs).astype(np.float64)
+
+    err = np.linalg.norm(got - want) / np.linalg.norm(want)
+    assert err < ORACLE_TOL_F64, (
+        f"{op} at nthreads=0: divide_by_n=True differs by {err:.3e} from the "
+        f"independently scaled call (tol {ORACLE_TOL_F64:.1e})"
+    )
+
+
+@pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
+@pytest.mark.parametrize("geometry", _ANISO_GEOMETRIES)
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_the_diagonal_is_indexed_l_by_m_and_not_m_by_l(
+    op: str,
+    geometry: dict[str, Any],
+    dtype: DTypeLike,
+    eps: float,
+    _dot_tol: float,
+) -> None:
+    """The oracle again, on a grid where ``n`` is *not* transpose-symmetric.
+
+    Everything else in this module runs on square plans with isotropic pixels,
+    where ``plan.n_minus_1`` equals its own transpose bit-for-bit. A diagonal
+    indexed ``[m, l]`` instead of ``[l, m]`` is therefore literally the same
+    array there, and all four of this module's mutation classes -- including
+    the ``(l, m)``-built oracle -- pass with the transpose in place. See
+    ``_ANISO_PIXSIZE_M_RATIO`` for the measurement.
+
+    Same relation as
+    ``test_every_cell_applies_the_documented_one_over_n_diagonal``, on the two
+    geometries that break the symmetry. One ``w_strategy`` and one
+    ``channel_strategy`` are enough here and the enumeration is deliberately
+    not repeated: the factor is applied outside both loops (ahead of the
+    strategy branch in the forward, after it in the adjoint), so the axis
+    assignment cannot depend on either. What this cell adds is geometry, not
+    dispatch.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, **geometry)
+    _assert_outside_disc_is_loaded(problem)
+    n_l, n_m = problem.shape
+    assert (n_l != n_m) or (problem.pixsize_l != problem.pixsize_m), (
+        "this geometry is square and isotropic, so n is transpose-symmetric and the "
+        "test cannot tell an [l, m] diagonal from an [m, l] one"
+    )
+    factor = _independent_one_over_n(problem)
+    kwargs: dict[str, Any] = {"w_strategy": "dense_scan", "channel_strategy": "scan"}
+
+    if op == "dirty2vis":
+        got = _forward(problem, problem.image, divide_by_n=True, **kwargs).astype(np.complex128)
+        scaled = (np.asarray(problem.image, dtype=np.float64) * factor).astype(problem.image.dtype)
+        want = _forward(problem, scaled, divide_by_n=False, **kwargs).astype(np.complex128)
+    else:
+        got = _adjoint(problem, divide_by_n=True, **kwargs).astype(np.float64)
+        want = factor * _adjoint(problem, divide_by_n=False, **kwargs).astype(np.float64)
+
+    is_f64 = np.dtype(jnp.dtype(dtype)) == np.float64
+    tol = ORACLE_TOL_F64 if is_f64 else ORACLE_TOL_F32
+    err = np.linalg.norm(got - want) / np.linalg.norm(want)
+    assert err < tol, (
+        f"{op} shape={problem.shape} pixsize_l={problem.pixsize_l:.6g} "
+        f"pixsize_m={problem.pixsize_m:.6g} dtype={np.dtype(jnp.dtype(dtype)).name}: "
+        f"divide_by_n=True differs by {err:.3e} (tol {tol:.1e}) from the independently "
+        "scaled call. On an asymmetric grid this catches a diagonal indexed [m, l] "
+        "instead of [l, m] -- which every square isotropic fixture in this repository "
+        "accepts silently."
     )
 
 

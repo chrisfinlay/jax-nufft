@@ -300,8 +300,8 @@ its default zeroes them &mdash; restrict the image to the disc and the mixed
 pair is adjoint again, to **4.105e-16**.
 
 Narrow fields hide it, because they have no outside-disc pixels at all: on
-MWA_compact the mixed pair's `n x` residual is 1.20e-14 at zenith and 1.94e-12
-at 30&deg;.
+MWA_compact the mixed pair's `n x` residual is 1.1794e-14 at zenith and
+1.9360e-12 at 30&deg;.
 
 **Recommendation: pass `divide_by_n=True` to both operators.** It is the
 factor the measurement equation actually carries, and it is what any
