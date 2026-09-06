@@ -74,6 +74,18 @@ The identity is scored **per channel** rather than on the channel sum; see
 :func:`_dot_product_residual` for why summing the blocks first would hide
 one-sided defects behind a cancellation between them.
 
+One more thing #21 will need, and the reason it is pinned here rather than
+left to that issue: reverse mode enters the cotangent **conjugated**. JAX's
+convention for a real-input, complex-output function makes
+``jax.vjp(dirty2vis)(y)`` equal ``vis2dirty(conj(y))``, not ``vis2dirty(y)``.
+Measured on EDA2 full-sky in float64, the conjugated form agrees to 7.8e-14
+(``divide_by_n=False``) and 2.6e-15 (``True``) while the unconjugated one is
+off by **1.4527** and **1.3327**. A ``custom_vjp`` that drops the conjugation
+returns finite, plausible, badly wrong gradients, and no test in this
+repository would have said so --
+``test_the_reverse_mode_vjp_is_vis2dirty_of_the_conjugated_cotangent`` now
+does, over both flags, both fold settings and both precisions.
+
 What each flag means, asserted separately from the identity in section 4:
 
   * forward with ``divide_by_n=True`` multiplies the image by ``1/n`` inside
@@ -148,7 +160,7 @@ things. The oracle compares the operators' float32 diagonal against
 :func:`_independent_one_over_n`, which is always float64, so most of the
 float32 residual is that deterministic construction gap rather than summation
 noise -- substituting the plan's own float32 grid for the independent one on
-the adjoint leg drops it from 1.381e-07 to 2.655e-08, i.e. ~81% of it is the
+the adjoint leg drops it from 1.381e-07 to 2.673e-08, i.e. ~81% of it is the
 grid difference. In float64 the two constructions agree to 7.6e-16 and nothing
 is left but round-off. ``GUARD_TOL_F32`` bounds exactly that gap, and says so.
 
@@ -1862,6 +1874,64 @@ def test_every_cell_applies_the_documented_one_over_n_diagonal(
     )
 
 
+@pytest.mark.parametrize("dtype, eps, _dot_tol", _PRECISIONS)
+@pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
+def test_weights_compose_with_both_flag_values(
+    divide_by_n: bool, dtype: DTypeLike, eps: float, _dot_tol: float
+) -> None:
+    """``weights`` x ``divide_by_n``: all four gates of one dispatch matrix.
+
+    ``apply_w_weights`` and ``divide_by_n`` are both static arguments on the
+    same ``_vis2dirty_jit`` boundary, so together they are a 2x2 dispatch
+    matrix -- and ``weights`` with ``divide_by_n=False`` was never executed
+    anywhere in this repository. Every ``weights=`` call site in the suite
+    leaves the flag at its ``True`` default, so a defect gated on exactly that
+    pair passed all 1278 tests; a planted 1.5x gain there was invisible.
+
+    Nothing shipped is wrong, and this is a hole in the enumeration rather
+    than a latent bug: the two arguments act about a hundred lines apart, at
+    opposite ends of the operator, and share no state, so it is hard to
+    construct a *natural* defect that lands on one gate only. It is closed
+    anyway, because "never executed" is not a property a contract issue #21
+    inherits should have.
+
+    The relation is the definition of ``weights``: they multiply the
+    visibilities before gridding (ducc's ``wgt``), so weighting is the same
+    operator applied to pre-multiplied visibilities. Held at ``ORACLE_TOL_*``
+    rather than bit-for-bit -- the two are different executables, the static
+    ``apply_w_weights`` differing -- though on CPU they agree exactly.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype)
+    weights = np.random.default_rng(31).uniform(0.3, 2.0, size=problem.vis.shape)
+    weights = weights.astype(np.dtype(jnp.dtype(dtype)))
+
+    weighted = np.asarray(
+        vis2dirty(
+            problem.plan,
+            jnp.asarray(problem.vis),
+            weights=jnp.asarray(weights),
+            divide_by_n=divide_by_n,
+        )
+    ).astype(np.float64)
+    premultiplied = np.asarray(
+        vis2dirty(
+            problem.plan,
+            jnp.asarray(problem.vis * weights),
+            divide_by_n=divide_by_n,
+        )
+    ).astype(np.float64)
+
+    is_f64 = np.dtype(jnp.dtype(dtype)) == np.float64
+    tol = ORACLE_TOL_F64 if is_f64 else ORACLE_TOL_F32
+    err = np.linalg.norm(weighted - premultiplied) / np.linalg.norm(premultiplied)
+    assert err < tol, (
+        f"divide_by_n={divide_by_n} dtype={np.dtype(jnp.dtype(dtype)).name}: weighting "
+        f"inside vis2dirty differs by {err:.3e} (tol {tol:.1e}) from pre-multiplying the "
+        "visibilities. weights are a diagonal on the visibility side and divide_by_n a "
+        "diagonal on the image side; they must not interact."
+    )
+
+
 @requires_x64
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
 def test_the_diagonal_survives_an_explicit_nthreads(op: str) -> None:
@@ -2015,6 +2085,66 @@ def test_the_pair_stays_adjoint_for_every_strategy_and_fold_setting(
 # ---------------------------------------------------------------------------
 # 7. the flag is static: JIT / grad traceability (issue #21's precondition)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype, eps, dot_tol", _IDENTITY_PRECISIONS)
+@pytest.mark.parametrize("hermitian", [False, True])
+@pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
+def test_the_reverse_mode_vjp_is_vis2dirty_of_the_conjugated_cotangent(
+    divide_by_n: bool,
+    hermitian: bool,
+    dtype: DTypeLike,
+    eps: float,
+    dot_tol: float,
+) -> None:
+    """``jax.vjp(dirty2vis)(y) == vis2dirty(conj(y))`` -- issue #21's rule.
+
+    The property #21's ``custom_vjp`` will be built on, stated here because
+    this branch is what establishes it and an unpinned claim about it in the
+    prose would be worth nothing.
+
+    Note the **conjugate**. JAX's reverse-mode convention for a real-input,
+    complex-output function makes the cotangent enter conjugated, so the
+    adjoint that reproduces ``jax.vjp`` is ``vis2dirty(conj(y))`` and not
+    ``vis2dirty(y)``. The difference is not subtle and not a tolerance
+    question: measured on EDA2 full-sky in float64, against ``conj(y)`` the
+    two agree to 7.8e-14 (``divide_by_n=False``) and 2.6e-15 (``True``), while
+    against ``y`` they differ by **1.4527** and **1.3327**. A ``custom_vjp``
+    that forgets the conjugation is wrong by that much and still returns
+    finite, plausible gradients.
+
+    Asserted at both flags, both fold settings and both precisions, since a
+    ``custom_vjp`` is chosen per call. Held at ``IDENTITY_TOL_*``: like the
+    dot-product identity this is an exact relation on paper, so the residual
+    is round-off (measured worst 8.8e-14 float64, 1.6e-07 float32).
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, hermitian=hermitian)
+    image = jnp.asarray(problem.image)
+    cotangent = jnp.asarray(problem.vis)
+
+    _, vjp_fn = jax.vjp(lambda im: dirty2vis(problem.plan, im, divide_by_n=divide_by_n), image)
+    got = np.asarray(vjp_fn(cotangent)[0], dtype=np.float64)
+    want = np.asarray(
+        vis2dirty(problem.plan, jnp.conj(cotangent), divide_by_n=divide_by_n)[0],
+        dtype=np.float64,
+    )
+    err = np.linalg.norm(got - want) / np.linalg.norm(want)
+    assert err < dot_tol, (
+        f"divide_by_n={divide_by_n} hermitian={hermitian} "
+        f"dtype={np.dtype(jnp.dtype(dtype)).name}: jax.vjp(dirty2vis) differs by "
+        f"{err:.3e} (tol {dot_tol:.1e}) from vis2dirty on the conjugated cotangent. "
+        "Issue #21's custom_vjp must reproduce this, conjugation included."
+    )
+
+    unconjugated = np.asarray(
+        vis2dirty(problem.plan, cotangent, divide_by_n=divide_by_n)[0], dtype=np.float64
+    )
+    contrast = np.linalg.norm(got - unconjugated) / np.linalg.norm(unconjugated)
+    assert contrast > 1e-2, (
+        f"vis2dirty on the *unconjugated* cotangent is only {contrast:.3e} from the vjp, "
+        "so this fixture cannot tell the conjugation convention from its absence and the "
+        "assertion above pins nothing"
+    )
 
 
 @pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
