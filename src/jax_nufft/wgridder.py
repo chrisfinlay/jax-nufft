@@ -52,13 +52,16 @@ image on such a plan, the fold being valid for a real sky only.
 from __future__ import annotations
 
 import warnings
-from functools import partial
+from collections.abc import Callable
+from functools import lru_cache, partial
 from typing import Any, Literal, cast
 
 import jax
+import jax.extend as jex
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.interpreters import ad, batching, mlir
 from jax_finufft import nufft1, nufft2
 from jax_finufft.options import Opts
 
@@ -710,6 +713,16 @@ def _prepare_image(image: Array, plan: WGridderPlan) -> Array:
     make a float32 plan accept a float64 numpy image on the 2-D path while
     correctly rejecting the same image on the 3-D path, which touches nothing
     before the check.
+
+    **The cast to complex is load-bearing for the gradient too** (issue #21),
+    which is not obvious from here. Because it happens *outside* the primitive,
+    reverse mode transposes it on its own and a real image gets the real part
+    of ``A^T y`` without anyone writing that down. Keeping a real image real
+    through the JIT boundary -- to save the copy, say -- would be correct in
+    the primal and would silently start exercising the ``.real`` branch of
+    :func:`_dirty2vis_transpose_rule`, which exists for that case, is a
+    numerical claim, and is unreachable (so untested) as long as this cast
+    stands. Move it and gate that branch in the same change.
     """
     if image.ndim == 2:
         if image.shape != (plan.n_l, plan.n_m):
@@ -1205,11 +1218,7 @@ def _channel_adjoint(
     raise ValueError(f"unknown w_strategy: {w_strategy!r}")
 
 
-@partial(
-    jax.jit,
-    static_argnames=("w_strategy", "channel_strategy", "nthreads", "divide_by_n"),
-)
-def _dirty2vis_jit(
+def _dirty2vis_forward(
     plan: WGridderPlan,
     image: Array,
     *,
@@ -1218,6 +1227,14 @@ def _dirty2vis_jit(
     nthreads: int,
     divide_by_n: bool,
 ) -> Array:
+    """``A image`` -- the forward operator's body, traced but not jitted.
+
+    issue #21: this is what :data:`_dirty2vis_p`'s lowering runs. It used to be
+    ``_dirty2vis_jit`` itself; that name now belongs to the thin wrapper that
+    binds the primitive (see the "linear primitives" section at the end of this
+    module), so that reverse mode transposes the operator rather than replaying
+    its w-plane loop. Nothing about the numerics moved with the rename.
+    """
     opts = Opts(nthreads=nthreads)
 
     # issue #20: the ``1/n`` factor of the measurement equation, when asked
@@ -1522,36 +1539,37 @@ def _channel_adjoint_windowed(
     return dirty_c
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "w_strategy",
-        "channel_strategy",
-        "nthreads",
-        "apply_w_weights",
-        "divide_by_n",
-    ),
-)
-def _vis2dirty_jit(
+def _dirty2vis_adjoint(
     plan: WGridderPlan,
     vis: Array,
-    weights: Array | None,
     *,
     w_strategy: WStrategy,
     channel_strategy: ChannelStrategy,
     nthreads: int,
-    apply_w_weights: bool,
     divide_by_n: bool,
 ) -> Array:
+    """``A^H vis`` as a **complex** ``(n_chan, n_l, n_m)`` image (issue #21).
+
+    One adjoint, two consumers. :func:`vis2dirty` is ``Re(A^H .)``, so it takes
+    the real part of what this returns; the transpose rule of the forward
+    primitive needs the full complex value, since ``jax.vjp`` owes ``A^T ct =
+    conj(A^H conj(ct))`` and dropping the imaginary part first would be a
+    different operator on a complex image. Writing the ``.real`` at the two
+    call sites rather than here is what keeps a single adjoint implementation:
+    two copies of this function would be two things to keep in step, and the
+    one that only the gradient exercises is the one that would drift.
+
+    Everything else -- the plane loop, the ``w0`` screen's conjugation, the
+    masked ``1/n`` -- is exactly what ``_vis2dirty_jit`` did before the change,
+    with the ``.real`` removed and the ``weights`` multiply lifted into the
+    wrapper (it is a visibility-side diagonal, so it composes on the outside
+    and does not belong in the operator's body).
+    """
     opts = Opts(nthreads=nthreads)
 
     # Visibility input has shape (n_rows, n_chan). Channel-loop expects channel
     # axis first, so transpose once up front.
     vis_per_chan = vis.T  # (n_chan, n_rows)
-    if apply_w_weights:
-        # weights has shape (n_rows, n_chan); align to (n_chan, n_rows).
-        weights_per_chan = weights.T.astype(vis_per_chan.dtype)  # type: ignore[union-attr]
-        vis_per_chan = vis_per_chan * weights_per_chan
 
     if w_strategy in ("windowed_scan", "windowed_vmap"):
         # Apply sort_perm once per channel so windowed slices line up with
@@ -1636,11 +1654,14 @@ def _vis2dirty_jit(
     # branch rather than zeros, which is exactly what the forward's ``False``
     # path integrates over and so what makes the two adjoint there.
     if not divide_by_n:
-        return dirty_per_chan.real
+        return dirty_per_chan
 
     # ``divide_by_n=True`` (the default, matching ducc's flag of the same
-    # name): apply 1/n on the output and take the real part to land in real
-    # space.
+    # name): apply 1/n on the output. The real part that lands the result in
+    # real space is taken by the caller (issue #21) -- ``1/n`` is a real
+    # diagonal, so ``Re(x)/n == Re(x/n)`` and the two orders agree on the
+    # value ``vis2dirty`` returns, while keeping the division here is what lets
+    # the transpose rule reuse this function for the full complex adjoint.
     #
     # The mask is ``n > 0`` **strictly**, and that is where this library
     # deliberately differs from ducc0. A pixel exactly on the unit circle has
@@ -1667,7 +1688,7 @@ def _vis2dirty_jit(
     # :func:`_disc_mask_and_safe_n` for why the unshifted grid is the only
     # correct one here (issue #16).
     inside, safe_n = _disc_mask_and_safe_n(plan, np.dtype(dirty_per_chan.real.dtype))
-    return jnp.where(inside, dirty_per_chan.real / safe_n, 0.0)
+    return jnp.where(inside, dirty_per_chan / safe_n, 0.0)
 
 
 def vis2dirty(
@@ -1797,6 +1818,468 @@ def vis2dirty(
         channel_strategy=channel_strategy,
         nthreads=resolved_nthreads,
         apply_w_weights=apply_w,
+        divide_by_n=divide_by_n,
+    )
+
+
+# ---------------------------------------------------------------------------
+# issue #21: the two operators as linear primitives
+# ---------------------------------------------------------------------------
+#
+# Both operators are linear in their non-plan argument, and until this issue
+# JAX had no way of knowing it: it differentiated the w-plane loop like any
+# other Python code, which in reverse mode means saving one image-sized
+# residual per plane. Measured with the repository's memory protocol
+# (``memory_analysis().temp_size_in_bytes``, CPU, float64, eps 1e-6,
+# ``nthreads=1``, ``divide_by_n=True``), ``grad(0.5 ||A x||^2)`` against the
+# plain forward: 1.72 MB against 0.138 MB on EDA2 zenith (n_w = 11), 285.47 MB
+# against 2.11 MB on MWA_extended off30 at 256^2 (n_w = 134) and 897.83 MB
+# against 33.87 MB at 1024^2 / 20k rows. The backward pass owes exactly one
+# call to the other operator, so the whole of that is waste.
+#
+# Three primitives rather than two, and rather than a ``jax.custom_vjp``:
+#
+#   * ``_dirty2vis_p``      -- ``image -> A image``. C-linear.
+#   * ``_dirty2vis_transpose_p`` -- ``y -> A^T y = conj(A^H conj(y))``, the
+#     transpose ``jax.vjp`` owes (see below). C-linear, and its own transpose
+#     is ``_dirty2vis_p`` again, which is what makes a *second* reverse pass --
+#     ``grad(grad(...))``, or any ``jax.vjp`` of a ``jax.vjp`` -- work.
+#   * ``_vis2dirty_p``      -- ``v -> Re(A^H v)``, the public adjoint. R-linear
+#     (complex in, real out); its transpose is ``conj(A .)``.
+#
+# Every one of the three also carries a ``batch_shape`` param, which is how
+# ``jax.vmap`` stays a *batched* call rather than becoming a loop; see
+# :func:`_linear_batcher`.
+#
+# Why ``vis2dirty`` gets a primitive of its own rather than being written as
+# ``conj``-wrapped uses of the other two: ``jnp.conj`` on the ``(n_rows,
+# n_chan)`` visibilities lowers to *real* tensors of that shape, which is
+# precisely what issue #23 deleted and what
+# ``tests/test_planning.py::test_no_operator_path_materialises_per_channel_row_
+# coordinates`` gates. ``Re(A^H v)`` needs no conjugation on the visibility
+# side at all, so the primal path stays clean and the conjugations live in the
+# transpose rules, where they act on *image*-shaped arrays.
+#
+# Why not ``jax.custom_vjp``, which the issue title names: it supplies a
+# reverse rule and removes forward mode. ``jax.jvp`` through such a function
+# raises ``TypeError: can't apply forward-mode autodiff (jvp) to a custom_vjp
+# function``, and the issue's own definition of done asks for
+# ``check_grads(modes=("fwd", "rev"))`` and a finite ``jax.hessian``. The
+# primitive route gives all of it, plus ``jax.linear_transpose``, which does
+# not work at all without it (transposing the channel ``scan`` over an
+# undefined primal raises ``TypeError: ... ValAccum``).
+#
+# The cotangent convention is JAX's, and it is a plain transpose, **not** the
+# Hermitian adjoint: ``jax.vjp(A)(y) == A^T y``, measured 1.5e-16 relative
+# against a dense ``A`` built column by column, against 1.47 for ``A^H y`` and
+# 1.32 for ``conj(A^T y)``. For a real image the three-way distinction is
+# invisible -- the image-side ``astype(complex)`` in :func:`_prepare_image`
+# transposes to a real part, and ``Re(conj z) == Re z`` -- which is why it has
+# to be fixed on the complex case, where the wrong choice is a relative 1.3-1.5
+# error that still returns entirely finite gradients.
+
+_dirty2vis_p = jex.core.Primitive("jax_nufft_dirty2vis")
+_dirty2vis_transpose_p = jex.core.Primitive("jax_nufft_dirty2vis_transpose")
+_vis2dirty_p = jex.core.Primitive("jax_nufft_vis2dirty")
+
+# The static configuration every one of the three carries. It is one tuple
+# because the whole point of the issue is that the backward pass runs the
+# *forward's* settings: the transpose rules below re-bind with ``**params``
+# untouched, so a strategy, a channel loop or an ``Opts(nthreads=...)`` cannot
+# differ between the two directions by construction rather than by care.
+# ``tests/test_custom_vjp.py`` spies on the per-channel helpers to gate it.
+_PRIMITIVE_STATIC = ("w_strategy", "channel_strategy", "nthreads", "divide_by_n")
+
+# How many eager-bind wrappers :func:`_eager_executable` keeps. One entry per
+# (lowering, static configuration, plan geometry) actually bound outside a
+# trace, which in a normal session is nothing at all -- see that function for
+# why the cache is bounded rather than unbounded.
+_EAGER_CACHE_SIZE = 64
+
+
+def _plan_from_leaves(treedef: Any, leaves: Any) -> WGridderPlan:
+    """Rebuild the plan from the primitive's operands and its ``treedef`` param.
+
+    The plan's array leaves travel as ordinary primitive *operands* rather than
+    being closed over, so that a plan arriving as a tracer -- ``jax.jit(jax.grad
+    (f))(plan, x)`` -- works the same as a concrete one. Its static fields
+    travel in the ``treedef`` param, which is hashable, so they stay part of the
+    cache key exactly as they are at the :func:`jax.jit` boundary.
+    """
+    return cast(WGridderPlan, jax.tree_util.tree_unflatten(treedef, list(leaves)))
+
+
+def _apply_batched(core: Callable[[Array], Array], x: Array, batch_shape: tuple[int, ...]) -> Array:
+    """Run ``core`` over ``x``'s leading ``batch_shape`` axes as one batched call.
+
+    ``batch_shape`` is empty on every call the public wrappers make; it is
+    non-empty only under ``jax.vmap``, where :func:`_linear_batcher` pushes the
+    mapped axis into the params instead of unrolling the operator. The leading
+    axes are flattened to one so that nested ``vmap`` needs no extra machinery,
+    and the single ``jax.vmap`` here is precisely the batching JAX applied to
+    these operators before they became primitives -- so a batched call keeps
+    the throughput it had, rather than becoming ``B`` serial calls.
+    """
+    if not batch_shape:
+        return core(x)
+    core_shape = x.shape[len(batch_shape) :]
+    n_batch = 1
+    for dim in batch_shape:
+        n_batch *= dim
+    out = jax.vmap(core)(x.reshape((n_batch, *core_shape)))
+    return out.reshape((*batch_shape, *out.shape[1:]))
+
+
+def _dirty2vis_lowering(
+    image: Array, *leaves: Array, treedef: Any, batch_shape: tuple[int, ...], **kw: Any
+) -> Array:
+    plan = _plan_from_leaves(treedef, leaves)
+
+    def core(im: Array) -> Array:
+        return _dirty2vis_forward(plan, im.astype(plan.complex_dtype), **kw)
+
+    return _apply_batched(core, image, batch_shape)
+
+
+def _dirty2vis_transpose_lowering(
+    ct: Array, *leaves: Array, treedef: Any, batch_shape: tuple[int, ...], **kw: Any
+) -> Array:
+    """``A^T ct = conj(A^H conj(ct))``.
+
+    Written through the one shared adjoint rather than as a second traversal:
+    ``A^H`` is conjugate-linear where ``A^T`` is linear, and the two
+    conjugations are what convert between them. Both act on arrays JAX has to
+    materialise anyway (the incoming cotangent and the outgoing image), so this
+    costs a pair of sign flips on top of the adjoint call.
+    """
+    plan = _plan_from_leaves(treedef, leaves)
+
+    def core(y: Array) -> Array:
+        adjoint = _dirty2vis_adjoint(plan, jnp.conj(y.astype(plan.complex_dtype)), **kw)
+        return jnp.conj(adjoint)
+
+    return _apply_batched(core, ct, batch_shape)
+
+
+def _vis2dirty_lowering(
+    vis: Array, *leaves: Array, treedef: Any, batch_shape: tuple[int, ...], **kw: Any
+) -> Array:
+    plan = _plan_from_leaves(treedef, leaves)
+
+    def core(v: Array) -> Array:
+        return jnp.real(_dirty2vis_adjoint(plan, v.astype(plan.complex_dtype), **kw))
+
+    return _apply_batched(core, vis, batch_shape)
+
+
+def _check_operand(aval: Any, plan: WGridderPlan, expected: tuple[int, ...], prim: Any) -> None:
+    """Reject an operand that does not match the plan the params carry.
+
+    Without this the shape mismatch survives abstract evaluation -- all three
+    output avals are derived from the plan, not from the operand -- and
+    detonates deep inside the lowering with a message about ``scan`` leading
+    axis sizes, or (under :func:`jax.eval_shape`, which never lowers) does not
+    detonate at all and reports a plausible shape for an impossible call. No
+    public path can reach either: :func:`_prepare_image` and
+    :func:`_validate_vis` check shapes with their own messages before the JIT
+    boundary, and the transpose rules bind shapes they derived from this same
+    plan. This is the primitives' own contract, stated where it is cheap.
+
+    The dtype clause is a check against *the plan*, not a kind check: the plan
+    owns the precision (issue #11), so ``plan.real_dtype`` and
+    ``plan.complex_dtype`` are the only two things a bind may carry. A merely
+    "inexact" test would accept a float32 operand on a float64 plan and let the
+    lowering's ``astype`` silently promote it -- which is exactly the
+    promote-on-the-quiet that :func:`_cast_to_plan_dtype` refuses to do at the
+    public boundary.
+
+    Called from both the abstract eval and :func:`_eager_impl`, so a raw
+    ``bind`` outside a trace is refused the same way a traced one is.
+    """
+    if aval.shape != expected:
+        raise TypeError(
+            f"{prim.name} got an operand of shape {aval.shape}, but this plan makes it {expected}."
+        )
+    if np.dtype(aval.dtype) not in (plan.real_dtype, plan.complex_dtype):
+        raise TypeError(
+            f"{prim.name} got an operand of dtype {np.dtype(aval.dtype)}; this plan is "
+            f"{plan.real_dtype} / {plan.complex_dtype}."
+        )
+
+
+def _dirty2vis_abstract(
+    image: Any, *leaves: Any, treedef: Any, batch_shape: tuple[int, ...], **kw: Any
+) -> Any:
+    plan = _plan_from_leaves(treedef, leaves)
+    _check_operand(image, plan, (*batch_shape, plan.n_chan, plan.n_l, plan.n_m), _dirty2vis_p)
+    return jax.core.ShapedArray((*batch_shape, plan.n_rows, plan.n_chan), plan.complex_dtype)
+
+
+def _dirty2vis_transpose_abstract(
+    ct: Any, *leaves: Any, treedef: Any, batch_shape: tuple[int, ...], **kw: Any
+) -> Any:
+    plan = _plan_from_leaves(treedef, leaves)
+    _check_operand(ct, plan, (*batch_shape, plan.n_rows, plan.n_chan), _dirty2vis_transpose_p)
+    return jax.core.ShapedArray((*batch_shape, plan.n_chan, plan.n_l, plan.n_m), plan.complex_dtype)
+
+
+def _vis2dirty_abstract(
+    vis: Any, *leaves: Any, treedef: Any, batch_shape: tuple[int, ...], **kw: Any
+) -> Any:
+    plan = _plan_from_leaves(treedef, leaves)
+    _check_operand(vis, plan, (*batch_shape, plan.n_rows, plan.n_chan), _vis2dirty_p)
+    return jax.core.ShapedArray((*batch_shape, plan.n_chan, plan.n_l, plan.n_m), plan.real_dtype)
+
+
+_dirty2vis_p.def_abstract_eval(_dirty2vis_abstract)
+_dirty2vis_transpose_p.def_abstract_eval(_dirty2vis_transpose_abstract)
+_vis2dirty_p.def_abstract_eval(_vis2dirty_abstract)
+
+
+@lru_cache(maxsize=_EAGER_CACHE_SIZE)
+def _eager_executable(lowering: Any, params: tuple[tuple[str, Any], ...]) -> Any:
+    """One ``jax.jit`` wrapper per (lowering, static params), for eager binds.
+
+    Bounded rather than unbounded, and the bound is the point: the key holds a
+    ``PyTreeDef``, whose ``__hash__`` does not appear to fold in the aux data,
+    so two plans differing only in their static fields hash into one bucket.
+    Equality still separates them -- correctness is not at stake, and was
+    checked directly on two plans with byte-identical treedefs and different
+    baselines -- but an unbounded cache would grow one colliding entry per plan
+    geometry a session ever builds. ``jax.clear_caches()`` does not reach this
+    dictionary (JAX's own dispatch cache, which this replaces, was evictable);
+    what it does reach is the compilation cache *inside* each entry, so what
+    survives a clear is at most ``_EAGER_CACHE_SIZE`` thin wrappers.
+    """
+    return jax.jit(lambda *operands: lowering(*operands, **dict(params)))
+
+
+def _eager_impl(abstract: Any, lowering: Any, *operands: Any, **params: Any) -> Any:
+    """``def_impl``: a ``bind`` outside every trace.
+
+    Reachable from the public API only under :func:`jax.disable_jit`, where the
+    wrappers' ``jax.jit`` is inert and every bind lands here -- a capability
+    that came for free before these were primitives, and is gated by
+    ``tests/test_custom_vjp.py::test_the_operators_work_under_disable_jit``.
+    A raw ``prim.bind`` is the other route, and nothing public performs one.
+
+    The ``abstract`` call is not redundant: on this path no abstract evaluation
+    has run, so without it a mis-shaped or mis-typed bind reaches the lowering
+    and fails there with a message about ``scan`` leading axis sizes, or does
+    not fail at all. Running the same function the trace would gives the same
+    error at the same boundary.
+
+    The cache exists for the raw-bind route, where the alternative is tracing
+    and compiling the whole operator per call. It buys nothing under
+    ``disable_jit``: ``jax.jit`` is disabled there too, so the cached wrapper is
+    re-entered and the operator body re-traced on every call, cache hit or not.
+    """
+    abstract(*(jax.typeof(operand) for operand in operands), **params)
+    return _eager_executable(lowering, tuple(sorted(params.items())))(*operands)
+
+
+_dirty2vis_p.def_impl(partial(_eager_impl, _dirty2vis_abstract, _dirty2vis_lowering))
+_dirty2vis_transpose_p.def_impl(
+    partial(_eager_impl, _dirty2vis_transpose_abstract, _dirty2vis_transpose_lowering)
+)
+_vis2dirty_p.def_impl(partial(_eager_impl, _vis2dirty_abstract, _vis2dirty_lowering))
+
+mlir.register_lowering(_dirty2vis_p, mlir.lower_fun(_dirty2vis_lowering, multiple_results=False))
+mlir.register_lowering(
+    _dirty2vis_transpose_p, mlir.lower_fun(_dirty2vis_transpose_lowering, multiple_results=False)
+)
+mlir.register_lowering(_vis2dirty_p, mlir.lower_fun(_vis2dirty_lowering, multiple_results=False))
+
+
+def _linear_jvp(prim: Any, primals: Any, tangents: Any, **params: Any) -> Any:
+    """The JVP of a linear map is the map itself, applied to the tangent.
+
+    The symbolic-zero branch is **defensive**, and known to be: no transform
+    tried reaches it -- ``grad``, ``jvp`` through a ``stop_gradient``,
+    ``hessian``, ``grad(grad(...))``, ``checkpoint`` with an unused output and
+    a ``scan`` discarding its ``ys`` all leave it uncovered, JAX having
+    dead-code-eliminated the primitive first in every case. It is kept because
+    ``ad.Zero`` is part of the rule contract and every rule JAX ships handles
+    it; deleting it would trade a line for a crash on the day some transform
+    does hand one over.
+    """
+    x, *leaves = primals
+    tangent_x, *leaf_tangents = tangents
+    if any(not isinstance(t, ad.Zero) for t in leaf_tangents):
+        raise TypeError(
+            "the wgridder operators are not differentiable with respect to the plan; "
+            "it is geometry (baselines, frequencies, plane centres), not data."
+        )
+    out = prim.bind(x, *leaves, **params)
+    if isinstance(tangent_x, ad.Zero):
+        return out, ad.Zero(jax.typeof(out).to_tangent_aval())
+    return out, prim.bind(tangent_x, *leaves, **params)
+
+
+ad.primitive_jvps[_dirty2vis_p] = partial(_linear_jvp, _dirty2vis_p)
+ad.primitive_jvps[_dirty2vis_transpose_p] = partial(_linear_jvp, _dirty2vis_transpose_p)
+ad.primitive_jvps[_vis2dirty_p] = partial(_linear_jvp, _vis2dirty_p)
+
+
+def _no_plan_cotangents(leaves: Any) -> list[None]:
+    """One ``None`` per plan leaf: the operators are linear in their data only."""
+    return [None] * len(leaves)
+
+
+def _dirty2vis_transpose_rule(ct: Any, x: Any, *leaves: Any, **params: Any) -> Any:
+    """``jax.vjp(dirty2vis)`` is ``A^T``, restricted to ``x``'s own dtype.
+
+    The restriction is where the real-image case is handled, and it is normally
+    handled by JAX rather than here: :func:`_prepare_image` casts the caller's
+    image to the plan's complex dtype *outside* the operator, and the transpose
+    of that cast takes the real part on its own. So the ``.real`` below, like
+    the ``ad.Zero`` branch above it (see :func:`_linear_jvp`), is defensive:
+    it is for a caller who reaches the JIT boundary with a real image directly,
+    and no public path does.
+    """
+    assert ad.is_undefined_primal(x)
+    if isinstance(ct, ad.Zero):
+        return [None, *_no_plan_cotangents(leaves)]
+    g = _dirty2vis_transpose_p.bind(ct, *leaves, **params)
+    if not jnp.issubdtype(x.aval.dtype, jnp.complexfloating):
+        g = g.real
+    return [g.astype(x.aval.dtype), *_no_plan_cotangents(leaves)]
+
+
+def _dirty2vis_transpose_transpose_rule(ct: Any, x: Any, *leaves: Any, **params: Any) -> Any:
+    """``(A^T)^T = A``: what a **second** reverse pass transposes.
+
+    Reached by ``grad(grad(...))``, or by any ``jax.vjp`` of a ``jax.vjp`` --
+    not by ``jax.hessian``, which is ``jacfwd(jacrev(...))`` and so needs the
+    *JVP* rule of whatever the inner reverse pass emitted. Instrumenting the
+    module over the whole suite records zero calls here against 77 to the
+    forward's transpose rule: ``tests/test_custom_vjp.py::test_second_order_
+    reverse_mode_is_the_operator_again`` is what exercises it, and both the
+    plausible mistakes -- deleting the rule, and binding
+    ``_dirty2vis_transpose_p`` here instead of ``_dirty2vis_p`` -- leave every
+    other test in the repository green while failing that one.
+    """
+    assert ad.is_undefined_primal(x)
+    if isinstance(ct, ad.Zero):
+        return [None, *_no_plan_cotangents(leaves)]
+    g = _dirty2vis_p.bind(ct, *leaves, **params)
+    return [g.astype(x.aval.dtype), *_no_plan_cotangents(leaves)]
+
+
+def _vis2dirty_transpose_rule(ct: Any, x: Any, *leaves: Any, **params: Any) -> Any:
+    """The transpose of ``Re(A^H .)`` is ``conj(A .)``, for a real cotangent image.
+
+    Measured 0.0 exactly against ``conj(A u)`` on the EDA2 fixture and 1.37-1.42
+    against ``A u``: dropping the conjugation is a ~1.4 relative error that
+    still returns finite gradients. ``ct`` is an *image*, so unlike the primal
+    path this conjugation is image-shaped and issue #23's per-``(channel, row)``
+    ban does not bear on it. The ``ad.Zero`` branch is defensive, as in
+    :func:`_linear_jvp`.
+    """
+    assert ad.is_undefined_primal(x)
+    if isinstance(ct, ad.Zero):
+        return [None, *_no_plan_cotangents(leaves)]
+    plan = _plan_from_leaves(params["treedef"], leaves)
+    g = jnp.conj(_dirty2vis_p.bind(ct.astype(plan.complex_dtype), *leaves, **params))
+    return [g.astype(x.aval.dtype), *_no_plan_cotangents(leaves)]
+
+
+ad.primitive_transposes[_dirty2vis_p] = _dirty2vis_transpose_rule
+ad.primitive_transposes[_dirty2vis_transpose_p] = _dirty2vis_transpose_transpose_rule
+ad.primitive_transposes[_vis2dirty_p] = _vis2dirty_transpose_rule
+
+
+def _linear_batcher(prim: Any, args: Any, dims: Any, **params: Any) -> Any:
+    """``vmap`` over the data argument, as one batched call.
+
+    The mapped axis is moved to the front and pushed into the ``batch_shape``
+    param, so the primitive still binds **once** and :func:`_apply_batched`
+    does the batching inside the lowering -- the same ``jax.vmap`` over the
+    same operator body that JAX applied before these were primitives. Nesting
+    works by accumulating axes onto that tuple.
+
+    Writing this as ``jax.lax.map`` instead -- one operator call per batch
+    element -- is correct and costs 1.5x at ``B = 2``, rising to 3.7x at
+    ``B = 16`` (EDA2 zenith 64^2, ``dense_scan``, median of 9). The batched
+    form is what the operators had before this issue and it is what they keep;
+    the memory this issue is about is the *gradient's*, and a batched gradient
+    is one batched adjoint call either way.
+    """
+    x, *leaves = args
+    batch_dim, *leaf_dims = dims
+    if any(d is not batching.not_mapped for d in leaf_dims):
+        raise NotImplementedError(
+            "vmap over the plan is not supported: a plan is one geometry, and "
+            "batching it would mean a different operator per batch element."
+        )
+    xs = jnp.moveaxis(x, batch_dim, 0)
+    params = {**params, "batch_shape": (xs.shape[0], *params["batch_shape"])}
+    return prim.bind(xs, *leaves, **params), 0
+
+
+batching.primitive_batchers[_dirty2vis_p] = partial(_linear_batcher, _dirty2vis_p)
+batching.primitive_batchers[_dirty2vis_transpose_p] = partial(
+    _linear_batcher, _dirty2vis_transpose_p
+)
+batching.primitive_batchers[_vis2dirty_p] = partial(_linear_batcher, _vis2dirty_p)
+
+
+@partial(jax.jit, static_argnames=_PRIMITIVE_STATIC)
+def _dirty2vis_jit(
+    plan: WGridderPlan,
+    image: Array,
+    *,
+    w_strategy: WStrategy,
+    channel_strategy: ChannelStrategy,
+    nthreads: int,
+    divide_by_n: bool,
+) -> Array:
+    """The forward operator's JIT boundary: bind the primitive on the plan's leaves."""
+    leaves, treedef = jax.tree_util.tree_flatten(plan)
+    return _dirty2vis_p.bind(
+        image,
+        *leaves,
+        treedef=treedef,
+        batch_shape=(),
+        w_strategy=w_strategy,
+        channel_strategy=channel_strategy,
+        nthreads=nthreads,
+        divide_by_n=divide_by_n,
+    )
+
+
+@partial(jax.jit, static_argnames=(*_PRIMITIVE_STATIC, "apply_w_weights"))
+def _vis2dirty_jit(
+    plan: WGridderPlan,
+    vis: Array,
+    weights: Array | None,
+    *,
+    w_strategy: WStrategy,
+    channel_strategy: ChannelStrategy,
+    nthreads: int,
+    apply_w_weights: bool,
+    divide_by_n: bool,
+) -> Array:
+    """The adjoint operator's JIT boundary.
+
+    ``weights`` are applied here rather than inside the primitive: they are a
+    visibility-side diagonal, so ``vis2dirty(v, weights=w) == vis2dirty(v * w)``
+    identically (``tests/test_divide_by_n.py::test_weights_compose_with_both_
+    flag_values``), and multiplying outside keeps the operator itself one thing
+    with one transpose -- which also gives the weights a gradient for free,
+    through the multiply rather than through a rule of their own.
+    """
+    if apply_w_weights:
+        vis = vis * weights.astype(vis.dtype)  # type: ignore[union-attr]
+    leaves, treedef = jax.tree_util.tree_flatten(plan)
+    return _vis2dirty_p.bind(
+        vis,
+        *leaves,
+        treedef=treedef,
+        batch_shape=(),
+        w_strategy=w_strategy,
+        channel_strategy=channel_strategy,
+        nthreads=nthreads,
         divide_by_n=divide_by_n,
     )
 

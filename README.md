@@ -587,15 +587,47 @@ above `_NTHREADS_SMALL_N_ROWS` in `wgridder.py` for the full numbers.
 canonical choices plus the `"auto"` resolver that picks between them, and
 the two v0.1 names are kept as deprecated aliases:
 
-| `w_strategy`      | Per-plane work               | Peak transient memory       | Notes                                          |
-|-------------------|------------------------------|-----------------------------|------------------------------------------------|
-| `"dense_scan"`    | `n_rows * W^2`               | `O(image_size + n_rows)`    | the default through v0.1.2; v0.1 `"scan"` is a deprecated alias. |
-| `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
-| `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
-| `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
-| `"auto"`          | resolves to one of the above | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
+| `w_strategy`      | Per-plane work               | Peak transient memory       | `grad` memory               | Notes                                          |
+|-------------------|------------------------------|-----------------------------|-----------------------------|------------------------------------------------|
+| `"dense_scan"`    | `n_rows * W^2`               | `O(image_size + n_rows)`    | 1.48-1.50x its own forward  | the default through v0.1.2; v0.1 `"scan"` is a deprecated alias. |
+| `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | ~1x its own forward         | v0.1 `"vmap"` is a deprecated alias.           |
+| `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | 1.48-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | ~1x its own forward         | v0.1.1; rare wins, mostly for completeness.    |
+| `"auto"`          | resolves to one of the above | matches the resolved choice | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
+
+The `grad` column is new in v0.1.3 (issue #21) and is a *ratio against the
+same strategy's forward*, not an absolute size: both operators are now bound
+as linear primitives whose transposes are each other, so reverse mode is one
+call to the other operator at the forward's own settings rather than a
+transposed replay of the w-plane loop. Before that change the scan strategies'
+gradient cost `O(n_w * image_size)` like the vmap ones — measured with
+`memory_analysis().temp_size_in_bytes` on `grad(0.5 ||A x||^2)` at eps 1e-6 in
+float64, 1.72 MB against a 0.138 MB forward on EDA2 zenith (`n_w` = 11), 7.21
+against 0.534 MB on MWA_compact off30, 285.5 against 2.11 MB on MWA_extended
+off30 at 256² (`n_w` = 134) and 897.8 against 33.9 MB at 1024² / 20k rows;
+after it, 0.20, 0.80, 3.16 and 50.7 MB, i.e. 12.5-135x down to 1.48-1.50x.
+The vmap rows moved from 1.89-2.11x to 0.98-1.18x on the same measurement, but
+they were never where the issue lived: their forward already allocates
+`n_w * image_size`, so their gradient carried no per-plane residual stack to
+remove. "Already inside 2x" would be too kind to them — on MWA_compact off30
+the `vis2dirty` vmap cells read 2.07-2.11x before the change on both precision
+legs, i.e. just outside it, while the scan cells read 13.5x. The forward
+numerics are untouched — the accuracy sweep's worst cell is unmoved at 1.48x
+eps, and both operators return bit-for-bit what they returned before.
+
+`jax.vmap` of either operator remains a single batched call rather than a
+per-element loop: the primitives carry the batch in a `batch_shape` parameter,
+so batched throughput and batched transient memory are unchanged from v0.1.2
+(measured identical at batch 1, 2, 4, 8 and 16).
+
+`jax.jvp`, `jax.linear_transpose`, `jax.hessian` and `vmap` of a gradient all
+work on both operators; `jax.linear_transpose` is new with the same change.
+The reverse-mode convention is JAX's own, i.e. the plain transpose rather than
+the Hermitian adjoint: `jax.vjp(dirty2vis)(y)` is `A^T y` (for a real image,
+`Re(A^T y) == vis2dirty(plan, conj(y))` at equal `divide_by_n`), and
+`jax.vjp(vis2dirty)(u)` is `conj(dirty2vis(plan, u))`.
 
 For the windowed strategies, the plan exposes
 
