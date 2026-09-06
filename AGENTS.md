@@ -46,6 +46,25 @@ the ducc parity tests — and `vis2dirty` also takes an optional
 `weights` arg (`(n_rows, n_chan)` real) that is multiplied into
 visibilities before gridding (matches ducc's `wgt`).
 
+Since issue #20 the `1/n` factor is a keyword-only **static**
+`divide_by_n` flag on *both* operators, defaulting to `False` on
+`dirty2vis` and `True` on `vis2dirty` — ducc0's pairing, and exactly
+the behaviour of every earlier release. `True` on the forward
+multiplies the image by `1/n` inside the unit disc and by zero
+outside; `False` on the adjoint returns the analytic-extension result
+with neither the division nor the mask. **The pair is adjoint only
+with equal flags**: on the EDA2 full-sky fixture (eps 1e-6, float64)
+`Re<A x, y> = <x, A^H y>` holds to 1.3e-13 (`False`) and 1.3e-15
+(`True`), while the shipped mixed defaults are off by 0.630 plain and
+0.273 in the `n·x` form, all of it from the 1155 of 4096 pixels
+outside the disc. `divide_by_n=True` on both is the recommendation for
+imaging and the precondition for issue #21's `custom_vjp`. The flag is
+an **image-side** diagonal — apply it on the image end of both
+operators, never alongside the visibility-side `nshift` compensation
+(#16) or Hermitian per-row conjugation (#17), and on the adjoint
+*after* the `w0` screen's conjugation, which is part of the operator
+at both flag settings. Gated by `tests/test_divide_by_n.py`.
+
 Since issue #17 `make_plan` also takes `hermitian=True/False`
 (defaulting to `True`): with the fold on, rows with `w < 0` are stored
 at `(-u, -v, -w)` with the conjugation put back per row at call time,
