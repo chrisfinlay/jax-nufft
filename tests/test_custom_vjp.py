@@ -36,9 +36,17 @@ MWA_extended off30 (256^2)   dense_scan       2.11 MB     3.16 MB     1.50x
 allocates ``n_w * image``, so their gradient ratio was 1.82-2.10 *before* the
 change: issue #21's definition of done says "grad temp <= 2x forward for all
 four strategies", and on two of the four that sentence is already true at
-``HEAD``. They are kept here as a regression guard at 2.5x, and the gate that
-carries the issue is the 2.0x on the two ``*_scan`` strategies, where the
+``HEAD``. They are kept here as a regression guard at **1.5x**, and the gate
+that carries the issue is the 2.0x on the two ``*_scan`` strategies, where the
 measured before/after is 13.5x -> 1.49x.
+
+1.5 rather than the 2.5 this module first carried, which could not have failed:
+the pre-change ratios on this fixture are 1.89-1.95x on ``dirty2vis`` and
+2.07-2.11x on ``vis2dirty`` (both precision legs), so a complete revert of the
+change left all four vmap cells inside 2.5 and the "regression guard" gated
+nothing. After the change they read 0.98-1.18x, so 1.5 sits with 27% headroom
+above the worst measured cell (``windowed_vmap`` / ``vis2dirty``, float32) and
+below every pre-change one.
 
 Why a separate module rather than more of ``test_jax_integration.py``: this is
 a contract about a *rule*, not about plumbing. It has to pin the cotangent
@@ -87,6 +95,7 @@ from __future__ import annotations
 from typing import Any
 
 import jax
+import jax.extend as jex
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -123,11 +132,11 @@ from tests.test_divide_by_n import EDA2 as EDA2  # re-export for readability
 
 # The gradient-memory gates. See the module docstring for the before/after
 # table these come from: 13.5x -> 1.49x on the scan strategies (so 2.0 sits
-# between the two with 6.7x margin on the failing side), and 1.89-2.10 ->
-# 0.98-1.15 on the vmap ones, where 2.5 is a regression guard rather than a
+# between the two with 6.7x margin on the failing side), and 1.89-2.11 ->
+# 0.98-1.18 on the vmap ones, where 1.5 is a regression guard rather than a
 # gate because their forward already carries the n_w * image allocation.
 GRAD_MEMORY_FACTOR_SCAN = 2.0
-GRAD_MEMORY_FACTOR_VMAP = 2.5
+GRAD_MEMORY_FACTOR_VMAP = 1.5
 
 SCAN_STRATEGIES = ("dense_scan", "windowed_scan")
 
@@ -230,8 +239,9 @@ def test_gradient_memory_is_within_a_small_factor_of_the_forward(op: str, w_stra
 
     Measured on MWA_compact off30 (float64, eps 1e-6, ``nthreads=1``):
     13.5x before, 1.48-1.49x after on the two scan strategies. The vmap
-    strategies read 1.89-1.95x before and 0.98-1.15x after -- see the module
-    docstring for why they cannot gate this issue.
+    strategies read 1.89-2.11x before (``vis2dirty`` being the pair above 2.0)
+    and 0.98-1.18x after -- see the module docstring for why they cannot gate
+    this issue, and why their guard sits at 1.5.
     """
     dtype = _active_dtype()
     problem = _problem(MWA_COMPACT, 30.0, eps=tol(1e-6, 1e-5), dtype=dtype)
@@ -693,6 +703,125 @@ def test_higher_order_autodiff_stays_finite(op: str) -> None:
     )
 
 
+def _dense_operator(plan: Any, shape: tuple[int, int], **kw: Any) -> np.ndarray:
+    """``A`` as a dense ``(n_rows * n_chan, n_pix)`` matrix, from ``dirty2vis``.
+
+    Column ``j`` is the operator applied to the ``j``-th unit image, so the
+    matrix is built from the *public* forward and carries no assumption about
+    how the gradient is implemented. The module docstring's four conventions
+    were established the same way.
+    """
+    n_pix = int(np.prod(shape))
+    columns = []
+    for j in range(n_pix):
+        basis = np.zeros(n_pix, dtype=np.float64)
+        basis[j] = 1.0
+        column = dirty2vis(plan, jnp.asarray(basis.reshape(shape), dtype=plan.real_dtype), **kw)
+        columns.append(np.asarray(column, dtype=np.complex128).ravel())
+    return np.stack(columns, axis=1)
+
+
+@pytest.mark.parametrize("dtype, eps, exact_tol", _IDENTITY_PRECISIONS)
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_second_order_reverse_mode_is_the_operator_again(
+    op: str, dtype: DTypeLike, eps: float, exact_tol: float
+) -> None:
+    """``grad(grad(...))``: the transpose of the transpose is the operator.
+
+    The one transform that reaches the *transpose of the transpose rule*, and
+    the reason this is a separate test from the Hessian one above.
+    ``jax.hessian`` is ``jacfwd(jacrev(...))``, so its outer pass needs a JVP
+    rule for what the inner reverse pass emitted and never transposes it; a
+    second **reverse** pass does. Instrumenting the operators over the whole
+    suite records zero calls to that rule without this test, and replacing its
+    body with ``raise NotImplementedError`` leaves all 1448 fast tests green --
+    while the ``dirty2vis`` leg here raises immediately. (The ``vis2dirty`` leg
+    is the symmetric second-order check rather than a second cover of that
+    rule: its two reverse passes go through the *other* two transposes, and it
+    survives that mutation. Both are kept, since "which rule does a given leg
+    reach" is exactly the thing a later change can move.)
+
+    The scalar parametrisation is what forces the second pass through the
+    operator rather than through the loss: ``f(s) = 0.5 ||A (s x)||^2`` is
+    ``0.5 s^2 ||A x||^2``, so ``f''(s) = ||A x||^2`` exactly, and the reference
+    is that norm taken on a **dense** ``A`` built column by column from the
+    public forward. A rule that transposed to the wrong member of the pair --
+    the plausible mistake, the two being adjacent lines -- is refused at
+    abstract evaluation, the shape it produces being the opposite end of the
+    operator.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, shape=(8, 8))
+    kw = dict(divide_by_n=True, w_strategy="dense_scan", nthreads=1)
+    dense = _dense_operator(problem.plan, (8, 8), **kw)
+
+    if op == "dirty2vis":
+        image = jnp.asarray(problem.image)
+
+        def f(s: Any) -> Any:
+            return 0.5 * jnp.sum(jnp.abs(dirty2vis(problem.plan, s * image, **kw)) ** 2)
+
+        want = float(np.linalg.norm(dense @ np.asarray(image, dtype=np.float64).ravel()) ** 2)
+    else:
+        vis = jnp.asarray(problem.vis)
+
+        def f(s: Any) -> Any:
+            return 0.5 * jnp.sum(vis2dirty(problem.plan, s * vis, **kw) ** 2)
+
+        adjoint = np.real(dense.conj().T @ np.asarray(vis, dtype=np.complex128).ravel())
+        want = float(np.linalg.norm(adjoint) ** 2)
+
+    got = float(jax.grad(jax.grad(f))(jnp.asarray(1.0, dtype=problem.plan.real_dtype)))
+    err = abs(got - want) / abs(want)
+    assert err < exact_tol, (
+        f"{op}: the second derivative of 0.5||A (s x)||^2 in s is {got:.6e}, "
+        f"{err:.3e} away (tol {exact_tol:.1e}) from the ||A x||^2 = {want:.6e} a dense "
+        "A gives. Both reverse passes are transposes of this operator; the second one "
+        "transposes the first one's rule."
+    )
+
+
+@pytest.mark.parametrize("dtype, eps, exact_tol", _IDENTITY_PRECISIONS)
+def test_the_weights_gradient_survives_the_primitive_boundary(
+    dtype: DTypeLike, eps: float, exact_tol: float
+) -> None:
+    """``grad`` with respect to ``vis2dirty``'s ``weights``.
+
+    #21 moved the ``weights`` multiply out of the operator body and into the
+    JIT wrapper, on the grounds that a visibility-side diagonal composes on the
+    outside and so keeps its gradient "for free" through the multiply. That is
+    a claim about a code path nothing exercised: wrapping ``weights`` in
+    ``jax.lax.stop_gradient`` inside the wrapper passes all 1448 fast tests.
+
+    The reference is the derivative written out by hand from the two public
+    operators. With ``g = Re(A^H (v * w))`` and ``L(w) = sum g^2``,
+    ``dL/dw_j = 2 Re(v_j conj((A g)_j))`` -- one adjoint and one forward call,
+    neither of which is the code under test.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype)
+    kw = dict(divide_by_n=True, w_strategy="dense_scan", nthreads=1)
+    vis = jnp.asarray(problem.vis)
+    weights = jnp.asarray(
+        np.random.default_rng(2121)
+        .uniform(0.3, 2.0, size=problem.vis.shape)
+        .astype(problem.plan.real_dtype)
+    )
+
+    def loss(w: Any) -> Any:
+        return jnp.sum(vis2dirty(problem.plan, vis, weights=w, **kw) ** 2)
+
+    got = jax.grad(loss)(weights)
+    gridded = vis2dirty(problem.plan, vis * weights.astype(vis.dtype), **kw)
+    want = 2.0 * jnp.real(jnp.conj(dirty2vis(problem.plan, gridded, **kw)) * vis)
+
+    err = _rel(got, want)
+    assert err < exact_tol, (
+        f"the gradient with respect to weights differs by {err:.3e} (tol "
+        f"{exact_tol:.1e}) from 2 Re(v conj(A g)) with g = vis2dirty(v * w). The "
+        "weights multiply sits outside the primitive precisely so that this works "
+        "without a rule of its own."
+    )
+
+
 @pytest.mark.parametrize("dtype, eps, exact_tol", _IDENTITY_PRECISIONS)
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
 def test_vmap_over_a_batch_of_gradients(
@@ -738,6 +867,170 @@ def test_vmap_over_a_batch_of_gradients(
     assert err < exact_tol, (
         f"{op}: vmap of the gradient differs by {err:.3e} (tol {exact_tol:.1e}) from "
         "the same gradients computed one at a time"
+    )
+
+
+def _walk_eqns(jaxpr: Any) -> Any:
+    """Every equation of a jaxpr, including those inside its sub-jaxprs."""
+    for eqn in jaxpr.eqns:
+        yield eqn
+        for param in eqn.params.values():
+            items = param if isinstance(param, (tuple, list)) else [param]
+            for item in items:
+                if isinstance(item, jex.core.ClosedJaxpr):
+                    yield from _walk_eqns(item.jaxpr)
+                elif isinstance(item, jex.core.Jaxpr):
+                    yield from _walk_eqns(item)
+
+
+_PRIMITIVE_NAME = {
+    "dirty2vis": "jax_nufft_dirty2vis",
+    "vis2dirty": "jax_nufft_vis2dirty",
+}
+
+
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_vmap_binds_the_operator_once_rather_than_looping(op: str) -> None:
+    """``vmap`` must stay a *batched* call, not become ``B`` serial ones.
+
+    The test above compares ``vmap`` against a Python loop, so it passes just
+    as happily if the implementation *is* a loop. That is not a hypothetical:
+    the obvious batching rule for a primitive is ``jax.lax.map`` over the batch
+    axis, it is correct, and it costs 1.5x at ``B = 2`` rising to 3.7x at
+    ``B = 16`` (EDA2 zenith 64^2, ``dense_scan``, median of 9) because the
+    batch then buys nothing. Before #21 JAX batched these operators natively
+    and no test would have seen that go away.
+
+    So the property is asserted where it is exact rather than by timing: the
+    lowered jaxpr must contain the operator's primitive **once**, carrying the
+    batch in its ``batch_shape`` param, rather than once per element inside a
+    ``scan``. That is the same statement as "the batch is one call" and it does
+    not depend on the machine.
+    """
+    dtype = _active_dtype()
+    problem = _problem(EDA2, 0.0, eps=tol(1e-6, 1e-5), dtype=dtype)
+    kw = dict(divide_by_n=True, w_strategy="dense_scan", nthreads=1)
+    batch = 3
+    if op == "dirty2vis":
+        fn = lambda x: dirty2vis(problem.plan, x, **kw)  # noqa: E731
+        xs = jnp.zeros((batch, *problem.image.shape), dtype=problem.plan.real_dtype)
+    else:
+        fn = lambda x: vis2dirty(problem.plan, x, **kw)  # noqa: E731
+        xs = jnp.zeros((batch, *problem.vis.shape), dtype=problem.plan.complex_dtype)
+
+    jaxpr = jax.make_jaxpr(jax.vmap(fn))(xs).jaxpr
+    binds = [eq for eq in _walk_eqns(jaxpr) if eq.primitive.name == _PRIMITIVE_NAME[op]]
+    assert len(binds) == 1, (
+        f"{op}: vmap over a batch of {batch} lowered to {len(binds)} binds of "
+        f"{_PRIMITIVE_NAME[op]}; a batched call is one bind"
+    )
+    assert binds[0].params["batch_shape"] == (batch,), (
+        f"{op}: the single bind carries batch_shape="
+        f"{binds[0].params['batch_shape']!r}, so the batch axis went somewhere other "
+        "than into the operator -- a per-element loop rather than a batched call"
+    )
+
+
+@pytest.mark.parametrize("dtype, eps, exact_tol", _IDENTITY_PRECISIONS)
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_the_gradient_of_a_batched_loss_is_the_batched_transpose(
+    op: str, dtype: DTypeLike, eps: float, exact_tol: float
+) -> None:
+    """``grad`` of a loss that ``vmap``s the operator -- mini-batch imaging.
+
+    Every other ``vmap`` test in this repository is ``vmap(grad(...))``, with
+    the batching *outside* the differentiation; the transpose rules then run on
+    batch tracers and their own params are empty. A census over the float64
+    suite makes that concrete: 174 transpose binds, every one of them with
+    ``batch_shape=()``. The opposite ordering -- ``grad`` of something that
+    contains a ``vmap`` of the operator, which is what
+    ``sum_b ||A x_b - v_b||^2`` is -- is the only one that puts a batch into a
+    transpose rule's params, and it was reached by nothing. Re-binding with
+    ``batch_shape=()`` instead of ``**params`` in any of the three rules passes
+    the rest of the suite and fails here, with the operand shape and the plan's
+    shape in the message.
+
+    The batch is **nested and unequal** (2, 5) for a second reason: nested
+    ``vmap`` was otherwise reached only at inner size 1 (via ``jax.hessian``),
+    so the leading-axis flattening in ``_apply_batched`` never ran on a
+    non-degenerate nest. At (2, 5) a swapped reshape is a shape error, and any
+    permutation of the ten elements is a value error against the loop below.
+
+    The reference is an explicit Python loop of ten independent gradients, so
+    nothing about the batched path is assumed.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype)
+    kw = dict(divide_by_n=True, w_strategy="dense_scan", nthreads=1)
+    outer, inner = 2, 5
+    rng = np.random.default_rng(2105)
+    if op == "dirty2vis":
+        fn = lambda x: dirty2vis(problem.plan, x, **kw)  # noqa: E731
+        xs = jnp.asarray(
+            rng.standard_normal((outer, inner, *problem.image.shape)).astype(
+                problem.plan.real_dtype
+            )
+        )
+    else:
+        fn = lambda x: vis2dirty(problem.plan, x, **kw)  # noqa: E731
+        shape = (outer, inner, *problem.vis.shape)
+        xs = jnp.asarray(
+            (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(
+                problem.plan.complex_dtype
+            )
+        )
+
+    def element_loss(x: Any) -> Any:
+        out = fn(x)
+        return jnp.sum(jnp.abs(out) ** 2) if jnp.iscomplexobj(out) else jnp.sum(out**2)
+
+    def batched_loss(batch: Any) -> Any:
+        return jnp.sum(jax.vmap(jax.vmap(element_loss))(batch))
+
+    got = jax.grad(batched_loss)(xs)
+    want = jnp.stack([jnp.stack([jax.grad(element_loss)(x) for x in row]) for row in xs])
+
+    assert got.shape == xs.shape, (
+        f"{op}: the gradient of a (2, 5)-batched loss came back shaped {got.shape} "
+        f"against an input of {xs.shape}"
+    )
+    err = _rel(got, want)
+    assert err < exact_tol, (
+        f"{op}: the gradient of a loss over a nested (2, 5) batch differs by "
+        f"{err:.3e} (tol {exact_tol:.1e}) from the same ten gradients taken one at a "
+        "time. The backward pass of a batched call is the batched transpose -- one "
+        "adjoint call over the whole batch, at the forward's own batch_shape."
+    )
+
+
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_the_operators_work_under_disable_jit(op: str) -> None:
+    """``jax.disable_jit()``: the one public route to the primitives' ``def_impl``.
+
+    Before #21 this came for free -- the operators were ordinary traced Python,
+    so disabling ``jit`` just ran them op by op. A primitive without an
+    evaluation rule raises ``NotImplementedError: Evaluation rule for
+    'jax_nufft_dirty2vis' not implemented`` instead, and deleting all three
+    ``def_impl`` registrations leaves the rest of the suite green. Debugging
+    with ``disable_jit`` is a normal thing to do to a library like this one, so
+    it is gated rather than left to the reader.
+    """
+    dtype = _active_dtype()
+    problem = _problem(EDA2, 0.0, eps=tol(1e-6, 1e-5), dtype=dtype)
+    kw = dict(divide_by_n=True, w_strategy="dense_scan", nthreads=1)
+    arg = jnp.asarray(problem.image if op == "dirty2vis" else problem.vis)
+    fn = dirty2vis if op == "dirty2vis" else vis2dirty
+
+    want = fn(problem.plan, arg, **kw)
+    with jax.disable_jit():
+        got = fn(problem.plan, arg, **kw)
+
+    # ``dtype`` is the run's own precision here, so the bound follows it: the
+    # two calls are the same arithmetic in a different execution mode, and were
+    # measured exactly equal.
+    bound = tol(IDENTITY_TOL_F64, 5e-6)
+    err = _rel(got, want)
+    assert err < bound, (
+        f"{op} under jax.disable_jit() differs by {err:.3e} (tol {bound:.1e}) from the jitted call"
     )
 
 
