@@ -15,7 +15,8 @@ that make it, so a re-measurement updates the citation and the assertion in one
 edit. Prose that quotes one of these aggregates should point here.
 
 **What is deliberately not covered.** Three families of quoted figure cannot be
-recomputed from anything in the tree, and are recorded rather than proxied:
+recomputed from anything in the tree, and are recorded rather than proxied,
+followed by one thing this module asserts on data it cannot check the scale of:
 
 * Issue #46's GH200-versus-ducc0 table ("1.4-5.6x slower than ducc0 on five of
   the table's six cells", "1.4-6.3x faster in all six", the "about 1.16x
@@ -34,6 +35,31 @@ recomputed from anything in the tree, and are recorded rather than proxied:
   in ``AGENTS.md`` sec 5 / sec 9, including the #24 ``nthreads`` ranges. The
   committed CPU JSON is aarch64 Grace/GH200 from 2026-05-18; those tables are a
   different machine and a different date, with no JSON behind them.
+
+And one hole that is *not* a missing case but a mismatch of scales, recorded
+here because the passing assertion hides it:
+
+* :func:`test_the_heuristic_picks_the_measured_winner_in_every_cell_and_slice`
+  feeds each row's ``window_padding_overhead`` into today's
+  ``_auto_w_strategy_gpu``, which compares it against
+  ``_GPU_PADDING_CUTOFF = 3.0``. But ``docs/benchmarks/README.md`` records that
+  every committed JSON carries the **pre-#43** padding scale, which "reads 0 -
+  17% lower on the same plan" and is not convertible after the fact. So that
+  case is checking old-scale data against a new-scale gate, and no assertion
+  here can see the difference.
+
+  Bounding the exposure at ``new = old / 0.83`` (measured 2026-09): two of the
+  20 cells cross the 3.0 cutoff, ``dirty2vis`` and ``vis2dirty`` on
+  ``GH200_large_off30``, both 2.588 -> up to 3.118. Eighteen keep their pick
+  either way and so does the ``dirty2vis`` one, whose ``n_w`` of 77 already
+  sends it to ``dense_vmap`` through the forward-ratio gate. **One flips:**
+  ``vis2dirty/GH200_large_off30`` takes the padding gate instead of the
+  large-row adjoint gate and picks ``dense_vmap`` where the measured winner is
+  ``windowed_vmap`` -- which would falsify both the "20/20 cells" claim and
+  "``windowed_vmap`` wins the adjoint at both pointings", while this module
+  stayed green, because it reads 2.588. Inherited from #43 rather than
+  introduced by #49, and fixable only by re-running the sweep on the current
+  scale.
 
 Pure-Python and fast: it reads JSON and replays the host-side heuristic, and
 runs no kernels.
@@ -58,6 +84,19 @@ _BENCH_DIR = Path(__file__).resolve().parent.parent / "docs" / "benchmarks"
 _GPU_BASELINE = _BENCH_DIR / "v0.1.2-baseline-gpu.json"
 _CPU_BASELINE = _BENCH_DIR / "v0.1.2-baseline-gh200.json"
 _CPU_PART1 = _BENCH_DIR / "v0.1.2-part1.json"
+
+_W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
+_CPU_FIXTURES = (
+    "EDA2_zenith",
+    "EDA2_off30",
+    "MWA_compact_zenith",
+    "MWA_compact_off30",
+    "MWA_extended_zenith",
+    "MWA_extended_off30",
+    "MeerKAT_zenith",
+    "MeerKAT_off30",
+)
+_OPS = ("dirty2vis", "vis2dirty")
 
 
 # --------------------------------------------------------------------------
@@ -127,7 +166,17 @@ CITATIONS: dict[str, Citation] = {
             "tests/test_default_w_strategy.py",
         ),
         source=_GPU_BASELINE,
-        figures={"min": 1.448, "max": 32.660, "median": 6.096},
+        figures={
+            "min": 1.448,
+            "max": 32.660,
+            "median": 6.096,
+            # The same three rounded the way src/, README.md and the test
+            # docstrings quote them. A second editorial step with its own
+            # chance to drift, so it is written down here rather than inline
+            # in the assertion: this table is meant to be the single place
+            # the numbers live.
+            "rounded": (1.45, 32.7, 6.1),
+        },
     ),
     "pairs_below_5x": Citation(
         claim=(
@@ -145,11 +194,26 @@ CITATIONS: dict[str, Citation] = {
         claim=(
             "'no subset of the sweep (off-zenith only, excluding GH200_large, "
             "best-of-family per cell), taken on its own, yields a 5-30x "
-            "range'."
+            "range'; and the parenthetical that makes 'taken on its own' "
+            "load-bearing -- 'conjoining all three restrictions does give a "
+            "population lying inside 5-30x, 10.376x to 29.393x over eight "
+            "cells'."
         ),
         sites=("AGENTS.md sec 9 (Part 6 correction)",),
         source=_GPU_BASELINE,
-        figures={"low": 5.0, "high": 30.0},
+        figures={
+            "low": 5.0,
+            "high": 30.0,
+            "named_subsets": (
+                "off-zenith only",
+                "excluding GH200_large",
+                "best-of-family per cell",
+            ),
+            # (min, max, n) of the conjunction, to the three decimals
+            # AGENTS.md sec 9 states it in. This is itself a hand-written
+            # aggregate of the JSON in prose, so it is pinned like the rest.
+            "conjunction": (10.376, 29.393, 8),
+        },
     ),
     "dense_vmap_cell_wins": Citation(
         claim="'dense_vmap winning 17/20 cells'.",
@@ -196,11 +260,14 @@ CITATIONS: dict[str, Citation] = {
             "1.86x) and only one of the 20 cells is within 15% ... taken as 40 "
             "separate per-channel slices the range is 1.07x to 7.36x and two "
             "are within 15%'. This replaced the wrong claim that the runner-up "
-            "is always inside the 15% acceptance bar."
+            "is always inside the 15% acceptance bar. Also issue #49's own "
+            "'worst 7.22x slower', which is the same gap restricted to the "
+            "channel_strategy == 'scan' half of those 40 slices."
         ),
         sites=(
             "src/jax_nufft/wgridder.py (_auto_w_strategy_gpu docstring)",
             "tests/test_default_w_strategy.py (assertion message)",
+            "issue #49 (body: 'worst 7.22x slower')",
         ),
         source=_GPU_BASELINE,
         figures={
@@ -211,6 +278,14 @@ CITATIONS: dict[str, Citation] = {
             "slice_min": 1.07,
             "slice_max": 7.36,
             "slice_within_15pct": 2,
+            # The two channel halves taken separately, to four decimals,
+            # because the difference between them is the whole of what the
+            # issue's 7.22x and wgridder.py's 7.36x disagree about. Measured
+            # 2026-09 under #49.
+            "scan_channel": (1.0847, 7.2205, 1.8620, 20),
+            "vmap_channel": (1.0738, 7.3605, 1.8557, 20),
+            "scan_channel_worst_cell": ("dirty2vis", "EDA2_off30"),
+            "scan_channel_worst_ms": (152.649, 21.141),
         },
     ),
     "acceptance_bar": Citation(
@@ -237,7 +312,16 @@ CITATIONS: dict[str, Citation] = {
         ),
         sites=("docs/v0.1.2-plan.md (Baseline summary; Part 1 GH200 snapshot)",),
         source=_CPU_BASELINE,
-        figures={"cells": 16},
+        # The population both plan-doc tables are quantified over: 8 fixtures
+        # x 2 operators x 4 strategies, one row per cell in each table. Every
+        # CPU case derives its cells from the JSON and checks them against
+        # this, rather than iterating it (see :func:`_cpu_cells`).
+        figures={
+            "cells": 16,
+            "fixtures": _CPU_FIXTURES,
+            "ops": _OPS,
+            "w_strategies": _W_STRATEGIES,
+        },
     ),
     "plan_long_scan_worst_case": Citation(
         claim=(
@@ -354,14 +438,24 @@ def _scan_vmap_pairs() -> list[tuple[tuple[str, str, str], str, str, float]]:
 
     A pair is one scan-family ``w_strategy`` against one vmap-family
     ``w_strategy`` measured in the same ``(op, fixture, channel_strategy)``
-    group -- 2 x 2 per group, 40 groups. This is the *only* one of the four
-    obvious pairings that reproduces the quoted figures; the alternatives were
-    measured while writing this module and give (n, min, max, median, count
-    below 5x) of (80, 1.4546, 32.6601, 5.4874, 36) pairing within a family at
-    matched channel strategy, (160, 1.4539, 33.0505, 5.4827, 72) pairing within
-    a family across channel strategies, and (320, 1.4477, 33.0505, 6.0960, 144)
-    for the full per-cell cross product. Only this one gives
-    (160, 1.4480, 32.6601, 6.0960, 72).
+    group -- 2 x 2 per group, 40 groups. It gives
+    ``(n, min, max, median, count below 5x)`` of
+    ``(160, 1.4480, 32.6601, 6.0960, 72)``, which is what the prose quotes.
+
+    Of the four obvious pairings, it is the only one that reproduces those
+    figures; the other three were measured while writing this module and give
+    (80, 1.4546, 32.6601, 5.4874, 36) pairing within a family at matched
+    channel strategy, (160, 1.4539, 33.0505, 5.4827, 72) pairing within a
+    family across channel strategies, and (320, 1.4477, 33.0505, 6.0960, 144)
+    for the full per-cell cross product.
+
+    **The endpoints are what identify it.** A fifth pairing -- every
+    scan-family row of a cell against that cell's ``channel_strategy ==
+    "vmap"`` vmap-family rows -- reproduces three of the four figures
+    (n = 160, median 6.0960, 72 below 5x) and differs only in the span,
+    1.4573 .. 33.0505. So a citation quoting only "160 pairs, median 6.1x"
+    would not pin the definition; the ``1.448x``/``32.660x`` endpoints
+    ``pair_spread`` asserts to three decimals are what does.
     """
     groups: dict[tuple[str, str, str], dict[str, list[tuple[str, float]]]] = defaultdict(
         lambda: {"scan": [], "vmap": []}
@@ -392,18 +486,49 @@ def _cpu_rows(path: Path) -> dict[tuple[str, str, str, str | None], dict]:
     return out
 
 
-_W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
-_CPU_FIXTURES = (
-    "EDA2_zenith",
-    "EDA2_off30",
-    "MWA_compact_zenith",
-    "MWA_compact_off30",
-    "MWA_extended_zenith",
-    "MWA_extended_off30",
-    "MeerKAT_zenith",
-    "MeerKAT_off30",
-)
-_OPS = ("dirty2vis", "vis2dirty")
+def _cpu_cells(path: Path) -> tuple[tuple[str, str], ...]:
+    """The ``(op, fixture)`` cells a CPU JSON *actually contains*, validated.
+
+    Derived from the parsed benchmark names rather than from
+    :data:`_CPU_FIXTURES`, and that is the whole point of the helper. Every
+    CPU claim below is quantified over "every fixture x operator"; if the
+    iteration comes from a literal tuple then ``len(cells) == 16`` is a
+    statement about the tuple, not about the sweep, and a fixture appearing
+    in either CPU JSON changes nothing anywhere. (Measured, 2026-09: cloning
+    the ``EDA2_zenith`` rows of both CPU JSONs into a ninth fixture whose
+    ``windowed_vmap`` is 1000x faster -- which makes
+    ``docs/v0.1.2-plan.md``'s "dense_vmap wins on every fixture x operator"
+    false -- fired **0** of the 18 cases while the CPU half iterated
+    :data:`_CPU_FIXTURES`. Cloning a 21st cell into the GPU JSON fired 8, so
+    the blindness was the CPU half's alone. With this helper the same CPU
+    experiment fires all six CPU cases.)
+
+    So the population is derived here, then asserted against the cited one,
+    and every CPU case calls this instead of iterating a constant.
+    """
+    cited = CITATIONS["plan_dense_vmap_sweeps_cpu_json"].figures
+    stats = _cpu_rows(path)
+    cells = tuple(sorted({(op, fixture) for lib, op, fixture, _ in stats if lib == "jax"}))
+    want = tuple(sorted(product(cited["ops"], cited["fixtures"])))
+    assert cells == want, (
+        f"{path.name} now measures {len(cells)} (op, fixture) cells, not the "
+        f"{len(want)} docs/v0.1.2-plan.md's tables have a row for. Added: "
+        f"{sorted(set(cells) - set(want))}; missing: {sorted(set(want) - set(cells))}."
+        f"{_cite('plan_dense_vmap_sweeps_cpu_json')}"
+    )
+    # Every cell a complete 4-strategy block plus its ducc reference, or the
+    # "winner" and "best/ducc" columns below compare different-sized menus.
+    for op, fixture in cells:
+        seen = {w for lib, o, f, w in stats if lib == "jax" and (o, f) == (op, fixture)}
+        assert seen == set(cited["w_strategies"]), (
+            f"{path.name}: {op}/{fixture} is not a complete "
+            f"{len(cited['w_strategies'])}-strategy block: {sorted(seen)}"
+        )
+        assert ("ducc", op, fixture, None) in stats, (
+            f"{path.name}: {op}/{fixture} has no ducc reference row, so its "
+            "best/ducc ratio cannot be formed."
+        )
+    return cells
 
 
 def _cite(key: str) -> str:
@@ -480,13 +605,12 @@ def test_the_scan_vmap_pairs_span_the_cited_range_and_median() -> None:
     # The same figures rounded the way src/, README.md and the test docstrings
     # quote them. Asserted separately: rounding 1.448 to "1.45x" is a second
     # editorial step and has its own chance to drift.
-    assert (round(min(ratios), 2), round(max(ratios), 1), round(statistics.median(ratios), 1)) == (
-        1.45,
-        32.7,
-        6.1,
-    ), (
-        "the one-decimal restatement '1.45x to 32.7x (median 6.1x)' no longer "
-        f"rounds from the data.{_cite('pair_spread')}"
+    rounded = (round(min(ratios), 2), round(max(ratios), 1), round(statistics.median(ratios), 1))
+    assert rounded == cited["rounded"], (
+        f"the coarse restatement is now {rounded[0]}x to {rounded[1]}x (median "
+        f"{rounded[2]}x); src/, README.md and the test docstrings quote "
+        f"'{cited['rounded'][0]}x to {cited['rounded'][1]}x (median "
+        f"{cited['rounded'][2]}x)'.{_cite('pair_spread')}"
     )
 
 
@@ -504,20 +628,38 @@ def test_seventy_two_of_the_160_pairs_are_below_five_times() -> None:
 def test_no_named_subset_of_the_sweep_yields_the_five_to_thirty_range() -> None:
     """AGENTS.md sec 9 names three subsets and says none produces "5-30x".
 
-    Each is checked on its own, which is how the sentence enumerates them. A
-    subset "yields a 5-30x range" only if its endpoints are the quoted ones, so
-    what is asserted is that neither endpoint lands on 5 or 30 -- not merely
-    that some value escapes the interval, which is a weaker and less useful
-    statement.
+    Each is checked on its own, which is how the sentence enumerates them, and
+    the check is *containment*: a subset reproduces the discarded "5-30x"
+    write-up if it lies inside [5, 30], because that is what would let someone
+    re-derive the range from this data. An earlier form of this case asserted
+    only that the endpoints did not round to exactly (5.0, 30.0), which is a
+    measure-zero coincidence: measured 2026-09, 200 random re-measurements of
+    the JSON (per-row lognormal noise, sigma 0.02 to 3.00) and 20 000 uniform
+    rescales of the scan family over s in [0.001, 20.000] fired it zero times,
+    and it is immune to a uniform rescale by construction, since a rescale
+    leaves each subset's max/min ratio alone and none of the three is the 6.0
+    that form needs (they are 13.2752, 15.7924 and 11.6752).
 
-    Measured while writing this (2026-09): conjoining all three named
-    restrictions at once *does* give a population lying inside [5, 30]
-    (10.376x to 29.393x over 8 cells). Its endpoints are still not 5 and 30, so
-    the sentence holds; AGENTS.md now says "taken on its own" so the stronger
-    reading is not left standing.
+    Containment is quiet under the same noise -- zero fires on those same 200
+    draws -- but for a reason, not by construction: "best-of-family per cell"
+    already satisfies the upper end at 29.3932x and is held out of [5, 30]
+    only by its 2.5176x low end, so a regime in which the scan penalty became
+    more uniform reaches it. Compressing the log-ratios toward 10x does
+    exactly that and fires this case, where the old form still does not.
+
+    The conjunction is evaluated as a population of its own, because
+    AGENTS.md sec 9 now spends a parenthetical on it and quotes three figures
+    for it. That parenthetical is a hand-written aggregate of the JSON, which
+    is the exact thing this module exists to stop, so it is pinned to
+    ``(min, max, n)`` rather than merely described. Note the direction:
+    the three named subsets must *not* be contained, the conjunction *is*.
+
+    "The whole sweep" is deliberately not in the list. It is not one of the
+    three subsets the sentence names, and its non-containment is already
+    pinned harder elsewhere -- ``pair_spread`` fixes its endpoints at
+    1.448x/32.660x to three decimals.
     """
     cited = CITATIONS["no_subset_is_5_to_30x"].figures
-    all_pairs = _scan_vmap_pairs()
 
     def by_group(rows: list[dict]) -> list[float]:
         groups: dict[tuple[str, str, str], dict[str, list[float]]] = defaultdict(
@@ -528,32 +670,71 @@ def test_no_named_subset_of_the_sweep_yields_the_five_to_thirty_range() -> None:
             groups[key][_w_family(row["w_strategy"])].append(row["median_s"])
         return [s / v for g in groups.values() for s, v in product(g["scan"], g["vmap"])]
 
-    rows = _gpu_rows()
-    best_of_family: dict[tuple[str, str], dict[str, list[float]]] = defaultdict(
-        lambda: {"scan": [], "vmap": []}
-    )
-    for row in rows:
-        best_of_family[(row["op"], row["fixture"])][_w_family(row["w_strategy"])].append(
-            row["median_s"]
+    def best_of_family(rows: list[dict]) -> list[float]:
+        cells: dict[tuple[str, str], dict[str, list[float]]] = defaultdict(
+            lambda: {"scan": [], "vmap": []}
         )
+        for row in rows:
+            cells[(row["op"], row["fixture"])][_w_family(row["w_strategy"])].append(row["median_s"])
+        return [min(g["scan"]) / min(g["vmap"]) for g in cells.values()]
+
+    rows = _gpu_rows()
+    off_zenith = [r for r in rows if r["fixture"].endswith("off30")]
+    no_gh200_large = [r for r in rows if not r["fixture"].startswith("GH200_large")]
 
     subsets = {
-        "the whole sweep": [r for _, _, _, r in all_pairs],
-        "off-zenith only": by_group([r for r in rows if r["fixture"].endswith("off30")]),
-        "excluding GH200_large": by_group(
-            [r for r in rows if not r["fixture"].startswith("GH200_large")]
-        ),
-        "best-of-family per cell": [
-            min(g["scan"]) / min(g["vmap"]) for g in best_of_family.values()
-        ],
+        "off-zenith only": by_group(off_zenith),
+        "excluding GH200_large": by_group(no_gh200_large),
+        "best-of-family per cell": best_of_family(rows),
     }
+    assert tuple(subsets) == cited["named_subsets"], (
+        f"the subsets evaluated here, {tuple(subsets)}, are no longer the ones "
+        f"AGENTS.md sec 9 names, {cited['named_subsets']}."
+        f"{_cite('no_subset_is_5_to_30x')}"
+    )
     for name, ratios in subsets.items():
-        lo, hi = round(min(ratios), 1), round(max(ratios), 1)
-        assert (lo, hi) != (cited["low"], cited["high"]), (
-            f"the subset {name!r} now spans {lo}x to {hi}x, which *is* the "
-            f"'5-30x' the sweep was originally written up with. AGENTS.md sec 9 "
-            f"says no named subset reproduces it.{_cite('no_subset_is_5_to_30x')}"
+        lo, hi = min(ratios), max(ratios)
+        assert not (cited["low"] <= lo and hi <= cited["high"]), (
+            f"the subset {name!r} now spans {lo:.3f}x to {hi:.3f}x over "
+            f"{len(ratios)} values, which lies inside the '{cited['low']:g}-"
+            f"{cited['high']:g}x' the sweep was originally written up with. "
+            f"AGENTS.md sec 9 says no named subset, taken on its own, yields "
+            f"that range.{_cite('no_subset_is_5_to_30x')}"
         )
+
+    # The conjunction of all three, which the same paragraph quotes and which
+    # *is* inside [5, 30] -- so it is pinned by its figures, not by
+    # non-containment.
+    conjoined = best_of_family(
+        [r for r in off_zenith if not r["fixture"].startswith("GH200_large")]
+    )
+    got = (round(min(conjoined), 3), round(max(conjoined), 3), len(conjoined))
+    assert got == cited["conjunction"], (
+        f"conjoining all three named restrictions now gives {got[0]}x to "
+        f"{got[1]}x over {got[2]} cells; AGENTS.md sec 9's parenthetical says "
+        f"{cited['conjunction'][0]}x to {cited['conjunction'][1]}x over "
+        f"{cited['conjunction'][2]} cells.{_cite('no_subset_is_5_to_30x')}"
+    )
+    # The two below add nothing while the pin above holds, and that is the
+    # point: a re-measurement reaches this module as an edit to
+    # ``conjunction``, and these are the two things AGENTS.md sec 9 asserts
+    # about the conjunction that such an edit could quietly falsify -- that it
+    # lies inside 5-30x at all, and that its endpoints are not the quoted 5
+    # and 30.
+    lo, hi = min(conjoined), max(conjoined)
+    assert cited["low"] <= lo and hi <= cited["high"], (
+        f"the conjunction now spans {lo:.3f}x to {hi:.3f}x, which is *not* "
+        f"inside {cited['low']:g}-{cited['high']:g}x. AGENTS.md sec 9 says it "
+        f"is, and that is the whole reason the sentence says 'taken on its "
+        f"own'.{_cite('no_subset_is_5_to_30x')}"
+    )
+    assert (round(lo, 1), round(hi, 1)) != (cited["low"], cited["high"]), (
+        f"the conjunction now spans {lo:.3f}x to {hi:.3f}x, whose endpoints "
+        f"round to exactly {cited['low']:g} and {cited['high']:g}: it does "
+        f"reproduce the discarded write-up after all, and AGENTS.md sec 9's "
+        f"'its endpoints are still not 5 and 30' is false."
+        f"{_cite('no_subset_is_5_to_30x')}"
+    )
 
 
 def test_dense_vmap_wins_seventeen_of_the_twenty_cells() -> None:
@@ -649,11 +830,27 @@ def test_the_runner_up_is_not_within_the_fifteen_percent_bar() -> None:
     like a bounded loss. Both populations wgridder.py quotes are checked -- the
     four strategies each aggregated by their better channel strategy, and the
     40 per-channel slices taken separately.
+
+    The 40 slices are *also* checked as their two halves, because that is
+    where issue #49's own "worst 7.22x slower" comes from and it was written
+    up as not reproducing. It reproduces: restricted to the
+    ``channel_strategy == "scan"`` half the gap is 1.0847x to 7.2205x over 20
+    cells (median 1.8620x), and the worst cell is ``dirty2vis`` /
+    ``EDA2_off30`` at ``windowed_vmap`` 152.649 ms over ``dense_vmap``
+    21.141 ms. The ``vmap`` half is 1.0738x to 7.3605x, which is the 7.36x the
+    tree quotes; the union of the two is the 40-slice line. So 7.22x, 7.31x
+    and 7.36x are three different populations, all three correct: 7.31x
+    aggregates each strategy by its better channel before ranking, while 7.22x
+    and 7.36x are the same per-slice ranking taken over one channel half or
+    the other. Worth pinning, since "which half" is what the apparent
+    arithmetic disagreement turned out to be.
     """
     cited = CITATIONS["runner_up_gap"].figures
     per_cell = []
     per_slice = []
-    for rows in _gpu_cells().values():
+    per_channel: dict[str, list[float]] = {"scan": [], "vmap": []}
+    worst_by_channel: dict[str, tuple[float, tuple[str, str], str, float, str, float]] = {}
+    for cell, rows in sorted(_gpu_cells().items()):
         best_by_w: dict[str, float] = {}
         for row in rows:
             w = row["w_strategy"]
@@ -661,8 +858,21 @@ def test_the_runner_up_is_not_within_the_fifteen_percent_bar() -> None:
         ordered = sorted(best_by_w.values())
         per_cell.append(ordered[1] / ordered[0])
         for channel in ("scan", "vmap"):
-            sub = sorted(r["median_s"] for r in rows if r["channel_strategy"] == channel)
-            per_slice.append(sub[1] / sub[0])
+            sub = sorted(
+                (r["median_s"], r["w_strategy"]) for r in rows if r["channel_strategy"] == channel
+            )
+            gap = sub[1][0] / sub[0][0]
+            per_slice.append(gap)
+            per_channel[channel].append(gap)
+            if gap > worst_by_channel.get(channel, (0.0,))[0]:
+                worst_by_channel[channel] = (
+                    gap,
+                    cell,
+                    sub[1][1],
+                    sub[1][0] * 1e3,
+                    sub[0][1],
+                    sub[0][0] * 1e3,
+                )
 
     got = (
         round(min(per_cell), 2),
@@ -689,6 +899,35 @@ def test_the_runner_up_is_not_within_the_fifteen_percent_bar() -> None:
         f"the prose says {want_slice[0]}x to {want_slice[1]}x with "
         f"{want_slice[2]} inside.{_cite('runner_up_gap')}"
     )
+    for channel in ("scan", "vmap"):
+        gaps = per_channel[channel]
+        got_channel = (
+            round(min(gaps), 4),
+            round(max(gaps), 4),
+            round(statistics.median(gaps), 4),
+            len(gaps),
+        )
+        want_channel = cited[f"{channel}_channel"]
+        assert got_channel == want_channel, (
+            f"the {channel}-channel half of the 40 slices now runs "
+            f"{got_channel[0]}x to {got_channel[1]}x (median {got_channel[2]}x) "
+            f"over {got_channel[3]} cells, not {want_channel[0]}x to "
+            f"{want_channel[1]}x (median {want_channel[2]}x) over "
+            f"{want_channel[3]}.{_cite('runner_up_gap')}"
+        )
+    _, worst_cell, runner_up_w, runner_up_ms, winner_w, winner_ms = worst_by_channel["scan"]
+    got_worst = (worst_cell, round(runner_up_ms, 3), round(winner_ms, 3))
+    want_worst = (
+        cited["scan_channel_worst_cell"],
+        cited["scan_channel_worst_ms"][0],
+        cited["scan_channel_worst_ms"][1],
+    )
+    assert got_worst == want_worst, (
+        f"the widest scan-channel gap -- issue #49's 'worst 7.22x slower' -- "
+        f"is now {worst_cell}, {runner_up_w} {runner_up_ms:.3f} ms over "
+        f"{winner_w} {winner_ms:.3f} ms, not {want_worst}."
+        f"{_cite('runner_up_gap')}"
+    )
 
 
 def test_the_auto_pick_meets_the_fifteen_percent_bar_by_being_the_best() -> None:
@@ -697,8 +936,13 @@ def test_the_auto_pick_meets_the_fifteen_percent_bar_by_being_the_best() -> None
     ``tests/test_auto_strategy_acceptance.py`` already asserts the bar. What is
     asserted here is the sentence wgridder.py adds about it: the bar is met
     "trivially ... by picking the best one every time", i.e. the worst cell's
-    ratio is 1.00x and not merely under 1.15x. If a retune ever spends real
+    ratio is 1.0x and not merely under 1.15x. If a retune ever spends real
     slack against that bar, this is the case that says so.
+
+    Asserted exactly rather than to two decimals: "picking the best one" makes
+    the picked row *be* the min row, so the ratio is the same float divided by
+    itself and the tolerance buys nothing except room for a pick up to 0.4%
+    off the best to still read as "the best one every time".
     """
     cited = CITATIONS["acceptance_bar"].figures
     worst = 0.0
@@ -719,10 +963,10 @@ def test_the_auto_pick_meets_the_fifteen_percent_bar_by_being_the_best() -> None
         f"{worst_cell} is {worst:.3f}x off the best strategy, over the "
         f"{cited['bar']}x acceptance bar.{_cite('acceptance_bar')}"
     )
-    assert round(worst, 2) == cited["actual_worst"], (
+    assert worst == cited["actual_worst"], (
         f"the heuristic no longer picks the outright best strategy in every "
-        f"cell: worst is {worst_cell} at {worst:.3f}x. The prose reads the "
-        f"{cited['bar']}x bar as met trivially; at {worst:.3f}x it is not."
+        f"cell: worst is {worst_cell} at {worst:.6f}x. The prose reads the "
+        f"{cited['bar']}x bar as met trivially; at {worst:.6f}x it is not."
         f"{_cite('acceptance_bar')}"
     )
 
@@ -745,18 +989,25 @@ def test_dense_vmap_wins_every_cpu_json_cell(label: str, path: Path, stat: str) 
     The statistic differs between them -- the baseline table is captioned
     "median ms" and the Part 1 table "mean wall-clock" -- so each is recomputed
     on the statistic its own caption names.
+
+    The cells come from :func:`_cpu_cells`, i.e. from the JSON, so "every
+    fixture x operator" is quantified over what the sweep measured rather than
+    over a tuple in this file.
     """
     cited = CITATIONS["plan_dense_vmap_sweeps_cpu_json"].figures
     stats = _cpu_rows(path)
+    cells = _cpu_cells(path)
     losses = []
-    cells = 0
-    for fixture, op in product(_CPU_FIXTURES, _OPS):
-        times = {w: stats[("jax", op, fixture, w)][stat] for w in _W_STRATEGIES}
-        cells += 1
+    for op, fixture in cells:
+        times = {w: stats[("jax", op, fixture, w)][stat] for w in cited["w_strategies"]}
         winner = min(times, key=lambda w: times[w])
         if winner != "dense_vmap":
             losses.append((op, fixture, winner))
-    assert cells == cited["cells"], f"{label}: {cells} cells, not {cited['cells']}"
+    assert len(cells) == cited["cells"], (
+        f"{label}: the sweep now has {len(cells)} (op, fixture) cells, not the "
+        f"{cited['cells']} the table has rows for."
+        f"{_cite('plan_dense_vmap_sweeps_cpu_json')}"
+    )
     assert not losses, (
         f"docs/v0.1.2-plan.md's {label} says dense_vmap wins every fixture x "
         f"operator, but on {stat} it loses in {losses}."
@@ -774,9 +1025,10 @@ def test_the_long_scan_worst_case_is_seven_tenths_to_one_and_a_bit_seconds() -> 
     """
     cited = CITATIONS["plan_long_scan_worst_case"].figures
     stats = _cpu_rows(_CPU_BASELINE)
+    ops = sorted({op for op, fixture in _cpu_cells(_CPU_BASELINE)})
     times = {
         (op, w): stats[("jax", op, "MWA_extended_off30", w)]["median"]
-        for op, w in product(_OPS, ("dense_scan", "windowed_scan"))
+        for op, w in product(ops, ("dense_scan", "windowed_scan"))
     }
     lo, hi = min(times.values()), max(times.values())
     assert (round(lo, 1), round(hi, 1)) == (cited["low_s"], cited["high_s"]), (
@@ -788,11 +1040,16 @@ def test_the_long_scan_worst_case_is_seven_tenths_to_one_and_a_bit_seconds() -> 
 
 
 def _part1_best_over_ducc() -> dict[tuple[str, str], float]:
-    """Part 1's ``best/ducc`` column: ducc mean over the best jax mean."""
+    """Part 1's ``best/ducc`` column: ducc mean over the best jax mean.
+
+    Over the cells :func:`_cpu_cells` derives from the JSON, so a fixture
+    entering the sweep enters this column too.
+    """
+    strategies = CITATIONS["plan_dense_vmap_sweeps_cpu_json"].figures["w_strategies"]
     stats = _cpu_rows(_CPU_PART1)
     out = {}
-    for fixture, op in product(_CPU_FIXTURES, _OPS):
-        best = min(stats[("jax", op, fixture, w)]["mean"] for w in _W_STRATEGIES)
+    for op, fixture in _cpu_cells(_CPU_PART1):
+        best = min(stats[("jax", op, fixture, w)]["mean"] for w in strategies)
         out[(op, fixture)] = stats[("ducc", op, fixture, None)]["mean"] / best
     return out
 
@@ -851,9 +1108,19 @@ def test_the_large_fixture_speedup_over_ducc_spans_the_corrected_range() -> None
 
 
 def _part1_vs_baseline(w_strategy: str) -> dict[tuple[str, str], float]:
-    """Part 1 median over baseline median, as a percentage change per cell."""
+    """Part 1 median over baseline median, as a percentage change per cell.
+
+    Both files are asked for their own cells and the two are required to
+    agree, so a fixture added to one sweep and not the other is a failure here
+    rather than a silently dropped column.
+    """
     base = _cpu_rows(_CPU_BASELINE)
     part1 = _cpu_rows(_CPU_PART1)
+    cells = _cpu_cells(_CPU_BASELINE)
+    assert cells == _cpu_cells(_CPU_PART1), (
+        "the baseline and Part 1 CPU sweeps no longer measure the same cells, "
+        "so a per-Part diff cannot be formed over them."
+    )
     return {
         (op, fixture): 100.0
         * (
@@ -861,7 +1128,7 @@ def _part1_vs_baseline(w_strategy: str) -> dict[tuple[str, str], float]:
             / base[("jax", op, fixture, w_strategy)]["median"]
             - 1.0
         )
-        for fixture, op in product(_CPU_FIXTURES, _OPS)
+        for op, fixture in cells
     }
 
 
@@ -931,9 +1198,13 @@ def test_the_windowed_scan_off_zenith_forward_regression_spans_the_cited_range()
 def test_every_committed_benchmark_json_is_covered_by_a_case() -> None:
     """A new JSON in docs/benchmarks/ is a new thing prose can cite wrongly.
 
-    This is the one guard against the failure mode the module cannot otherwise
-    see: someone commits a fresh sweep, quotes an aggregate of it in a comment,
-    and nothing here notices because no case names that file.
+    The guard against a whole *file* arriving uncovered: someone commits a
+    fresh sweep, quotes an aggregate of it in a comment, and nothing here
+    notices because no case names that file. New *rows* inside an already
+    covered file are a different failure and are caught elsewhere -- the GPU
+    half by ``test_the_sweep_has_twenty_cells_...``, the CPU half by
+    :func:`_cpu_cells` -- which is what this docstring used to claim for
+    itself and does not reach.
     """
     committed = {p.name for p in sorted(_BENCH_DIR.glob("*.json"))}
     covered = {c.source.name for c in CITATIONS.values()}

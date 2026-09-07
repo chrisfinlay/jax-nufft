@@ -783,7 +783,8 @@ timing, hardware fingerprint, HBM capture via `device.memory_stats()`)
 plus `tests/test_benchmark_gpu.py`, gated behind `--runbench-gpu`.
 Stable JSON schema documented in `docs/benchmarks/README.md`.
 
-**Part 6: GPU sweep + platform-aware defaults.** 160-cell GH200 sweep
+**Part 6: GPU sweep + platform-aware defaults.** GH200 sweep of 160 measured
+rows over 20 (op, fixture) cells
 (`docs/benchmarks/v0.1.2-baseline-gpu.json`) showed `_scan` variants
 5-30x slower than `_vmap`, `dense_vmap` winning 17/20 cells, and
 `windowed_vmap` winning only the 50k-row `GH200_large` fixture.
