@@ -59,8 +59,10 @@ def reference_lmn_grids(
     statement of that convention -- it is written from the README, not from
     ``planning`` -- so a change to one and not the other shows up as a DFT
     parity failure on the odd geometry cells rather than as two files agreeing
-    on a shifted grid. Substituting ``/`` for ``//`` in ``planning`` passed
-    1478 of this suite's 1480 tests before those cells existed.
+    on a shifted grid. Measured: substituting ``/`` for ``//`` in
+    ``planning._n_minus_1_grid`` fails exactly the six odd cells below (two
+    geometries x three ``w_strategy`` legs) out of 1495, and before those cells
+    existed it failed nothing at all.
     """
     n_l, n_m = image_shape
     i = np.arange(n_l) - n_l // 2
@@ -498,12 +500,54 @@ def test_forward_2d_image_broadcasts_across_channels() -> None:
 #     ``pixsize_m * n_m`` so the physical field of view is asymmetric too, not
 #     just the sampling.
 #
-# One epsilon (1e-6) and one w_strategy (the default) per cell: what varies
-# here is geometry, and the four w-traversals are already crossed with
-# everything else in ``tests/test_strategies_equivalent.py``. 300 rows with
-# w in +/-40 m so the w-plane machinery is genuinely engaged rather than
-# collapsing onto the constant-w fast path.
+# One epsilon (1e-6) per cell, and three ``w_strategy`` values -- not one.
+#
+# The first version of this block pinned ``w_strategy="dense_scan"`` on both
+# operators and called that "the default". It is not the default: the default
+# is ``"auto"`` (issue #46), and on *every one* of the seven geometries above
+# ``_auto_w_strategy`` resolves the adjoint to ``windowed_scan`` on the CPU
+# backend (the forward it does resolve to ``dense_scan``). So the block steered
+# around the one adjoint path a user actually gets, and the consequence was
+# measurable: with ``dense_scan`` pinned, both
+#
+#     nufft1((plan.n_m, plan.n_l), ...)          in _channel_adjoint_windowed
+#     dirty_init = jnp.zeros((plan.n_m, plan.n_l), ...)   ditto
+#
+# survived the *entire* suite, while the identical mutation on the dense
+# adjoint's ``nufft1`` was caught by ``[nonsquare_32x48]``. The site the tests
+# reached was checked and the site they did not reach was not.
+#
+# Hence ``_GEOMETRY_W_STRATEGIES``, and why it is those three:
+#
+#   * ``"auto"`` is what ships, so at least one leg per geometry has to be the
+#     operator a caller who passes no ``w_strategy`` actually runs.
+#   * ``"dense_scan"`` and ``"windowed_scan"`` pin the two *helper families*
+#     explicitly, so this block does not become hostage to how the heuristic
+#     resolves. That matters concretely: ``_auto_w_strategy`` dispatches on
+#     ``jax.devices()[0].platform`` and the GPU branch never picks a ``_scan``
+#     variant at all, so on GPU the ``"auto"`` leg alone would cover neither of
+#     the two scan-only ``jnp.zeros((n_l, n_m))`` accumulators. The two
+#     explicit legs cover all four operator-internal grid-shape sites
+#     (``wgridder.py`` lines 1190/1214 dense, 1516/1537 windowed) on every
+#     platform. For the same reason this block does *not* assert what
+#     ``"auto"`` resolves to -- that is the heuristic's business and it is
+#     platform-dependent; what is asserted is that both families are reached
+#     whatever it picks.
+#
+# The two ``*_vmap`` variants are deliberately omitted, and that omission is
+# the one axis this block still holds constant. It is safe by inspection
+# rather than by hope: the four grid-shape literals above live in the shared
+# prologue of ``_channel_adjoint`` / ``_channel_adjoint_windowed`` or in their
+# ``scan`` accumulators, and the ``vmap`` branches allocate no image-shaped
+# array of their own (they ``jnp.sum`` a mapped stack). So a ``*_vmap`` leg
+# would re-execute the same grid indexing at 7 more cells apiece and could not
+# falsify anything the ``*_scan`` legs do not. Scan-vs-vmap equivalence itself
+# is crossed with everything in ``tests/test_strategies_equivalent.py``.
+#
+# 300 rows with w in +/-40 m so the w-plane machinery is genuinely engaged
+# rather than collapsing onto the constant-w fast path.
 _GEOMETRY_EPS = 1e-6
+_GEOMETRY_W_STRATEGIES = ["auto", "dense_scan", "windowed_scan"]
 _GEOMETRY_CASES = [
     pytest.param((32, 32), (0.01, 0.01), id="even_square_isotropic_control"),
     pytest.param((33, 33), (0.01, 0.01), id="odd_square"),
@@ -548,17 +592,41 @@ def _geometry_data(
     return image, vis
 
 
+@functools.cache
+def _geometry_references(
+    image_shape: tuple[int, int], pixsize: tuple[float, float]
+) -> tuple[np.ndarray, np.ndarray]:
+    """The exact-DFT ``(vis_ref, dirty_ref)`` for one geometry.
+
+    Cached because the references are row-loop DFTs and depend only on the
+    geometry -- not on ``w_strategy``, which the test is parametrised over.
+    Without the cache each geometry would recompute both references once per
+    strategy leg for an identical answer.
+    """
+    uvw, freq = _geometry_uvw_freq()
+    image, vis = _geometry_data(image_shape)
+    pixsize_l, pixsize_m = pixsize
+    return (
+        _reference_forward(image, uvw, freq, pixsize_l, pixsize_m),
+        _reference_adjoint(vis, uvw, freq, image_shape, pixsize_l, pixsize_m),
+    )
+
+
+@pytest.mark.parametrize("w_strategy", _GEOMETRY_W_STRATEGIES)
 @pytest.mark.parametrize("image_shape, pixsize", _GEOMETRY_CASES)
 def test_geometry_matches_dft_forward_and_adjoint(
-    image_shape: tuple[int, int], pixsize: tuple[float, float]
+    image_shape: tuple[int, int], pixsize: tuple[float, float], w_strategy: str
 ) -> None:
     """Odd / non-square / anisotropic image grids against the exact DFT.
 
     Both operators, because they index the grid independently: the forward
     multiplies the image by ``exp(2 pi i w_k (n - 1 + nshift)) / phi_hat_n`` and
     hands FINUFFT an ``(n_l, n_m)`` array, while the adjoint asks ``nufft1`` for
-    an ``(n_l, n_m)`` output and then applies the same screen plus the ``1/n``
-    diagonal. A swap on one side is not a swap on the other.
+    an ``(n_l, n_m)`` output, accumulates into a ``jnp.zeros((n_l, n_m))``, and
+    then applies the same screen plus the ``1/n`` diagonal. A swap on one side
+    is not a swap on the other, and -- see ``_GEOMETRY_W_STRATEGIES`` -- a swap
+    in the *windowed* adjoint is not a swap in the dense one either: those are
+    two separate ``nufft1`` call sites and two separate accumulators.
 
     ``hermitian=False`` with a complex image, so the forward is exercised at
     full strength (a folded plan refuses a complex image). The fold acts on the
@@ -580,23 +648,24 @@ def test_geometry_matches_dft_forward_and_adjoint(
     assert not plan.is_constant_w
     assert plan.n_w > 1
 
-    vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy="dense_scan"))
-    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="dense_scan"))
+    vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy=w_strategy))
+    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy=w_strategy))
     assert vis_jax.shape == (uvw.shape[0], 1)
     assert dirty_jax.shape == (1, n_l, n_m)
 
-    vis_ref = _reference_forward(image, uvw, freq, pixsize_l, pixsize_m)
-    dirty_ref = _reference_adjoint(vis, uvw, freq, image_shape, pixsize_l, pixsize_m)
+    vis_ref, dirty_ref = _geometry_references(image_shape, pixsize)
 
     fwd_err = np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref)
     adj_err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
     assert fwd_err < DFT_TOL_FACTOR * eps, (
-        f"forward shape={image_shape} pixsize=({pixsize_l:g}, {pixsize_m:g}): relative error "
-        f"{fwd_err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+        f"forward shape={image_shape} pixsize=({pixsize_l:g}, {pixsize_m:g}) "
+        f"w_strategy={w_strategy}: relative error {fwd_err:.3e} exceeds "
+        f"{DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
     )
     assert adj_err < DFT_TOL_FACTOR * eps, (
-        f"adjoint shape={image_shape} pixsize=({pixsize_l:g}, {pixsize_m:g}): relative error "
-        f"{adj_err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+        f"adjoint shape={image_shape} pixsize=({pixsize_l:g}, {pixsize_m:g}) "
+        f"w_strategy={w_strategy}: relative error {adj_err:.3e} exceeds "
+        f"{DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
     )
 
 
@@ -668,3 +737,59 @@ def test_the_geometry_cases_can_actually_falsify_an_axis_swap() -> None:
         (s, p) for s, p in zip(shapes, pixsizes, strict=True) if s[0] == s[1] and p[0] == p[1]
     ]
     assert control, "no square isotropic control cell to attribute a universal failure against"
+
+
+def test_the_geometry_block_reaches_both_w_strategy_families() -> None:
+    """The geometry cells must not all run the same operator path.
+
+    This is the parametrisation-integrity guard for the *other* axis of the
+    block, and it exists because that axis was silently wrong once already: the
+    cells originally pinned ``w_strategy="dense_scan"`` on both operators and
+    a comment called it "the default". It is not -- ``"auto"`` is -- and on
+    every geometry here ``auto`` resolves the adjoint to ``windowed_scan`` on
+    CPU. The dense and windowed adjoints are *different call sites*
+    (``wgridder.py`` 1190/1214 and 1516/1537: two ``nufft1`` output shapes and
+    two ``jnp.zeros((n_l, n_m))`` accumulators), so pinning one family left the
+    other's two sites reachable by no test in the suite. Transposing either of
+    them passed all 1480 tests.
+
+    Three claims, each of which would have caught that:
+
+    1. ``"auto"`` really is the shipped default of both operators, so the leg
+       that runs it is the operator a caller who passes nothing actually gets.
+       Read off the signatures rather than assumed, since the point is to
+       notice if the default moves again.
+    2. The list carries an explicit member of *both* families, so coverage of
+       the two call-site pairs does not depend on how the heuristic resolves
+       -- which is platform-dependent (``_auto_w_strategy`` dispatches on the
+       backend and its GPU branch never picks a ``_scan`` variant).
+    3. The explicit members are ``_scan``, not ``_vmap``: the two accumulators
+       above exist only in the scan branches, so a ``*_vmap`` pair would not
+       reach them.
+    """
+    import inspect
+
+    for op in (dirty2vis, vis2dirty):
+        default = inspect.signature(op).parameters["w_strategy"].default
+        assert default == "auto", (
+            f"{op.__name__}'s default w_strategy is {default!r}, not 'auto'; this block "
+            "parametrises over 'auto' precisely so one leg per geometry is the operator a "
+            "caller gets by passing nothing -- update _GEOMETRY_W_STRATEGIES to match"
+        )
+    assert "auto" in _GEOMETRY_W_STRATEGIES
+
+    explicit = [s for s in _GEOMETRY_W_STRATEGIES if s != "auto"]
+    assert any(s.startswith("dense_") for s in explicit), (
+        "no explicit dense strategy: the dense adjoint's nufft1 output shape and scan "
+        "accumulator would be covered only if the auto heuristic happened to pick dense"
+    )
+    assert any(s.startswith("windowed_") for s in explicit), (
+        "no explicit windowed strategy: the windowed adjoint's nufft1 output shape and scan "
+        "accumulator are a second, separate pair of call sites -- transposing either passed "
+        "the entire suite while this block pinned dense_scan"
+    )
+    for family in ("dense", "windowed"):
+        assert f"{family}_scan" in explicit, (
+            f"{family}_scan missing: the image-shaped accumulator in the {family} adjoint is "
+            f"allocated only on the scan branch, so {family}_vmap does not reach it"
+        )
