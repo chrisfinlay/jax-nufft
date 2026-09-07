@@ -459,6 +459,15 @@ number of forward and adjoint calls.
 Build the wgridder plan. Inputs are host-side numpy / jnp arrays (planning math
 runs on the host); the resulting plan holds JAX device arrays.
 
+`image_shape` is `(n_l, n_m)`, and **neither extent has to be even and the two
+need not be equal**: `(33, 33)`, `(32, 48)` and `(31, 45)` are all valid, as
+are independent `pixsize_l` and `pixsize_m`. This is a difference from ducc0,
+whose `wgridder` asserts `nx_dirty must be even` and refuses an odd `npix_x` /
+`npix_y` outright (it does accept non-square even shapes and anisotropic pixel
+sizes). Odd and non-square grids are gated against the exact DFT in
+`tests/test_against_dft.py`, which is the only available oracle for the odd
+cases.
+
 `dtype` fixes the precision of the whole plan — `uvw` and `freq` are cast to
 it, and the operators accept and return the matching real / complex dtypes.
 See [Precision](#precision) below.

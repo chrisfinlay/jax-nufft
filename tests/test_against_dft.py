@@ -430,3 +430,230 @@ def test_forward_2d_image_broadcasts_across_channels() -> None:
     image_3d = np.broadcast_to(image_2d, (2, n_l, n_m))
     vis_3d = dirty2vis(plan, jnp.asarray(image_3d))
     np.testing.assert_allclose(np.asarray(vis_2d), np.asarray(vis_3d), rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Image-geometry coverage: odd, non-square, anisotropic (issue #14)
+# ---------------------------------------------------------------------------
+#
+# Until issue #20 every fixture in this repository was square (``n_l == n_m``)
+# with isotropic pixels (``pixsize_l == pixsize_m``). On such a plan the whole
+# image grid is transpose-symmetric *bit for bit* -- ``max|nm1 - nm1.T| ==
+# 0.0`` -- so every quantity indexed on that grid (the ``n - 1`` plane phase,
+# ``phi_hat_n``, the ``w0`` screen, the ``1/n`` diagonal, the NUFFT output
+# shape) is free to confuse its two axes and no test can see it. Issue #20
+# measured the consequence on the one diagonal it added: transposing it is a
+# one-token change that passed the entire 1255-test suite and gives 1.022
+# relative error against ducc0 on an anisotropic plan.
+#
+# This block is the general case rather than one diagonal, and it is here (in
+# the DFT file) rather than in the ducc0 file for one hard reason: ducc0's
+# public API refuses an odd image size outright --
+# ``ducc0.wgridder.dirty2vis(dirty=np.zeros((33, 33)), ...)`` raises
+# ``RuntimeError: ... Assertion failure / nx_dirty must be even`` on 0.41.0, and
+# so does ``vis2dirty(npix_x=33, ...)``. Non-square *even* sizes it accepts
+# fine. So odd sizes have no oracle but the exact DFT, which is in any case the
+# definition of the answer and the tighter bound (``2 * eps`` rather than
+# ``3 * eps``).
+#
+# The cells, and what each one can falsify that the others cannot:
+#
+#   * ``(32, 32) / (0.01, 0.01)`` -- the control. Square and isotropic, i.e.
+#     the blind geometry every pre-#20 fixture had. It falsifies no axis
+#     confusion at all and is here so a failure that shows up on *every* cell
+#     is legible as "the operator is broken" rather than "the geometry is".
+#   * ``(33, 33)`` -- odd, square, isotropic. Exercises the ``i - n // 2``
+#     grid convention where the centre pixel is exact and the grid is not
+#     symmetric about zero (``-16 .. +16`` rather than ``-16 .. +15``), and the
+#     FFT sizes FINUFFT picks from an odd extent. ducc0 cannot check this at
+#     all.
+#   * ``(32, 48)`` and ``(48, 32)`` -- non-square, isotropic, and each other's
+#     transpose. A grid-indexed array that swaps its axes cannot even broadcast
+#     here, so these catch an axis swap as a *shape* error, which is a better
+#     failure than a numeric one. Both orders because a swap that happens to be
+#     compensated in one order shows up in the other.
+#   * ``(32, 32) / (0.012, 0.006)`` -- **square and anisotropic: the sharp
+#     one.** A transposed grid-indexed array is still shape-valid here, so
+#     nothing but the number can catch it. This is the geometry issue #20
+#     measured the 1.022 error on, and it is the cell that makes this block
+#     more than a shape check. It is not in issue #14's stated list, which
+#     jumps straight from square-isotropic to non-square; without it the whole
+#     parametrisation would hold "the transpose is shape-valid" constant at
+#     False for every asymmetric cell.
+#   * ``(31, 45) / (0.01, 0.007)`` -- odd *and* non-square *and* anisotropic,
+#     with two odd extents that share no factor. The compound case.
+#   * ``(32, 48) / (0.012, 0.006)`` -- even, non-square and anisotropic at
+#     once, with ``pixsize_l * n_l`` deliberately *not* equal to
+#     ``pixsize_m * n_m`` so the physical field of view is asymmetric too, not
+#     just the sampling.
+#
+# One epsilon (1e-6) and one w_strategy (the default) per cell: what varies
+# here is geometry, and the four w-traversals are already crossed with
+# everything else in ``tests/test_strategies_equivalent.py``. 300 rows with
+# w in +/-40 m so the w-plane machinery is genuinely engaged rather than
+# collapsing onto the constant-w fast path.
+_GEOMETRY_EPS = 1e-6
+_GEOMETRY_CASES = [
+    pytest.param((32, 32), (0.01, 0.01), id="even_square_isotropic_control"),
+    pytest.param((33, 33), (0.01, 0.01), id="odd_square"),
+    pytest.param((32, 48), (0.01, 0.01), id="nonsquare_32x48"),
+    pytest.param((48, 32), (0.01, 0.01), id="nonsquare_48x32"),
+    pytest.param((32, 32), (0.012, 0.006), id="square_anisotropic"),
+    pytest.param((31, 45), (0.01, 0.007), id="odd_nonsquare_anisotropic"),
+    pytest.param((32, 48), (0.012, 0.006), id="even_nonsquare_anisotropic"),
+]
+
+
+@functools.cache
+def _geometry_uvw_freq() -> tuple[np.ndarray, np.ndarray]:
+    """The one (uvw, freq) every geometry cell shares.
+
+    Shared deliberately: the only thing that varies across the cells above is
+    the image geometry, so holding the baselines fixed makes a per-cell failure
+    attributable to the geometry and nothing else.
+    """
+    rng = np.random.default_rng(4141)
+    n_rows = 300
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-120.0, 120.0, size=n_rows)
+    uvw[:, 1] = rng.uniform(-120.0, 120.0, size=n_rows)
+    uvw[:, 2] = rng.uniform(-40.0, 40.0, size=n_rows)
+    return uvw, np.array([1.0e9])
+
+
+@functools.cache
+def _geometry_data(
+    image_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(image, vis)`` for one geometry: complex image, complex visibilities."""
+    n_l, n_m = image_shape
+    uvw, _ = _geometry_uvw_freq()
+    n_rows = uvw.shape[0]
+    rng = np.random.default_rng(909 + n_l * 1000 + n_m)
+    image = rng.standard_normal((1, n_l, n_m)) + 1j * rng.standard_normal((1, n_l, n_m))
+    vis = (rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))).astype(
+        np.complex128
+    )
+    return image, vis
+
+
+@pytest.mark.parametrize("image_shape, pixsize", _GEOMETRY_CASES)
+def test_geometry_matches_dft_forward_and_adjoint(
+    image_shape: tuple[int, int], pixsize: tuple[float, float]
+) -> None:
+    """Odd / non-square / anisotropic image grids against the exact DFT.
+
+    Both operators, because they index the grid independently: the forward
+    multiplies the image by ``exp(2 pi i w_k (n - 1 + nshift)) / phi_hat_n`` and
+    hands FINUFFT an ``(n_l, n_m)`` array, while the adjoint asks ``nufft1`` for
+    an ``(n_l, n_m)`` output and then applies the same screen plus the ``1/n``
+    diagonal. A swap on one side is not a swap on the other.
+
+    ``hermitian=False`` with a complex image, so the forward is exercised at
+    full strength (a folded plan refuses a complex image). The fold acts on the
+    w axis and the row order, which is orthogonal to the l/m axis assignment
+    this block is about, and it is crossed with everything else in
+    ``tests/test_hermitian.py``.
+    """
+    eps = _GEOMETRY_EPS
+    n_l, n_m = image_shape
+    pixsize_l, pixsize_m = pixsize
+    uvw, freq = _geometry_uvw_freq()
+    image, vis = _geometry_data(image_shape)
+
+    plan = make_plan(uvw, freq, image_shape, pixsize_l, pixsize_m, eps, hermitian=False)
+    assert (plan.n_l, plan.n_m) == image_shape
+    # The plan must be genuinely w-dependent, or the w-plane loop -- which is
+    # where every grid-indexed phase is applied -- collapses to a single plane
+    # and the geometry is being checked against a much weaker operator.
+    assert not plan.is_constant_w
+    assert plan.n_w > 1
+
+    vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy="dense_scan"))
+    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis), w_strategy="dense_scan"))
+    assert vis_jax.shape == (uvw.shape[0], 1)
+    assert dirty_jax.shape == (1, n_l, n_m)
+
+    vis_ref = _reference_forward(image, uvw, freq, pixsize_l, pixsize_m)
+    dirty_ref = _reference_adjoint(vis, uvw, freq, image_shape, pixsize_l, pixsize_m)
+
+    fwd_err = np.linalg.norm(vis_jax - vis_ref) / np.linalg.norm(vis_ref)
+    adj_err = np.linalg.norm(dirty_jax - dirty_ref) / np.linalg.norm(dirty_ref)
+    assert fwd_err < DFT_TOL_FACTOR * eps, (
+        f"forward shape={image_shape} pixsize=({pixsize_l:g}, {pixsize_m:g}): relative error "
+        f"{fwd_err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+    )
+    assert adj_err < DFT_TOL_FACTOR * eps, (
+        f"adjoint shape={image_shape} pixsize=({pixsize_l:g}, {pixsize_m:g}): relative error "
+        f"{adj_err:.3e} exceeds {DFT_TOL_FACTOR:g}*eps={DFT_TOL_FACTOR * eps:.3e}"
+    )
+
+
+def test_the_geometry_cases_can_actually_falsify_an_axis_swap() -> None:
+    """The parametrisation above must not hold "symmetric grid" constant.
+
+    Every cell in ``_GEOMETRY_CASES`` runs the same two operator calls against
+    the same reference, so the only thing that makes the block worth its run
+    time is that the *set* of geometries breaks the symmetries a square
+    isotropic grid has. That is a property of the parameter list, not of any
+    one test, so it is asserted here rather than left as a comment nobody
+    re-checks when a cell is added or dropped.
+
+    Three separate statements, because they fail an axis swap in three
+    different ways and the block needs all three:
+
+    1. at least one **odd** extent -- the grid convention and the FFT sizes,
+       and the only regime with no ducc0 oracle at all;
+    2. at least one **non-square** shape, where a transposed grid-indexed array
+       is a shape error rather than a wrong number, *and* both orders of one
+       such pair;
+    3. at least one **square anisotropic** cell, where a transposed
+       grid-indexed array is still shape-valid and only the number can catch
+       it. This is the one issue #20 measured a 1.022 relative error on, and
+       the one whose absence would leave the block a pure shape check.
+
+    The last one is checked twice over: the parameter list has to contain such
+    a cell, and the plan built from it has to have a grid that really is not
+    transpose-symmetric. ``plan.n_minus_1`` is bit-for-bit equal to its own
+    transpose on every square isotropic fixture in this repository, which is
+    exactly why a positive measurement is worth making here.
+    """
+    shapes = [tuple(p.values[0]) for p in _GEOMETRY_CASES]
+    pixsizes = [tuple(p.values[1]) for p in _GEOMETRY_CASES]
+
+    odd = [s for s in shapes if s[0] % 2 or s[1] % 2]
+    assert odd, "no odd image extent: ducc0 cannot check odd sizes, so this file must"
+
+    nonsquare = {s for s in shapes if s[0] != s[1]}
+    assert nonsquare, "no non-square shape: an axis swap would stay shape-valid everywhere"
+    assert any((b, a) in nonsquare for a, b in nonsquare), (
+        "non-square shapes come in one orientation only; include a transposed pair so a "
+        "swap that is compensated in one order is still caught in the other"
+    )
+
+    square_aniso = [
+        (s, p) for s, p in zip(shapes, pixsizes, strict=True) if s[0] == s[1] and p[0] != p[1]
+    ]
+    assert square_aniso, (
+        "no square anisotropic cell: with only non-square asymmetry every axis swap fails as "
+        "a shape error, and a grid-indexed quantity built with pixsize_l and pixsize_m "
+        "exchanged -- which is shape-valid on any grid -- would go untested"
+    )
+
+    uvw, freq = _geometry_uvw_freq()
+    for shape, pixsize in square_aniso:
+        plan = make_plan(uvw, freq, shape, pixsize[0], pixsize[1], _GEOMETRY_EPS, hermitian=False)
+        nm1 = np.asarray(plan.n_minus_1)
+        asymmetry = float(np.max(np.abs(nm1 - nm1.T)))
+        assert asymmetry > 0.0, (
+            f"shape={shape} pixsize={pixsize}: plan.n_minus_1 equals its own transpose "
+            f"(max|nm1 - nm1.T| = {asymmetry:g}), so a diagonal indexed [m, l] instead of "
+            "[l, m] is literally the same array and this cell gates nothing"
+        )
+
+    # And the control cell must be blind, or "it passes on the control too" is
+    # not the diagnostic this block relies on it being.
+    control = [
+        (s, p) for s, p in zip(shapes, pixsizes, strict=True) if s[0] == s[1] and p[0] == p[1]
+    ]
+    assert control, "no square isotropic control cell to attribute a universal failure against"

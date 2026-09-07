@@ -6,6 +6,8 @@ jax.vmap without falling back to host execution.
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -231,8 +233,76 @@ def test_grad_through_pipeline_works() -> None:
     assert jnp.all(jnp.isfinite(g))
 
 
+# The channel-strategy comparison bound (issue #14). ``scan`` and ``vmap``
+# walk the *same* per-channel helper in the same order over the same inputs;
+# they are two lowerings of one reduction, not two reductions, so what
+# separates them is floating point and nothing else. 1e-11 is the repo's
+# eps-independent strategy-equivalence bound (AGENTS.md sec 6), reused here
+# rather than reinvented.
+CHANNEL_STRATEGY_TOL = 1e-11
+
+
+def _multichannel_setup(seed: int = 0):
+    """A small **multi-channel, non-square** problem with per-channel images.
+
+    ``_tiny_setup`` is single-channel and square, which is exactly the
+    configuration in which the two ``channel_strategy`` values cannot be told
+    apart: with one channel a scan over a length-1 axis and a vmap over a
+    length-1 axis produce the same graph up to naming, and neither can
+    mis-associate a channel because there is only one thing to associate.
+    Three channels at distinct frequencies, with independent image content per
+    channel, is the smallest fixture where the association is falsifiable.
+
+    ``n_l != n_m`` for the same reason, one axis over: a square grid cannot
+    distinguish an ``[l, m]``-indexed quantity from an ``[m, l]``-indexed one,
+    and this module's other fixtures are all 16 x 16.
+    """
+    rng = np.random.default_rng(seed)
+    n_l, n_m = 12, 20
+    n_rows = 32
+    n_chan = 3
+    pixsize_l = 0.005
+    pixsize_m = 0.008
+    uvw = np.zeros((n_rows, 3))
+    uvw[:, 0] = rng.uniform(-50.0, 50.0, size=n_rows)
+    uvw[:, 1] = rng.uniform(-50.0, 50.0, size=n_rows)
+    uvw[:, 2] = rng.uniform(-8.0, 8.0, size=n_rows)
+    freq = np.array([0.9, 1.0, 1.15]) * 1.4e9
+    plan = make_plan(uvw, freq, (n_l, n_m), pixsize_l, pixsize_m, epsilon=1e-6, hermitian=False)
+    image = rng.standard_normal((n_chan, n_l, n_m)) + 1j * rng.standard_normal((n_chan, n_l, n_m))
+    vis = (
+        rng.standard_normal((n_rows, n_chan)) + 1j * rng.standard_normal((n_rows, n_chan))
+    ).astype(np.complex128)
+    return plan, jnp.asarray(image), jnp.asarray(vis)
+
+
 def test_jit_static_strategy_args() -> None:
-    """w_strategy / channel_strategy must be static (passing them through jit)."""
+    """w_strategy / channel_strategy must be static (passing them through jit),
+    and ``channel_strategy="vmap"`` must agree with ``"scan"`` *numerically*.
+
+    The shape assertion is the original content of this test and is kept: it is
+    what says the strategy names survived the ``jit`` boundary as static
+    arguments rather than being traced. On its own, though, it is a weak
+    statement about ``vmap`` -- the output shape of ``dirty2vis`` is derived
+    from the plan, not from the channel loop (since issue #21 it is literally
+    the primitive's abstract eval, ``(n_rows, n_chan)``), so a ``vmap`` branch
+    that computed the wrong numbers, or the right numbers in the wrong channel
+    order, would return the right shape and pass.
+
+    So the value comparison is the substance. It needs a multi-channel plan
+    (see ``_multichannel_setup``): at ``n_chan == 1`` the two branches are
+    indistinguishable by construction and this assertion would hold for any
+    implementation of either. Both operators, since the two channel loops are
+    written separately -- the forward maps/scans over ``(image,
+    plan.inv_lambda)`` and transposes the stacked result, the adjoint over
+    ``(vis_per_chan, plan.inv_lambda)`` and does not.
+
+    Related but not the same: ``tests/test_strategies_equivalent.py`` compares
+    all eight ``(w_strategy, channel_strategy)`` combinations pairwise on the
+    telescope fixtures, so the numeric claim here is not the suite's only one.
+    What this cell adds is the claim *inside* ``jit`` on a non-square grid, and
+    a home for it next to the staticness assertion it strengthens.
+    """
     plan, image, _ = _tiny_setup(6)
 
     @jax.jit
@@ -241,6 +311,56 @@ def test_jit_static_strategy_args() -> None:
 
     out = vmap_call(image)
     assert out.shape == (plan.n_rows, plan.n_chan)
+
+    mc_plan, mc_image, mc_vis = _multichannel_setup(6)
+    assert mc_plan.n_chan > 1, "a single-channel plan cannot tell the two branches apart"
+    assert mc_plan.n_l != mc_plan.n_m
+
+    # ``static_argnums=1`` rather than two separate closures: passing the
+    # strategy name *through* ``jit`` as a static argument is the same claim
+    # the shape assertion above makes, now made once per branch.
+    @functools.partial(jax.jit, static_argnums=1)
+    def forward(im, channel_strategy):
+        return dirty2vis(mc_plan, im, w_strategy="dense_vmap", channel_strategy=channel_strategy)
+
+    @functools.partial(jax.jit, static_argnums=1)
+    def adjoint(v, channel_strategy):
+        return vis2dirty(mc_plan, v, w_strategy="dense_vmap", channel_strategy=channel_strategy)
+
+    fwd_scan = np.asarray(forward(mc_image, "scan"))
+    fwd_vmap = np.asarray(forward(mc_image, "vmap"))
+    adj_scan = np.asarray(adjoint(mc_vis, "scan"))
+    adj_vmap = np.asarray(adjoint(mc_vis, "vmap"))
+
+    assert fwd_vmap.shape == (mc_plan.n_rows, mc_plan.n_chan)
+    assert adj_vmap.shape == (mc_plan.n_chan, mc_plan.n_l, mc_plan.n_m)
+
+    # ``channel_axis`` differs between the two: ``dirty2vis`` returns
+    # ``(n_rows, n_chan)`` and ``vis2dirty`` ``(n_chan, n_l, n_m)``.
+    for name, got, want, channel_axis in (
+        ("dirty2vis", fwd_vmap, fwd_scan, -1),
+        ("vis2dirty", adj_vmap, adj_scan, 0),
+    ):
+        err = float(np.linalg.norm(got - want) / np.linalg.norm(want))
+        assert err < CHANNEL_STRATEGY_TOL, (
+            f'{name}: channel_strategy="vmap" differs from "scan" by {err:.3e} '
+            f"(tol {CHANNEL_STRATEGY_TOL:.1e}) on a {mc_plan.n_chan}-channel "
+            f"{mc_plan.n_l}x{mc_plan.n_m} plan -- the two are the same reduction in the "
+            "same order, so anything above the rounding floor is a wiring difference"
+        )
+        # Per channel too: the norm above is dominated by the loudest channel,
+        # and a permuted channel axis is exactly the defect that hides there
+        # when the per-channel magnitudes are comparable.
+        got_by_chan = np.moveaxis(got, channel_axis, 0)
+        want_by_chan = np.moveaxis(want, channel_axis, 0)
+        for c in range(mc_plan.n_chan):
+            c_err = float(
+                np.linalg.norm(got_by_chan[c] - want_by_chan[c]) / np.linalg.norm(want_by_chan[c])
+            )
+            assert c_err < CHANNEL_STRATEGY_TOL, (
+                f'{name}: channel_strategy="vmap" differs from "scan" by {c_err:.3e} '
+                f"on channel {c} (tol {CHANNEL_STRATEGY_TOL:.1e})"
+            )
 
 
 @pytest.mark.parametrize(
