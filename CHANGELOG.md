@@ -69,6 +69,29 @@ tagged or released, so its changes appear here for the first time; they are mark
   `windowed_scan` and `windowed_vmap`. Opt-in when introduced, and the default since
   [#46](https://github.com/chrisfinlay/jax-nufft/issues/46). *(v0.1.2 series)*
 
+- **`w_strategy="chunked"` / `"windowed_chunked"` with a static `w_chunk` (default 32)**, making the
+  w-plane loop a memory/compute curve instead of a choice between two points. The loop scans over
+  chunks of at most `w_chunk` planes with a `vmap` inside each, so transient memory follows
+  `w_chunk` rather than `n_w`. The four older names *are* points on that curve — `dense_scan` and
+  `windowed_scan` are `w_chunk=1`, `dense_vmap` and `windowed_vmap` are `w_chunk=n_w` — and share
+  its code, so a call at either end is bit-identical to the old name for it. `w_chunk` is part of
+  the JIT key and of the primitives' static configuration, so reverse mode chunks the way its
+  forward did.
+
+  Measured on MWA_extended off30 (256², 600 rows, `n_w = 134`, float64, eps 1e-6, `nthreads=1`,
+  single channel, `memory_analysis().temp_size_in_bytes`), in units of one complex image:
+
+  | | `dense_scan` | `chunked(8)` | `chunked(16)` | `chunked(32)` | `dense_vmap` |
+  |---|---:|---:|---:|---:|---:|
+  | forward | 2.01× | 9.08× | 16.15× | **28.26×** | 135.23× |
+  | adjoint | 2.01× | 9.01× | 16.01× | **28.01×** | 268.00× |
+
+  `chunked(32)` there runs 1.04–1.16× (forward) and 0.98–1.00× (adjoint) of `dense_vmap`'s time
+  across two interleaved passes on a 10-core Apple M-series. Existing strategies are untouched: the
+  optimised HLO for all four, plus `auto`, is byte-identical before and after over both operators
+  and four fixtures.
+  ([#25](https://github.com/chrisfinlay/jax-nufft/issues/25))
+
 - **A constant-w fast path.** When every row shares one `w` in wavelengths, the plan collapses to a
   single plane (`plan.n_w == 1`, `plan.is_constant_w`). *(v0.1.2 series)*
 

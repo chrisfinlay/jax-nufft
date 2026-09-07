@@ -406,6 +406,39 @@ If you touch any of these, run `tests/test_planning.py` and
 | `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | ~1x its own forward        | v0.1 `"vmap"` is a deprecated alias.           |
 | `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | 1.48-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | ~1x its own forward        | v0.1.1; rare wins, mostly for completeness.    |
+| `chunked`         | `n_rows * W^2`          | `O(w_chunk * image_size)`   | ~1x its own forward        | issue #25; takes the static `w_chunk` (default 32). |
+| `windowed_chunked`| `max_window_size * W^2` | `O(w_chunk * image_size)`   | ~1x its own forward        | issue #25; the windowed half of the same knob. |
+
+The last two are not a fifth and sixth algorithm — they are the *general
+form of the other four*, and the other four are values of `w_chunk`.
+`wgridder._resolve_w_chunk` maps `dense_scan` / `windowed_scan` to
+`w_chunk = 1` and `dense_vmap` / `windowed_vmap` to `w_chunk = plan.n_w`
+in the public wrapper, and `wgridder._sum_over_planes` — the one w-plane
+loop every dense strategy and the windowed adjoint run — then branches on
+nothing but `w_chunk`. So `chunked(1)` and `dense_scan` are the same
+computation in the strict sense, bit-identical on a deterministic backend
+rather than equal to 1e-11, and adding a chunk size between the ends does
+not add a code path. `w_chunk` is in `_PRIMITIVE_STATIC`, so the backward
+chunks the way its forward did, by the same construction the rest of that
+tuple relies on.
+
+`w_chunk` is an *upper bound* on the planes live at once, not an exact
+count: the loop runs `ceil(n_w / w_chunk)` chunks of
+`ceil(n_w / n_chunks) <= w_chunk` planes, so the padded remainder is at
+most `n_chunks - 1` planes rather than up to `w_chunk - 1`. That
+balancing is measured, not cosmetic — a padded plane runs a full 2D NUFFT
+whose result is multiplied by zero, and the unbalanced version (pad to
+`n_chunks * w_chunk`, as issue #25's plan describes) ran 1.24x
+`dense_vmap` at `w_chunk = 32` and 1.44x at 64 on MWA_extended off30
+(`n_w = 134`), tracking its 19% and 43% wasted planes; balanced, both
+waste one plane and `chunked(32)` runs 1.04-1.16x. Splitting the ragged
+remainder off as a smaller `vmap` after the scan wastes nothing and is
+*worse*: with few full chunks XLA schedules that block alongside the scan,
+measured 13.05x image on MeerKAT off30 at `w_chunk = 8` against
+`dense_vmap`'s 13.12x, i.e. the chunking bought nothing.
+
+`auto` never resolves to a chunked strategy. Picking a chunk size needs a
+memory budget the heuristic is not given; retuning it is issue #34's.
 
 The `grad` column is issue #21's. Both operators are bound as **linear
 primitives** (`_dirty2vis_p`, `_dirty2vis_transpose_p`, `_vis2dirty_p` at

@@ -260,9 +260,11 @@ between the w-kernel and the `(u, v)` NUFFT, and FINUFFT's `eps` is a target
 rather than a bound, so the NUFFT gets one extra digit of headroom (issue
 #9). The same call appears in the adjoint operator below.
 
-w-plane traversal has four strategies (`dense_scan`, `dense_vmap`,
-`windowed_scan`, `windowed_vmap`), one of which the default
-`w_strategy="auto"` picks per plan and platform. The dense variants evaluate every
+w-plane traversal has six strategies (`dense_scan`, `dense_vmap`,
+`windowed_scan`, `windowed_vmap`, and `chunked` / `windowed_chunked`, which
+take a chunk size and generalise the first four), one of the first four of
+which the default `w_strategy="auto"` picks per plan and platform. The dense
+variants evaluate every
 visibility on every w-plane and rely on the kernel zeroing out non-
 contributing rows; the windowed variants take a contiguous slice of
 visibilities (after sorting by `w`) per plane, cutting the spread cost
@@ -542,7 +544,7 @@ Hermitian fold's one-byte `plan.flip_sign`.) `plan.uvw_lambda`,
 reading `plan.uvw_lambda` materialises the full `(n_chan, n_rows, 3)` array,
 so it is for introspection, not for hot loops.
 
-### `dirty2vis(plan, image, *, divide_by_n=False, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
+### `dirty2vis(plan, image, *, divide_by_n=False, w_strategy="auto", channel_strategy="scan", nthreads=None, w_chunk=32) -> Array`
 
 Forward operator. `image` may be `(n_chan, n_l, n_m)` or `(n_l, n_m)`
 (broadcast across channels), real or complex. Output is complex
@@ -554,7 +556,7 @@ otherwise.
 factor to the image: `1/n` inside the unit disc, zero outside. The default
 `False` omits it, matching ducc0 and every release through v0.1.2.
 
-### `vis2dirty(plan, vis, *, divide_by_n=True, weights=None, w_strategy="auto", channel_strategy="scan", nthreads=None) -> Array`
+### `vis2dirty(plan, vis, *, divide_by_n=True, weights=None, w_strategy="auto", channel_strategy="scan", nthreads=None, w_chunk=32) -> Array`
 
 Adjoint operator. `vis` is complex `(n_rows, n_chan)`; optional `weights` is
 real `(n_rows, n_chan)`. Output is real `(n_chan, n_l, n_m)`.
@@ -606,9 +608,9 @@ above `_NTHREADS_SMALL_N_ROWS` in `wgridder.py` for the full numbers.
 
 ### Strategy options
 
-`w_strategy` selects how the w-plane loop is structured. There are four
-canonical choices plus the `"auto"` resolver that picks between them, and
-the two v0.1 names are kept as deprecated aliases:
+`w_strategy` selects how the w-plane loop is structured. There are six
+canonical choices plus the `"auto"` resolver that picks between the first
+four, and the two v0.1 names are kept as deprecated aliases:
 
 | `w_strategy`      | Per-plane work               | Peak transient memory       | `grad` memory               | Notes                                          |
 |-------------------|------------------------------|-----------------------------|-----------------------------|------------------------------------------------|
@@ -616,9 +618,49 @@ the two v0.1 names are kept as deprecated aliases:
 | `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | ~1x its own forward         | v0.1 `"vmap"` is a deprecated alias.           |
 | `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | 1.48-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | ~1x its own forward         | v0.1.1; rare wins, mostly for completeness.    |
-| `"auto"`          | resolves to one of the above | matches the resolved choice | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
+| `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | ~1x its own forward         | v0.1.3 (#25); takes `w_chunk` (default 32).    |
+| `"windowed_chunked"` | `max_window_size * W^2`   | `O(w_chunk * image_size)`   | ~1x its own forward         | v0.1.3 (#25); the windowed half of the same knob. |
+| `"auto"`          | resolves to one of the first four | matches the resolved choice | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
+
+#### `w_chunk`: the memory/compute knob
+
+The last two rows are not a fifth and sixth algorithm. They are the general
+form of the other four, and the other four are values of `w_chunk`: the
+w-plane loop scans over chunks of at most `w_chunk` planes with a `vmap`
+inside each chunk, and `dense_scan` / `windowed_scan` **are** `w_chunk = 1`
+while `dense_vmap` / `windowed_vmap` **are** `w_chunk = n_w`. They share the
+code, not merely the answer, so a call at either end is bit-identical to the
+old name for it on a deterministic backend.
+
+```python
+# 32 planes live at once instead of all n_w of them.
+vis = dirty2vis(plan, image, w_strategy="chunked", w_chunk=32)
+```
+
+`w_chunk` is keyword-only and static (part of the JIT cache key, since it
+sets the shape of every intermediate in the plane loop), must be a positive
+`int`, and is clamped to `plan.n_w`. It is an *upper bound* on the planes
+live at once, not an exact count: the loop runs `ceil(n_w / w_chunk)` chunks
+of `ceil(n_w / n_chunks) <= w_chunk` planes, so at most `n_chunks - 1` planes
+of padding are run and thrown away rather than up to `w_chunk - 1`.
+
+Measured on MWA_extended off30 (256&sup2;, 600 rows, `n_w = 134`, float64,
+eps 1e-6, `nthreads=1`, single channel, `memory_analysis().temp_size_in_bytes`
+on the CPU backend), in units of one complex image, with wall-clock as a
+ratio against `dense_vmap` on the same machine (10-core Apple M-series, plan
+and warm-up outside the timer, 9-11 interleaved rounds, median):
+
+| | `dense_scan` | `chunked(8)` | `chunked(16)` | `chunked(32)` | `dense_vmap` |
+|---|---:|---:|---:|---:|---:|
+| forward temp | 2.01x | 9.08x | 16.15x | 28.26x | 135.23x |
+| adjoint temp | 2.01x | 9.01x | 16.01x | 28.01x | 268.00x |
+| forward time | 1.61-1.72x | 1.23-1.26x | 1.09-1.17x | 1.04-1.16x | 1.00x |
+| adjoint time | 1.33-1.41x | 1.13x | 0.99x | 0.98-1.00x | 1.00x |
+
+`w_strategy="auto"` never resolves to a chunked strategy: choosing a chunk
+size needs a memory budget the heuristic is not given.
 
 The `grad` column is new in v0.1.3 (issue #21) and is a *ratio against the
 same strategy's forward*, not an absolute size: both operators are now bound

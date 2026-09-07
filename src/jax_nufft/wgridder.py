@@ -27,12 +27,24 @@ Two loops are configurable, and they do not share a default.
 ``channel_strategy`` selects how the channel loop runs -- ``"scan"`` (lower
 memory, the default) or ``"vmap"`` (potentially faster on GPU, at
 ``n_chan`` x the transient memory). ``w_strategy`` selects how the w-plane
-loop runs and has four canonical values, crossing dense/windowed traversal
-with scan/vmap: ``"dense_scan"``, ``"dense_vmap"``, ``"windowed_scan"``,
-``"windowed_vmap"``. Its default is ``"auto"`` (issue #46), which resolves
-to one of those four before the JIT boundary using the plan and the
-platform -- see :func:`_auto_w_strategy`. Through v0.1.2 the default here
-was ``"dense_scan"``; passing that explicitly restores the same code path.
+loop runs and has six canonical values: the four that cross dense/windowed
+traversal with scan/vmap -- ``"dense_scan"``, ``"dense_vmap"``,
+``"windowed_scan"``, ``"windowed_vmap"`` -- and issue #25's ``"chunked"`` /
+``"windowed_chunked"``, which take a static ``w_chunk`` and generalise them.
+Its default is ``"auto"`` (issue #46), which resolves to one of the first
+four before the JIT boundary using the plan and the platform -- see
+:func:`_auto_w_strategy`. Through v0.1.2 the default here was
+``"dense_scan"``; passing that explicitly restores the same code path.
+
+issue #25: the w-plane loop is one function, :func:`_sum_over_planes`, that
+scans over chunks of ``w_chunk`` planes with a ``vmap`` inside each chunk.
+The four pre-#25 strategy names are chunk *sizes* rather than code paths --
+:func:`_resolve_w_chunk` maps ``*_scan`` to ``1`` and ``*_vmap`` to
+``plan.n_w`` -- so ``chunked(1)`` and ``dense_scan`` are the same
+computation, not two that agree, and transient memory is a continuum in
+``w_chunk`` between the two regimes those names used to be the only access
+to. ``w_chunk`` is in :data:`_PRIMITIVE_STATIC`, so reverse mode chunks the
+way its forward did.
 
 Sign convention: matches ducc's ``explicit_degridder``, i.e.
 
@@ -75,19 +87,56 @@ from jax_nufft.planning import WGridderPlan
 # the JIT boundary, having been replaced by one of the four canonical names
 # in the public wrapper. The bare ``scan`` / ``vmap`` names from v0.1 are
 # accepted as deprecated aliases that map to the ``dense_*`` variants.
+#
+# issue #25 adds ``"chunked"`` and ``"windowed_chunked"``, which take the
+# static ``w_chunk`` and are the *general* form of the other four: the plane
+# loop scans over chunks of ``w_chunk`` planes with a ``vmap`` inside each
+# chunk, so ``w_chunk = 1`` is the scan variant and ``w_chunk = n_w`` the vmap
+# one. That is not a claimed equivalence, it is how the code is written --
+# :func:`_resolve_w_chunk` turns each of the four old names into a chunk size
+# and :func:`_sum_over_planes` is the single loop all six run.
 WStrategy = Literal[
     "dense_scan",
     "dense_vmap",
     "windowed_scan",
     "windowed_vmap",
+    "chunked",
+    "windowed_chunked",
     "auto",
     "scan",
     "vmap",
 ]
 ChannelStrategy = Literal["scan", "vmap"]
 
-_CANONICAL_W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
+_CANONICAL_W_STRATEGIES = (
+    "dense_scan",
+    "dense_vmap",
+    "windowed_scan",
+    "windowed_vmap",
+    "chunked",
+    "windowed_chunked",
+)
 _W_STRATEGY_ALIASES: dict[str, WStrategy] = {"scan": "dense_scan", "vmap": "dense_vmap"}
+
+# The strategies that traverse windows rather than whole rows. Named because
+# three call sites test the family and a fourth name was added to it by issue
+# #25; an ``in`` against a literal tuple is where a family membership test
+# silently goes stale.
+_WINDOWED_W_STRATEGIES = ("windowed_scan", "windowed_vmap", "windowed_chunked")
+
+# The chunk-size-taking strategies -- the two whose ``w_chunk`` is the
+# caller's rather than implied by the name.
+_CHUNKED_W_STRATEGIES = ("chunked", "windowed_chunked")
+
+# Default number of w-planes held live at once by the two chunked strategies
+# (issue #25's implementation plan, item 1). It is a memory/compute knob, not
+# a tuned optimum: 32 planes of a 3600^2 complex128 image is 3.2 GB, against
+# the 29.6 GB the whole plane stack costs on MWA_extended off30 at that size
+# (issue #25's own measurement on a GH200). Note that every fixture in this
+# repository has ``n_w < 32``, so the default is the ``w_chunk >= n_w`` path
+# -- i.e. ``dense_vmap`` -- on all of them; it starts to bite only at
+# realistic image sizes.
+DEFAULT_W_CHUNK = 32
 
 # Smallest epsilon FINUFFT can honour in double precision; asking for less
 # makes it warn and clamp, and ``filterwarnings = ["error"]`` turns that into a
@@ -161,6 +210,65 @@ def _canonicalise_w_strategy(
     )
 
 
+def _validate_w_chunk(w_chunk: Any) -> int:
+    """``w_chunk`` must be a positive integer -- checked on every call.
+
+    Checked whatever the strategy, not only for ``"chunked"``: it is a static
+    *shape*, so a bad value has to be refused where the caller can see it
+    rather than clamped into something plausible. A caller who asks for
+    ``w_chunk=0`` and is silently given ``1`` believes they picked a point on
+    the memory curve and is sitting somewhere else entirely.
+
+    ``bool`` is refused despite being an ``int`` for the same reason: it is
+    much more likely to be a mistyped flag than a request for one plane.
+    """
+    if isinstance(w_chunk, bool) or not isinstance(w_chunk, int | np.integer):
+        raise TypeError(
+            f"w_chunk must be a positive int, got {type(w_chunk).__name__} ({w_chunk!r}). "
+            "It is a static shape (part of the JIT cache key), not a traced quantity."
+        )
+    value = int(w_chunk)
+    if value < 1:
+        raise ValueError(f"w_chunk must be a positive int, got {value}")
+    return value
+
+
+def _resolve_w_chunk(w_strategy: WStrategy, w_chunk: Any, plan: WGridderPlan) -> int:
+    """The number of w-planes the plane loop holds live at once.
+
+    This is where issue #25's item 2 actually happens. Rather than
+    ``"dense_scan"`` and ``"chunked"`` being two code paths that agree, the
+    four pre-#25 names are *resolved to chunk sizes* here and the plane loop
+    (:func:`_sum_over_planes`) branches on nothing else:
+
+      ``dense_scan`` / ``windowed_scan``   -> ``1``
+      ``dense_vmap`` / ``windowed_vmap``   -> ``plan.n_w``
+      ``chunked``    / ``windowed_chunked``-> the caller's ``w_chunk``
+
+    so ``chunked(1)`` and ``dense_scan`` are the same computation in the
+    strict sense of running the same lines with the same arguments, and are
+    bit-identical on a deterministic backend rather than equal to 1e-11.
+
+    Clamped to ``plan.n_w`` on the chunked strategies. ``w_chunk > n_w`` is
+    not an edge case -- the default 32 exceeds ``n_w`` on every fixture in
+    this repository -- and one chunk of ``n_w`` planes with no padding is both
+    the cheapest way to serve it and the thing that makes
+    ``chunked(n_w) == dense_vmap`` hold for *every* ``w_chunk >= n_w`` rather
+    than for the one value that happens to equal ``n_w``. It also collapses
+    those values onto a single JIT cache entry instead of compiling an
+    identical executable per over-size request.
+
+    Runs in the public wrapper, ahead of the JIT boundary, so the value
+    reaching the primitive is always a concrete ``int`` in ``[1, n_w]``.
+    """
+    value = _validate_w_chunk(w_chunk)
+    if w_strategy in ("dense_scan", "windowed_scan"):
+        return 1
+    if w_strategy in ("dense_vmap", "windowed_vmap"):
+        return int(plan.n_w)
+    return min(value, int(plan.n_w))
+
+
 # Below this many rows, the whole plane loop is short enough that spinning up
 # an OpenMP thread pool per FINUFFT call isn't worth it regardless of
 # strategy -- ``_resolve_nthreads`` overrides the strategy-family rule to `1`
@@ -215,6 +323,7 @@ def _resolve_nthreads(
     *,
     plan: WGridderPlan | None = None,
     is_adjoint: bool | None = None,
+    w_chunk: int | None = None,
 ) -> int:
     """Resolve the public ``nthreads: int | None = None`` default to an ``int``.
 
@@ -248,7 +357,11 @@ def _resolve_nthreads(
             just re-spins the whole OpenMP pool on every plane) -> ``1``;
           - else ``"dense_vmap"`` / ``"windowed_vmap"`` (the *vmap* family,
             one batched FINUFFT call across planes) -> ``0`` (let FINUFFT
-            thread the batch).
+            thread the batch);
+          - else ``"chunked"`` / ``"windowed_chunked"`` (issue #25), which
+            belong to whichever family their ``w_chunk`` puts them in: ``1``
+            at ``w_chunk = 1`` (one FINUFFT call per plane, the scan family's
+            situation), ``0`` otherwise (one batched call per chunk).
 
     Measured on the review machine (Apple M-series, 10 cores), default
     ``nthreads=0`` vs. explicit ``nthreads=1`` on ``dense_scan``: MWA_extended
@@ -293,6 +406,15 @@ def _resolve_nthreads(
         return 1
     if canonical in ("dense_scan", "windowed_scan"):
         return 1
+    if canonical in _CHUNKED_W_STRATEGIES:
+        # issue #25: the chunked strategies span both families, so the family
+        # rule above cannot be read off the name. ``w_chunk = 1`` re-enters
+        # FINUFFT once per plane exactly as the scan family does and wants the
+        # same ``1``; any larger chunk is a batched call and gets the vmap
+        # family's ``0``. A caller who reached here without a resolved
+        # ``w_chunk`` (a direct call, not one of the operators) gets the vmap
+        # answer, matching the default ``w_chunk = 32``.
+        return 1 if w_chunk == 1 else 0
     return 0
 
 
@@ -985,6 +1107,138 @@ def _hermitian_conj_rows(vis: Array, flip_sign: Array, plan: WGridderPlan) -> Ar
     return jnp.where(flip_sign < 0, jnp.conj(vis), vis)
 
 
+def _plane_chunk_grid(n_w: int, w_chunk: int) -> tuple[int, int, int]:
+    """``(n_chunks, chunk, pad)`` for scanning ``n_w`` planes ``w_chunk`` at a time.
+
+    ``chunk`` is **not** ``w_chunk``. The caller asks for at most ``w_chunk``
+    planes live at once; this spreads the planes evenly over the
+    ``ceil(n_w / w_chunk)`` chunks that number implies, so ``chunk =
+    ceil(n_w / n_chunks) <= w_chunk`` and the padding is at most
+    ``n_chunks - 1`` planes rather than up to ``w_chunk - 1``.
+
+    That is a measured choice, not tidiness. Padding is not free work in this
+    loop: a padded plane runs a full 2D NUFFT whose result is then multiplied
+    by zero. On MWA_extended off30 (n_w = 134, 256^2, 600 rows, float64,
+    eps 1e-6, nthreads=1, macOS arm64 10-core, 11 interleaved rounds, median)
+    the unbalanced version -- ``chunk = w_chunk``, padding to
+    ``ceil(n_w / w_chunk) * w_chunk`` as issue #25's plan describes -- ran
+    1.24x ``dense_vmap`` on the forward at ``w_chunk = 32`` and 1.44x at
+    ``w_chunk = 64``, against 1.09x at ``w_chunk = 48``. The ordering is the
+    padding's: 26 wasted planes (19% of the work) at 32 and 58 (43%) at 64,
+    against 10 (7%) at 48. Balanced, the same two chunk sizes waste **one**
+    plane each (5 chunks of 27 = 135, 3 chunks of 45 = 135).
+
+    The alternative -- ``lax.scan`` over the full chunks and the ragged
+    remainder as one smaller ``vmap`` after it, wasting nothing at all -- was
+    written and measured and is *worse*, on the axis this issue is about.
+    When ``n_w // w_chunk`` is small XLA schedules the remainder block
+    alongside the scan rather than after it, so the two are live together:
+    measured on MeerKAT off30 (n_w = 13) at ``w_chunk = 8``, 13.05x image
+    against ``dense_vmap``'s 13.12x -- i.e. the chunking bought nothing.
+    Padding keeps every chunk the same shape, which is what keeps the peak at
+    one chunk's worth.
+    """
+    n_chunks = -(-n_w // w_chunk)
+    chunk = -(-n_w // n_chunks)
+    return n_chunks, chunk, n_chunks * chunk - n_w
+
+
+def _chunk_plane_arrays(
+    xs: tuple[Array, ...], *, w_chunk: int, real_dtype: Any
+) -> tuple[tuple[Array, ...], Array]:
+    """Reshape per-plane arrays into ``(n_chunks, chunk, ...)``, plus a keep mask.
+
+    The grid comes from :func:`_plane_chunk_grid`; the padding entries repeat
+    the *last* real plane rather than being invented, so every value the loop
+    exponentiates stays inside the range the plan was built for, and the
+    returned ``keep`` mask (``1`` on the real planes, ``0`` on the padding) is
+    what makes them contribute exactly nothing.
+
+    A mask rather than "put the padding plane outside the kernel's support and
+    let ``phi(|z| > 1) = 0`` do it": that trick works, and issue #25 offers it,
+    but it makes the exactness of the padding a property of a *data-dependent*
+    w-range -- one plan whose rows reach further than expected and the padding
+    quietly starts contributing a real number. The mask is exact by
+    construction on any input, and it is multiplied into ``phi``'s real output
+    (see the ``keep`` argument of the per-plane closures), so a padded plane
+    contributes a hard zero rather than something small.
+    """
+    n_w = int(xs[0].shape[0])
+    n_chunks, chunk, pad = _plane_chunk_grid(n_w, w_chunk)
+
+    def extend(x: Array) -> Array:
+        if pad:
+            x = jnp.concatenate([x, jnp.broadcast_to(x[-1:], (pad, *x.shape[1:]))])
+        return x.reshape((n_chunks, chunk, *x.shape[1:]))
+
+    keep = jnp.concatenate(
+        [jnp.ones((n_w,), dtype=real_dtype), jnp.zeros((pad,), dtype=real_dtype)]
+    ).reshape((n_chunks, chunk))
+    return tuple(extend(x) for x in xs), keep
+
+
+def _sum_over_planes(
+    plane: Callable[..., Array],
+    xs: tuple[Array, ...],
+    *,
+    w_chunk: int,
+    shape: tuple[int, ...],
+    dtype: Any,
+    real_dtype: Any,
+) -> Array:
+    """Sum one contribution per w-plane, at most ``w_chunk`` live at a time.
+
+    ``plane(*per_plane_args, keep=None)`` returns one contribution of
+    ``shape``; ``xs`` are the per-plane arrays it is called on, each with
+    ``n_w`` leading. This is the single w-plane loop of issue #25: both dense
+    strategies, the two chunked ones and the windowed adjoint run it, and
+    ``w_chunk`` is the only thing it branches on.
+
+    Three branches, and two of them are the pre-#25 code verbatim:
+
+    ``w_chunk >= n_w``
+        one ``vmap`` over every plane and one sum -- the ``*_vmap``
+        strategies, and what ``chunked`` does whenever the caller's chunk size
+        reaches the plane count (which, on every fixture in this repository,
+        the default 32 does). No padding is built, so an over-size ``w_chunk``
+        costs nothing rather than running empty planes.
+    ``w_chunk == 1``
+        ``lax.scan`` over planes with an image-sized (or row-sized) carry --
+        the ``*_scan`` strategies.
+    otherwise
+        ``lax.scan`` over :func:`_plane_chunk_grid`'s chunks with a ``vmap``
+        inside each: one FINUFFT plan and sort per chunk with ``n_transf =
+        chunk``, and one chunk's worth of contributions live at once instead
+        of ``n_w``.
+
+    The first two are not special-cased *approximations* of the third -- they
+    are what the third degenerates to at those two chunk sizes, with the
+    padding and the mask arithmetic removed. Writing them out is what makes
+    ``chunked(1)`` and ``dense_scan`` bit-identical rather than merely equal
+    to 1e-11, and it keeps an over-size ``w_chunk`` from paying for padding
+    planes it does not need.
+    """
+    n_w = int(xs[0].shape[0])
+    if w_chunk >= n_w:
+        return jnp.sum(jax.vmap(plane)(*xs), axis=0)
+
+    if w_chunk == 1:
+
+        def step(acc: Array, args: tuple[Array, ...]) -> tuple[Array, None]:
+            return acc + plane(*args), None
+
+        out, _ = jax.lax.scan(step, jnp.zeros(shape, dtype=dtype), xs)
+        return out
+
+    chunked_xs, keep = _chunk_plane_arrays(xs, w_chunk=w_chunk, real_dtype=real_dtype)
+
+    def chunk_step(acc: Array, args: tuple[Array, ...]) -> tuple[Array, None]:
+        return acc + jnp.sum(jax.vmap(plane)(*args), axis=0), None
+
+    out, _ = jax.lax.scan(chunk_step, jnp.zeros(shape, dtype=dtype), (*chunked_xs, keep))
+    return out
+
+
 def _channel_forward(
     image_c: Array,
     uvw_m: Array,
@@ -992,6 +1246,8 @@ def _channel_forward(
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
+    *,
+    w_chunk: int,
 ) -> Array:
     """Forward operator for a single channel: image (n_l, n_m) -> vis (n_rows,).
 
@@ -1001,13 +1257,19 @@ def _channel_forward(
     ``plan.w0``* are derived from the pair by :func:`_channel_ft_coords`. The
     absolute part of w is carried by ``plan.w0_screen`` and never enters this
     function.
+
+    ``w_strategy`` is here only to be handed to callers' spies and to say which
+    *family* this is; since issue #25 the plane traversal is decided entirely
+    by ``w_chunk`` (``1`` for ``dense_scan``, ``plan.n_w`` for ``dense_vmap``,
+    the caller's value for ``chunked``), resolved by :func:`_resolve_w_chunk`
+    before the JIT boundary.
     """
     two_pi = 2.0 * jnp.pi
     cdtype = image_c.dtype
     u_ft_c, v_ft_c, w_rel_c = _channel_ft_coords(uvw_m, inv_lambda_c, plan)
     n_rows = u_ft_c.shape[0]
 
-    def w_plane_contribution(w_k: Array) -> Array:
+    def w_plane_contribution(w_k: Array, keep: Array | None = None) -> Array:
         # issue #16: the shifted grid, not plan.n_minus_1. The resulting
         # exp(+2πi w nshift) excess is removed from the *summed* output below.
         phase = (two_pi * w_k) * plan.n_minus_1_shifted  # (n_l, n_m), real
@@ -1018,21 +1280,24 @@ def _channel_forward(
         )
         # w-direction kernel applied at the visibility output
         z = (w_rel_c - w_k) / plan.w_kernel_scale
-        kernel_w = phi(z, plan.beta).astype(cdtype)
-        return vis_k * kernel_w
+        kernel = phi(z, plan.beta)
+        # issue #25: a padded plane's kernel is zeroed here, in real
+        # arithmetic and before the cast, so its contribution is an exact
+        # zero. ``keep`` is ``None`` on the two unpadded branches of
+        # :func:`_sum_over_planes`, which is what keeps them the pre-#25
+        # computation to the bit rather than to a rounding.
+        if keep is not None:
+            kernel = kernel * keep
+        return vis_k * kernel.astype(cdtype)
 
-    if w_strategy == "dense_vmap":
-        contributions = jax.vmap(w_plane_contribution)(plan.w_centers_rel)
-        vis_c = jnp.sum(contributions, axis=0)
-    elif w_strategy == "dense_scan":
-
-        def step(acc: Array, w_k: Array) -> tuple[Array, None]:
-            return acc + w_plane_contribution(w_k), None
-
-        init = jnp.zeros((n_rows,), dtype=cdtype)
-        vis_c, _ = jax.lax.scan(step, init, plan.w_centers_rel)
-    else:
-        raise ValueError(f"unknown w_strategy: {w_strategy!r}")
+    vis_c = _sum_over_planes(
+        w_plane_contribution,
+        (plan.w_centers_rel,),
+        w_chunk=w_chunk,
+        shape=(n_rows,),
+        dtype=cdtype,
+        real_dtype=plan.real_dtype,
+    )
 
     # issue #16: once per visibility, *after* the plane loop -- the factor is
     # common to every plane, so pulling it out of the sum is both cheaper and
@@ -1051,6 +1316,8 @@ def _channel_forward_windowed(
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
+    *,
+    w_chunk: int,
 ) -> Array:
     """Windowed forward operator for a single channel.
 
@@ -1068,9 +1335,12 @@ def _channel_forward_windowed(
     coordinates come from :func:`_channel_ft_coords` on that sorted array, so
     they land in sorted-row order too.
 
-    ``w_strategy`` selects scan-over-planes (``windowed_scan``, low memory)
-    or vmap-over-planes (``windowed_vmap``, higher memory, possibly faster
-    on GPU).
+    ``w_chunk`` selects the traversal, exactly as it does on the dense path
+    (issue #25): ``1`` is scan-over-planes (``windowed_scan``, low memory),
+    ``plan.n_w`` is vmap-over-planes (``windowed_vmap``, higher memory,
+    possibly faster on GPU), and anything between is ``windowed_chunked`` --
+    a scan over chunks with a ``vmap`` inside. ``w_strategy`` names the
+    family only.
     """
     two_pi = 2.0 * jnp.pi
     u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)
@@ -1083,13 +1353,18 @@ def _channel_forward_windowed(
     # explicitly so the slice is always in-bounds.
     lo_max = max(n_rows - max_window_size, 0)
 
-    def plane_to_window(lo_raw: Array, w_k: Array) -> tuple[Array, Array]:
+    def plane_to_window(
+        lo_raw: Array, w_k: Array, keep: Array | None = None
+    ) -> tuple[Array, Array]:
         """Compute one w-plane's per-window contribution.
 
         Returns ``(lo, contrib)`` where ``lo`` is the clamped sorted-row
         start of the window and ``contrib`` is the ``(max_window_size,)``
         complex contribution in sorted-row order (i.e. aligned with
         ``uvw_m_sorted[lo:lo+max_window_size]``).
+
+        ``keep`` is issue #25's padding mask, ``None`` on every unpadded
+        traversal; see :func:`_chunk_plane_arrays`.
         """
         lo = jnp.clip(lo_raw, 0, lo_max)
 
@@ -1105,10 +1380,12 @@ def _channel_forward_windowed(
         contrib = nufft2(image_k, u_k, v_k, iflag=-1, eps=_nufft_epsilon(plan.epsilon), opts=opts)
 
         z = (w_rel_window - w_k) / plan.w_kernel_scale
-        kernel_w = phi(z, plan.beta).astype(cdtype)
-        return lo, contrib * kernel_w
+        kernel = phi(z, plan.beta)
+        if keep is not None:
+            kernel = kernel * keep
+        return lo, contrib * kernel.astype(cdtype)
 
-    if w_strategy == "windowed_vmap":
+    if w_chunk >= plan.n_w:
         # vmap path materialises one (n_rows,) row-order vector per plane
         # and sums; unchanged from the v0.1.1 behaviour aside from the
         # plane_to_window factoring.
@@ -1136,19 +1413,40 @@ def _channel_forward_windowed(
         # above, and the reason this path needs its own call site.
         return _hermitian_conj_rows(vis_c, plan.flip_sign, plan)
 
-    # windowed_scan path: keep the carry in sorted-row order so each plane
-    # touches only its (max_window_size,)-sized slice. The per-step
-    # dynamic_slice + add + dynamic_update_slice is O(max_window_size); the
-    # v0.1.1 code paid O(n_rows) per plane for a full-row zero + scatter.
-    def step(vis_sorted_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
-        lo_raw, w_k = args
-        lo, contrib = plane_to_window(lo_raw, w_k)
-        old = jax.lax.dynamic_slice(vis_sorted_acc, (lo,), (max_window_size,))
-        new = old + contrib
-        return jax.lax.dynamic_update_slice(vis_sorted_acc, new, (lo,)), None
-
     vis_sorted_init = jnp.zeros((n_rows,), dtype=cdtype)
-    vis_sorted, _ = jax.lax.scan(step, vis_sorted_init, (window_start_c, plan.w_centers_rel))
+    if w_chunk == 1:
+        # windowed_scan path: keep the carry in sorted-row order so each plane
+        # touches only its (max_window_size,)-sized slice. The per-step
+        # dynamic_slice + add + dynamic_update_slice is O(max_window_size); the
+        # v0.1.1 code paid O(n_rows) per plane for a full-row zero + scatter.
+        def step(vis_sorted_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
+            lo_raw, w_k = args
+            lo, contrib = plane_to_window(lo_raw, w_k)
+            old = jax.lax.dynamic_slice(vis_sorted_acc, (lo,), (max_window_size,))
+            new = old + contrib
+            return jax.lax.dynamic_update_slice(vis_sorted_acc, new, (lo,)), None
+
+        vis_sorted, _ = jax.lax.scan(step, vis_sorted_init, (window_start_c, plan.w_centers_rel))
+    else:
+        # windowed_chunked (issue #25 item 3): scan over chunks, ``vmap`` over
+        # the chunk's planes. The carry stays in sorted-row order as on the
+        # scan path -- the windows of a chunk start at different rows, so a
+        # single ``dynamic_update_slice`` cannot serve them and the accumulate
+        # is a scatter-add over the chunk's ``(w_chunk, max_window_size)``
+        # index block. Windows overlap, which is exactly what a scatter-*add*
+        # is for; the padded planes' contributions are hard zeros, so they add
+        # nothing wherever their (repeated) window lands.
+        offsets = jnp.arange(max_window_size)
+        chunked_xs, keep = _chunk_plane_arrays(
+            (window_start_c, plan.w_centers_rel), w_chunk=w_chunk, real_dtype=plan.real_dtype
+        )
+
+        def chunk_step(vis_sorted_acc: Array, args: tuple[Array, ...]) -> tuple[Array, None]:
+            los, contribs = jax.vmap(plane_to_window)(*args)
+            rows = los[:, None] + offsets[None, :]
+            return vis_sorted_acc.at[rows].add(contribs), None
+
+        vis_sorted, _ = jax.lax.scan(chunk_step, vis_sorted_init, (*chunked_xs, keep))
     # issue #16: applied here, in sorted-row order, where ``vis_sorted`` and
     # ``w_rel_sorted`` already agree -- i.e. before the unsort rather than
     # across it.
@@ -1169,10 +1467,13 @@ def _channel_adjoint(
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
+    *,
+    w_chunk: int,
 ) -> Array:
     """Adjoint operator for a single channel: vis (n_rows,) -> dirty (n_l, n_m).
 
-    See :func:`_channel_forward` for the coord-arg convention.
+    See :func:`_channel_forward` for the coord-arg convention, and for why
+    ``w_chunk`` rather than ``w_strategy`` decides the plane traversal.
     """
     two_pi = 2.0 * jnp.pi
     cdtype = vis_c.dtype
@@ -1188,10 +1489,16 @@ def _channel_adjoint(
     # here rather than inside the plane loop (see _apply_nshift_compensation).
     vis_c = _apply_nshift_compensation(vis_c, w_rel_c, plan, conjugate=True)
 
-    def w_plane_contribution(w_k: Array) -> Array:
+    def w_plane_contribution(w_k: Array, keep: Array | None = None) -> Array:
         z = (w_rel_c - w_k) / plan.w_kernel_scale
-        kernel_w = phi(z, plan.beta).astype(cdtype)
-        vis_k = vis_c * kernel_w
+        kernel = phi(z, plan.beta)
+        # issue #25: see the forward's twin of this branch. Here the zero also
+        # makes the padded plane's NUFFT input identically zero, so its type-1
+        # transform is an exact zero image rather than an exact-zero-after-
+        # scaling one.
+        if keep is not None:
+            kernel = kernel * keep
+        vis_k = vis_c * kernel.astype(cdtype)
         # Adjoint of the type-2 NUFFT is type 1 with iflag = +1 (the conjugate
         # of iflag=-1 used in the forward).
         h_k = nufft1(
@@ -1210,20 +1517,14 @@ def _channel_adjoint(
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
 
-    if w_strategy == "dense_vmap":
-        contributions = jax.vmap(w_plane_contribution)(plan.w_centers_rel)
-        return jnp.sum(contributions, axis=0)
-
-    if w_strategy == "dense_scan":
-
-        def step(acc: Array, w_k: Array) -> tuple[Array, None]:
-            return acc + w_plane_contribution(w_k), None
-
-        init = jnp.zeros((plan.n_l, plan.n_m), dtype=cdtype)
-        result, _ = jax.lax.scan(step, init, plan.w_centers_rel)
-        return result
-
-    raise ValueError(f"unknown w_strategy: {w_strategy!r}")
+    return _sum_over_planes(
+        w_plane_contribution,
+        (plan.w_centers_rel,),
+        w_chunk=w_chunk,
+        shape=(plan.n_l, plan.n_m),
+        dtype=cdtype,
+        real_dtype=plan.real_dtype,
+    )
 
 
 def _dirty2vis_forward(
@@ -1234,6 +1535,7 @@ def _dirty2vis_forward(
     channel_strategy: ChannelStrategy,
     nthreads: int,
     divide_by_n: bool,
+    w_chunk: int,
 ) -> Array:
     """``A image`` -- the forward operator's body, traced but not jitted.
 
@@ -1273,7 +1575,7 @@ def _dirty2vis_forward(
     # pixel but on neither the visibility nor the plane.
     image = image * plan.w0_screen
 
-    if w_strategy in ("windowed_scan", "windowed_vmap"):
+    if w_strategy in _WINDOWED_W_STRATEGIES:
         # Windowed path: the per-channel helper takes the *sorted* baselines in
         # metres plus this channel's inv_lambda and the per-channel
         # window-start table. issue #23: the sort key is w in metres, so the
@@ -1285,7 +1587,7 @@ def _dirty2vis_forward(
         if channel_strategy == "vmap":
             vis_per_chan = jax.vmap(
                 lambda im_c, il_c, ws_c: _channel_forward_windowed(
-                    im_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
+                    im_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy, w_chunk=w_chunk
                 )
             )(image, plan.inv_lambda, plan.window_start)
         elif channel_strategy == "scan":
@@ -1296,7 +1598,7 @@ def _dirty2vis_forward(
             ) -> tuple[None, Array]:
                 im_c, il_c, ws_c = args
                 return None, _channel_forward_windowed(
-                    im_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy
+                    im_c, uvw_m_sorted, il_c, ws_c, plan, opts, w_strategy, w_chunk=w_chunk
                 )
 
             _, vis_per_chan = jax.lax.scan(
@@ -1312,13 +1614,17 @@ def _dirty2vis_forward(
     # it is one array for every channel, not one per channel (issue #23).
     if channel_strategy == "vmap":
         vis_per_chan = jax.vmap(
-            lambda im_c, il_c: _channel_forward(im_c, plan.uvw_m, il_c, plan, opts, w_strategy)
+            lambda im_c, il_c: _channel_forward(
+                im_c, plan.uvw_m, il_c, plan, opts, w_strategy, w_chunk=w_chunk
+            )
         )(image, plan.inv_lambda)
     elif channel_strategy == "scan":
 
         def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
             im_c, il_c = args
-            return None, _channel_forward(im_c, plan.uvw_m, il_c, plan, opts, w_strategy)
+            return None, _channel_forward(
+                im_c, plan.uvw_m, il_c, plan, opts, w_strategy, w_chunk=w_chunk
+            )
 
         _, vis_per_chan = jax.lax.scan(step, None, (image, plan.inv_lambda))
     else:
@@ -1335,6 +1641,7 @@ def dirty2vis(
     w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int | None = None,
+    w_chunk: int = DEFAULT_W_CHUNK,
 ) -> Array:
     """Forward wgridder: image cube -> visibilities.
 
@@ -1397,10 +1704,14 @@ def dirty2vis(
         that helper's docstring for the heuristic itself. The canonical
         names, all of which override the heuristic when passed explicitly,
         are ``"dense_scan"`` (low memory), ``"dense_vmap"`` (potentially
-        faster on GPU but allocates ``n_w * image_size`` peak memory) and
+        faster on GPU but allocates ``n_w * image_size`` peak memory),
         ``"windowed_scan"`` / ``"windowed_vmap"``, which use the per-plane
-        windowed path. The bare names ``"scan"`` / ``"vmap"`` are accepted
-        as deprecated aliases.
+        windowed path, and ``"chunked"`` / ``"windowed_chunked"`` (issue
+        #25), which take ``w_chunk`` below and are the general form of the
+        other four. The bare names ``"scan"`` / ``"vmap"`` are accepted as
+        deprecated aliases. ``"auto"`` never resolves to a chunked strategy:
+        picking a chunk size needs a memory budget the heuristic is not
+        given, so the chunked pair is opt-in by name.
 
         The default was ``"dense_scan"`` through v0.1.2, which left the
         heuristic unreachable and, on GPU, made the shipped default the
@@ -1444,6 +1755,47 @@ def dirty2vis(
         spinning up a pool at all isn't worth it, so every strategy gets
         ``1``. Pass an explicit ``int`` (including ``0``) to opt out.
 
+        The chunked strategies belong to whichever family their ``w_chunk``
+        puts them in: ``1`` at ``w_chunk = 1``, ``0`` above it.
+    w_chunk:
+        How many w-planes the plane loop holds live at once, for
+        ``w_strategy="chunked"`` / ``"windowed_chunked"`` (issue #25).
+        Ignored -- beyond being validated -- by the other four strategies,
+        whose names already fix it: ``dense_scan`` and ``windowed_scan``
+        *are* ``w_chunk=1`` and ``dense_vmap`` and ``windowed_vmap`` *are*
+        ``w_chunk=plan.n_w``, in the literal sense that
+        :func:`_resolve_w_chunk` turns the name into this number and the
+        plane loop then branches on nothing else. So the two chunked names
+        are a continuum whose ends are the four old ones, and a call at
+        either end is bit-identical to the old name for it on a
+        deterministic backend.
+
+        Transient memory goes as ``w_chunk`` rather than as ``n_w``, and
+        compute goes the other way (one FINUFFT plan and sort per chunk
+        instead of per plane). Values above ``plan.n_w`` are clamped to it,
+        which is what the default 32 does on every fixture in this
+        repository (all have ``n_w < 32``); there is no padding and no
+        wasted plane in that regime, and such calls share one JIT cache
+        entry.
+
+        It is an **upper bound** on the planes held live, not an exact
+        count: the loop runs ``ceil(n_w / w_chunk)`` chunks of
+        ``ceil(n_w / ceil(n_w / w_chunk))`` planes, which is ``<= w_chunk``
+        and spreads the planes evenly, so the padded remainder is at most
+        ``n_chunks - 1`` planes instead of up to ``w_chunk - 1``. Padded
+        planes cost a full 2D NUFFT that is then multiplied by zero, so this
+        is worth measurably more than it looks -- see
+        :func:`_plane_chunk_grid`. On MWA_extended off30 at 256^2
+        (``n_w = 134``) ``w_chunk = 32`` therefore runs 5 chunks of 27 and
+        costs 28.3 x image of transient against ``dense_vmap``'s 135.2 x
+        (forward) and 268.0 x (adjoint), for 1.04x / 0.98x of its time.
+
+        Static (part of the JIT cache key -- it sets the shape of every
+        intermediate in the plane loop), and carried in
+        ``_PRIMITIVE_STATIC``, so reverse mode runs the *forward's* chunk
+        size. Must be a positive ``int``; ``0``, negatives and non-integers
+        raise rather than being clamped.
+
     Returns
     -------
     vis:
@@ -1451,9 +1803,12 @@ def dirty2vis(
         ``plan.complex_dtype``.
     """
     w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=False)
+    resolved_w_chunk = _resolve_w_chunk(w_strategy, w_chunk, plan)
     _reject_complex_image_on_a_folded_plan(image, plan)
     image = _prepare_image(image, plan)
-    resolved_nthreads = _resolve_nthreads(nthreads, w_strategy, plan.n_rows)
+    resolved_nthreads = _resolve_nthreads(
+        nthreads, w_strategy, plan.n_rows, w_chunk=resolved_w_chunk
+    )
     return _dirty2vis_jit(
         plan,
         image,
@@ -1461,6 +1816,7 @@ def dirty2vis(
         channel_strategy=channel_strategy,
         nthreads=resolved_nthreads,
         divide_by_n=divide_by_n,
+        w_chunk=resolved_w_chunk,
     )
 
 
@@ -1473,15 +1829,20 @@ def _channel_adjoint_windowed(
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
+    *,
+    w_chunk: int,
 ) -> Array:
     """Windowed adjoint operator for a single channel.
 
     Mirrors :func:`_channel_forward_windowed`: per plane we take a
     contiguous slice of the w-sorted visibilities, apply the w-kernel
     weight (which zeros out padded entries automatically), run a 2D
-    NUFFT type 1 to land an image, and accumulate. ``w_strategy``
-    chooses scan-over-planes (``windowed_scan``) or vmap-over-planes
-    (``windowed_vmap``).
+    NUFFT type 1 to land an image, and accumulate. As on the dense path,
+    ``w_chunk`` chooses the traversal -- scan-over-planes at ``1``
+    (``windowed_scan``), vmap-over-planes at ``plan.n_w``
+    (``windowed_vmap``), scan-over-chunks in between
+    (``windowed_chunked``) -- and this direction is a plain sum of
+    image-shaped contributions, so it is :func:`_sum_over_planes` unchanged.
 
     See :func:`_channel_forward_windowed` for the coord-arg convention.
 
@@ -1508,7 +1869,7 @@ def _channel_adjoint_windowed(
     # order here, so no permutation is involved.
     vis_sorted_c = _apply_nshift_compensation(vis_sorted_c, w_rel_sorted, plan, conjugate=True)
 
-    def plane_to_image(lo_raw: Array, w_k: Array) -> Array:
+    def plane_to_image(lo_raw: Array, w_k: Array, keep: Array | None = None) -> Array:
         lo = jnp.clip(lo_raw, 0, lo_max)
 
         u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (max_window_size,))
@@ -1517,8 +1878,10 @@ def _channel_adjoint_windowed(
         vis_k = jax.lax.dynamic_slice(vis_sorted_c, (lo,), (max_window_size,))
 
         z = (w_rel_window - w_k) / plan.w_kernel_scale
-        kernel_w = phi(z, plan.beta).astype(cdtype)
-        vis_k = vis_k * kernel_w
+        kernel = phi(z, plan.beta)
+        if keep is not None:  # issue #25's padding mask; see _chunk_plane_arrays
+            kernel = kernel * keep
+        vis_k = vis_k * kernel.astype(cdtype)
 
         h_k = nufft1(
             (plan.n_l, plan.n_m),
@@ -1534,17 +1897,14 @@ def _channel_adjoint_windowed(
         shift = jnp.exp((-1j * phase).astype(cdtype))
         return h_k * shift / plan.phi_hat_n.astype(cdtype)
 
-    if w_strategy == "windowed_vmap":
-        contributions = jax.vmap(plane_to_image)(window_start_c, plan.w_centers_rel)
-        return jnp.sum(contributions, axis=0)
-
-    def step(dirty_acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
-        lo_raw, w_k = args
-        return dirty_acc + plane_to_image(lo_raw, w_k), None
-
-    dirty_init = jnp.zeros((plan.n_l, plan.n_m), dtype=cdtype)
-    dirty_c, _ = jax.lax.scan(step, dirty_init, (window_start_c, plan.w_centers_rel))
-    return dirty_c
+    return _sum_over_planes(
+        plane_to_image,
+        (window_start_c, plan.w_centers_rel),
+        w_chunk=w_chunk,
+        shape=(plan.n_l, plan.n_m),
+        dtype=cdtype,
+        real_dtype=plan.real_dtype,
+    )
 
 
 def _dirty2vis_adjoint(
@@ -1555,6 +1915,7 @@ def _dirty2vis_adjoint(
     channel_strategy: ChannelStrategy,
     nthreads: int,
     divide_by_n: bool,
+    w_chunk: int,
 ) -> Array:
     """``A^H vis`` as a **complex** ``(n_chan, n_l, n_m)`` image (issue #21).
 
@@ -1579,7 +1940,7 @@ def _dirty2vis_adjoint(
     # axis first, so transpose once up front.
     vis_per_chan = vis.T  # (n_chan, n_rows)
 
-    if w_strategy in ("windowed_scan", "windowed_vmap"):
+    if w_strategy in _WINDOWED_W_STRATEGIES:
         # Apply sort_perm once per channel so windowed slices line up with
         # plan.window_start; the baselines get the same permutation once for
         # the whole call (see _dirty2vis_jit's note -- the sort key is w in
@@ -1593,7 +1954,15 @@ def _dirty2vis_adjoint(
         if channel_strategy == "vmap":
             dirty_per_chan = jax.vmap(
                 lambda v_s_c, il_c, ws_c: _channel_adjoint_windowed(
-                    v_s_c, uvw_m_sorted, flip_sign_sorted, il_c, ws_c, plan, opts, w_strategy
+                    v_s_c,
+                    uvw_m_sorted,
+                    flip_sign_sorted,
+                    il_c,
+                    ws_c,
+                    plan,
+                    opts,
+                    w_strategy,
+                    w_chunk=w_chunk,
                 )
             )(vis_sorted_per_chan, plan.inv_lambda, plan.window_start)
         elif channel_strategy == "scan":
@@ -1604,7 +1973,15 @@ def _dirty2vis_adjoint(
             ) -> tuple[None, Array]:
                 v_s_c, il_c, ws_c = args
                 return None, _channel_adjoint_windowed(
-                    v_s_c, uvw_m_sorted, flip_sign_sorted, il_c, ws_c, plan, opts, w_strategy
+                    v_s_c,
+                    uvw_m_sorted,
+                    flip_sign_sorted,
+                    il_c,
+                    ws_c,
+                    plan,
+                    opts,
+                    w_strategy,
+                    w_chunk=w_chunk,
                 )
 
             _, dirty_per_chan = jax.lax.scan(
@@ -1616,13 +1993,17 @@ def _dirty2vis_adjoint(
             raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
     elif channel_strategy == "vmap":
         dirty_per_chan = jax.vmap(
-            lambda v_c, il_c: _channel_adjoint(v_c, plan.uvw_m, il_c, plan, opts, w_strategy)
+            lambda v_c, il_c: _channel_adjoint(
+                v_c, plan.uvw_m, il_c, plan, opts, w_strategy, w_chunk=w_chunk
+            )
         )(vis_per_chan, plan.inv_lambda)
     elif channel_strategy == "scan":
 
         def step(_: None, args: tuple[Array, Array]) -> tuple[None, Array]:
             v_c, il_c = args
-            return None, _channel_adjoint(v_c, plan.uvw_m, il_c, plan, opts, w_strategy)
+            return None, _channel_adjoint(
+                v_c, plan.uvw_m, il_c, plan, opts, w_strategy, w_chunk=w_chunk
+            )
 
         _, dirty_per_chan = jax.lax.scan(step, None, (vis_per_chan, plan.inv_lambda))
     else:
@@ -1708,6 +2089,7 @@ def vis2dirty(
     w_strategy: WStrategy = "auto",
     channel_strategy: ChannelStrategy = "scan",
     nthreads: int | None = None,
+    w_chunk: int = DEFAULT_W_CHUNK,
 ) -> Array:
     """Adjoint wgridder: visibilities -> image cube (with 1/n factor).
 
@@ -1758,7 +2140,8 @@ def vis2dirty(
         imaginary part.
     w_strategy:
         ``"auto"`` (the shipped default since issue #46), ``"dense_scan"``,
-        ``"dense_vmap"``, ``"windowed_scan"`` or ``"windowed_vmap"``; same
+        ``"dense_vmap"``, ``"windowed_scan"``, ``"windowed_vmap"``,
+        ``"chunked"`` or ``"windowed_chunked"``; same
         semantics as in :func:`dirty2vis`, including that an explicit name
         overrides the heuristic, that ``"dense_scan"`` restores the pre-#46
         code path but not the pre-#46 numbers (other changes in the same
@@ -1805,6 +2188,47 @@ def vis2dirty(
         spinning up a pool at all isn't worth it, so every strategy gets
         ``1``. Pass an explicit ``int`` (including ``0``) to opt out.
 
+        The chunked strategies belong to whichever family their ``w_chunk``
+        puts them in: ``1`` at ``w_chunk = 1``, ``0`` above it.
+    w_chunk:
+        How many w-planes the plane loop holds live at once, for
+        ``w_strategy="chunked"`` / ``"windowed_chunked"`` (issue #25).
+        Ignored -- beyond being validated -- by the other four strategies,
+        whose names already fix it: ``dense_scan`` and ``windowed_scan``
+        *are* ``w_chunk=1`` and ``dense_vmap`` and ``windowed_vmap`` *are*
+        ``w_chunk=plan.n_w``, in the literal sense that
+        :func:`_resolve_w_chunk` turns the name into this number and the
+        plane loop then branches on nothing else. So the two chunked names
+        are a continuum whose ends are the four old ones, and a call at
+        either end is bit-identical to the old name for it on a
+        deterministic backend.
+
+        Transient memory goes as ``w_chunk`` rather than as ``n_w``, and
+        compute goes the other way (one FINUFFT plan and sort per chunk
+        instead of per plane). Values above ``plan.n_w`` are clamped to it,
+        which is what the default 32 does on every fixture in this
+        repository (all have ``n_w < 32``); there is no padding and no
+        wasted plane in that regime, and such calls share one JIT cache
+        entry.
+
+        It is an **upper bound** on the planes held live, not an exact
+        count: the loop runs ``ceil(n_w / w_chunk)`` chunks of
+        ``ceil(n_w / ceil(n_w / w_chunk))`` planes, which is ``<= w_chunk``
+        and spreads the planes evenly, so the padded remainder is at most
+        ``n_chunks - 1`` planes instead of up to ``w_chunk - 1``. Padded
+        planes cost a full 2D NUFFT that is then multiplied by zero, so this
+        is worth measurably more than it looks -- see
+        :func:`_plane_chunk_grid`. On MWA_extended off30 at 256^2
+        (``n_w = 134``) ``w_chunk = 32`` therefore runs 5 chunks of 27 and
+        costs 28.3 x image of transient against ``dense_vmap``'s 135.2 x
+        (forward) and 268.0 x (adjoint), for 1.04x / 0.98x of its time.
+
+        Static (part of the JIT cache key -- it sets the shape of every
+        intermediate in the plane loop), and carried in
+        ``_PRIMITIVE_STATIC``, so reverse mode runs the *forward's* chunk
+        size. Must be a positive ``int``; ``0``, negatives and non-integers
+        raise rather than being clamped.
+
     Returns
     -------
     dirty:
@@ -1814,10 +2238,13 @@ def vis2dirty(
         with ``divide_by_n=False``.
     """
     w_strategy = _canonicalise_w_strategy(w_strategy, plan=plan, is_adjoint=True)
+    resolved_w_chunk = _resolve_w_chunk(w_strategy, w_chunk, plan)
     vis = _validate_vis(vis, plan)
     weights = _validate_weights(weights, plan)
     apply_w = weights is not None
-    resolved_nthreads = _resolve_nthreads(nthreads, w_strategy, plan.n_rows)
+    resolved_nthreads = _resolve_nthreads(
+        nthreads, w_strategy, plan.n_rows, w_chunk=resolved_w_chunk
+    )
     return _vis2dirty_jit(
         plan,
         vis,
@@ -1827,6 +2254,7 @@ def vis2dirty(
         nthreads=resolved_nthreads,
         apply_w_weights=apply_w,
         divide_by_n=divide_by_n,
+        w_chunk=resolved_w_chunk,
     )
 
 
@@ -1896,7 +2324,7 @@ _vis2dirty_p = jex.core.Primitive("jax_nufft_vis2dirty")
 # untouched, so a strategy, a channel loop or an ``Opts(nthreads=...)`` cannot
 # differ between the two directions by construction rather than by care.
 # ``tests/test_custom_vjp.py`` spies on the per-channel helpers to gate it.
-_PRIMITIVE_STATIC = ("w_strategy", "channel_strategy", "nthreads", "divide_by_n")
+_PRIMITIVE_STATIC = ("w_strategy", "channel_strategy", "nthreads", "divide_by_n", "w_chunk")
 
 # How many eager-bind wrappers :func:`_eager_executable` keeps. One entry per
 # (lowering, static configuration, plan geometry) actually bound outside a
@@ -2241,6 +2669,7 @@ def _dirty2vis_jit(
     channel_strategy: ChannelStrategy,
     nthreads: int,
     divide_by_n: bool,
+    w_chunk: int,
 ) -> Array:
     """The forward operator's JIT boundary: bind the primitive on the plan's leaves."""
     leaves, treedef = jax.tree_util.tree_flatten(plan)
@@ -2253,6 +2682,7 @@ def _dirty2vis_jit(
         channel_strategy=channel_strategy,
         nthreads=nthreads,
         divide_by_n=divide_by_n,
+        w_chunk=w_chunk,
     )
 
 
@@ -2267,6 +2697,7 @@ def _vis2dirty_jit(
     nthreads: int,
     apply_w_weights: bool,
     divide_by_n: bool,
+    w_chunk: int,
 ) -> Array:
     """The adjoint operator's JIT boundary.
 
@@ -2289,6 +2720,7 @@ def _vis2dirty_jit(
         channel_strategy=channel_strategy,
         nthreads=nthreads,
         divide_by_n=divide_by_n,
+        w_chunk=w_chunk,
     )
 
 
