@@ -79,9 +79,19 @@ def test_the_stub_default_width_is_the_real_eps_1e_6_width() -> None:
     Not a tautology against ``kernel_params``: it is a check that the *docstring
     above* is true, i.e. that eps=1e-6 really is a plan whose kernel is this
     wide, and it fails loudly if a future width-rule change moves it. Before
-    issue #9 the default was 8 and the docstring said so; the rule changed, the
-    number did not, and for six PRs every ratio in this file was computed
-    against a width no shipped plan has. A comment cannot catch that; this can.
+    issue #9 the default was 8 and the docstring said so; the rule changed and
+    the number did not, so for six PRs the stub's documented "typical eps=1e-6
+    plan" was a width no shipped plan has.
+
+    The blast radius was small, and saying so is part of the point: of the 27
+    ``_stub_plan`` call sites in this file, 26 pass ``w_kernel_width``
+    explicitly (twelve at 8, twelve at 6, one at 2, one forwarding a
+    parametrised value), and the only one that takes the default is
+    ``_stub_plan(n_w=10)`` in
+    ``test_canonicalise_auto_requires_context``, which asserts a ``ValueError``
+    and never resolves a strategy at all. So the stale default was inert; what
+    it corrupted was the documentation, and a comment cannot catch that. This
+    can.
     """
     assert _TYPICAL_W_KERNEL_WIDTH == 7, _TYPICAL_W_KERNEL_WIDTH
     uvw = np.zeros((8, 3))
@@ -128,9 +138,12 @@ def test_cpu_small_n_w_gate_stops_at_plus_two() -> None:
     the gate and free to pick ``windowed_scan``.
 
     The case above pins the inside of the gate but not its edge, because at
-    the stub's default ``w_kernel_width=8`` the two are indistinguishable:
-    ``n_w = 11`` clears a ``+ 2`` gate only to fail the ratio test
-    (``11 / 8 = 1.375``, not ``> 2``) and land on ``dense_scan`` anyway. The
+    the ``w_kernel_width=8`` it passes explicitly the two are
+    indistinguishable: ``n_w = 11`` clears a ``+ 2`` gate only to fail the
+    ratio test (``11 / 8 = 1.375``, not ``> 2``) and land on ``dense_scan``
+    anyway. The stub's *default* width (7, from ``kernel_params(1e-6)``) is no
+    different -- ``n_w = 10`` clears the gate and ``10 / 7 = 1.43`` fails the
+    ratio test just the same. The
     gate's width is observable only where the ratio test would *pass*, which
     needs ``w_kernel_width + 3 > 2 * w_kernel_width``, i.e. ``W < 3``.
 

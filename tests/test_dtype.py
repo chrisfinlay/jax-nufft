@@ -82,9 +82,11 @@ def _weights() -> np.ndarray:
 _OFF30_TELESCOPES: tuple[Telescope, ...] = (MWA_COMPACT, MWA_EXTENDED, MEERKAT)
 
 # Measured float32 relative error against the double-precision ducc0 oracle at
-# eps=1e-4 (macOS arm64, jax 0.9.2, ducc0 0.41.0), forward / adjoint:
+# eps=1e-4 (macOS arm64, jax 0.9.2, ducc0 0.41.0; uvw seed 0, image seed 7,
+# vis seed 11, weights seed 13; shipped ``hermitian=True`` and the default
+# ``w_strategy="auto"``), forward / adjoint:
 #
-#     MWA_compact off30   n_w=10    0.50x eps / 0.52x eps
+#     MWA_compact off30   n_w=10    0.50x eps / 0.54x eps
 #     MWA_extended off30  n_w=132   0.73x eps / 0.70x eps
 #     MeerKAT off30       n_w=11    0.57x eps / 0.58x eps
 #

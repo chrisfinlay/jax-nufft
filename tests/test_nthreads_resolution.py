@@ -50,9 +50,20 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Protocol
 
+import numpy as np
 import pytest
 
+from jax_nufft import make_plan
+from jax_nufft.kernel import kernel_params
 from jax_nufft.wgridder import _auto_w_strategy
+from tests.conftest import requires_x64
+
+# The kernel half-width a typical eps=1e-6 plan actually gets, derived rather
+# than written out -- the same treatment ``tests/test_auto_strategy.py`` gives
+# its own copy of this stub, and for the same reason: a literal here is exactly
+# how the pre-issue-#9 width of 8 survived the rule change that made it 7.
+_TYPICAL_EPS = 1e-6
+_TYPICAL_W_KERNEL_WIDTH = kernel_params(_TYPICAL_EPS)[0]
 
 
 class _ResolveNthreads(Protocol):
@@ -91,7 +102,7 @@ def small_n_rows_cutoff() -> int:
 def _stub_plan(
     *,
     n_w: int,
-    w_kernel_width: int = 7,
+    w_kernel_width: int = _TYPICAL_W_KERNEL_WIDTH,
     window_padding_overhead: float = 1.0,
     n_rows: int = 600,
 ):
@@ -100,9 +111,11 @@ def _stub_plan(
     Mirrors ``tests/test_auto_strategy.py::_stub_plan`` -- kept local (not
     imported) so this module stays self-contained like the rest of the
     per-file test suite. The default width is a typical eps=1e-6 plan's, 7
-    under the issue #9 rule ``W = ceil(-log10(eps / 10))``; pinned by
-    ``test_the_stub_default_width_is_the_real_eps_1e_6_width`` below so the
-    mirror cannot drift away from the module it mirrors.
+    under the issue #9 rule ``W = ceil(-log10(eps / 10))``, and is *derived*
+    from ``kernel_params`` rather than written out, so it cannot drift the way
+    the literal 8 it replaced did. That eps=1e-6 really is such a plan is
+    checked against ``make_plan`` by
+    ``test_the_stub_default_width_is_the_real_eps_1e_6_width`` below.
     """
     return SimpleNamespace(
         n_w=n_w,
@@ -112,17 +125,34 @@ def _stub_plan(
     )
 
 
+@requires_x64
 def test_the_stub_default_width_is_the_real_eps_1e_6_width() -> None:
     """The mirrored stub's default must be a real eps=1e-6 plan's width.
 
-    The twin of ``tests/test_auto_strategy.py``'s check of the same name. That
-    module's stub carried ``w_kernel_width=8`` -- the pre-issue-#9 width rule's
-    answer -- for six PRs after the rule changed, and this file copied it.
-    """
-    from jax_nufft.kernel import kernel_params
+    The twin of ``tests/test_auto_strategy.py``'s check of the same name, and
+    it has to build a plan to be worth anything. Comparing the stub default
+    against ``kernel_params(1e-6)`` alone is a tautology now that the default
+    is derived from it; what is not a tautology is that ``make_plan`` at
+    eps=1e-6 really does hand back a kernel that wide, which is the claim the
+    stub's docstring makes and the one that went stale for six PRs after issue
+    #9 changed the width rule.
 
-    assert kernel_params(1e-6)[0] == 7
-    assert _stub_plan(n_w=10).w_kernel_width == kernel_params(1e-6)[0]
+    ``@requires_x64`` only because a default-dtype ``make_plan`` raises with
+    x64 off and eps=1e-6 is below the float32 floor. The rest of this module
+    is precision-agnostic and stays out of ``conftest.collect_ignore``.
+    """
+    assert _TYPICAL_W_KERNEL_WIDTH == 7, _TYPICAL_W_KERNEL_WIDTH
+    assert _stub_plan(n_w=10).w_kernel_width == _TYPICAL_W_KERNEL_WIDTH
+
+    uvw = np.zeros((8, 3))
+    uvw[:, 0] = np.linspace(-50.0, 50.0, 8)
+    uvw[:, 2] = np.linspace(-5.0, 5.0, 8)
+    plan = make_plan(uvw, np.array([1.4e9]), (16, 16), 0.005, 0.005, _TYPICAL_EPS)
+    assert plan.w_kernel_width == _TYPICAL_W_KERNEL_WIDTH, (
+        f"make_plan(eps={_TYPICAL_EPS:g}) gives w_kernel_width={plan.w_kernel_width}, "
+        f"but _stub_plan defaults to {_TYPICAL_W_KERNEL_WIDTH}: every n_w / W ratio in "
+        "this file is being computed against a width no real plan has"
+    )
 
 
 class _FakeDevice:

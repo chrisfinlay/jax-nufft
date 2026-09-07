@@ -155,12 +155,18 @@ def test_forward_parity_long(
     """Slow forward parity for MWA_extended / MeerKAT (skipped without --runslow).
 
     ``windowed_scan`` as well as ``dense_scan`` (issue #15). The large fixtures
-    are the only ones where the windowed slice is a small fraction of the rows
-    -- MWA_extended off30 runs ``n_w = 134`` planes against a ``max_window_size``
-    of 561 out of 600 rows on the short fixtures' geometry -- so a window bound
-    that is wrong only when ``n_w >> w_kernel_width`` has, until now, been
-    checked against ducc0 on no fixture at all. The short fixtures do cover
-    ``windowed_scan``, but at ``n_w`` in the low teens.
+    are the only ones where the windowed slice is a small fraction of the rows.
+    Measured on this machine at the seed, epsilon and precision this test
+    actually uses -- ``synthetic_uvw(tel, zen_deg, seed=4)``, eps=1e-6,
+    float64, shipped ``hermitian=True`` -- MWA_extended off30 runs
+    ``n_w = 138`` planes (268 unfolded) at ``w_kernel_width = 7``, with a
+    ``max_window_size`` of 158 out of 600 rows. Every fixture the short parity
+    tests above run on has a **full** window at every seed and epsilon they use
+    (seeds 0/1/2, eps 1e-4 and 1e-6): EDA2 zenith 400 of 400 at ``n_w`` 9-11,
+    MWA_compact zenith 600 of 600 at 6-8, MWA_compact off30 600 of 600 at
+    10-12. So a windowed cell there is the dense computation under another
+    name, and a window bound that is wrong only when ``n_w >> w_kernel_width``
+    had, until now, been checked against ducc0 on no fixture at all.
     """
     tel, zen_deg = long_telescope_pointing
     uvw = synthetic_uvw(tel, zen_deg, seed=4)
@@ -202,14 +208,19 @@ def test_adjoint_parity_long(
     direction where the windowed traversals actually pay, and the one whose
     reduction order differs between them -- had never been checked against an
     external oracle above ``n_w`` in the low teens. MWA_extended off30 is the
-    cell that matters: ``n_w = 134`` folded (251 unfolded) against
-    ``w_kernel_width = 7``, the only shipped CPU fixture whose ``auto`` adjoint
-    resolves to ``windowed_scan`` at all (AGENTS.md section 5).
+    cell that matters. Measured on this machine at this test's own seed,
+    epsilon and precision (seed 4, eps=1e-6, float64, shipped
+    ``hermitian=True``): ``n_w = 138`` folded, 268 unfolded, against
+    ``w_kernel_width = 7`` -- the only shipped CPU fixture whose ``auto``
+    adjoint resolves to ``windowed_scan`` at all (AGENTS.md section 5, whose
+    134 / 251 are the same geometry at seed 0).
 
     All four ``w_strategy`` values rather than the short fixtures' pair: the
     ``vmap`` variants build the same planes through a batched composition, and
     ``n_w`` in the hundreds is where a per-plane indexing slip stops being
-    masked by planes that all contain every row.
+    masked by planes that all contain every row -- which, on the short
+    fixtures, is every plane (``max_window_size == n_rows`` there; see
+    ``test_forward_parity_long``).
     """
     tel, zen_deg = long_telescope_pointing
     uvw = synthetic_uvw(tel, zen_deg, seed=4)
