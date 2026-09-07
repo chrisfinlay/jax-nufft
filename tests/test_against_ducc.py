@@ -147,9 +147,27 @@ def test_forward_parity_with_weights(
     assert err < DUCC_TOL_FACTOR * eps
 
 
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "windowed_scan"])
 @pytest.mark.parametrize("eps", [1e-6])
-def test_forward_parity_long(long_telescope_pointing: tuple[Telescope, float], eps: float) -> None:
-    """Slow parity tests for MWA_extended / MeerKAT (skipped without --runslow)."""
+def test_forward_parity_long(
+    long_telescope_pointing: tuple[Telescope, float], eps: float, w_strategy: str
+) -> None:
+    """Slow forward parity for MWA_extended / MeerKAT (skipped without --runslow).
+
+    ``windowed_scan`` as well as ``dense_scan`` (issue #15). The large fixtures
+    are the only ones where the windowed slice is a small fraction of the rows.
+    Measured on this machine at the seed, epsilon and precision this test
+    actually uses -- ``synthetic_uvw(tel, zen_deg, seed=4)``, eps=1e-6,
+    float64, shipped ``hermitian=True`` -- MWA_extended off30 runs
+    ``n_w = 138`` planes (268 unfolded) at ``w_kernel_width = 7``, with a
+    ``max_window_size`` of 158 out of 600 rows. Every fixture the short parity
+    tests above run on has a **full** window at every seed and epsilon they use
+    (seeds 0/1/2, eps 1e-4 and 1e-6): EDA2 zenith 400 of 400 at ``n_w`` 9-11,
+    MWA_compact zenith 600 of 600 at 6-8, MWA_compact off30 600 of 600 at
+    10-12. So a windowed cell there is the dense computation under another
+    name, and a window bound that is wrong only when ``n_w >> w_kernel_width``
+    had, until now, been checked against ducc0 on no fixture at all.
+    """
     tel, zen_deg = long_telescope_pointing
     uvw = synthetic_uvw(tel, zen_deg, seed=4)
     freq = np.array([tel.freq_hz])
@@ -158,7 +176,7 @@ def test_forward_parity_long(long_telescope_pointing: tuple[Telescope, float], e
     image = rng.standard_normal((tel.n_pix, tel.n_pix))
 
     plan = make_plan(uvw, freq, (tel.n_pix, tel.n_pix), pix, pix, eps)
-    vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image)))
+    vis_jax = np.asarray(dirty2vis(plan, jnp.asarray(image), w_strategy=w_strategy))
     vis_ducc = ducc0.wgridder.dirty2vis(
         uvw=uvw,
         freq=freq,
@@ -171,7 +189,69 @@ def test_forward_parity_long(long_telescope_pointing: tuple[Telescope, float], e
         nthreads=1,
     )
     err = np.linalg.norm(vis_jax - vis_ducc) / np.linalg.norm(vis_ducc)
-    assert err < DUCC_TOL_FACTOR * eps
+    assert err < DUCC_TOL_FACTOR * eps, (
+        f"{tel.name} zen={zen_deg} eps={eps:g} {w_strategy}: relative error {err:.3e}"
+    )
+
+
+@pytest.mark.parametrize(
+    "w_strategy", ["dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap"]
+)
+@pytest.mark.parametrize("eps", [1e-6])
+def test_adjoint_parity_long(
+    long_telescope_pointing: tuple[Telescope, float], eps: float, w_strategy: str
+) -> None:
+    """Slow adjoint parity for MWA_extended / MeerKAT (issue #15).
+
+    Until this landed the large fixtures were exercised against ducc0 by a
+    single forward-only test at the default strategy, so the *adjoint* -- the
+    direction where the windowed traversals actually pay, and the one whose
+    reduction order differs between them -- had never been checked against an
+    external oracle above ``n_w`` in the low teens. MWA_extended off30 is the
+    cell that matters. Measured on this machine at this test's own seed,
+    epsilon and precision (seed 4, eps=1e-6, float64, shipped
+    ``hermitian=True``): ``n_w = 138`` folded, 268 unfolded, against
+    ``w_kernel_width = 7`` -- the only shipped CPU fixture whose ``auto``
+    adjoint resolves to ``windowed_scan`` at all (AGENTS.md section 5, whose
+    134 / 251 are the same geometry at seed 0).
+
+    All four ``w_strategy`` values rather than the short fixtures' pair: the
+    ``vmap`` variants build the same planes through a batched composition, and
+    ``n_w`` in the hundreds is where a per-plane indexing slip stops being
+    masked by planes that all contain every row -- which, on the short
+    fixtures, is every plane (``max_window_size == n_rows`` there; see
+    ``test_forward_parity_long``).
+    """
+    tel, zen_deg = long_telescope_pointing
+    uvw = synthetic_uvw(tel, zen_deg, seed=4)
+    freq = np.array([tel.freq_hz])
+    pix = tel.pixsize
+    rng = np.random.default_rng(23)
+    vis_np = (
+        rng.standard_normal((tel.n_rows, 1)) + 1j * rng.standard_normal((tel.n_rows, 1))
+    ).astype(np.complex128)
+
+    plan = make_plan(uvw, freq, (tel.n_pix, tel.n_pix), pix, pix, eps)
+    dirty_jax = np.asarray(vis2dirty(plan, jnp.asarray(vis_np), w_strategy=w_strategy))[0]
+
+    dirty_ducc = ducc0.wgridder.vis2dirty(
+        uvw=uvw,
+        freq=freq,
+        vis=vis_np,
+        npix_x=tel.n_pix,
+        npix_y=tel.n_pix,
+        pixsize_x=pix,
+        pixsize_y=pix,
+        epsilon=eps,
+        do_wgridding=True,
+        divide_by_n=True,
+        nthreads=1,
+    )
+    err = np.linalg.norm(dirty_jax - dirty_ducc) / np.linalg.norm(dirty_ducc)
+    assert err < DUCC_TOL_FACTOR * eps, (
+        f"{tel.name} zen={zen_deg} eps={eps:g} {w_strategy}: relative error {err:.3e} "
+        f"(n_w={plan.n_w}, W={plan.w_kernel_width})"
+    )
 
 
 @pytest.mark.parametrize(
