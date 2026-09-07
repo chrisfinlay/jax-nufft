@@ -37,7 +37,16 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft.planning import WGridderPlan
-from tests.conftest import EDA2, requires_x64, synthetic_uvw, tol
+from tests.conftest import (
+    EDA2,
+    MEERKAT,
+    MWA_COMPACT,
+    MWA_EXTENDED,
+    Telescope,
+    requires_x64,
+    synthetic_uvw,
+    tol,
+)
 
 # EDA2 zenith: 400 rows, 64x64 pixels, 120-degree FoV. The smallest review
 # fixture, so the whole module (including one child interpreter) stays well
@@ -62,6 +71,44 @@ def _weights() -> np.ndarray:
     """Strictly positive per-visibility weights, ``(n_rows, 1)`` real."""
     rng = np.random.default_rng(_WEIGHT_SEED)
     return rng.uniform(0.5, 2.0, size=(EDA2.n_rows, 1))
+
+
+# The three off30 review fixtures (issue #15). Everything else in this module
+# runs on EDA2 at *zenith*, whose float32 plan is nine w-planes deep; these put
+# the x64-off leg at 10, 132 and 11 planes. The w-plane loop is the only part of
+# the operator whose cost and error both scale with the plane count, and until
+# these landed no float32 run in this repository had ever taken more than nine
+# passes through it.
+_OFF30_TELESCOPES: tuple[Telescope, ...] = (MWA_COMPACT, MWA_EXTENDED, MEERKAT)
+
+# Measured float32 relative error against the double-precision ducc0 oracle at
+# eps=1e-4 (macOS arm64, jax 0.9.2, ducc0 0.41.0), forward / adjoint:
+#
+#     MWA_compact off30   n_w=10    0.50x eps / 0.52x eps
+#     MWA_extended off30  n_w=132   0.73x eps / 0.70x eps
+#     MeerKAT off30       n_w=11    0.57x eps / 0.58x eps
+#
+# So the repo's 3*eps ducc0 contract holds on the float32 leg on these
+# fixtures, with the same headroom the zenith probe has; it is asserted at 3
+# rather than loosened.
+_OFF30_EPS = 1e-4
+
+
+def _off30_arrays(tel: Telescope) -> dict[str, np.ndarray]:
+    """Fixture arrays for ``tel`` at 30 degrees off zenith, ready for ``np.savez``."""
+    rng = np.random.default_rng(_IMAGE_SEED)
+    vis_rng = np.random.default_rng(_VIS_SEED)
+    wgt_rng = np.random.default_rng(_WEIGHT_SEED)
+    return {
+        "name": np.asarray(f"{tel.name}_off30"),
+        "uvw": synthetic_uvw(tel, 30.0, seed=_SEED),
+        "freq": np.array([tel.freq_hz]),
+        "image": rng.standard_normal((tel.n_pix, tel.n_pix)),
+        "vis": vis_rng.standard_normal((tel.n_rows, 1))
+        + 1j * vis_rng.standard_normal((tel.n_rows, 1)),
+        "weights": wgt_rng.uniform(0.5, 2.0, size=(tel.n_rows, 1)),
+        "pixsize": np.asarray(tel.pixsize),
+    }
 
 
 def _rel_err(a: np.ndarray, b: np.ndarray) -> float:
@@ -99,8 +146,11 @@ def test_precision_fixtures_match_the_active_configuration(
 _CHILD_SCRIPT = '''
 """Probe the wgridder dtype contract with jax_enable_x64 off.
 
-Run as ``python child.py fixture.npz`` with ``JAX_ENABLE_X64=0`` in the
-environment. Emits one JSON object on stdout, prefixed by a marker line.
+Run as ``python child.py eda2.npz [off30.npz ...]`` with ``JAX_ENABLE_X64=0``
+in the environment. The first npz drives the dtype-contract probes (a)-(d);
+every further npz is an extra geometry probed for ducc0 parity only, keyed by
+the ``name`` it carries. Emits one JSON object on stdout, prefixed by a marker
+line.
 """
 
 import json
@@ -233,6 +283,74 @@ else:
     out["wide_numpy_image_error"] = None
     out["wide_numpy_image_dtype"] = str(np.asarray(result).dtype)
 
+# (e) Off-zenith geometries (issue #15). Everything above runs on EDA2 at
+#     zenith, whose float32 plan is NINE w-planes deep -- so the entire
+#     single-precision CI leg has been exercising the w-plane machinery at a
+#     plane count the dense and windowed traversals cannot be told apart at.
+#     The three off30 review fixtures put it at 10, 132 and 11 planes, and
+#     MWA_extended off30 is the one that matters: 132 float32 planes, each
+#     accumulating into the same grid. Forward and adjoint, against the double
+#     oracle at the same 3*eps as the zenith probe.
+out["off30"] = {}
+for path in sys.argv[2:]:
+    d = np.load(path)
+    name = str(d["name"])
+    entry = {"error": None}
+    out["off30"][name] = entry
+    try:
+        u = d["uvw"]
+        f = d["freq"]
+        img = d["image"]
+        v = d["vis"]
+        wgt = d["weights"]
+        px = float(d["pixsize"])
+        npx = int(img.shape[0])
+        pl = make_plan(u, f, (npx, npx), px, px, 1e-4, dtype=jnp.float32)
+        entry["n_w"] = int(pl.n_w)
+        entry["w_kernel_width"] = int(pl.w_kernel_width)
+        entry["real_dtype"] = str(np.dtype(pl.real_dtype))
+
+        vj = np.asarray(dirty2vis(pl, jnp.asarray(img, dtype=jnp.float32)))
+        entry["vis_dtype"] = str(vj.dtype)
+        vd = ducc0.wgridder.dirty2vis(
+            uvw=u,
+            freq=f,
+            dirty=img,
+            pixsize_x=px,
+            pixsize_y=px,
+            epsilon=1e-4,
+            do_wgridding=True,
+            divide_by_n=False,
+            nthreads=1,
+        )
+        entry["forward_rel_err"] = float(np.linalg.norm(vj - vd) / np.linalg.norm(vd))
+
+        dj = np.asarray(
+            vis2dirty(
+                pl,
+                jnp.asarray(v, dtype=jnp.complex64),
+                weights=jnp.asarray(wgt, dtype=jnp.float32),
+            )
+        )[0]
+        entry["dirty_dtype"] = str(dj.dtype)
+        dd = ducc0.wgridder.vis2dirty(
+            uvw=u,
+            freq=f,
+            vis=v,
+            wgt=wgt,
+            npix_x=npx,
+            npix_y=npx,
+            pixsize_x=px,
+            pixsize_y=px,
+            epsilon=1e-4,
+            do_wgridding=True,
+            divide_by_n=True,
+            nthreads=1,
+        )
+        entry["adjoint_rel_err"] = float(np.linalg.norm(dj - dd) / np.linalg.norm(dd))
+    except Exception as exc:
+        entry["error"] = describe(exc)
+
 print("<<<JSON>>>" + json.dumps(out))
 '''
 
@@ -254,13 +372,18 @@ def x64_off_report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
         weights=_weights(),
         pixsize=np.asarray(pixsize),
     )
+    off30_paths = []
+    for tel in _OFF30_TELESCOPES:
+        path = tmp / f"{tel.name}_off30.npz"
+        np.savez(path, **_off30_arrays(tel))
+        off30_paths.append(str(path))
     script = tmp / "x64_off_child.py"
     script.write_text(_CHILD_SCRIPT)
 
     env = dict(os.environ)
     env["JAX_ENABLE_X64"] = "0"
     proc = subprocess.run(
-        [sys.executable, str(script), str(npz)],
+        [sys.executable, str(script), str(npz), *off30_paths],
         capture_output=True,
         text=True,
         env=env,
@@ -366,6 +489,64 @@ def test_x64_off_float32_plan_warns_below_the_floor(x64_off_report: dict[str, An
     assert "float32" in message, message
     # The achievable floor has to be named so the user can act on it.
     assert "1e-5" in message, message
+
+
+@pytest.mark.parametrize("tel", _OFF30_TELESCOPES, ids=lambda t: f"{t.name}_off30")
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_x64_off_float32_matches_ducc_off_zenith(
+    x64_off_report: dict[str, Any], tel: Telescope, op: str
+) -> None:
+    """The x64-off leg must run off-zenith geometry, not only EDA2 at zenith.
+
+    Every other probe in this module runs on EDA2 zenith, whose float32 plan has
+    ``n_w = 9`` -- fewer planes than ``w_kernel_width + 5``. At that plane count
+    the w-plane loop is nearly degenerate: a bug in plane placement, in the
+    per-plane phase, or in the accumulation across planes has almost nothing to
+    accumulate over, and single precision has almost nothing to lose. Plane
+    count is an axis the single-precision leg held constant, and MWA_extended
+    off30 moves it to 132.
+
+    Not a windowed-vs-dense or float32-vs-float64 comparison: those are internal
+    and would agree with each other while both drifted. The oracle is
+    double-precision ducc0, at the repo's 3*eps.
+    """
+    key = f"{tel.name}_off30"
+    report = x64_off_report["off30"][key]
+    assert report["error"] is None, f"the {key} float32 probe failed in the child: {report}"
+    assert report["real_dtype"] == "float32"
+    assert report["vis_dtype"] == "complex64"
+    assert report["dirty_dtype"] == "float32"
+
+    err = report["forward_rel_err"] if op == "dirty2vis" else report["adjoint_rel_err"]
+    bound = 3 * _OFF30_EPS
+    assert err < bound, (
+        f"{key} float32 {op} vs ducc0 at eps={_OFF30_EPS:g}: relative error "
+        f"{err:.3e} exceeds {bound:.3e} (n_w={report['n_w']})"
+    )
+
+
+def test_the_x64_off_leg_reaches_a_deep_w_plane_stack(x64_off_report: dict[str, Any]) -> None:
+    """At least one x64-off fixture must be many planes deep.
+
+    The anti-vacuity guard for the test above: if a planning change collapsed
+    every off30 float32 plan back to the zenith fixture's handful of planes,
+    those cells would keep passing while covering nothing the zenith probe did
+    not already cover. ``10 * w_kernel_width`` is well clear of the shipped
+    numbers (MWA_extended off30 is 132 planes at W=5) and well clear of the
+    other two fixtures (10 and 11), so it is a statement about the deep cell.
+    """
+    deepest = max(
+        (r for r in x64_off_report["off30"].values() if r["error"] is None),
+        key=lambda r: r["n_w"],
+        default=None,
+    )
+    assert deepest is not None
+    assert deepest["n_w"] > 10 * deepest["w_kernel_width"], (
+        f"the deepest x64-off fixture has only n_w={deepest['n_w']} planes at "
+        f"W={deepest['w_kernel_width']}: the single-precision leg is back to "
+        "exercising the w-plane loop at a plane count that cannot distinguish "
+        "the traversals"
+    )
 
 
 # ---------------------------------------------------------------------------

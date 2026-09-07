@@ -241,6 +241,107 @@ def synthetic_uvw(
     return np.column_stack([u_new, uv[:, 1], z_new])
 
 
+# --- clumped w-distributions (issue #15) ------------------------------------
+# ``synthetic_uvw`` produces a *symmetric, unimodal* w-distribution at every
+# pointing: at zenith w is the Gaussian ``z`` offset, and off-zenith it is a
+# rotation that mixes a Gaussian ``u`` into it. Every telescope fixture in this
+# repository -- and therefore every ducc0- and DFT-parity assertion in it --
+# holds the shape of the w-distribution constant at "Gaussian". That is an axis
+# held constant, and it is precisely the axis the windowed strategies exist to
+# exploit: their whole premise is that the rows contributing to a plane are a
+# contiguous slice of the w-sorted array, which is interesting exactly when the
+# slices are wildly unequal.
+#
+# ``tests/test_boundary_planes.py`` does build clumped w-distributions, but it
+# only ever compares the windowed path against the dense one on the same plan.
+# That is a reduction-order comparison between two spellings of the same
+# operator: an error the two share -- a mis-placed plane centre, a plane grid
+# that under-resolves a clump -- cancels out of it and passes cleanly, which is
+# the shared-mode failure mode AGENTS.md section 6 records from issue #16. It
+# also runs on a toy geometry (32^2, uniform (u, v), one channel), not on a
+# telescope fixture. So nothing in the suite has ever held a clumped
+# w-distribution against an *external* oracle.
+#
+# ``clumped_track`` closes that gap. The (u, v) columns are taken verbatim from
+# ``synthetic_uvw(telescope, 0.0, seed)``, so the *only* thing that differs
+# from the zenith fixture of the same telescope is the w column -- which is
+# what makes a failure attributable to the w-distribution rather than to a
+# second, incidentally different geometry.
+#
+# The distribution is the one issue #15 asks for and the one a short
+# hour-angle-blocked track produces: two dense clumps at +/- ``clump_offset``
+# of the array's longest baseline, plus a sparse uniform tail that sets the
+# w-extent (and hence the plane count) while populating almost none of the
+# planes between the clumps. Measured against the matching ``synthetic_uvw``
+# off30 plan (float64, eps=1e-6, shipped ``hermitian=True`` default):
+#
+#     fixture           n_w   empty planes   window_padding_overhead
+#     EDA2 clumped       81        13                 11.25
+#     EDA2 off30         56         0                  2.52
+#     MWA_extended clu. 214        90                 29.50
+#     MWA_extended off30 134       18                  4.94
+#
+# It is a w-distribution stress fixture, not a physically simulated track: as
+# in ``tests/test_boundary_planes.py`` the w column is drawn independently of
+# (u, v). |w| stays under the array's longest baseline, which is the only
+# physical bound that matters for the plane grid.
+_CLUMP_OFFSET_FRAC = 0.4
+_CLUMP_WIDTH_FRAC = 0.002
+_CLUMP_TAIL_FRACTION = 0.04
+_CLUMP_TAIL_SPAN_FRAC = 0.9
+
+
+def clumped_track(
+    telescope: Telescope,
+    seed: int,
+    *,
+    clump_offset_frac: float = _CLUMP_OFFSET_FRAC,
+    clump_width_frac: float = _CLUMP_WIDTH_FRAC,
+    tail_fraction: float = _CLUMP_TAIL_FRACTION,
+    tail_span_frac: float = _CLUMP_TAIL_SPAN_FRAC,
+) -> np.ndarray:
+    """``(n_rows, 3)`` uvw in metres with a bimodal, heavily clumped w column.
+
+    The ``(u, v)`` columns are exactly ``synthetic_uvw(telescope, 0.0, seed)``'s;
+    only ``w`` differs, and it is drawn as
+
+      * ``1 - tail_fraction`` of the rows split evenly between two narrow
+        Gaussian clumps at ``+/- clump_offset_frac * max_baseline_m``, with
+        standard deviation ``clump_width_frac * max_baseline_m``;
+      * the remaining ``tail_fraction`` uniform over
+        ``+/- tail_span_frac * max_baseline_m`` -- the sparse tail that sets
+        the w-extent, and hence ``n_w``, while leaving the planes between the
+        clumps almost or entirely empty.
+
+    The result is shuffled, so w is uncorrelated with row index and the sort
+    permutation is a genuine reordering rather than a near-identity.
+
+    A dedicated RNG stream (``seed + 977``) draws the w column, so the ``(u, v)``
+    columns are bit-identical to the zenith fixture built from the same seed.
+    """
+    uvw = synthetic_uvw(telescope, 0.0, seed=seed).copy()
+    rng = np.random.default_rng(seed + 977)
+    n_rows = uvw.shape[0]
+    baseline = telescope.max_baseline_m
+
+    n_tail = round(tail_fraction * n_rows)
+    n_clump = n_rows - n_tail
+    n_low = n_clump // 2
+
+    w = np.empty(n_rows)
+    w[:n_low] = rng.normal(
+        loc=-clump_offset_frac * baseline, scale=clump_width_frac * baseline, size=n_low
+    )
+    w[n_low:n_clump] = rng.normal(
+        loc=+clump_offset_frac * baseline,
+        scale=clump_width_frac * baseline,
+        size=n_clump - n_low,
+    )
+    w[n_clump:] = rng.uniform(-tail_span_frac * baseline, tail_span_frac * baseline, size=n_tail)
+    uvw[:, 2] = rng.permutation(w)
+    return uvw
+
+
 _SHORT_TELESCOPES = [EDA2, MWA_COMPACT]
 _LONG_TELESCOPES = [MWA_EXTENDED, MEERKAT]
 
@@ -272,6 +373,48 @@ def short_telescope_pointing(request) -> tuple[Telescope, float]:
     ids=lambda v: _telescope_pointing_id(v),
 )
 def long_telescope_pointing(request) -> tuple[Telescope, float]:
+    return request.param
+
+
+# Which telescopes the clumped generator is worth running on. Clumping the w
+# column only reaches the *plan* when the plane count is well above the kernel
+# width: below that every window already spans essentially every row and the
+# distribution's shape stops mattering. Measured at eps=1e-6, float64, shipped
+# ``hermitian=True``, ``clumped_track`` vs ``synthetic_uvw(tel, 30.0)``:
+#
+#     telescope       n_w clumped / off30   padding overhead clumped / off30
+#     EDA2                  81 / 56                 11.25 / 2.52
+#     MWA_extended         214 / 134                29.50 / 4.94
+#     MWA_compact           15 / 12                  2.14 / 1.71
+#     MeerKAT               17 / 13                  1.86 / 1.86
+#
+# EDA2 gets there on a 120-degree field (large ``max|n-1|``) and MWA_extended on
+# 5.3 km baselines (large w-extent in wavelengths); MWA_compact and MeerKAT have
+# neither and sit at ``n_w`` under ``2 * w_kernel_width`` however the w column is
+# drawn. Running them here would add cells that cannot fail for the reason this
+# fixture exists, and would force the "is it really clumped" guard in
+# ``tests/test_clumped_track.py`` down to a threshold that no longer says
+# anything. ``tests/test_boundary_planes.py`` keeps the small-``n_w`` clumped
+# cases.
+_CLUMPED_SHORT_TELESCOPES = [EDA2]
+_CLUMPED_LONG_TELESCOPES = [MWA_EXTENDED]
+
+
+@pytest.fixture(params=_CLUMPED_SHORT_TELESCOPES, ids=lambda t: f"{t.name}_clumped")
+def clumped_track_telescope(request) -> Telescope:
+    """A short telescope whose uvw comes from :func:`clumped_track` (issue #15).
+
+    Deliberately *not* a ``(telescope, angle)`` pair: the clumped fixture has no
+    pointing -- it replaces the w column outright -- so a pointing parameter
+    would produce identical data twice.
+    """
+    return request.param
+
+
+@pytest.fixture(params=_CLUMPED_LONG_TELESCOPES, ids=lambda t: f"{t.name}_clumped")
+def long_clumped_track_telescope(request) -> Telescope:
+    """The 256-pixel clumped fixture; gated behind ``--runslow`` like
+    ``long_telescope_pointing``."""
     return request.param
 
 
@@ -352,6 +495,8 @@ def pytest_collection_modifyitems(config, items):
         reason=f"--bench-pointing={bench_pointing} excludes this combination"
     )
     platform = _jax_platform()
+    # Fixtures whose presence means "this item is a --runslow item".
+    needs_slow = {"long_telescope_pointing", "long_clumped_track_telescope"}
     for item in items:
         is_bench_item = "bench_telescope_pointing" in item.fixturenames
         is_runbench_gpu = "runbench_gpu" in item.keywords
@@ -369,7 +514,7 @@ def pytest_collection_modifyitems(config, items):
         if "runtiming" in item.keywords and not runtiming:
             item.add_marker(skip_timing)
             continue
-        if "long_telescope_pointing" in item.fixturenames and not runslow:
+        if needs_slow & set(item.fixturenames) and not runslow:
             item.add_marker(skip_slow)
         if is_runbench_gpu:
             if not runbench_gpu:

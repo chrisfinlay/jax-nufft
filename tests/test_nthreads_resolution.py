@@ -91,7 +91,7 @@ def small_n_rows_cutoff() -> int:
 def _stub_plan(
     *,
     n_w: int,
-    w_kernel_width: int = 8,
+    w_kernel_width: int = 7,
     window_padding_overhead: float = 1.0,
     n_rows: int = 600,
 ):
@@ -99,7 +99,10 @@ def _stub_plan(
 
     Mirrors ``tests/test_auto_strategy.py::_stub_plan`` -- kept local (not
     imported) so this module stays self-contained like the rest of the
-    per-file test suite.
+    per-file test suite. The default width is a typical eps=1e-6 plan's, 7
+    under the issue #9 rule ``W = ceil(-log10(eps / 10))``; pinned by
+    ``test_the_stub_default_width_is_the_real_eps_1e_6_width`` below so the
+    mirror cannot drift away from the module it mirrors.
     """
     return SimpleNamespace(
         n_w=n_w,
@@ -107,6 +110,19 @@ def _stub_plan(
         window_padding_overhead=window_padding_overhead,
         n_rows=n_rows,
     )
+
+
+def test_the_stub_default_width_is_the_real_eps_1e_6_width() -> None:
+    """The mirrored stub's default must be a real eps=1e-6 plan's width.
+
+    The twin of ``tests/test_auto_strategy.py``'s check of the same name. That
+    module's stub carried ``w_kernel_width=8`` -- the pre-issue-#9 width rule's
+    answer -- for six PRs after the rule changed, and this file copied it.
+    """
+    from jax_nufft.kernel import kernel_params
+
+    assert kernel_params(1e-6)[0] == 7
+    assert _stub_plan(n_w=10).w_kernel_width == kernel_params(1e-6)[0]
 
 
 class _FakeDevice:

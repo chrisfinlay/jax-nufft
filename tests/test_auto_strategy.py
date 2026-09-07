@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
+from jax_nufft.kernel import kernel_params
 from jax_nufft.wgridder import (
     _CPU_PADDING_CUTOFF,
     _GPU_LARGE_N_ROWS,
@@ -40,25 +41,57 @@ from jax_nufft.wgridder import (
     _vis2dirty_jit,
 )
 
+# The kernel half-width a typical eps=1e-6 plan actually gets. Issue #9
+# replaced ``ceil(-log10(eps) * 2/pi) + 2`` with FINUFFT's
+# ``W = ceil(-log10(eps / 10))`` at sigma = 2, which took eps=1e-6 from 8 to 7,
+# and this stub's default was left behind describing the old rule. It is
+# derived from ``kernel_params`` rather than written out again so it cannot
+# drift a second time, and pinned by
+# ``test_the_stub_default_width_is_the_real_eps_1e_6_width`` below.
+_TYPICAL_EPS = 1e-6
+_TYPICAL_W_KERNEL_WIDTH = kernel_params(_TYPICAL_EPS)[0]
+
 
 def _stub_plan(
     *,
     n_w: int,
-    w_kernel_width: int = 8,
+    w_kernel_width: int = _TYPICAL_W_KERNEL_WIDTH,
     window_padding_overhead: float = 1.0,
     n_rows: int = 600,
 ):
     """Minimal stand-in exposing the fields both heuristics read.
 
-    The defaults match a typical eps=1e-6 plan (w_kernel_width=8, no
-    windowed padding waste) on a small-row fixture. The GPU branch also
-    reads ``n_rows``; CPU branch ignores it.
+    The defaults match a typical eps=1e-6 plan (``w_kernel_width`` = 7 under the
+    issue #9 width rule, no windowed padding waste) on a small-row fixture. The
+    GPU branch also reads ``n_rows``; CPU branch ignores it.
     """
     return SimpleNamespace(
         n_w=n_w,
         w_kernel_width=w_kernel_width,
         window_padding_overhead=window_padding_overhead,
         n_rows=n_rows,
+    )
+
+
+def test_the_stub_default_width_is_the_real_eps_1e_6_width() -> None:
+    """The stub's default must be the width ``make_plan`` actually produces.
+
+    Not a tautology against ``kernel_params``: it is a check that the *docstring
+    above* is true, i.e. that eps=1e-6 really is a plan whose kernel is this
+    wide, and it fails loudly if a future width-rule change moves it. Before
+    issue #9 the default was 8 and the docstring said so; the rule changed, the
+    number did not, and for six PRs every ratio in this file was computed
+    against a width no shipped plan has. A comment cannot catch that; this can.
+    """
+    assert _TYPICAL_W_KERNEL_WIDTH == 7, _TYPICAL_W_KERNEL_WIDTH
+    uvw = np.zeros((8, 3))
+    uvw[:, 0] = np.linspace(-50.0, 50.0, 8)
+    uvw[:, 2] = np.linspace(-5.0, 5.0, 8)
+    plan = make_plan(uvw, np.array([1.4e9]), (16, 16), 0.005, 0.005, _TYPICAL_EPS)
+    assert plan.w_kernel_width == _TYPICAL_W_KERNEL_WIDTH, (
+        f"make_plan(eps={_TYPICAL_EPS:g}) gives w_kernel_width={plan.w_kernel_width}, "
+        f"but _stub_plan defaults to {_TYPICAL_W_KERNEL_WIDTH}: every n_w / W ratio in "
+        "this file is being computed against a width no real plan has"
     )
 
 
