@@ -46,6 +46,39 @@ the ducc parity tests — and `vis2dirty` also takes an optional
 `weights` arg (`(n_rows, n_chan)` real) that is multiplied into
 visibilities before gridding (matches ducc's `wgt`).
 
+**Image grid convention** (the companion invariant, and equally
+load-bearing): the pixel centres are
+
+```
+l_i = (i - n_l // 2) · pixsize_l    for i = 0, …, n_l - 1
+```
+
+and likewise `m_j = (j - n_m // 2) · pixsize_m`. The offset is
+**floor division**, `n_l // 2`. It is built once in
+`planning._n_minus_1_grid` and restated independently by every grid
+construction under `tests/` — `grep -rn 'arange(n_l)' tests/` finds
+nine, all using `// 2`; the ones a change would be checked against
+first are `test_against_dft.py::reference_lmn_grids`,
+`test_adjoint.py::_reference_adjoint` and
+`test_divide_by_n.py::_independent_one_over_n`.
+
+`// 2` and `/ 2` agree for even `n_l` and differ by half a pixel for
+odd `n_l`, so **do not "simplify" `//` to `/`**: the phase centre
+`l = 0` has to land on the exact pixel `n_l // 2` at both parities,
+and with `/ 2` an odd-sized image has no pixel there at all. Issue
+#14 measured this on the suite as it now stands (1495 tests):
+substituting `/` for `//` in `_n_minus_1_grid` fails exactly **six**
+cells — the two odd geometries of
+`tests/test_against_dft.py::test_geometry_matches_dft_forward_and_adjoint`
+times its three `w_strategy` legs — and passes the other 1489.
+Before that test existed the repository had **no** odd extent
+anywhere and nothing in it could tell the two forms apart.
+
+Odd and non-square `image_shape` and `pixsize_l ≠ pixsize_m` are all
+supported, and ducc0 is *not* an available oracle for the odd ones —
+its public API asserts `nx_dirty must be even` for both operators —
+so the exact DFT is the only reference there.
+
 Since issue #20 the `1/n` factor is a keyword-only **static**
 `divide_by_n` flag on *both* operators, defaulting to `False` on
 `dirty2vis` and `True` on `vis2dirty` — ducc0's pairing, and exactly

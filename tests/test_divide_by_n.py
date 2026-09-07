@@ -605,10 +605,18 @@ def _independent_one_over_n(problem: _Problem) -> np.ndarray:
     The oracle for section 6's semantic check, and the point of it is what it
     does **not** touch: not ``plan.n_minus_1``, not ``plan.real_dtype``, not
     any helper in ``src/``. Only the image geometry the caller passed to
-    ``make_plan`` -- the pixel size and the ``(i - n/2) * pixsize`` grid
+    ``make_plan`` -- the pixel size and the ``(i - n // 2) * pixsize`` grid
     convention documented in the README -- and ``n = sqrt(1 - l^2 - m^2)``
     straight from the measurement equation. Always float64, whatever the plan's
     precision, so the oracle is not limited by the thing it is checking.
+
+    Note the ``//``: the offset is **floor** division, which the code below
+    uses and which is what the README states. It is not cosmetic -- ``n // 2``
+    and ``n / 2`` are the same for even extents and half a pixel apart for odd
+    ones, and this docstring previously wrote the ambiguous ``(i - n/2)`` while
+    the code did the right thing. AGENTS.md section 1 cites this function as
+    one of the independent statements of that convention, so the prose here
+    has to be as unambiguous as the code.
 
     Why an independent construction rather than ``_n_grid(plan)``, which is
     right there and cheaper: the two other section-6 tests are both blind to a
