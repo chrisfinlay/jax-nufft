@@ -866,10 +866,11 @@ def test_gpu_default_resolves_to_the_expected_strategy(
     table's six cells (the GH200_large off30 adjoint is the exception, at
     about 1.16x faster than ducc0, though still 2.0x off that table's
     ``dense_vmap`` column), while the strategy ``"auto"`` picks is
-    1.4-6.3x faster in all six. Independently, the 160-cell GH200 sweep
-    behind ``docs/benchmarks/v0.1.2-baseline-gpu.json`` has the scan family
-    slower than the vmap family in *every* scan/vmap pair it contains,
-    by 1.45x to 32.7x with a median of 6.1x. A scan-family pick is the
+    1.4-6.3x faster in all six. Independently, the GH200 sweep behind
+    ``docs/benchmarks/v0.1.2-baseline-gpu.json`` -- 160 measured rows over
+    20 (op, fixture) cells -- has the scan family slower than the vmap
+    family in *every* one of the 160 scan/vmap pairs it contains, by 1.45x
+    to 32.7x with a median of 6.1x. A scan-family pick is the
     headline regression this catches, but the exact-name assertion also
     catches picking the wrong member of the vmap family -- see the table
     comment above.

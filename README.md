@@ -717,7 +717,10 @@ vis   = dirty2vis(plan, image, w_strategy="dense_vmap")
 The GPU gates are validated against `docs/benchmarks/v0.1.2-baseline-gpu.json`
 by `tests/test_auto_strategy_acceptance.py`, which asserts the picked
 strategy is within 15% of the best measured strategy for every
-(operator, telescope) cell.
+(operator, telescope) cell. The `1.45x`, `32.7x` and `6.1x` above — and every
+other figure this repository quotes from that JSON — are recomputed from it by
+`tests/test_benchmark_claims.py`, so a re-measurement that leaves a sentence
+behind fails the suite (issue #49).
 
 ##### Why it became the default (issue #46)
 
