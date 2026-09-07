@@ -619,6 +619,12 @@ When adding a feature, the right test files to update are:
 - regression on synthetic edge cases &rarr; `test_boundary_planes.py`
 - cross-strategy regression (any change to the w-plane or channel loop
   structure) &rarr; `test_strategies_equivalent.py`
+- a number quoted from `docs/benchmarks/*.json` in prose &rarr;
+  `test_benchmark_claims.py` (issue #49). Its `CITATIONS` table holds every
+  such figure with the sentence and the files that make it; a citation
+  written anywhere else and not recomputed there is the failure mode that
+  issue exists for. Figures that cannot come from committed JSON are listed
+  in that module's docstring with the reason instead of being proxied.
 
 ---
 
@@ -785,10 +791,21 @@ Stable JSON schema documented in `docs/benchmarks/README.md`.
 recomputation from the committed JSON, but the `5-30x` does not. The 160
 scan/vmap pairs span 1.448x to 32.660x with a median of 6.096x, and 72 of
 them are below 5x; no subset of the sweep (off-zenith only, excluding
-`GH200_large`, best-of-family per cell) yields a 5-30x range. What the data
-does support -- and what the "never auto-pick a scan strategy on GPU" rule
-actually rests on -- is that the scan family is slower in *every one* of the
-160 pairs.
+`GH200_large`, best-of-family per cell), *taken on its own*, yields a 5-30x
+range. What the data does support -- and what the "never auto-pick a scan
+strategy on GPU" rule actually rests on -- is that the scan family is slower
+in *every one* of the 160 pairs. ("Taken on its own" is load-bearing and was
+measured under issue #49: conjoining all three restrictions does give a
+population lying inside 5-30x, 10.376x to 29.393x over eight cells. Its
+endpoints are still not 5 and 30, so it does not reproduce the quoted range
+either.)
+
+Every aggregate quoted in this paragraph, in `README.md`'s strategy section,
+in `wgridder.py`'s heuristic comments and in `docs/v0.1.2-plan.md` is
+recomputed from the committed JSON by `tests/test_benchmark_claims.py`
+(issue #49), whose `CITATIONS` table is the one place the figures are
+written down. Re-measuring means editing that table; a citation left behind
+fails the suite rather than rotting quietly.
 `_auto_w_strategy` is now platform-aware (`jax.devices()[0].platform`);
 unknown platforms fall back to the CPU heuristic.
 `tests/test_auto_strategy_acceptance.py` asserts the GPU pick is within

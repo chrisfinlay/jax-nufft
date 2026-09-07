@@ -415,14 +415,22 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     return "dense_scan"
 
 
-# Empirical cutoffs from the v0.1.2 GH200 baseline sweep (160 cells,
-# docs/benchmarks/v0.1.2-baseline-gpu.json). On GPU, scan variants are
+# Empirical cutoffs from the v0.1.2 GH200 baseline sweep (160 measured rows
+# over 20 (op, fixture) cells, docs/benchmarks/v0.1.2-baseline-gpu.json).
+# On GPU, scan variants are
 # slower than vmap in every one of that sweep's 160 scan/vmap pairs
 # (kernel-launch overhead dominates per-plane work) -- by 1.45x to 32.7x,
 # median 6.1x, recomputed from the JSON. The "never pick scan on GPU"
 # rule rests on the *universality*, not on the size, of that gap;
 # the windowed_vmap wins only on the GH200_large (50k-row)
 # fixture where dense_vmap's per-plane n_rows*W^2 starts to bite.
+# Every figure in this comment and in _auto_w_strategy_gpu's docstring is
+# recomputed from that JSON by tests/test_benchmark_claims.py, whose
+# CITATIONS table is where they are written down; a re-measurement edits
+# that table and the sentences together or fails the suite (issue #49).
+# A "pair" there is one scan-family w_strategy against one vmap-family
+# w_strategy in the same (op, fixture, channel_strategy) group -- the only
+# pairing of the four obvious ones that reproduces these figures.
 _GPU_LARGE_N_ROWS = 10_000
 # Unmoved by issue #43 or #17, unlike ``_CPU_PADDING_CUTOFF`` above -- and in
 # both cases that is a measurement, not an omission. The #43 redefinition
