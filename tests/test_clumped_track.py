@@ -1,13 +1,13 @@
 """Clumped w-distributions and multi-channel constant-w (issue #15).
 
-Two fixtures live here, and both exist because of an axis every other fixture in
-this repository holds constant.
+Four fixtures live here, and they exist because of an axis every other fixture
+in this repository holds constant.
 
 **The clumped track.** ``tests/conftest.py``'s ``synthetic_uvw`` produces a
 symmetric, unimodal w-distribution at every pointing -- a Gaussian ``z`` offset
 at zenith, a rotated Gaussian ``u`` off it. So the *shape* of the
-w-distribution is constant across the whole review fixture set, and it is
-constant at the one shape the windowed strategies have least to say about.
+w-distribution is constant across the whole review fixture set: unimodal, with
+no dense core to concentrate the planes and no sparse tail to stretch them.
 ``tests/test_boundary_planes.py`` does build clumped distributions, but it only
 compares the windowed path against the dense one on the same plan, on a toy
 geometry (32^2, uniform ``(u, v)``, one channel). So no *clumped* fixture had
@@ -62,9 +62,20 @@ kwarg), so the configuration a real multi-frequency observation of coplanar
 data actually produces -- generic path, w-distribution collapsed onto ``n_chan``
 discrete spikes -- was untested. That fixture cannot say anything about window
 *bounds*, for a structural reason recorded at
-:func:`test_multi_channel_constant_w_does_not_take_the_fast_path`; the
-per-channel window derivation is covered instead by
-:func:`test_multi_channel_spread_w_matches_ducc`, whose w column is spread.
+:func:`test_multi_channel_constant_w_does_not_take_the_fast_path`.
+
+**Multi-channel spread w.** This module's window-bound instrument, and the only
+one in the repository that varies the *per-channel* window derivation: three
+channels spanning a factor of two in frequency, ``n_w = 68`` with
+``max_window_size`` 40 of 96 rows, so each channel's window is a strict subset
+of the rows and the three subsets differ. Deriving every channel's bounds from
+``inv_lambda[0]`` -- a defect that reaches only two plan-bookkeeping tests
+elsewhere in the suite -- fails its eight windowed cells. The pre-existing
+multi-channel windowed fixtures span 1.25 and 1.105 in fractional bandwidth,
+where that defect is near-inert.
+
+**The small clumped geometry.** A 24^2 / 48-row clumped track, small enough to
+afford an exact ``O(n_rows * n_pix^2)`` DFT reference at ``2 * eps``.
 
 Oracle
 ------
@@ -114,8 +125,12 @@ ducc0_wgridder = pytest.importorskip("ducc0.wgridder")
 #     MWA_extended 1e-4          6.200e-05     6.228e-05     7.183e-05     7.309e-05
 #     MWA_extended 1e-6          7.481e-07     7.359e-07         --            --
 #
+# The unfolded leg, which this factor also governs since the parity cells are
+# parametrised over ``hermitian``, lands lower: 0.474x-0.847x over both
+# precisions, and the spread-w cells at 0.719x-0.770x.
+#
 # i.e. 0.95x eps at worst on the float64 leg (EDA2 forward at eps=1e-6) and
-# 0.89x on the float32 one (EDA2 forward at eps=1e-4) -- the two legs land on
+# 0.89x on the float32 one (EDA2 forward at eps=1e-4), worst over both folds -- the two legs land on
 # top of each other, so this fixture is not float32-limited at eps=1e-4 and
 # 3.0 is asserted on both, exactly as ``tests/test_dtype.py:84-93`` does on the
 # same evidence for the off-zenith float32 fixtures.
@@ -397,10 +412,24 @@ def test_clumped_track_matches_ducc(
 ) -> None:
     """Forward and adjoint parity on a clumped track, for all four traversals.
 
-    All four ``w_strategy`` values, not the usual dense/windowed pair: this is
-    the fixture where the windowed slice bounds are least like the dense loop's,
-    and the ``vmap`` variants place their planes through a different (batched)
-    composition than the ``scan`` ones.
+    All four ``w_strategy`` values, not the usual dense/windowed pair -- but
+    not because the windows here are unusual. They are the opposite: measured
+    ``max_window_size / n_rows`` at eps=1e-6 is 0.965-0.998 on all four
+    telescopes at the shipped ``hermitian=True`` (EDA2 389/400, MWA_extended
+    579/600, MWA_compact 599/600, MeerKAT 597/600) and 0.485-0.503 unfolded,
+    against 0.147-0.258 for the off-zenith Gaussian fixtures the suite already
+    runs. Clumping *widens* windows, because the clump sets the extent while
+    most planes stay empty. These are among the most dense-like plans in the
+    repository, and a 2% narrowing of the padded slice bounds passes all 95
+    cells of this module while failing 49 tests elsewhere.
+
+    What the four traversals cover here is plane *placement and accumulation*
+    at the deepest stacks in the repository -- ``n_w`` 214 folded / 461
+    unfolded against 134 for the deepest Gaussian, with 90 / 312 empty planes
+    and a padding overhead of 29.50 against 4.94 -- and the ``vmap`` variants
+    place their planes through a different (batched) composition than the
+    ``scan`` ones. Window-bound coverage lives in
+    :func:`test_multi_channel_spread_w_matches_ducc` (0.417 / 0.260).
 
     Both ``hermitian`` settings, because the fold is applied *before* all plan
     geometry, so it is not a summation-order variation on one plan but a second
@@ -626,7 +655,7 @@ def test_small_clumped_geometry_matches_the_exact_dft(
     strategies and both fold settings): 0.47-0.58x eps at eps=1e-4,
     0.67-0.76x at 1e-6, and 0.98-1.11x at 1e-8, against the 2x contract.
     Under that ``_nufft_epsilon`` mutation the same cells measure 1.12-1.51x,
-    1.52-2.11x and 1.17-1.20x, so it is the four eps=1e-6 ``vis2dirty`` cells
+    1.52-2.11x and 1.17-1.24x, so it is the four eps=1e-6 ``vis2dirty`` cells
     that actually cross the bound -- a real detection with a thin margin, not a
     10x one. The regression is 10x in the (u, v) NUFFT's share of the budget,
     and that share is not what dominates this fixture's total error; nothing
@@ -711,7 +740,10 @@ def test_multi_channel_constant_w_does_not_take_the_fast_path(real_dtype) -> Non
     The second assertion records why this fixture is a *dense*-path fixture.
     Every row has the same w in metres, so for any (channel, plane) the window
     either contains every row or none of them: ``sort_perm`` is over a constant
-    array and the two ``searchsorted`` boundaries land together. Some plane
+    array and the two ``searchsorted`` boundaries land together. ("None" is
+    exact for the nominal support that ``empty_plane_count`` counts; the padded
+    slice is then widened to a single row by the ``+/-1`` clamp in
+    ``planning.py``, which does not change the conclusion below.) Some plane
     always covers each channel's single spike, so ``max_window_size`` is
     ``n_rows`` no matter how the geometry is retuned -- and a
     ``dynamic_slice`` of ``n_rows`` rows out of ``n_rows`` is the dense
