@@ -58,7 +58,10 @@ with equal flags**: on the EDA2 full-sky fixture (eps 1e-6, float64)
 (`True`), while the shipped mixed defaults are off by 0.630 plain and
 0.273 in the `n·x` form, all of it from the 1155 of 4096 pixels
 outside the disc. `divide_by_n=True` on both is the recommendation for
-imaging and the precondition for issue #21's `custom_vjp`. The flag is
+imaging and for anything that composes the two as `A` and `A^H`. Since
+issue #21 the backward pass runs the forward's *own* flag, so `grad` is
+the transpose of the operator that was actually called; the flag still
+has to match on a pair the caller assembles by hand. The flag is
 an **image-side** diagonal — apply it on the image end of both
 operators, never alongside the visibility-side `nshift` compensation
 (#16) or Hermitian per-row conjugation (#17), and on the adjoint
@@ -363,13 +366,43 @@ If you touch any of these, run `tests/test_planning.py` and
 
 ## 5. Strategies
 
-| `w_strategy`      | Per-plane work          | Peak transient memory       | Notes                                          |
-|-------------------|-------------------------|-----------------------------|------------------------------------------------|
-| `auto`            | resolves to one below   | matches the resolved choice | **The shipped default** (issue #46). Platform-aware heuristic. |
-| `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
-| `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | v0.1 `"vmap"` is a deprecated alias.           |
-| `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | v0.1.1; helps on adjoint when `n_w >> W`.      |
-| `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | v0.1.1; rare wins, mostly for completeness.    |
+| `w_strategy`      | Per-plane work          | Peak transient memory       | `grad` memory              | Notes                                          |
+|-------------------|-------------------------|-----------------------------|----------------------------|------------------------------------------------|
+| `auto`            | resolves to one below   | matches the resolved choice | matches the resolved choice | **The shipped default** (issue #46). Platform-aware heuristic. |
+| `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | 1.48-1.50x its own forward | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
+| `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | ~1x its own forward        | v0.1 `"vmap"` is a deprecated alias.           |
+| `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | 1.48-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | ~1x its own forward        | v0.1.1; rare wins, mostly for completeness.    |
+
+The `grad` column is issue #21's. Both operators are bound as **linear
+primitives** (`_dirty2vis_p`, `_dirty2vis_transpose_p`, `_vis2dirty_p` at
+the foot of `wgridder.py`) whose transposes are each other, so reverse mode
+is one call to the other operator *at the forward's own static
+configuration* — same `w_strategy`, same `channel_strategy`, same
+`Opts(nthreads=...)` — rather than a transposed replay of the w-plane loop.
+Before it, `grad` through the scan strategies cost `O(n_w * image_size)`:
+285.5 MB against a 2.11 MB forward on MWA_extended off30 at 256², now 3.16
+MB. Three primitives rather than two because `vis2dirty` is `Re(A^H .)`,
+which is R-linear and needs no conjugation on the `(n_rows, n_chan)`
+visibilities — writing it through the forward's transpose would put a
+`jnp.conj` there, whose real tensors trip issue #23's memory guard in
+`tests/test_planning.py`. Not `jax.custom_vjp`, which would remove forward
+mode (`jax.jvp`, `check_grads(modes=("fwd", "rev"))` and `jax.hessian` all
+raise through one). Gated by `tests/test_custom_vjp.py`, including spy tests
+on the static configuration the backward runs with — a backward that ran a
+different strategy would agree to 1e-11 on the values and have entirely the
+wrong memory.
+
+Two things to keep in mind when touching that section. The primitives carry a
+`batch_shape` param and their batching rule pushes `vmap`'s axis into it, so a
+batched call stays **one** call: the obvious `jax.lax.map` rule is correct and
+costs 1.5x at batch 2 rising to 3.7x at batch 16, which no value-comparison
+test can see — `test_vmap_binds_the_operator_once_rather_than_looping` asserts
+it on the jaxpr instead. And the transpose-of-transpose rule
+(`(A^T)^T = A`) is reached only by a *second reverse* pass, `grad(grad(...))`,
+never by `jax.hessian`, which is `jacfwd(jacrev(...))` and stops at the JVP
+rule; `test_second_order_reverse_mode_is_the_operator_again` is the only thing
+that exercises it.
 
 `auto` is resolved by `_auto_w_strategy` in the public wrapper, *before*
 the JIT boundary, so the static arg reaching `_dirty2vis_jit` /
