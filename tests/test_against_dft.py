@@ -50,6 +50,17 @@ def reference_lmn_grids(
     Clipping to ``n - 1 = -1`` there instead would make the reference disagree
     with the operator under test by O(1) on the corner pixels, which has
     nothing to do with the gridding accuracy we are trying to measure.
+
+    The pixel-centre offset below is ``n_l // 2`` -- **floor** division, the
+    convention ``planning._n_minus_1_grid`` implements and the README states.
+    It matters only at odd extents, where ``n_l // 2`` and ``n_l / 2`` differ
+    by half a pixel; floor division is what puts ``l = 0`` on the exact pixel
+    ``n_l // 2`` at both parities. This reference is the *independent*
+    statement of that convention -- it is written from the README, not from
+    ``planning`` -- so a change to one and not the other shows up as a DFT
+    parity failure on the odd geometry cells rather than as two files agreeing
+    on a shifted grid. Substituting ``/`` for ``//`` in ``planning`` passed
+    1478 of this suite's 1480 tests before those cells existed.
     """
     n_l, n_m = image_shape
     i = np.arange(n_l) - n_l // 2

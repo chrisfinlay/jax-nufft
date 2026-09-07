@@ -110,11 +110,25 @@ V(u, v, w) = integral B(l, m) / n * exp(-2 pi i (u l + v m + w (n - 1))) dl dm
 with `n = sqrt(1 - l^2 - m^2)`. The image is on a regular tangent-plane grid
 
 ```
-l_i = (i - n_l / 2) * pixsize_l    for i = 0, ..., n_l - 1
+l_i = (i - n_l // 2) * pixsize_l    for i = 0, ..., n_l - 1
 ```
 
-(and similarly for `m`). It is assumed centred on the phase centre &mdash;
-off-zenith pointing is the caller's responsibility (rotated `uvw`).
+(and similarly for `m`), where `//` is **floor division** &mdash; the offset is
+the integer `n_l // 2`, not `n_l / 2`. The two agree for even `n_l` and differ
+by half a pixel for odd `n_l`, so the distinction is only visible on the odd
+image sizes this library supports (ducc0 accepts even extents only). Floor
+division is the convention the code implements
+(`planning._n_minus_1_grid`), and it is the one that puts `l = 0` &mdash; the
+phase centre &mdash; on the *exact pixel* `n_l // 2` at both parities: index
+`i` runs over `-n_l/2 ... n_l/2 - 1` for even `n_l` and symmetrically over
+`-(n_l - 1)/2 ... +(n_l - 1)/2` for odd `n_l`. With `n_l / 2` an odd-sized
+image would have no pixel at the phase centre at all and every pixel would sit
+half a pixel off. Pinned by the odd cells of
+`tests/test_against_dft.py::test_geometry_matches_dft_forward_and_adjoint`;
+before those existed, substituting `/` for `//` passed the entire suite.
+
+The grid is assumed centred on the phase centre &mdash; off-zenith pointing is
+the caller's responsibility (rotated `uvw`).
 
 #### Sign convention
 
