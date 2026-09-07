@@ -103,8 +103,16 @@ from jax.test_util import check_grads
 from jax.typing import DTypeLike
 
 import jax_nufft.wgridder as wgridder
-from jax_nufft import dirty2vis, vis2dirty
-from tests.conftest import MWA_COMPACT, X64, Telescope, requires_x64, tol
+from jax_nufft import dirty2vis, make_plan, vis2dirty
+from jax_nufft._utils import SPEED_OF_LIGHT
+from tests.conftest import (
+    MWA_COMPACT,
+    X64,
+    Telescope,
+    reference_lmn_grids,
+    requires_x64,
+    tol,
+)
 from tests.test_divide_by_n import (
     _ANISO_GEOMETRIES,
     _BOUNDARY_PIXSIZE,
@@ -491,6 +499,278 @@ def test_the_gradient_of_half_the_squared_norm_is_the_normal_equations(
     )
 
 
+@pytest.mark.parametrize("dtype, eps, exact_tol", _IDENTITY_PRECISIONS)
+@pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
+@pytest.mark.parametrize("w_strategy", W_STRATEGIES)
+def test_the_gradient_of_a_complex_image_loss_is_the_conjugated_normal_equations(
+    w_strategy: str, divide_by_n: bool, dtype: DTypeLike, eps: float, exact_tol: float
+) -> None:
+    """``grad(0.5 ||A x||^2)(x) == conj(A^H A x)`` for a **complex** image.
+
+    The Wirtinger half of the identity above, and the one #22 names. JAX's
+    convention for ``f: C^n -> R`` is the *conjugate* Wirtinger gradient,
+    ``g = dL/d(Re x) - i dL/d(Im x)`` -- which is what makes ``x - lr * g`` a
+    descent step, and what the finite-difference smoke test in
+    ``test_jax_integration.py`` checks componentwise. Writing ``x = u + iv`` and
+    ``w = A^H A x``, a perturbation gives ``dL = Re<w, dx>``, so
+    ``dL/du = Re(w)`` and ``dL/dv = Im(w)``, hence ``g = Re(w) - i Im(w) =
+    conj(w)``.
+
+    So the complex case is *not* the real one with the ``Re`` dropped: it is the
+    real one conjugated. On a real image ``g = Re(A^H A x)`` and the conjugation
+    is invisible, which is why the test above cannot reach this.
+
+    ``A^H`` comes from :func:`_complex_adjoint`, two calls to the public
+    ``vis2dirty`` -- so this constrains the backward pass against the shipped
+    adjoint, not against another copy of itself. ``hermitian=False`` because
+    ``dirty2vis`` refuses a complex image on a folded plan (#17).
+
+    Round-off row: the identity is exact on paper, so the bound is
+    ``_IDENTITY_PRECISIONS`` (1e-11 float64 / 5e-6 float32) rather than
+    anything measured here.
+    """
+    problem = _problem(EDA2, 0.0, eps=eps, dtype=dtype, hermitian=False)
+    kw = dict(divide_by_n=divide_by_n, w_strategy=w_strategy, nthreads=1)
+    image = jnp.asarray(problem.image)
+    x = (image + 0.5j * image[::-1]).astype(problem.plan.complex_dtype)
+
+    def loss(z: Any) -> Any:
+        vis = dirty2vis(problem.plan, z, **kw)
+        return 0.5 * jnp.sum(vis.real**2 + vis.imag**2)
+
+    got = jax.grad(loss)(x)
+    normal = _complex_adjoint(problem.plan, dirty2vis(problem.plan, x, **kw), **kw)
+
+    err = _rel(got, jnp.conj(normal))
+    assert err < exact_tol, (
+        f"{w_strategy}, divide_by_n={divide_by_n}: grad(0.5||Ax||^2) differs by "
+        f"{err:.3e} (tol {exact_tol:.1e}) from conj(A^H A x). JAX returns the "
+        "conjugate Wirtinger gradient, so the complex case is the real one "
+        "conjugated, not the real one with the Re dropped."
+    )
+
+    # Without these the tolerance pins nothing: on a real image all three
+    # candidates coincide, so the cell has to show they are separated here.
+    unconjugated = _rel(got, normal)
+    assert unconjugated > 1e-2, (
+        f"A^H A x is only {unconjugated:.3e} from the gradient on this fixture, so "
+        "this cell cannot tell the conjugate Wirtinger convention from its absence"
+    )
+    real_part = _rel(got, jnp.real(normal).astype(got.dtype))
+    assert real_part > 1e-2, (
+        f"Re(A^H A x) -- the real-image answer -- is only {real_part:.3e} away, so "
+        "this cell adds nothing over the real-image identity above"
+    )
+
+
+# ---------------------------------------------------------------------------
+# the derivative reference: JAX's own VJP of an exact DFT
+# ---------------------------------------------------------------------------
+
+# Every other gradient test in this module compares the backward pass against
+# something built from the library's *own* forward and adjoint. That pins the
+# transpose algebra exactly (those are identities, good to 1e-11) but it is
+# blind by construction to a shared-mode error: if the forward is wrong and the
+# adjoint is wrong the same way, ``A^H A`` is still self-consistent and every
+# identity above still holds.
+#
+# The exact DFT is the independent statement of what the operator *is*, and
+# ``jax.vjp`` of it is the independent statement of what its derivative is --
+# differentiated by JAX through a two-line sum rather than by a hand-written
+# transpose rule. This is the same ordering the issue #15 review established for
+# the forward operator: the DFT at ``2 * eps`` catches shared-mode errors that a
+# library-against-library comparison at a looser bound cannot see. It applies to
+# the gradients for exactly the same reason.
+#
+# Approximation-gap row, not a round-off one: the wgridder approximates the DFT
+# to the requested epsilon and its transpose inherits that same approximation,
+# so the bound here is ``DFT_GRAD_TOL_FACTOR * eps`` and not
+# ``_IDENTITY_PRECISIONS``. Measured below.
+
+_DFT_N_PIX = 32
+_DFT_N_ROWS = 48
+_DFT_PIXSIZE = 1e-2
+_DFT_W_METRES = 60.0
+_DFT_FREQ = np.array([1.4e9])
+
+# The fixture has to have real w depth, or this cell degenerates into a test of
+# the 2-D NUFFT. The first version of it used 16^2 / 24 rows / +-3 m of w, which
+# gave ``n_w - w_kernel_width == 1``: the plane count was ENTIRELY kernel
+# overhang, the w-phase ``2 pi w (n - 1)`` spanned 0.137 rad against 9.3 turns
+# for ``2 pi u l``, and a 10x coarsening of the w-plane spacing
+# (``W_OVERSAMPLE_X0`` 0.25 -> 2.5) failed 206 of the 240 cells in this module
+# while leaving all 24 of these unchanged to every printed digit. The cell
+# advertised as the one able to see a shared-mode error was the only cell in the
+# module that could not see that one. Both guards in the test body exist to stop
+# that returning silently.
+#
+# At +-60 m of w on a 32^2 / 1e-2 rad grid, over both fold settings and all
+# three eps: n_w 20-37 against w_kernel_width 7, so 15-28 inner planes; and
+# max_window_size 13-32 of 48 rows, a strict subset everywhere, so the windowed
+# strategies are a different computation from the dense ones rather than the
+# same one spelled differently. +-60 is the smallest spread at which BOTH hold
+# on all six cells: at +-30 the folded plan at eps=1e-8 has max_window_size 48
+# of 48, the fold having halved the w extent. The guards in the test body are
+# what found that, so they stay.
+
+# Measured on this machine (macOS arm64, jax 0.9.2, float64), relative L2 of
+# the wgridder cotangent against jax.vjp of the exact DFT, worst over the four
+# w_strategy values and both divide_by_n settings:
+#
+#     eps       real folded    real unfolded   complex unfolded
+#     1e-4      0.49x          0.49x           0.50x
+#     1e-6      0.69x          0.73x           0.71x
+#     1e-8      0.75x          0.86x           0.83x
+#
+# 0.86x eps at worst (4.881e-05 / 6.945e-07 / 7.520e-09 folded; 4.909e-05 /
+# 7.311e-07 / 8.627e-09 unfolded real; 5.005e-05 / 7.076e-07 / 8.339e-09
+# complex). Higher than the 0.21-0.33x the degenerate fixture gave, and it
+# should be: the w-kernel now contributes to the error instead of being one
+# plane's worth of overhang. It sits at the top of the 0.15x-0.84x band
+# tests/test_against_dft.py measures for the forward.
+#
+# Approximation-gap row, so per the #20 taxonomy it is backend-stable; 2.0
+# leaves 2.3x of margin, matching the factor test_against_dft uses for the
+# forward. (The round-off rows in this module sit at ``_IDENTITY_PRECISIONS``
+# instead, and those are the ones that move between backends.)
+DFT_GRAD_TOL_FACTOR = 2.0
+
+
+def _dft_geometry() -> tuple[np.ndarray, np.ndarray]:
+    """A small (u, v, w) set with genuine w depth, and a matching image."""
+    rng = np.random.default_rng(5)
+    uvw = np.zeros((_DFT_N_ROWS, 3))
+    uvw[:, 0] = rng.uniform(-50.0, 50.0, size=_DFT_N_ROWS)
+    uvw[:, 1] = rng.uniform(-50.0, 50.0, size=_DFT_N_ROWS)
+    uvw[:, 2] = rng.uniform(-_DFT_W_METRES, _DFT_W_METRES, size=_DFT_N_ROWS)
+    image = rng.standard_normal((_DFT_N_PIX, _DFT_N_PIX))
+    return uvw, image
+
+
+def _dft_forward_jnp(image: Any, uvw: np.ndarray, *, divide_by_n: bool = False) -> Any:
+    """``V = sum_lm I(l, m) [/ n] exp(-2 pi i (u l + v m - w (n - 1)))``, in ``jnp``.
+
+    Written from the README's sign convention and :func:`reference_lmn_grids`
+    -- the grid helper is itself written from the README rather than from
+    ``planning`` -- so neither the operator nor the geometry is taken from the
+    code under test. The only thing imported from ``src`` is the speed of light.
+    Small enough (48 x 32 x 32) that ``jax.vjp`` through it is free.
+
+    ``divide_by_n`` is the plain image-side ``1 / n`` of #20. This fixture needs
+    no disc handling for it: at 32 pixels of 1e-2 rad the largest ``l^2 + m^2``
+    is 0.051, so ``n >= 0.974`` everywhere and the ``n == 0`` branch that
+    ``_disc_mask_and_safe_n`` exists for is never reached. Outside-disc
+    behaviour is covered by ``tests/test_divide_by_n.py``.
+    """
+    ll, mm, nm1 = reference_lmn_grids((_DFT_N_PIX, _DFT_N_PIX), _DFT_PIXSIZE, _DFT_PIXSIZE)
+    scale = _DFT_FREQ[0] / SPEED_OF_LIGHT
+    u = jnp.asarray(uvw[:, 0] * scale)[:, None, None]
+    v = jnp.asarray(uvw[:, 1] * scale)[:, None, None]
+    w = jnp.asarray(uvw[:, 2] * scale)[:, None, None]
+    phase = -2j * jnp.pi * (u * jnp.asarray(ll) + v * jnp.asarray(mm) - w * jnp.asarray(nm1))
+    weighted = image / jnp.asarray(nm1 + 1.0) if divide_by_n else image
+    return jnp.sum(weighted[None] * jnp.exp(phase), axis=(1, 2))[:, None]
+
+
+# ``hermitian=True`` only with a real image: ``dirty2vis`` refuses a complex one
+# on a folded plan (#17, the fold is a real-sky identity). Both are run for the
+# real image so this cell exercises the SHIPPED default plan, not only the
+# unfolded one.
+_DFT_IMAGE_FOLD_CELLS = [
+    pytest.param(False, True, id="real-folded"),
+    pytest.param(False, False, id="real-unfolded"),
+    pytest.param(True, False, id="complex-unfolded"),
+]
+
+
+@requires_x64
+@pytest.mark.parametrize("eps", [1e-4, 1e-6, 1e-8])
+@pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
+@pytest.mark.parametrize("complex_image, hermitian", _DFT_IMAGE_FOLD_CELLS)
+@pytest.mark.parametrize("w_strategy", W_STRATEGIES)
+def test_the_cotangent_matches_jax_vjp_of_the_exact_dft(
+    w_strategy: str, complex_image: bool, hermitian: bool, divide_by_n: bool, eps: float
+) -> None:
+    """``jax.vjp(dirty2vis)`` against ``jax.vjp`` of the exact DFT.
+
+    The only gradient test in the repository whose reference is not built from
+    the library's own operators. Both the operator and its derivative come from
+    outside: the DFT is a direct sum written from the README, and its VJP is
+    produced by JAX differentiating that sum, not by any transpose rule of ours.
+
+    So this is the cell that can see a *shared-mode* error -- a forward and an
+    adjoint wrong in the same way, which every ``A^H A`` identity in this module
+    accepts by construction. Measured: giving the (u, v) NUFFT the whole epsilon
+    budget fails 16 of these cells and moves no other cell in the module;
+    coarsening the w-plane spacing 10x fails them too, on this fixture (it did
+    not on the degenerate one this replaces -- see the note above the
+    constants).
+
+    It is looser than the identities (``2 * eps``, an approximation gap, against
+    their exact ``1e-11``) and that is the trade: they are exact and
+    self-referential, this one is approximate and independent, and neither
+    substitutes for the other.
+
+    ``divide_by_n`` is parametrised because it is the image-side diagonal (#20)
+    and the only independent reference for the *gradient* of that diagonal is
+    here -- with it pinned off, a fault in ``_disc_mask_and_safe_n`` reaches no
+    new cell in this module.
+    """
+    uvw, image_np = _dft_geometry()
+    plan = make_plan(
+        uvw,
+        _DFT_FREQ,
+        (_DFT_N_PIX, _DFT_N_PIX),
+        _DFT_PIXSIZE,
+        _DFT_PIXSIZE,
+        eps,
+        hermitian=hermitian,
+    )
+
+    # Anti-vacuity, both of them measured failures of the first version of this
+    # fixture rather than hypotheticals. Without the first, the plane count is
+    # all kernel overhang and no w-direction error can show up at all; without
+    # the second, every window holds every row and the four w_strategy values
+    # are one computation under four names.
+    inner = plan.n_w - plan.w_kernel_width
+    assert inner > 1, (
+        f"n_w={plan.n_w} with w_kernel_width={plan.w_kernel_width} leaves "
+        f"{inner} inner plane(s): the w axis is kernel overhang only, and this "
+        "cell has degenerated into a test of the 2-D NUFFT"
+    )
+    assert plan.max_window_size < plan.n_rows, (
+        f"max_window_size is {plan.max_window_size} of {plan.n_rows} rows, so "
+        "windowed_* and dense_* are the same computation and this cell's "
+        "w_strategy axis is quantified over a constant"
+    )
+
+    kw = dict(divide_by_n=divide_by_n, w_strategy=w_strategy, nthreads=1)
+    if complex_image:
+        x = jnp.asarray(image_np + 0.5j * image_np[::-1]).astype(plan.complex_dtype)
+    else:
+        x = jnp.asarray(image_np).astype(plan.real_dtype)
+
+    rng = np.random.default_rng(17)
+    ct = jnp.asarray(
+        rng.standard_normal((_DFT_N_ROWS, 1)) + 1j * rng.standard_normal((_DFT_N_ROWS, 1))
+    ).astype(plan.complex_dtype)
+
+    _, vjp_op = jax.vjp(lambda z: dirty2vis(plan, z, **kw), x)
+    _, vjp_dft = jax.vjp(lambda z: _dft_forward_jnp(z, uvw, divide_by_n=divide_by_n), x)
+    got = vjp_op(ct)[0]
+    want = vjp_dft(ct)[0]
+
+    err = _rel(got, want)
+    assert err < DFT_GRAD_TOL_FACTOR * eps, (
+        f"{w_strategy}, complex_image={complex_image}, hermitian={hermitian}, "
+        f"divide_by_n={divide_by_n}, eps={eps:.0e}: the wgridder cotangent "
+        f"differs by {err:.3e} ({err / eps:.2f}x eps, bound "
+        f"{DFT_GRAD_TOL_FACTOR:.1f}x) from jax.vjp of the exact DFT. Unlike the "
+        "A^H A identities above, this reference shares no code with the operator, "
+        "so a forward and adjoint wrong in the same way fail here and nowhere else."
+    )
+
+
 @requires_x64
 @pytest.mark.parametrize("geometry", _ANISO_GEOMETRIES)
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
@@ -618,6 +898,86 @@ def test_check_grads_passes_in_both_modes(op: str, w_strategy: str) -> None:
     else:
         fn = lambda x: vis2dirty(problem.plan, x, **kw)  # noqa: E731
         args = (jnp.asarray(problem.vis),)
+    check_grads(fn, args, order=1, modes=("fwd", "rev"), eps=1e-4, rtol=2e-4, atol=2e-4)
+
+
+# ``check_grads`` differentiates numerically, so every cell below is float64
+# only. The axes here are the ones the cell above holds constant: it runs a real
+# image on a folded plan with ``divide_by_n=True`` and no weights, which is one
+# corner of the operators' input space.
+
+
+@requires_x64
+@pytest.mark.parametrize("w_strategy", W_STRATEGIES)
+@pytest.mark.parametrize("hermitian", [False, True])
+@pytest.mark.parametrize("divide_by_n", FLAG_VALUES)
+def test_check_grads_on_the_flags_the_default_cell_holds_constant(
+    divide_by_n: bool, hermitian: bool, w_strategy: str
+) -> None:
+    """``check_grads`` across ``divide_by_n`` x ``hermitian``, both operators.
+
+    ``test_check_grads_passes_in_both_modes`` pins one corner: ``divide_by_n``
+    true on a folded plan. The four cells here that repeat that corner are left
+    in rather than special-cased out -- the grid is cheap and a hole in it would
+    be worse than an overlap. Both flags change the operator rather than the way
+    it is traversed -- ``divide_by_n`` multiplies by a real image-side diagonal
+    (#20) and ``hermitian`` folds the w axis and multiplies rows by
+    ``flip_sign`` (#17) -- so each is a distinct linear map whose transpose has
+    to be right on its own account.
+    """
+    problem = _problem(EDA2, 0.0, eps=1e-6, dtype=jnp.float64, hermitian=hermitian)
+    kw = dict(divide_by_n=divide_by_n, w_strategy=w_strategy, nthreads=1)
+    for fn, args in (
+        (lambda x: dirty2vis(problem.plan, x, **kw), (jnp.asarray(problem.image),)),
+        (lambda v: vis2dirty(problem.plan, v, **kw), (jnp.asarray(problem.vis),)),
+    ):
+        check_grads(fn, args, order=1, modes=("fwd", "rev"), eps=1e-4, rtol=2e-4, atol=2e-4)
+
+
+@requires_x64
+@pytest.mark.parametrize("w_strategy", W_STRATEGIES)
+def test_check_grads_on_a_complex_image(w_strategy: str) -> None:
+    """``check_grads`` for ``dirty2vis`` on a **complex** image.
+
+    The forward is C-linear in the image but the cotangent rule differs between
+    the real and complex cases -- ``A^T y`` against ``conj(A^T y)`` -- and they
+    agree on a real image because ``Re(conj z) == Re z``. So a numerical check
+    on a real image cannot see the convention at all; this one can.
+
+    ``hermitian=False``: the fold is a real-sky identity and ``dirty2vis``
+    refuses a complex image on a folded plan (#17), so this is the only setting
+    the complex leg can be asked at.
+    """
+    problem = _problem(EDA2, 0.0, eps=1e-6, dtype=jnp.float64, hermitian=False)
+    kw = dict(divide_by_n=True, w_strategy=w_strategy, nthreads=1)
+    image = jnp.asarray(problem.image) + 0.5j * jnp.asarray(problem.image)[::-1]
+    fn = lambda x: dirty2vis(problem.plan, x, **kw)  # noqa: E731
+    check_grads(fn, (image,), order=1, modes=("fwd", "rev"), eps=1e-4, rtol=2e-4, atol=2e-4)
+
+
+@requires_x64
+@pytest.mark.parametrize("argnum", [0, 1])
+@pytest.mark.parametrize("w_strategy", W_STRATEGIES)
+def test_check_grads_with_weights(w_strategy: str, argnum: int) -> None:
+    """``check_grads`` for ``vis2dirty`` with weights, in ``vis`` and in ``weights``.
+
+    #21 moved the ``weights`` multiply out of the primitive and into the Python
+    wrapper, so the two arguments reach the backward pass by different routes:
+    ``vis`` through the primitive's transpose rule, ``weights`` through XLA's
+    own differentiation of the multiply. ``argnum=1`` is the only cell in this
+    module that exercises the second route numerically.
+    """
+    problem = _problem(EDA2, 0.0, eps=1e-6, dtype=jnp.float64)
+    kw = dict(divide_by_n=True, w_strategy=w_strategy, nthreads=1)
+    vis = jnp.asarray(problem.vis)
+    rng = np.random.default_rng(11)
+    weights = jnp.asarray(rng.uniform(0.25, 4.0, size=vis.shape).astype(problem.plan.real_dtype))
+    if argnum == 0:
+        fn = lambda v: vis2dirty(problem.plan, v, weights=weights, **kw)  # noqa: E731
+        args = (vis,)
+    else:
+        fn = lambda w: vis2dirty(problem.plan, vis, weights=w, **kw)  # noqa: E731
+        args = (weights,)
     check_grads(fn, args, order=1, modes=("fwd", "rev"), eps=1e-4, rtol=2e-4, atol=2e-4)
 
 

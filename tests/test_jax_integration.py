@@ -102,78 +102,60 @@ def test_jit_idempotent_with_eager() -> None:
     )
 
 
-def test_grad_of_dirty2vis_finite_difference() -> None:
-    """jax.grad of a real scalar built from dirty2vis matches finite differences."""
-    plan, image, _ = _tiny_setup(1)
-    image_real = image.real  # use real-valued image so the loss is purely a function of image_real
+def test_grad_matches_finite_differences_smoke() -> None:
+    """One cheap central difference, kept for documentation (issue #22).
 
-    def loss(im_real):
-        vis = dirty2vis(plan, im_real)
-        return jnp.sum(vis.real**2 + vis.imag**2)
+    This replaces two tests that checked ``jax.grad`` against finite differences
+    at ``rtol=1e-4`` on eight sampled pixels and ``rtol=1e-3`` on six. Central
+    differences at ``h=1e-5`` truncate at ``O(h^2) = 1e-10`` in exact arithmetic
+    and lose about half the mantissa to cancellation, so those bounds were some
+    seven orders looser than the quantity they measured -- wide enough to admit a
+    wrong conjugation, which is exactly the defect #21's first prototype had.
 
-    grad_fn = jax.grad(loss)
-    g_jax = np.asarray(grad_fn(image_real))
+    What actually pins the gradients now, all exact identities rather than
+    numerical differentiation, in ``tests/test_custom_vjp.py``:
 
-    # Pick a few random pixels for finite differences (full-grid FD is too slow).
-    rng = np.random.default_rng(42)
-    sample_idx = rng.choice(image_real.size, size=8, replace=False)
-    image_flat = np.asarray(image_real).ravel()
-    h = 1e-5
-    fd = np.zeros_like(image_flat)
-    for k in sample_idx:
-        bumped = image_flat.copy()
-        bumped[k] += h
-        plus = float(loss(jnp.asarray(bumped.reshape(image_real.shape))))
-        bumped[k] -= 2 * h
-        minus = float(loss(jnp.asarray(bumped.reshape(image_real.shape))))
-        fd[k] = (plus - minus) / (2 * h)
-    fd_at_sample = fd[sample_idx]
-    grad_at_sample = g_jax.ravel()[sample_idx]
-    np.testing.assert_allclose(grad_at_sample, fd_at_sample, rtol=1e-4, atol=1e-6)
+    * ``test_the_gradient_of_half_the_squared_norm_is_the_normal_equations``
+      and ``..._of_a_complex_image_loss_is_the_conjugated_normal_equations`` --
+      ``grad(0.5||Ax||^2)`` against ``Re(A^H A x)`` and ``conj(A^H A x)``, at
+      1e-11, with contrast assertions that separate the candidate conventions.
+    * ``test_the_complex_image_cotangent_is_the_plain_transpose`` and
+      ``test_the_vis2dirty_cotangent_is_the_conjugated_forward`` -- the
+      conjugation convention itself.
+    * the ``check_grads`` cells, ``modes=("fwd", "rev")`` over both flags, a
+      complex image, and weights.
 
+    This one stays because a reader wants to see, once and concretely, that the
+    gradient is the derivative of the thing the operator computes -- and because
+    it is the only place the Wirtinger sign convention is stated in the units a
+    numerical check works in: ``g.real`` against a real-direction difference and
+    ``-g.imag`` against an imaginary-direction one, ``g`` being the conjugate
+    Wirtinger gradient ``dL/d(re) - i dL/d(im)``.
 
-def test_grad_of_vis2dirty_finite_difference() -> None:
-    """Reverse-mode AD through vis2dirty matches finite differences in vis.
-
-    For a real-valued loss with a complex input, jax.grad returns the
-    "conjugate Wirtinger" gradient ``g = dL/d(re) - i * dL/d(im)``, so
-    ``g.real`` matches a real-direction FD and ``-g.imag`` matches an
-    imag-direction FD.
+    (This module is in ``conftest.collect_ignore`` when ``JAX_ENABLE_X64=0``, so
+    this cell runs on the float64 leg only.)
     """
     plan, _, vis = _tiny_setup(2)
 
     def loss(v):
-        dirty = vis2dirty(plan, v)
-        return jnp.sum(dirty**2)
+        return jnp.sum(vis2dirty(plan, v) ** 2)
 
-    g_jax = np.asarray(jax.grad(loss)(vis.astype(jnp.complex128)))
+    g = np.asarray(jax.grad(loss)(vis.astype(jnp.complex128)))
 
-    rng = np.random.default_rng(43)
-    sample_idx = rng.choice(vis.size, size=6, replace=False)
-    vis_flat = np.asarray(vis).ravel()
+    k = 3
     h = 1e-5
-    fd_re_list = []
-    fd_im_list = []
-    for k in sample_idx:
-        bumped = vis_flat.copy()
-        bumped[k] += h
-        plus_re = float(loss(jnp.asarray(bumped.reshape(vis.shape))))
-        bumped[k] -= 2 * h
-        minus_re = float(loss(jnp.asarray(bumped.reshape(vis.shape))))
-        fd_re_list.append((plus_re - minus_re) / (2 * h))
+    flat = np.asarray(vis).ravel()
 
-        bumped = vis_flat.copy()
-        bumped[k] += 1j * h
-        plus_im = float(loss(jnp.asarray(bumped.reshape(vis.shape))))
-        bumped[k] -= 2j * h
-        minus_im = float(loss(jnp.asarray(bumped.reshape(vis.shape))))
-        fd_im_list.append((plus_im - minus_im) / (2 * h))
+    def bumped(delta):
+        out = flat.copy()
+        out[k] += delta
+        return float(loss(jnp.asarray(out.reshape(vis.shape))))
 
-    fd_re = np.asarray(fd_re_list)
-    fd_im = np.asarray(fd_im_list)
-    g_at_sample = g_jax.ravel()[sample_idx]
-    np.testing.assert_allclose(g_at_sample.real, fd_re, rtol=1e-3, atol=1e-6)
-    np.testing.assert_allclose(-g_at_sample.imag, fd_im, rtol=1e-3, atol=1e-6)
+    fd_re = (bumped(h) - bumped(-h)) / (2 * h)
+    fd_im = (bumped(1j * h) - bumped(-1j * h)) / (2 * h)
+
+    np.testing.assert_allclose(g.ravel()[k].real, fd_re, rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(-g.ravel()[k].imag, fd_im, rtol=1e-4, atol=1e-6)
 
 
 def test_vmap_over_image_batch() -> None:
