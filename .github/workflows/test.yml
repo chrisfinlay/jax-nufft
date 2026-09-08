@@ -63,6 +63,51 @@ jobs:
           JAX_ENABLE_X64: "0"
         run: pixi run -e test test -ra
 
+  jax-floor:
+    # Issue #53. Every other job here runs the single jax the pixi lockfile
+    # resolves, so the `jax>=` bound in pyproject.toml was exercised by nothing
+    # and was free to drift from the code -- it said 0.5.0 while wgridder.py
+    # called `jax.typeof`, added in 0.6.0 (found and fixed on #21). This job is
+    # the only thing that runs the declared minimum.
+    #
+    # jax ALONE, no matrix, so the job is one pip install and a few seconds.
+    # Running the whole suite at the floor would need a conda-forge
+    # jax-finufft that solves against a jax that old on all three platforms;
+    # #53 puts that out of scope and it has not been attempted. The probe
+    # reads the floor out of pyproject.toml rather than repeating it here, so
+    # this job follows the declaration and cannot itself go stale.
+    name: jax floor probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # The oldest interpreter the project supports (`requires-python`),
+          # paired with the oldest jax it supports: the combination most
+          # likely to be missing something.
+          python-version: "3.11"
+
+      - name: Read the declared jax floor
+        id: floor
+        # stdlib only -- the probe deliberately imports no jax for this, so it
+        # runs before anything is installed. Assigned to a variable under
+        # `set -e` rather than substituted straight into `echo`, so a probe
+        # that cannot read pyproject.toml fails here instead of silently
+        # writing an empty pin.
+        run: |
+          set -euo pipefail
+          version="$(python tests/jax_floor_probe.py --print-floor)"
+          echo "pyproject.toml declares jax>=$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install jax at the declared floor
+        run: python -m pip install "jax==${{ steps.floor.outputs.version }}"
+
+      - name: Probe the floor
+        run: python tests/jax_floor_probe.py
+
   lint:
     name: ruff + mypy
     runs-on: ubuntu-latest

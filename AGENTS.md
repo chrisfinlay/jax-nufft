@@ -122,7 +122,7 @@ jax-nufft/
 ├── pixi.toml                 # pixi workspace + tasks (test, lint, format, …)
 ├── pixi.lock
 ├── .github/
-│   └── workflows/test.yml    # CI: lint + fast suite on every push
+│   └── workflows/test.yml    # CI: lint + fast suite + jax-floor probe
 ├── docs/
 │   ├── v0.1.1-plan.md        # formal v0.1.1 plan with rationale
 │   └── v0.1.2-plan.md        # prioritised v0.1.2 performance plan
@@ -144,6 +144,8 @@ jax-nufft/
     ├── test_against_ducc.py  # ducc parity across telescopes (slow tests gated)
     ├── test_boundary_planes.py  # windowed-vs-dense parity on edge cases
     ├── test_jax_integration.py  # jit / grad / vmap traceability
+    ├── jax_floor_probe.py    # standalone declared-jax-floor probe (issue #53)
+    ├── test_jax_floor.py     # keeps that probe from passing vacuously
     └── test_benchmark_against_ducc.py  # opt-in pytest-benchmark suite
 ```
 
@@ -870,6 +872,31 @@ pixi run -e dev typecheck              # mypy (best-effort)
   which uses a delta image at the phase centre (exact answer: 1 for every
   visibility, analytically) so that the residual *is* the phase error,
   with no reference implementation in the loop.
+* **The declared JAX floor is exercised by exactly one thing**, the `jax
+  floor probe` CI job (issue #53). Everything else in this repository
+  &mdash; both precision legs, CPU and GH200, every Python version in
+  the matrix &mdash; runs the single `jax` the pixi lockfile resolves,
+  so the `jax>=` bound in `pyproject.toml` is otherwise tested by
+  nothing and free to drift from the code. That is how it came to say
+  `0.5.0` while `wgridder.py` called `jax.typeof`, exported in 0.6.0
+  (issue #21). The job installs **jax alone** at the declared version
+  and runs `tests/jax_floor_probe.py`, which reads the floor out of
+  `pyproject.toml`, derives the list of `jax` symbols `src/` and
+  `tests/` use by walking their ASTs, `getattr`s every one, and then
+  drives a 3x3-matmul miniature of `wgridder.py`'s primitive pattern
+  through `jit` / `grad` / `jvp` / `linear_transpose` / `vmap`-in-`grad`
+  / `grad(grad(...))` / `disable_jit`. Neither the version nor the
+  symbol list is written down by hand; both are read from the repo, so
+  neither can go stale. The probe is stdlib + `jax` only &mdash; no
+  `jax_nufft`, no `jax-finufft`, no `pytest` &mdash; so the job is one
+  `pip install` and a few seconds. Running the *whole suite* at the
+  floor instead would need a conda-forge `jax-finufft` that solves
+  against a jax that old on all three platforms; issue #53 puts that out
+  of scope and it has not been attempted. If you raise the floor, raise
+  it in all three places (`pyproject.toml`, `feature.cpu`,
+  `feature.gpu`); `tests/test_jax_floor.py` fails if they disagree, and
+  also pins the derived symbol scan against returning nothing, which
+  would make the probe green at every jax ever released.
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.
