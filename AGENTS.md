@@ -299,7 +299,7 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   `max_window_size` and `window_padding_overhead` at plan time.
   Issue #43 added `live_row_count` and `empty_plane_count` to that
   diagnostic and kept them **scalars** for the same reason — two static
-  ints is the whole budget, and reintroducing a `(n_chan, n_row)` array
+  ints is the whole budget, and reintroducing a `(n_chan, n_rows)` array
   in any form would undo #23. Issue #26's `window_plane_order` is the one
   `(n_chan, n_w)` leaf that budget does allow: it is per *plane*, which
   is what bucketing is about, and it is not diagnostic — the loops index
@@ -477,6 +477,44 @@ fixture (float64, eps 1e-6, `hermitian=True`, `max_window_size` 1072 of
 1,097,136 B with bucketing as well. `windowed_scan`'s peak is one
 bucket's slice and so is set by the *widest* bucket — it does not fall,
 and must not rise: 128,032 B → 128,224 B on the same fixture.
+
+**All of the above is `n_chan = 1`, and the multi-channel picture is
+different.** A bucket's slice length is a static `dynamic_slice` shape, so
+the channel axis can only be mapped over channels that bucket
+*identically*; `wgridder._window_bucket_channel_groups` groups channels by
+bucket table and each group gets its own compiled body, with the results
+concatenated (and, when the groups are not contiguous in channel index,
+permuted back). Bucket edges are placed against each channel's own window
+sizes, so **the group count equals `n_chan` on every realistic spectral
+plan** — the source's "one body per distinct table rather than per channel"
+is a bound, not the observed behaviour. Measured (EDA2 off30, seed 0,
+eps 1e-6, float64, `hermitian=True`, `freq = f * linspace(0.95, 1.05,
+n_chan)`, the ±5% spread `tests/test_strategies_equivalent.py` uses, on
+this machine):
+
+| `n_chan` | groups | `windowed_scan` `vis2dirty` compile | at `ab7fbbd` | `dense_scan` compile | `windowed_scan` `vis2dirty` transient | at `ab7fbbd` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1  | 1  | 0.13 s | 0.08 s | 0.07 s |   135,688 B |   135,496 B |
+| 3  | 3  | 0.29 s | 0.09 s | 0.08 s |   221,064 B |   302,216 B |
+| 8  | 8  | 0.63 s | 0.11 s | 0.09 s |   582,344 B |   661,896 B |
+| 16 | 16 | 1.10 s | 0.10 s | 0.09 s | 2,035,712 B | 1,237,384 B |
+
+So windowed compile time went from O(1) to O(`n_chan`) — 14x at sixteen
+channels, extrapolating to seconds on a 64-channel cube — and the windowed
+*adjoint*'s transient, which is below both baselines to eight channels, is
++64.5% over `ab7fbbd` and +69.3% over `dense_scan` at sixteen, because it
+concatenates one `(n_l, n_m)` output cube per group. Run time is unchanged
+(11.4 / 37.1 / 100.2 / 197.6 ms against `ab7fbbd`'s 11.6 / 38.3 / 100.3 /
+200.3 ms) and `dirty2vis` is unaffected (279,904 B at `n_chan = 16` against
+`ab7fbbd`'s 1,243,904 B), because its output is `(n_chan, n_rows)` rather
+than the image cube. Nothing in the suite measures compile time;
+`tests/test_custom_vjp.py::test_gradient_memory_holds_over_many_windowed_channel_groups`
+is the only memory gate above `n_chan = 2`, and it needed a factor of its
+own (2.5) because the standing 2.0 has no usable margin in that regime —
+`grad` over `forward` on a windowed adjoint at `n_chan = 8` is 1.99x on
+EDA2 off30 (was 1.66x at `ab7fbbd`) and 2.00x on MWA_extended off30 (was
+1.77x).
+Issue #34 is where a channel-count-aware `auto` rule belongs.
 
 The last two are not a fifth and sixth algorithm — they are the *general
 form of the other four*, and the other four are values of `w_chunk`.

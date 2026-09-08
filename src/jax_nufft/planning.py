@@ -114,15 +114,23 @@ MAX_WINDOW_BUCKETS = 4
 
 # Upper bound on the number of candidate bucket edges the DP searches over.
 # The DP is O(MAX_WINDOW_BUCKETS * m^2) in the number ``m`` of *distinct*
-# padded window sizes a channel has, and ``m <= n_w``. Every plan in this
-# repository and every realistic one tabulated in issue #26 has ``n_w`` in the
-# tens or low hundreds (worst: 501 planes on MWA_extended off30 at eps 1e-12),
-# so the cap below is never reached in practice; it exists so that a plan with
-# thousands of planes degrades to a restricted search rather than to a
-# quadratic-in-n_w plan-build time. Restricting the candidate edges only
-# shrinks the search space -- the cost of any partition it does consider is
-# still exact -- so the result stays a valid bucketing, merely not provably
-# optimal.
+# padded window sizes a channel has, and ``m <= n_w``. Measured over every
+# plan this repository builds -- five telescopes x two pointings x eps
+# {1e-3, 1e-6, 1e-9, 1e-12} x both geometries, plus the clumped tracks -- the
+# worst ``n_w`` is 467 (MWA_extended clumped, eps 1e-12, unfolded) and the
+# worst ``m`` is **77** (MWA_extended off30, eps 1e-12, unfolded, ``n_w = 257``);
+# ``m`` is far below ``n_w`` because a plane's window length is a row count and
+# many planes share one. So the cap below is nowhere near reached in practice;
+# it exists so that a plan with thousands of *distinct* window lengths degrades
+# to a restricted search rather than to a quadratic-in-n_w plan-build time.
+# Restricting the candidate edges only shrinks the search space -- the cost of
+# any partition it does consider is still exact -- so the result stays a valid
+# bucketing, merely not provably optimal. Measured in
+# ``tests/test_planning.py::test_the_bucket_dp_degrades_gracefully_past_its_edge_cap``,
+# which is the only thing in the suite that enters this branch: at 1025 / 3000
+# / 5000 distinct sizes the restricted search costs 1.000000x / 1.000061x /
+# 1.000188x the unrestricted optimum, and takes 10.8 / 11.0 / 11.1 ms against
+# 10.9 / 49.5 / 113.5 ms.
 _BUCKET_DP_MAX_EDGES = 1024
 
 # Veltkamp splitting constant for :func:`_two_product`: 2**ceil(53/2) + 1.

@@ -226,9 +226,15 @@ def _large_row_windowed_problem(real_dtype: DTypeLike, complex_dtype: DTypeLike,
 
     The uniform ``w`` spread is what keeps the padding low while ``n_w``
     clears the gate. Measured on this fixture: float64 ``n_w=11 W=7
-    pad=1.57``, float32 ``n_w=9 W=5 pad=1.80`` -- both comfortably inside
+    pad=1.0368``, float32 ``n_w=9 W=5 pad=1.0515`` -- both comfortably inside
     the cutoffs, so the pick is the same on both precision legs and
-    ``_EXPECTED_BOUNDARY`` needs no precision key.
+    ``_EXPECTED_BOUNDARY`` needs no precision key. (``n_w`` and ``W`` are
+    unchanged by issue #26; the padding figures are not. 1.5714 and 1.8000
+    are what the same fixture reads on the pre-#26 un-bucketed metric, which
+    is what those two numbers used to be -- bucketing this plan's eleven
+    planes into four size classes is what takes 1.5714 to 1.0368. The
+    conclusion holds more comfortably than it did, but no number in it
+    survived.)
 
     The image stays small (48^2): every test using this stubs the JIT call
     out, so the plan is built but no transform runs.

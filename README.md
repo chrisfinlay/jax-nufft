@@ -669,6 +669,19 @@ scales with the padded row-work; measured forward `temp_size_in_bytes` on a
 against 1,097,136 B after. A scan holds one class's slice at a time, so
 `windowed_scan`'s peak is set by the widest class and is unchanged.
 
+Those figures, and every other timing quoted for #26, are single-channel.
+A slice length is a static shape, so the channel axis can only be mapped
+over channels that bucket identically, and at a realistic frequency spread
+no two of them do — the compiled body count equals `n_chan`. Measured on
+EDA2 off30 with `freq = f * linspace(0.95, 1.05, n_chan)`, the compile time
+of a jitted `windowed_scan` adjoint is 0.13 / 0.29 / 0.63 / 1.10 s at
+`n_chan` 1 / 3 / 8 / 16 against a flat 0.07-0.09 s for `dense_scan`; run
+time is unchanged, and the adjoint's transient (which concatenates one
+image cube per group) is 2,035,712 B at 16 channels against 1,202,376 B for
+`dense_scan` on the same plan. On a wide spectral cube, prefer a dense or
+chunked strategy, or expect a one-off compile of a few seconds. Retuning
+`auto` for channel count is [#34](https://github.com/chrisfinlay/jax-nufft/issues/34).
+
 Whether the default clamps is a property of the plan. Measured over every
 telescope in `tests/conftest.py` at both pointings (seed 0, eps 1e-6,
 float64, hermitian, one channel), `n_w` is EDA2 11 / **56**, GH200_large

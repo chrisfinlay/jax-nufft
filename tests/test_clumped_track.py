@@ -460,7 +460,8 @@ def test_clumped_track_matches_ducc(
     What the four traversals cover here is plane *placement and accumulation*
     at the deepest stacks in the repository -- ``n_w`` 214 folded / 461
     unfolded against 134 for the deepest Gaussian, with 90 / 312 empty planes
-    and a padding overhead of 29.50 against 4.94 -- and the ``vmap`` variants
+    and an un-bucketed padding overhead of 29.50 against 4.94 (1.21 against
+    1.38 on the metric issue #26 reports) -- and the ``vmap`` variants
     place their planes through a different (batched) composition than the
     ``scan`` ones. Window-bound coverage lives in
     :func:`test_multi_channel_spread_w_matches_ducc` (0.417 / 0.260).
@@ -531,8 +532,10 @@ def test_clumped_track_matches_ducc_long(
 
     MWA_extended clumped is the extreme cell. Measured on this machine at
     eps=1e-6, float64, seed 0: ``n_w = 214`` folded against the Gaussian off30
-    fixture's 134, with 90 of those planes empty and a padding overhead of
-    29.50 against 4.94; unfolded it is 461 planes with 312 empty.
+    fixture's 134, with 90 of those planes empty and an un-bucketed padding
+    overhead of 29.50 against 4.94 -- 1.21 against 1.38 on the bucketed metric
+    issue #26 reports, both re-measured on this branch; unfolded it is 461
+    planes with 312 empty.
     """
     eps = 1e-6 if X64 else 1e-4
     tel = long_clumped_track_telescope

@@ -111,6 +111,7 @@ from tests.conftest import (
     Telescope,
     reference_lmn_grids,
     requires_x64,
+    synthetic_uvw,
     tol,
 )
 from tests.test_divide_by_n import (
@@ -145,6 +146,35 @@ from tests.test_divide_by_n import EDA2 as EDA2  # re-export for readability
 # gate because their forward already carries the n_w * image allocation.
 GRAD_MEMORY_FACTOR_SCAN = 2.0
 GRAD_MEMORY_FACTOR_VMAP = 1.5
+
+# The same gate for a *multi-group* windowed plan (issue #26). It needs its own
+# constant because 2.0 no longer has usable margin there, and that is a finding
+# rather than an inconvenience. A plan whose channels bucket differently
+# compiles one body per group and concatenates one output per group, so the
+# adjoint's forward transient falls (bucketing removes row slices) while the
+# backward's does not (it carries the concatenation of the whole image cube) --
+# and the *ratio* between them is what this gate measures.
+#
+# Measured on EDA2 off30 at ``n_chan = 8``, ``freq = f * linspace(0.95, 1.05,
+# 8)``, eight distinct bucket tables, ``windowed_scan``, ``nthreads=1``, this
+# machine, and identical on both precision legs -- at HEAD against ``ab7fbbd``:
+#
+#     dirty2vis channel_strategy=scan   1.67x   (1.64x at ab7fbbd)
+#     vis2dirty channel_strategy=scan   1.99x   (1.66x)
+#     dirty2vis channel_strategy=vmap   1.67x   (1.42x)
+#     vis2dirty channel_strategy=vmap   1.84x   (1.10x)
+#
+# and on MWA_extended off30 at the same eight channels (float64): vis2dirty
+# 2.00x scan (1.77x at ab7fbbd) and 1.98x vmap (1.04x). So the worst reading is
+# 2.00x against a 2.0 gate -- 0.06% of margin, which is a coin toss and not a
+# test. 2.5 is 25% above the worst measured value.
+#
+# It is still a gate and not a licence: the regime it excludes is a backward
+# that saves one image-sized residual per (channel, plane), which on the cell
+# below is ``n_chan * n_w * image`` = 30.9 MB against ``2.5 * forward`` =
+# 1.46 MB, i.e. 21x outside. The separation the constant has to keep is an
+# order of magnitude, and it keeps one.
+GRAD_MEMORY_FACTOR_MULTI_GROUP = 2.5
 
 SCAN_STRATEGIES = ("dense_scan", "windowed_scan")
 
@@ -306,6 +336,107 @@ def test_gradient_memory_holds_with_several_channels(op: str, channel_strategy: 
         f"{op} (dense_scan, channel_strategy={channel_strategy}, n_chan=2): grad "
         f"transient memory {grad / 1e6:.3f} MB against forward {fwd / 1e6:.3f} MB "
         f"({grad / fwd:.2f}x, gate {factor}x)"
+    )
+
+
+@pytest.mark.parametrize("channel_strategy", CHANNEL_STRATEGIES)
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_gradient_memory_holds_over_many_windowed_channel_groups(
+    op: str, channel_strategy: str
+) -> None:
+    """The gate on a plan with eight issue-#26 bucket-table groups.
+
+    Every other memory cell in this module is ``n_chan <= 2``, and the one
+    two-channel cell above pins ``w_strategy="dense_scan"``. That leaves the
+    axis issue #26 actually added -- more than one *group* of channels, each
+    with its own bucket table, its own compiled body and its own slab of the
+    concatenated output -- measured nowhere. This is that cell.
+
+    ``n_chan = 8`` at a +/-5% frequency spread gives eight distinct bucket
+    tables on this fixture, i.e. eight groups: bucket edges are placed against
+    each channel's own window sizes, so two channels share a table only if
+    their whole size distributions coincide, which a realistic spread does not
+    produce. The assertions below pin that rather than assume it, because a
+    plan that collapsed to one group would be back to the pre-#26 program and
+    this test would be measuring nothing.
+
+    The gate is :data:`GRAD_MEMORY_FACTOR_MULTI_GROUP` and not
+    :data:`GRAD_MEMORY_FACTOR_SCAN`; see that constant for the measured
+    before/after table and for why 2.0 is no longer a number this regime can
+    be held to.
+    """
+    dtype = _active_dtype()
+    n_chan = 8
+    telescope = EDA2
+    uvw = synthetic_uvw(telescope, 30.0, seed=0)
+    freq = telescope.freq_hz * np.linspace(0.95, 1.05, n_chan)
+    plan = make_plan(
+        uvw,
+        freq,
+        (telescope.n_pix, telescope.n_pix),
+        telescope.pixsize,
+        telescope.pixsize,
+        tol(1e-6, 1e-5),
+        dtype=dtype,
+        hermitian=True,
+    )
+    # Non-vacuity, three ways. Without the first this is a single-group plan
+    # and so the pre-#26 program; without the second the windowed path is the
+    # dense one under another name; without the third a per-(channel, plane)
+    # residual backward would fit inside the gate.
+    assert len(set(plan.window_buckets)) == n_chan, (
+        "this plan's channels do not all bucket differently "
+        f"({len(set(plan.window_buckets))} distinct tables for {n_chan} channels), so "
+        "the multi-group path is not what is being measured"
+    )
+    assert plan.max_window_size < plan.n_rows, (
+        f"vacuous fixture: max_window_size {plan.max_window_size} spans all "
+        f"{plan.n_rows} rows, so windowed_scan is dense_scan here"
+    )
+
+    rng = np.random.default_rng(7)
+    image = jnp.asarray(
+        rng.standard_normal((n_chan, telescope.n_pix, telescope.n_pix)), dtype=dtype
+    )
+    vis = jnp.asarray(rng.standard_normal((plan.n_rows, n_chan)), dtype=dtype)
+    kw = dict(
+        w_strategy="windowed_scan",
+        channel_strategy=channel_strategy,
+        nthreads=1,
+        divide_by_n=True,
+    )
+    if op == "dirty2vis":
+        arg = image
+
+        def call(x: Any) -> Any:
+            return dirty2vis(plan, x, **kw)
+
+        def loss(x: Any) -> Any:
+            return jnp.sum(jnp.abs(call(x)) ** 2)
+    else:
+        arg = vis
+
+        def call(x: Any) -> Any:
+            return vis2dirty(plan, x, **kw)
+
+        def loss(x: Any) -> Any:
+            return jnp.sum(call(x) ** 2)
+
+    fwd = _temp_bytes(call, arg)
+    grad = _temp_bytes(jax.grad(loss), arg)
+
+    per_plane = plan.n_chan * plan.n_w * plan.n_l * plan.n_m * np.dtype(plan.complex_dtype).itemsize
+    assert per_plane > GRAD_MEMORY_FACTOR_MULTI_GROUP * fwd, (
+        f"{op}: the fixture is too small to falsify anything -- n_chan * n_w * image = "
+        f"{per_plane / 1e6:.3f} MB is already inside "
+        f"{GRAD_MEMORY_FACTOR_MULTI_GROUP} x forward "
+        f"({GRAD_MEMORY_FACTOR_MULTI_GROUP * fwd / 1e6:.3f} MB)"
+    )
+    assert grad <= GRAD_MEMORY_FACTOR_MULTI_GROUP * fwd, (
+        f"{op} (windowed_scan, channel_strategy={channel_strategy}, n_chan={n_chan}, "
+        f"{len(set(plan.window_buckets))} bucket-table groups): grad transient memory "
+        f"{grad / 1e6:.3f} MB against a forward of {fwd / 1e6:.3f} MB ({grad / fwd:.2f}x, "
+        f"gate {GRAD_MEMORY_FACTOR_MULTI_GROUP}x) on a plan with n_w = {plan.n_w}"
     )
 
 

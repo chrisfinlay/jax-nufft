@@ -187,8 +187,45 @@ tagged or released, so its changes appear here for the first time; they are mark
   slice at a time, so `windowed_scan`'s peak is set by the widest class and does not fall
   (128,032 B → 128,224 B on the same fixture).
 
-  **Not done:** the definition of done's GPU gate, which needs a CUDA jax-finufft build. The CPU
-  gates above are met; the GPU cell is pending.
+  **The definition of done's two CPU timing gates, stated as measured rather than as met.**
+
+  *Gate 1 — "windowed strategies within 1.2× of the best dense strategy on CPU single-thread for
+  MWA_extended off30 and MeerKAT off30".* Re-measured on this branch under the same protocol (a
+  fresh interleaved run on the same machine; it agrees with the runtime paragraph above to within
+  2.6% on every ratio):
+  `windowed_vmap` and `windowed_chunked` clear it on all four (fixture, operator) cells at
+  0.85–1.06×, but `windowed_scan` reads 1.42× / 1.13× (MWA_extended off30 forward / adjoint) and
+  1.36× / 1.24× (MeerKAT off30), so it is **above 1.2× on three of the four**. That is the scan
+  family's own gap and not windowing: on the same runs `windowed_scan` is 0.87–0.98× of
+  `dense_scan` — never slower than its own family's dense member — while `dense_scan` alone is
+  1.30–1.46× of the best dense strategy. The gate as written is therefore measuring a difference
+  between the scan and vmap families rather than the change under review. Read on the pick a caller
+  actually gets, it is met: CPU `auto` resolves to a windowed strategy on exactly one of the four
+  cells (MWA_extended off30 *adjoint*; the two forwards go to `dense_scan`, and MeerKAT off30's
+  adjoint fails the `n_w / W > 2` gate at 1.86), and that cell reads **1.13×**.
+
+  *Gate 2 — "faster than dense on the adjoint for a 20k-row problem" (`synthetic_uvw` with
+  `GH200_LARGE`'s baseline parameters, `n_rows = 20_000`, `n_pix = 512`, off30).* Measured, same
+  protocol, eps 1e-6, float64, seed 0, `hermitian=True`: `n_w = 25`, `max_window_size` 15,067 of
+  20,000, buckets `((2568, 11), (5567, 4), (10266, 5), (15067, 5))`, overhead 1.2656 against an
+  un-bucketed 2.6905. Adjoint, best dense/chunked 172.7 ms: `windowed_vmap` **141.7 ms (0.82×)**,
+  `windowed_chunked(32)` 142.6 ms (0.83×), `windowed_scan` 179.5 ms (1.04×). Forward, best dense
+  138.8 ms: `windowed_chunked(32)` 128.5 ms (0.93×), `windowed_vmap` 129.0 ms (0.93×),
+  `windowed_scan` 154.1 ms (1.11×). **Gate met on the adjoint**, by 1.22×.
+
+  **Not done:** the definition of done's GPU gate, which needs a CUDA jax-finufft build.
+
+  **Not measured by any gate:** the multi-channel path. Every figure above is `n_chan = 1`, which
+  is one bucket-table group and emits the pre-#26 program. A plan whose channels bucket differently
+  compiles one body per group, and at a realistic ±5% frequency spread the group count *equals*
+  `n_chan`. Measured on EDA2 off30 at `n_chan` 1 / 3 / 8 / 16, the compile time of a jitted
+  `windowed_scan` `vis2dirty` is 0.13 / 0.29 / 0.63 / 1.10 s against a flat 0.07–0.09 s for
+  `dense_scan` and 0.08–0.11 s for `windowed_scan` at `ab7fbbd`; run time is unchanged. The
+  windowed adjoint's transient is below both baselines to eight channels and above them past that
+  — 2,035,712 B at `n_chan = 16` against `ab7fbbd`'s 1,237,384 B (+64.5%) and `dense_scan`'s
+  1,202,376 B (+69.3%) — because it concatenates one image cube per group. `dirty2vis` is
+  unaffected (279,904 B against 1,243,904 B). Retuning `auto` for channel count is issue
+  [#34](https://github.com/chrisfinlay/jax-nufft/issues/34).
   ([#26](https://github.com/chrisfinlay/jax-nufft/issues/26))
 
 - **A constant-w fast path.** When every row shares one `w` in wavelengths, the plan collapses to a

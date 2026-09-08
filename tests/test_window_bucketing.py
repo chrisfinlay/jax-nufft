@@ -150,13 +150,22 @@ At ``ab7fbbd``:
   1.5714, 4.9441, 1.8571, 2.7389), and passes on MWA_compact zenith
   (1.1431), MeerKAT zenith (1.1429) and GH200_large zenith (1.2857);
 * ``test_the_lowered_windowed_loop_takes_more_than_one_slice_length`` fails
-  on all six of its cells with "still takes a single slice length [1072]";
+  on all six of its cells, but not all six the same way: the three
+  ``dirty2vis`` cells fail on "still takes a single slice length [1072]",
+  while the three ``vis2dirty`` ones find ``{1, 1072}`` -- the extra ``1``
+  being the adjoint's ``flip_sign`` row gather and not a window -- so they
+  clear that assertion and fail at :func:`_bucket_layout` instead. See the
+  test's own docstring;
+* ``test_interleaved_channel_groups_are_reassembled_in_channel_order`` fails
+  on all six of its cells at :func:`_bucket_layout`, that being how it reads
+  the channel grouping;
 * ``test_windowed_vmap_temp_memory_falls_with_bucketing`` fails at
   13,565,952 bytes against a 6,782,976-byte bound;
 * the equivalence, gradient, vmap/jit and vacuity-guard tests **pass** today
-  (40 of the module's 62 cells at ``ab7fbbd``) and are regression
-  protection: they carry the vacuity guard so that they are still meaningful
-  once bucketing lands, but they assert nothing that is false before it.
+  (measured: 40 passed, 28 failed of the module's 68 cells at ``ab7fbbd``)
+  and are regression protection: they carry the vacuity guard so that they
+  are still meaningful once bucketing lands, but they assert nothing that is
+  false before it.
 """
 
 from __future__ import annotations
@@ -828,6 +837,110 @@ def test_equivalence_still_holds_once_the_windows_are_actually_bucketed(op: str)
         )
 
 
+# ``freq`` factors chosen so that the channels which share a bucket table are
+# *not* contiguous in channel index. ``make_plan`` does not require a sorted
+# ``freq`` and nothing downstream sorts it, but every other multi-channel
+# fixture in this repository passes an ascending one
+# (``linspace(0.95, 1.05, 4)``, ``[0.9, 1.0, 1.1]``,
+# :data:`MULTI_CHAN_FREQ_FACTORS`, ``[1e9, 1.5e9]``) -- and window size is
+# monotone in frequency, so with an ascending ``freq`` equal bucket tables
+# always fall in contiguous runs and the channel-group reassembly is the
+# identity permutation. Measured: 256 repository-shaped plans (four
+# telescopes x two pointings x both ``hermitian`` settings x eps
+# {1e-6, 1e-3} x eight frequency-factor sets, including all four this
+# repository uses) plus 480 random ascending draws of two to five channels
+# spanning 0.6x to 2.5x the telescope frequency -- the identity on every one
+# of the 736. This fixture is the smallest departure from that --
+# channels 0 and 2 at the telescope frequency and channel 1 at twice it, so
+# the groups come out ``[(0, 2), (1,)]`` and their concatenation is
+# ``[0, 2, 1]``.
+_NON_MONOTONE_FREQ_FACTORS = (1.0, 2.0, 1.0)
+
+
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+@pytest.mark.parametrize("w_strategy", WINDOWED_STRATEGIES)
+def test_interleaved_channel_groups_are_reassembled_in_channel_order(
+    w_strategy: str, op: str
+) -> None:
+    """Channels that share a bucket table need not be adjacent in the plan.
+
+    A bucket's slice length is a static shape, so the channel axis can only be
+    mapped over channels that bucket identically; the implementation therefore
+    groups channels by bucket table, runs each group, concatenates the results
+    **in group order** and permutes them back into channel order. That last
+    step is a no-op on every fixture this repository can build, which is
+    exactly why it needs a cell of its own: with this test deselected,
+    deleting the permutation leaves the whole ``--runslow`` suite
+    byte-identical, pass for pass and skip for skip, because with an ascending
+    ``freq`` the groups are already contiguous ascending runs. See
+    :data:`_NON_MONOTONE_FREQ_FACTORS` for how far that was checked.
+
+    The implementation skips the permutation when it *is* the identity, which
+    makes the reordering branch rarer still -- on every repository fixture the
+    fast path is the one taken and the ``argsort`` never runs. So this cell is
+    what pins both halves of that branch, and it was checked against both
+    mutations: deleting the reassembly outright (``return out``
+    unconditionally), and inverting the identity test so the fast path and the
+    reorder swap places. Each fails all six cells here, with the readings
+    below, and neither is caught anywhere else in the suite.
+
+    The comparison is per channel and not on the stacked result, because a
+    permutation of the channel axis is invisible to a norm over the whole
+    array only if the channels happen to be equal -- and, more usefully,
+    because a per-channel report names *which* channels were swapped.
+
+    Measured on this fixture (EDA2 off30, ``freq = f * [1.0, 2.0, 1.0]``,
+    seed 0, eps 1e-6, float64, ``hermitian=True``, ``max_window_size`` 126 of
+    400 rows, per-channel maxima 126 / 72 / 126, groups ``[(0, 2), (1,)]``),
+    worst per-channel disagreement with ``dense_scan`` over the three windowed
+    strategies: forward 1.323e-16, adjoint 3.464e-15. Under either mutation
+    channels 1 and 2 come back swapped and all six cells fail, at the same
+    readings both times -- forward ``[1.323e-16, 1.477e+00, 1.373e+00]`` and
+    adjoint ``[2.888e-15, 1.415e+00, 1.562e+00]``, channel 0 (which is first
+    in its own group and therefore lands in the right slot either way) being
+    the one that stays correct.
+    """
+    plan = _plan(EDA2, 30.0, freq_factors=_NON_MONOTONE_FREQ_FACTORS)
+    _assert_windows_are_strict(plan)
+    assert plan.n_chan == len(_NON_MONOTONE_FREQ_FACTORS)
+
+    # The grouping, derived from the public plan surface rather than imported:
+    # channels in first-appearance order of their bucket table.
+    by_table: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    for chan, table in enumerate(_bucket_layout(plan)):
+        by_table.setdefault(table, []).append(chan)
+    grouped_order = [chan for chans in by_table.values() for chan in chans]
+    assert len(by_table) > 1, (
+        "vacuous fixture: every channel of this plan has the same bucket table, "
+        "so there is only one group and no reassembly happens at all "
+        f"({_bucket_layout(plan)})"
+    )
+    assert grouped_order != sorted(grouped_order), (
+        "vacuous fixture: the bucket-table groups are already contiguous ascending "
+        f"runs of channel index ({grouped_order}), so the reassembly this test is "
+        "about is the identity permutation and deleting it would change nothing"
+    )
+
+    image, vis = _inputs(plan, EDA2)
+    arg = image if op == "dirty2vis" else vis
+    reference = _call(op, plan, arg, w_strategy="dense_scan")
+    got = _call(op, plan, arg, w_strategy=w_strategy)
+
+    # ``dirty2vis`` puts the channel axis last ((n_rows, n_chan)) and
+    # ``vis2dirty`` first ((n_chan, n_l, n_m)); take the channel either way.
+    def channel(x: Any, chan: int) -> Any:
+        return x[..., chan] if op == "dirty2vis" else x[chan]
+
+    per_chan = [_rel(channel(got, c), channel(reference, c)) for c in range(plan.n_chan)]
+    assert max(per_chan) < STRATEGY_TOL, (
+        f"{w_strategy} {op} disagrees with dense_scan per channel by "
+        f"{[f'{v:.3e}' for v in per_chan]} on a plan whose bucket-table groups are "
+        f"{[tuple(chans) for chans in by_table.values()]} -- channels that share a "
+        "bucket table are not contiguous here, so a result concatenated in group "
+        "order and not permuted back comes out with those channels transposed"
+    )
+
+
 # =============================================================================
 # 3. per-channel window sizes (implementation-plan item 2)
 # =============================================================================
@@ -910,10 +1023,28 @@ def test_the_lowered_windowed_loop_takes_more_than_one_slice_length(
     Measured at ``ab7fbbd`` on the NARROW fixture (off30, seed 0, eps 1e-6,
     float64, hermitian=True, n_w = 138, max_window_size = 1072 of 4000 rows,
     85 distinct padded window sizes from 2 to 1072 with a median of 24): all
-    three windowed strategies, both operators, lower to exactly one distinct
-    slice length, ``{1072}``. ``dense_scan`` lowers to none at all, which is
-    the control that the probe is reading the windowed slice and not
-    something incidental.
+    three windowed strategies lower ``dirty2vis`` to exactly one distinct
+    slice length, ``{1072}``, and ``vis2dirty`` to ``{1, 1072}``.
+    ``dense_scan`` lowers to none at all in either direction, which is the
+    control that the probe is reading the windowed slice and not something
+    incidental.
+
+    The stray ``1`` is not a window: it is the adjoint's
+    ``plan.flip_sign[plan.sort_perm]``, a whole-row gather that lowers with
+    ``slice_sizes = array<i64: 1>`` out of ``tensor<4000xi8>`` and which
+    :func:`_window_slice_lengths` cannot tell from a one-row window. So at
+    ``ab7fbbd`` the three ``vis2dirty`` cells reach the ``> 1`` assertion and
+    pass it for the wrong reason, then fail at :func:`_bucket_layout` on the
+    absent bucket table -- which is why the ``found <= bucket_lengths``
+    assertion at the foot of this test matters: 1 is not a bucket length on
+    this plan (its narrowest window is 2), so a probe reading that gather
+    after bucketing would fail there. The shipped source keeps the probe
+    honest at the source instead, by gathering ``flip_sign`` through an
+    ``(n_rows, 1)`` view so that every whole-row gather of a plan leaf lowers
+    at rank 2 and the only rank-1 row slice left is a w-plane window; the
+    alternative was to anchor this module's regex on the operand's element
+    type (``tensor<{n}x(?:f|complex)``) rather than on ``[a-z]``. Nothing but
+    a comment in ``wgridder.py`` enforces the convention that was chosen.
 
     After bucketing the set must be the plan's own bucket lengths -- a length
     the plan does not claim as a bucket is work nothing accounts for -- and

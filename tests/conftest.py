@@ -332,11 +332,24 @@ def synthetic_uvw(
 # planes between the clumps. Measured against the matching ``synthetic_uvw``
 # off30 plan (float64, eps=1e-6, shipped ``hermitian=True`` default):
 #
-#     fixture           n_w   empty planes   window_padding_overhead
-#     EDA2 clumped       81        13                 11.25
-#     EDA2 off30         56         0                  2.52
-#     MWA_extended clu. 214        90                 29.50
-#     MWA_extended off30 134       18                  4.94
+#     fixture           n_w   empty planes   padded row-work / live row-work
+#                                            un-bucketed    issue #26 buckets
+#     EDA2 clumped       81        13           11.25             1.10
+#     EDA2 off30         56         0            2.52             1.24
+#     MWA_extended clu. 214        90           29.50             1.21
+#     MWA_extended off30 134       18            4.94             1.38
+#
+# Two columns since issue #26, because the two say different things and the
+# fixture exists for the first. "Un-bucketed" is ``n_chan * n_w *
+# max_window_size / live_row_count``, the quantity ``window_padding_overhead``
+# reported before #26 and still exactly recomputable from the plan (#26 left
+# every term of it in place); it is what makes clumping a stress fixture --
+# 11.25 and 29.50 are the padded traversals a clumped w-column would have cost.
+# The second column is what ``plan.window_padding_overhead`` reports today,
+# after per-channel size bucketing has removed most of that padding, and it is
+# the reason the ordering this fixture was built to demonstrate now has to be
+# asserted on the un-bucketed ratio (see
+# ``test_planning.py::test_window_builder_clumped_distribution``).
 #
 # It is a w-distribution stress fixture, not a physically simulated track: as
 # in ``tests/test_boundary_planes.py`` the w column is drawn independently of
@@ -444,11 +457,18 @@ def long_telescope_pointing(request) -> tuple[Telescope, float]:
 # machine at eps=1e-6, float64, shipped ``hermitian=True``, ``clumped_track``
 # (seed 0) vs ``synthetic_uvw(tel, 30.0, seed=0)``, at ``w_kernel_width = 7``:
 #
-#     telescope    n_w clu/off30   empty clu/off30   overhead clu/off30   max_window_size clumped
-#     EDA2            81 / 56          13 / 0            11.25 / 2.52          389 of 400
-#     MWA_extended   214 / 134         90 / 18           29.50 / 4.94          579 of 600
-#     MWA_compact     15 / 12           0 / 0             2.14 / 1.71          599 of 600
-#     MeerKAT         17 / 13           0 / 0             2.42 / 1.86          597 of 600
+#     telescope    n_w clu/off30   empty clu/off30   un-bucketed clu/off30   bucketed clu/off30   max_window_size clumped
+#     EDA2            81 / 56          13 / 0             11.25 / 2.52            1.10 / 1.24           389 of 400
+#     MWA_extended   214 / 134         90 / 18            29.50 / 4.94            1.21 / 1.38           579 of 600
+#     MWA_compact     15 / 12           0 / 0              2.14 / 1.71            1.01 / 1.05           599 of 600
+#     MeerKAT         17 / 13           0 / 0              2.42 / 1.86            1.01 / 1.07           597 of 600
+#
+# "Un-bucketed" is the pre-issue-#26 metric ``n_chan * n_w * max_window_size /
+# live_row_count``, still recomputable from the plan; "bucketed" is what
+# ``plan.window_padding_overhead`` reports since #26. The criterion below is
+# argued on the un-bucketed column, which is the padded traversal the clumped
+# w-column would produce, and is therefore the quantity that says whether
+# clumping reaches the plan at all.
 #
 # EDA2 gets there on a 120-degree field (large ``max|n-1|``) and MWA_extended on
 # 5.3 km baselines (large w-extent in wavelengths). MWA_compact and MeerKAT do
@@ -460,9 +480,18 @@ def long_telescope_pointing(request) -> tuple[Telescope, float]:
 # here would add cells that cannot fail for the reason this fixture exists.
 # ``tests/test_boundary_planes.py`` keeps the small-``n_w`` clumped cases.
 #
-# Clumping does move MeerKAT's padding overhead by 30% (1.86 -> 2.42), so it is
-# not a strict no-op there; it just does not move the two quantities the parity
-# tests in ``tests/test_clumped_track.py`` guard on.
+# Clumping does move MeerKAT's *un-bucketed* padding overhead by 30%
+# (1.86 -> 2.42), so it is not a strict no-op there; it just does not move the
+# two quantities the parity tests in ``tests/test_clumped_track.py`` guard on.
+# On the metric ``plan.window_padding_overhead`` reports since issue #26 the
+# sign of that sentence inverts and its size collapses: 1.0690 -> 1.0143,
+# i.e. clumping *lowers* the reported overhead by 5.1%. Both readings are of the
+# same plans and neither is wrong -- clumping concentrates the rows, which
+# raises the widest window relative to the mean (the un-bucketed numerator is
+# ``n_w * max_window_size``) while making the size distribution easier to
+# bucket, which is the numerator #26 reports. The 30% figure is kept because
+# it is the one this fixture's design rationale rests on, but it is now a
+# statement about the un-bucketed quantity and is labelled as such.
 _CLUMPED_SHORT_TELESCOPES = [EDA2]
 _CLUMPED_LONG_TELESCOPES = [MWA_EXTENDED]
 

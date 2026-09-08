@@ -22,8 +22,10 @@ from jax_nufft import dirty2vis, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
 from jax_nufft.kernel import kernel_params
 from jax_nufft.planning import (
+    MAX_WINDOW_BUCKETS,
     W_OVERSAMPLE_X0,
     WGridderPlan,
+    bucket_window_sizes,
     make_plan,
     window_boundary_margin,
 )
@@ -1064,6 +1066,82 @@ def test_window_builder_matches_independent_reference(freq: np.ndarray) -> None:
         "sizes vary, so nothing was bucketed"
     )
     assert plan.live_row_count < int(expected_size.sum())
+
+
+@pytest.mark.parametrize("n_distinct", [1025, 3000, 5000])
+def test_the_bucket_dp_degrades_gracefully_past_its_edge_cap(n_distinct: int) -> None:
+    """The ``_BUCKET_DP_MAX_EDGES`` branch, which no plan in this repository reaches.
+
+    ``bucket_window_sizes`` is ``O(MAX_WINDOW_BUCKETS * m^2)`` in the number
+    ``m`` of *distinct* padded window sizes, and it caps ``m`` at
+    ``_BUCKET_DP_MAX_EDGES`` candidate cut points so that a plan with thousands
+    of distinct window lengths degrades to a restricted search rather than to a
+    quadratic plan-build time. Measured over every plan this repository builds
+    (five telescopes x two pointings x four epsilons x both geometries, plus
+    the clumped tracks), the worst ``m`` is 77 and the worst ``n_w`` is 467, so
+    that branch is dead code as far as every other test here is concerned --
+    which is exactly why it needs a cell of its own, entered through the public
+    function and not by lowering the constant.
+
+    What is asserted is what the branch's docstring promises: restricting the
+    candidate edges shrinks the *search space* only, so the result is still a
+    valid bucketing (ascending distinct lengths, counts summing to ``m``, and
+    every size covered by the length of the class it lands in -- a plane
+    bucketed below its own window would silently drop rows the dense path
+    weights), merely not provably optimal. The optimum it is compared against
+    is computed by the same function with the cap lifted.
+
+    Measured on this machine (uniformly drawn distinct sizes, seeds 0 / 1 / 2),
+    restricted cost against unrestricted: 4,789,394 vs 4,789,394 (m = 1025,
+    exactly optimal), 40,246,634 vs 40,244,172 (m = 3000, +0.0061%) and
+    109,947,623 vs 109,926,955 (m = 5000, +0.0188%); wall time 10.8 / 11.0 /
+    11.1 ms restricted against 10.9 / 49.5 / 113.5 ms unrestricted, i.e. the
+    cap does the flattening it exists for. The gate below is 1% rather than
+    those figures: the claim is "a valid bucketing at a bounded cost", and
+    pinning 0.0188% would be pinning the draw.
+    """
+    rng = np.random.default_rng({1025: 0, 3000: 1, 5000: 2}[n_distinct])
+    sizes = np.unique(rng.integers(1, 20 * n_distinct, size=n_distinct * 3))[:n_distinct]
+    assert sizes.size == n_distinct, "the draw did not yield enough distinct sizes"
+
+    buckets, order = bucket_window_sizes(sizes)
+
+    lengths = [length for length, _ in buckets]
+    counts = [count for _, count in buckets]
+    assert 1 <= len(buckets) <= MAX_WINDOW_BUCKETS
+    assert lengths == sorted(lengths) and len(set(lengths)) == len(lengths)
+    assert sum(counts) == n_distinct
+    assert sorted(order.tolist()) == list(range(n_distinct))
+    np.testing.assert_array_equal(sizes[order], np.sort(sizes))
+    assert np.all(np.repeat(lengths, counts) >= np.sort(sizes)), (
+        "the restricted search returned a bucket shorter than a plane it holds"
+    )
+
+    restricted = sum(length * count for length, count in buckets)
+    cap = jax_nufft.planning._BUCKET_DP_MAX_EDGES
+    assert n_distinct > cap, (
+        f"vacuous cell: {n_distinct} distinct sizes is inside the "
+        f"{cap}-edge cap, so the restricted branch is not taken"
+    )
+    # Lift the cap by asking the same DP over every candidate edge; the cap is a
+    # module constant the function reads, so this is the only way in.
+    saved = cap
+    jax_nufft.planning._BUCKET_DP_MAX_EDGES = n_distinct
+    try:
+        unrestricted_buckets, _ = bucket_window_sizes(sizes)
+    finally:
+        jax_nufft.planning._BUCKET_DP_MAX_EDGES = saved
+    unrestricted = sum(length * count for length, count in unrestricted_buckets)
+
+    assert restricted >= unrestricted, (
+        "the restricted search beat the full one, which is impossible: its "
+        "candidate edges are a subset"
+    )
+    assert restricted <= 1.01 * unrestricted, (
+        f"the {cap}-edge search costs {restricted} against an optimum of "
+        f"{unrestricted} ({restricted / unrestricted:.6f}x) on {n_distinct} "
+        "distinct sizes"
+    )
 
 
 def _clumped_and_uniform_uvw(n_rows: int = 400) -> tuple[np.ndarray, np.ndarray]:

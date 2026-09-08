@@ -1052,14 +1052,33 @@ def test_padding_overhead_is_never_below_one() -> None:
 # measures the windowed adjoint win on. See the derivation comment on
 # ``_CPU_PADDING_CUTOFF`` in ``wgridder.py``.
 #
-# ``_GPU_PADDING_CUTOFF`` does not move either, and on the folded grid it stops
-# being reachable at all: unfolded, three cells sit above 3.0 (MWA_compact
-# off30 3.050 and MeerKAT off30 3.172 at eps 1e-3, plus the MWA_extended off30
-# column); folded, the maximum outside MWA_extended off30 is 2.765, so only
-# that one fixture is above the cutoff. Both cells that cross are on plans of
-# 600 rows, which the GPU heuristic sends to ``dense_vmap`` on the row-count
-# gate before the padding branch is consulted, so no GPU pick depends on it
-# either way.
+# **Every number above in this comment -- the four-cell table included -- is
+# the pre-#26 un-bucketed metric, and stays exactly reproducible as such**:
+# ``n_chan * n_w * max_window_size / live_row_count``, all three terms of which
+# #26 leaves in place. Re-measured on this branch, the table reads
+# 1.0769 - 3.1720 / 5.1729 - 5.7843 unfolded and 1.0769 - 2.7649 /
+# 4.9441 - 5.0762 folded on that metric, and the seed sweep reads
+# 5.0762 - 6.4661 float64 and
+# 5.0741 - 6.4688 float32 over the same twelve folded seeds, crossing 6.0 on
+# four of them in both legs. What #26 changes is that the *shipped* metric is
+# no longer that quantity: on the same twelve seeds it reads 1.3867 - 1.5569
+# (float64) / 1.3867 - 1.5581 (float32) and crosses 6.0 on none. So the
+# argument above is preserved as a record of how 6.0 was arrived at, and the
+# cutoff's present status -- unreachable on the scale it is actually compared
+# against, retune deferred to issue #34 -- is stated on
+# ``test_cpu_padding_cutoff_is_six_and_still_gates`` below.
+#
+# ``_GPU_PADDING_CUTOFF`` does not move either, and since issue #26 the
+# reported metric does not reach it anywhere: no cell of this forty-cell grid
+# is above 3.0 in either geometry, the maximum being 1.6206 unfolded and
+# 1.4133 folded. On the un-bucketed metric the old picture is unchanged and
+# still reproduces: unfolded, six cells sit above 3.0 (MWA_compact off30 3.050
+# and MeerKAT off30 3.172 at eps 1e-3, plus all four MWA_extended off30 cells
+# at 5.173 - 5.784); folded, the maximum outside MWA_extended off30 is 2.765,
+# so only that one fixture is above the cutoff. Both of the ordinary cells
+# that crossed are on plans of 600 rows, which the GPU heuristic sends to
+# ``dense_vmap`` on the row-count gate before the padding branch is consulted,
+# so no GPU pick depended on it either way even then.
 
 _FIXTURES = [EDA2, MWA_COMPACT, MWA_EXTENDED, MEERKAT, GH200_LARGE]
 _POINTINGS = [0.0, 30.0]
@@ -1104,8 +1123,16 @@ _HIGH_OVERHEAD_POINTING = 30.0
 #   hermitian=True         1.000 - 1.286          1.377 - 1.413
 #
 # Two consequences worth stating rather than leaving to be noticed. First,
-# ``MWA_extended off30`` is barely the outlier it was: the unfolded bands now
-# almost touch (1.400 against 1.422) where they used to be separated by 1.8.
+# ``MWA_extended off30`` is barely the outlier it was: the two unfolded
+# populations are now 1.3998 and 1.4215, a gap of 1.55%, where they used to be
+# separated by 1.8. **The unfolded bands therefore overlap on [1.41, 1.42]**,
+# and that is a statement about the fixtures rather than slack in the bands --
+# no assignment of round numbers with usable rounding room on both sides can
+# separate two populations 1.55% apart. The overlap costs nothing operationally
+# (the test picks a band by fixture identity, never by membership) but it does
+# mean the unfolded leg no longer demonstrates that MWA_extended off30 is a
+# distinguishable regime. The folded leg -- the shipped geometry -- still does,
+# at 1.2861 against 1.3768 with a clean 1.32 / 1.35 cut.
 # Second, **no cell of this grid comes near either cutoff any more** -- the
 # worst is 1.621 against ``_CPU_PADDING_CUTOFF`` 6.0 and ``_GPU_PADDING_CUTOFF``
 # 3.0 -- so the padding branch of the ``auto`` selector no longer fires on any
@@ -1113,9 +1140,10 @@ _HIGH_OVERHEAD_POINTING = 30.0
 # effect of issue #26 (the padding it guarded against is what bucketing
 # removes) and not a loosening of the guard: the cutoffs are unchanged and
 # ``test_cpu_padding_cutoff_is_six_and_still_gates`` still exercises the branch
-# on both sides by substituting the field.
-_ORDINARY_OVERHEAD_RANGE = {False: (1.0, 1.45), True: (1.0, 1.32)}
-_HIGH_OVERHEAD_RANGE = {False: (1.40, 1.70), True: (1.35, 1.45)}
+# on both sides by substituting the field. It does mean the cutoffs are now
+# pinned by that substitution test alone; see its docstring, and issue #34.
+_ORDINARY_OVERHEAD_RANGE = {False: (1.0, 1.42), True: (1.0, 1.32)}
+_HIGH_OVERHEAD_RANGE = {False: (1.41, 1.70), True: (1.35, 1.45)}
 
 
 def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
@@ -1124,27 +1152,34 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     Stated as its own test so the number is auditable without running the
     forty-cell sweep. Two halves, and the second is the one that matters:
 
-    * **6.0 exactly.** On the *unfolded* geometry the corrected metric reaches
-      5.784 (float64) / 5.792 (float32) on MWA_extended off30, so anything at
-      or below that flips the measured CPU win to ``dense_scan``. That is a
-      *lower* bound, and a lower bound alone is satisfied by 100.0 -- which
-      would clear the grid by switching the guard off. The upper bound is the
-      derivation: the worst padded-to-live inflation on the grid is
-      5.7843 / 4.8089 = 1.2028, so carrying the shipped 5.0 across the change
-      of scale gives 6.014, and 6.0 is that rounded down to the nearest tenth.
-      The construction yields 6.014, not 6.0; 6.0 is the round number just
-      below it, which is what keeps the restatement from loosening the cutoff.
+    * **6.0 exactly -- on the scale it was derived for, which since issue #26
+      is no longer the scale it is compared against.** The derivation is
+      #43's and it still reproduces exactly, but every quantity in it is now
+      the *un-bucketed* metric ``n_chan * n_w * max_window_size /
+      live_row_count``, which #26 kept recomputable (it left
+      ``max_window_size`` and ``live_row_count`` alone) but stopped reporting.
+      Re-measured on this grid, float64, unfolded: the un-bucketed metric
+      reaches 5.7843 on MWA_extended off30 (5.7915 on the float32 leg), the
+      worst un-bucketed-to-pre-#43 inflation is still 5.7843 / 4.8089 =
+      1.2028, and 5.0 x 1.2028 = 6.014 still rounds down to 6.0. Folded, the
+      un-bucketed maximum is still 5.0762, which 6.0 still clears by 18.2%.
 
-      Issue #17's fold does not re-open that derivation, and the reason is
-      that #43 changed the metric's *denominator* while #17 changes only the
-      geometry measured under it: there is no change of scale to restate
-      across a second time. What it does change is the headroom -- the folded
-      grid's maximum is 5.076, so 6.0 now clears the worst shipped cell by
-      18.2% where it cleared the unfolded one by 3.7%. See the grid comment
-      above for why that headroom is not re-fitted onto 5.076.
+      What no longer holds is the *connection* between that derivation and
+      the constant's use. ``plan.window_padding_overhead`` is now the
+      bucketed ratio, and on this grid it reads 1.4215 - 1.6206 unfolded and
+      1.3768 - 1.4133 folded on the same MWA_extended off30 cells -- a lower
+      bound of 6.0 on a quantity whose grid maximum is 1.62 is not a
+      calibration, it is a switch in the off position. So the honest status
+      is: 6.0 is pinned by the assertion below and by nothing else, no
+      repository fixture can reach it at any epsilon in either geometry, and
+      re-fitting it onto the bucketed scale is issue #34's business, not a
+      change to smuggle in here. It is left where it is so that the value
+      does not move twice.
     * **It still gates.** A constant no branch can reach is not a cutoff, so
       exercise the branch on both sides of the value rather than trusting that
-      the comparison is still wired up.
+      the comparison is still wired up. With the grid no longer reaching 6.0
+      this is the *only* thing keeping the branch alive, which is why it
+      substitutes the field rather than looking for a fixture.
     """
     assert _CPU_PADDING_CUTOFF == 6.0
     # The GPU cutoff is unchanged by the redefinition; pin that it did not
@@ -1183,9 +1218,17 @@ def test_calibration_grid_padding_overhead(
       #43's redefinition;
     * the ``True`` leg is the shipped geometry (issue #17). Its bands are
       *narrower* and lower, so they are a real re-measurement rather than the
-      unfolded ones with slack added: the folded high band is 4.944 - 5.076
-      against an unfolded 5.173 - 5.784, and a plan that silently stopped
-      folding would read outside it.
+      unfolded ones with slack added: re-measured on this branch, the folded
+      high cells read 1.3768 - 1.4133 against an unfolded 1.4215 - 1.6206 (on
+      the pre-#26 un-bucketed metric the same cells are 4.9441 - 5.0762 folded
+      against 5.1729 - 5.7843 unfolded, which is where the older figures in
+      this module come from), and a plan that silently stopped folding would
+      read outside its band.
+
+    What the bands no longer pin is that MWA_extended off30 is a separable
+    regime on the unfolded leg: see the comment on
+    ``_ORDINARY_OVERHEAD_RANGE`` for why the two unfolded bands now overlap on
+    [1.41, 1.42].
 
     Both legs are swept because the grid is cheap (host-side plan building
     only) and because the cutoff derivation quotes numbers from each.
@@ -1223,10 +1266,32 @@ def test_calibration_grid_auto_picks_survive_the_redefinition(
     denominator, against the old 5.0 / 3.0 cutoffs -- rather than written down
     as a table of strategy names, so what is asserted is *equivalence*: not
     which strategy each cell gets, but that redefining the diagnostic and
-    restating the cutoff moved none of them. The bite is the four
-    MWA_extended off30 adjoint cells: their corrected overhead is 5.17 - 5.79
-    against a padded 4.71 - 4.93, so any ``_CPU_PADDING_CUTOFF`` at or below
-    5.79 flips them to ``dense_scan`` and this fails.
+    restating the cutoff moved none of them. The bite *was* the four
+    MWA_extended off30 adjoint cells: on the metric #43 shipped they read
+    5.17 - 5.79 against a padded 4.71 - 4.93, so any ``_CPU_PADDING_CUTOFF``
+    at or below 5.79 flipped them to ``dense_scan`` and this failed.
+
+    Since issue #26 the CPU half of that bite is gone, and that is worth
+    saying plainly rather than leaving the paragraph above to imply otherwise.
+    Re-measured on this branch, the same four cells read 1.4215 - 1.6206 on
+    the shipped metric (the 5.1729 - 5.7843 figures survive as the un-bucketed
+    metric ``n_chan * n_w * max_window_size / live_row_count``). The old
+    rule's CPU padding branch does not fire either -- the padded metric it
+    reads spans 1.0766 - 4.9328 over this grid, under its own 5.0 -- so the
+    two CPU rules now agree because neither fires, and what this test pins on
+    that side is the *rest* of the selector (the small-``n_w`` and ``n_w / W``
+    gates). Issue #34 is where the cutoffs get re-fitted onto the bucketed
+    scale, and this test regains its CPU bite there.
+
+    The GPU half still has one. The old rule's 3.0 on the padded metric fires
+    on six of the forty cells (MWA_compact off30 3.0256 and MeerKAT off30
+    3.1419 at eps 1e-3, and all four MWA_extended off30 cells at
+    4.7116 - 4.9328) where the shipped rule's does not, so the two GPU rules
+    reach the padding comparison with different answers and still return the
+    same pick -- because every one of those cells is a 600-row plan that
+    ``plan.n_rows < 10_000`` has already sent to ``dense_vmap``. That is a
+    real agreement between two rules that disagree on the branch, and it is
+    the part of this test that has not gone quiet.
 
     **``hermitian=False``, and this is the one place in the module where that
     is the right geometry rather than a legacy one.** What is compared here is

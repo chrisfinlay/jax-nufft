@@ -529,6 +529,22 @@ def _resolve_nthreads(
 # ``chunked``; picking a new number here off one draw is exactly what the
 # paragraphs above argue against.
 #
+# Two consequences of that decision, stated rather than left to be inferred,
+# because the derivation above now reads as if it still applied and it does
+# not. **Every figure in it -- 5.784, 5.7843 / 4.8089 = 1.2028, the 3.7% and
+# 18.2% headroom, the folded 5.076, the 5.076 - 6.466 seed span -- is on the
+# pre-#26 un-bucketed metric ``n_chan * n_w * max_window_size /
+# live_row_count``.** All of it still reproduces exactly, because #26 left
+# every term of that expression in place; none of it is a statement about the
+# quantity ``plan.window_padding_overhead`` now returns, which is what the
+# comparison below actually reads. And **6.0 is now pinned by
+# ``tests/test_padding_overhead.py::test_cpu_padding_cutoff_is_six_and_still_gates``
+# and by nothing else**: that test substitutes the field to exercise the
+# branch on both sides, because no repository fixture reaches 6.0 on the
+# bucketed scale at any epsilon in either geometry -- the grid maximum is
+# 1.621 and the worst seed of the sweep is 1.773. The constant is being held,
+# not calibrated, until #34.
+#
 # Pinned to this exact value by
 # ``tests/test_padding_overhead.py::test_cpu_padding_cutoff_is_six_and_still_gates``,
 # which also exercises the branch on both sides of it by substituting the
@@ -1239,9 +1255,41 @@ def _window_bucket_channel_groups(
 
     A single-channel plan, and any multi-channel plan whose channels happen to
     bucket alike, gives exactly one group -- which the callers below run
-    without any channel indexing at all, i.e. as the pre-#26 program. The cost
-    of item 2 is paid only by plans whose channels genuinely differ, and it is
-    one compiled body per distinct table rather than per channel.
+    without any channel indexing at all, i.e. as the pre-#26 program.
+
+    **The cost of item 2 is one compiled body per group, and on a real
+    spectral cube that is one per channel.** "Per distinct table rather than
+    per channel" is the bound, not the observed behaviour: bucket edges are
+    placed against each channel's own window sizes, so two channels share a
+    table only if their whole size distributions coincide. Measured (EDA2
+    off30, seed 0, eps 1e-6, float64, ``hermitian=True``, ``freq = f *
+    linspace(0.95, 1.05, n_chan)`` -- the same +/-5% spread
+    ``tests/test_strategies_equivalent.py`` uses), the group count *equals*
+    ``n_chan`` at every one of ``n_chan`` 1 / 3 / 8 / 16, and the compile time
+    of ``jit(vis2dirty(..., windowed_scan)).lower(...).compile()`` grows with
+    it -- 0.13 / 0.29 / 0.63 / 1.10 s against ``dense_scan``'s flat
+    0.07 / 0.08 / 0.09 / 0.09 s on the same plans, and against 0.08 / 0.09 /
+    0.11 / 0.10 s for ``windowed_scan`` at ``ab7fbbd``. Runtime is unchanged
+    (11.4 / 37.1 / 100.2 / 197.6 ms against ``ab7fbbd``'s 11.6 / 38.3 / 100.3 /
+    200.3 ms). Extrapolating the compile time linearly puts a 64-channel cube
+    near 4 s and a 1024-channel one near a minute, all of it host-side and
+    once per shape. Nothing in the suite measures compile time; issue #34 is
+    where a per-channel-count strategy rule would live.
+
+    The other cost is the adjoint's transient, and it goes the other way from
+    the forward's. ``vis2dirty`` ``windowed_scan`` ``temp_size_in_bytes`` on
+    the same plans, at ``n_chan`` 1 / 2 / 4 / 8 / 16 / 32: 135,688 / 148,808 /
+    293,320 / 582,344 / 2,035,712 / 4,202,624 B, against ``dense_scan`` on the
+    same plans 137,608 / 232,136 / 376,008 / 663,752 / 1,202,376 / 2,250,952
+    and against ``windowed_scan`` at ``ab7fbbd`` 135,496 / - / - / 661,896 /
+    1,237,384 / -. So multi-group ``vis2dirty`` is *below* both baselines up to
+    eight channels and above them past that: +64.5% over ``ab7fbbd`` and +69.3%
+    over ``dense_scan`` at sixteen. The concatenation of one output cube per
+    group is what it buys. ``dirty2vis`` is unaffected, because its output is
+    ``(n_chan, n_rows)`` and not the image cube -- 279,904 B at ``n_chan=16``
+    against ``ab7fbbd``'s 1,243,904. ``tests/test_custom_vjp.py::
+    test_gradient_memory_holds_over_many_windowed_channel_groups`` is the gate
+    that holds this.
     """
     groups: dict[tuple[tuple[int, int], ...], list[int]] = {}
     for c, table in enumerate(plan.window_buckets):
@@ -1263,6 +1311,38 @@ def _map_over_channel_groups(
     ``mapped`` are the ``(n_chan, ...)`` arrays it is called on. With one group
     -- every single-channel plan -- the group's arrays are the originals and no
     gather or permutation is emitted, so the traced program is the pre-#26 one.
+
+    With more than one group the results come back in group order, which is
+    channel order only when the groups happen to be contiguous ascending runs
+    of channel indices. That is the *common* case and not a guaranteed one:
+    window size is monotone in frequency, so equal bucket tables fall in
+    contiguous runs whenever ``freq`` is ascending -- true of every fixture in
+    this repository -- but ``make_plan`` does not require a sorted ``freq``,
+    and ``freq = f * [1.0, 2.0, 1.0]`` gives groups ``[(0, 2), (1,)]`` whose
+    concatenation is ``[0, 2, 1]``. Dropping the reassembly returns those two
+    channels swapped;
+    ``tests/test_window_bucketing.py::test_interleaved_channel_groups_are_reassembled_in_channel_order``
+    is the cell that catches it, and it is the only one in the suite that can
+    -- every other multi-channel fixture has an ascending ``freq``.
+
+    **The identity skip below makes the reorder rarer, not commoner: on every
+    repository fixture the fast path is the one taken and the ``argsort``
+    never runs at all.** That same cell is therefore the only thing pinning
+    either half of this branch, and it was checked against both mutations --
+    deleting the reassembly outright, and inverting the identity test so the
+    two paths swap -- each of which fails all six of its cells.
+
+    The identity case is skipped for clarity rather than for speed, and the
+    measurement is worth recording because it is the opposite of what one
+    would guess. On EDA2 off30 ``n_chan=16`` at a +/-5% frequency spread
+    (64^2, 400 rows, eps 1e-6, float64, ``hermitian=True``, 16 groups) the
+    ``vis2dirty`` ``windowed_scan`` ``temp_size_in_bytes`` is 2,035,712 B with
+    the gather forced, with it skipped, and with it deleted outright -- all
+    three byte-identical, and the results bit-identical. XLA folds an identity
+    gather away for free. The transient that multi-group plans *do* pay is the
+    ``jnp.concatenate`` and the separate group bodies behind it, which no
+    branch here can avoid: see :func:`_window_bucket_channel_groups` for that
+    cost and its measurements.
     """
 
     def run(sub: tuple[Array, ...], buckets: tuple[tuple[int, int], ...]) -> Array:
@@ -1281,9 +1361,13 @@ def _map_over_channel_groups(
         return run(mapped, groups[0][0])
 
     parts = [run(tuple(x[np.asarray(chans)] for x in mapped), table) for table, chans in groups]
-    # Concatenated in group order; put the channels back in their own order.
-    order = np.argsort(np.concatenate([np.asarray(chans) for _, chans in groups]))
-    return jnp.concatenate(parts, axis=0)[order]
+    out = jnp.concatenate(parts, axis=0)
+    # Concatenated in group order; put the channels back in their own order,
+    # but only when that is not the identity -- see the docstring.
+    concatenated = np.concatenate([np.asarray(chans) for _, chans in groups])
+    if np.array_equal(concatenated, np.arange(concatenated.size)):
+        return out
+    return out[np.argsort(concatenated)]
 
 
 def _accumulate_windowed_bucket(
@@ -2209,9 +2293,26 @@ def _dirty2vis_adjoint(
         # the plan declares as issue #26 buckets, and a rank-1 gather here
         # lowers to ``slice_sizes = array<i64: 1>`` on a ``tensor<n_rows x i8>``,
         # which is character-for-character a one-row window. The reshape is
-        # free -- no copy, no buffer, the same gather of the same bytes -- and
+        # free -- measured on ``tests/test_window_bucketing.py``'s NARROW
+        # fixture (4000 rows, 16^2, off30, seed 0, eps 1e-6, float64,
+        # ``hermitian=True``, adjoint), this spelling and the plain
+        # ``plan.flip_sign[plan.sort_perm]`` compile to identical
+        # ``temp_size_in_bytes`` (``windowed_scan`` 106,760, ``windowed_vmap``
+        # 1,038,464), identical optimised-HLO line counts (800 / 354),
+        # identical ``copy(`` counts (8 / 0) and bit-identical results -- and
         # it keeps the one rank-1 row slice in the program the one that means
         # something.
+        #
+        # Two things to know before touching it. The equally good fix was in
+        # the test rather than here: anchoring that probe's regex on the
+        # operand's element type (``tensor<{n}x(?:f|complex)``) instead of on
+        # ``[a-z]`` would exclude an int8 gather without constraining ``src``
+        # at all. And this convention is enforced by nothing but this comment
+        # -- no test asserts that whole-row gathers are rank 2, only that the
+        # slice lengths found are exactly the declared bucket lengths, so a
+        # future rank-1 leaf gather would surface as a puzzling failure over
+        # in ``test_the_lowered_windowed_loop_takes_more_than_one_slice_length``
+        # rather than as a message about this line.
         flip_sign_sorted = plan.flip_sign[:, None][plan.sort_perm][:, 0]  # (n_rows,)
 
         # issue #26: see _dirty2vis_forward -- the channel axis is walked one
