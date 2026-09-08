@@ -268,9 +268,11 @@ variants evaluate every
 visibility on every w-plane and rely on the kernel zeroing out non-
 contributing rows; the windowed variants take a contiguous slice of
 visibilities (after sorting by `w`) per plane, cutting the spread cost
-to roughly `p * n_rows * W^3` where `p ~ 1.5-3` is the window padding
-overhead. See *Strategy options* below for the trade-offs. Channel
-traversal independently supports `scan` (default) or `vmap`.
+to roughly `p * n_rows * W^3` where `p` is the window padding overhead —
+1.14-4.94 on the review fixtures for the forward, and 1.00-1.38 for the
+adjoint, which v0.1.3 (#26) bucketed. See *Strategy options* below for the
+trade-offs. Channel traversal independently supports `scan` (default) or
+`vmap`.
 
 ### Adjoint operator (`vis2dirty`)
 
@@ -512,9 +514,15 @@ suitable for the kernel chosen by `epsilon` (32 for `W <= 4`, 64 for `W <= 8`,
 an explicit integer to override.
 
 The returned plan also exposes `max_window_size`,
-`window_padding_overhead`, `live_row_count` and `empty_plane_count` for
-callers that want to inspect whether the windowed strategies will be
-efficient on a given uvw distribution. `live_row_count` is the number of
+`max_window_size_per_chan`, `window_buckets`, `window_padding_overhead`,
+`window_padding_overhead_adjoint`, `live_row_count` and `empty_plane_count`
+for callers that want to inspect whether the windowed strategies will be
+efficient on a given uvw distribution. `window_buckets[c]` is channel `c`'s
+w-planes sorted into at most four size classes as `((slice_length,
+n_planes), ...)`; those lengths are the row slices the windowed **adjoint**
+takes, and `max_window_size` — the largest of them over the whole plan — is
+what the windowed **forward** takes for every plane. `live_row_count` is the
+number of
 `(channel, plane, row)` incidences inside a plane's nominal kernel support
 (`|w - w_k| <= w_kernel_scale`, as the host computes `w`), and
 `empty_plane_count` the number of `(channel, plane)` pairs holding none — a
@@ -616,10 +624,10 @@ four, and the two v0.1 names are kept as deprecated aliases:
 |-------------------|------------------------------|-----------------------------|-----------------------------|------------------------------------------------|
 | `"dense_scan"`    | `n_rows * W^2`               | `O(image_size + n_rows)`    | 1.48-1.50x its own forward  | the default through v0.1.2; v0.1 `"scan"` is a deprecated alias. |
 | `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1 `"vmap"` is a deprecated alias.           |
-| `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | 1.46-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
-| `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1.1; rare wins, mostly for completeness.    |
+| `"windowed_scan"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(image_size + n_rows)`    | 1.46-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `"windowed_vmap"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1.1; rare wins, mostly for completeness.    |
 | `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward  | v0.1.3 (#25); takes `w_chunk` (default 32).    |
-| `"windowed_chunked"` | `max_window_size * W^2`   | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward  | v0.1.3 (#25); the windowed half of the same knob. |
+| `"windowed_chunked"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward  | v0.1.3 (#25); the windowed half of the same knob. |
 | `"auto"`          | resolves to one of the first four | matches the resolved choice | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
@@ -651,6 +659,37 @@ sets the shape of every intermediate in the plane loop), must be a positive
 live at once, not an exact count: the loop runs `ceil(n_w / w_chunk)` chunks
 of `ceil(n_w / n_chunks) <= w_chunk` planes, so at most `n_chunks - 1` planes
 of padding are run and thrown away rather than up to `w_chunk - 1`.
+
+Since v0.1.3 (#26) the windowed **adjoint** slices `bucket_length`, not
+`max_window_size`: each channel's planes are sorted into at most four size
+classes and each class is a sub-loop with its own static slice length, so a
+plane whose window holds 8 rows does not read 155. Measured adjoint
+`temp_size_in_bytes` on a 4000-row, 16², 138-plane fixture (float64,
+eps 1e-6, `max_window_size` 1072 of 4000 rows), before against after:
+`windowed_vmap` 2,932,224 B → 1,038,464 B and `windowed_chunked(32)`
+1,143,392 B → 787,616 B. A scan holds one class's slice at a time, so
+`windowed_scan`'s peak is set by the widest class and is unchanged
+(106,568 B → 106,760 B).
+
+**The windowed forward is unchanged**, and deliberately: bucketing it as
+well ran 20.3x to 58.4x slower on a GH200 on the plans `auto` sends to
+`windowed_vmap`, so it keeps the pre-#26 code, the `max_window_size` slice
+and the `window_padding_overhead` figure. Its transients on that fixture are
+byte-identical to the previous release's.
+
+Those figures, and every other timing quoted for #26, are single-channel.
+A slice length is a static shape, so the adjoint's channel axis can only be
+mapped over channels that bucket identically, and at a realistic frequency
+spread no two of them do — the compiled body count equals `n_chan`. Measured
+on EDA2 off30 with `freq = f * linspace(0.95, 1.05, n_chan)`, the compile
+time of a jitted `windowed_scan` adjoint is 0.083 / 0.224 / 0.397 / 0.656 s
+at `n_chan` 1 / 4 / 8 / 16 against a flat 0.047-0.070 s for `dense_scan`;
+run time is unchanged, and the adjoint's transient (which concatenates one
+image cube per group) is 2,035,712 B at 16 channels against 1,202,376 B for
+`dense_scan` on the same plan. The forward does not group and is unaffected.
+On a wide spectral cube, prefer a dense or chunked strategy for the adjoint,
+or expect a one-off compile of a second or two. Retuning `auto` for channel
+count is [#34](https://github.com/chrisfinlay/jax-nufft/issues/34).
 
 Whether the default clamps is a property of the plan. Measured over every
 telescope in `tests/conftest.py` at both pointings (seed 0, eps 1e-6,
@@ -834,18 +873,34 @@ the Hermitian adjoint: `jax.vjp(dirty2vis)(y)` is `A^T y` (for a real image,
 For the windowed strategies, the plan exposes
 
 ```
+# the forward's: every plane slices the plan's widest window
 plan.window_padding_overhead = n_chan * n_w * max_window_size / plan.live_row_count
+
+# the adjoint's: every plane slices its own size class (v0.1.3, #26)
+plan.window_padding_overhead_adjoint = (
+    sum(slice_length * n_planes for c in channels for slice_length, n_planes in
+        plan.window_buckets[c])
+    / plan.live_row_count
+)
 ```
 
-as a diagnostic: the factor by which a windowed traversal's row-work exceeds
+as diagnostics: the factor by which a windowed traversal's row-work exceeds
 the irreducible minimum. The numerator is what the traversal actually touches
-— each `(channel, plane)` step slices a *static* `max_window_size` rows, since
-the shape has to be static for `lax.scan` / `vmap` — and the denominator counts
-only the rows inside a plane's nominal `w`-kernel support. It is bounded below
-by 1.0, attaining it
-on the constant-`w` fast path where the single plane holds every row and none
-of the slice is padding; pathological `w`-distributions can drive it above ~3,
-at which point dense strategies usually win on absolute time.
+— each `(channel, plane)` step slices a *static* number of rows, since the
+shape has to be static for `lax.scan` / `vmap` — and the denominator, shared
+by both, counts only the rows inside a plane's nominal `w`-kernel support.
+Both are bounded below by 1.0, attaining it on the constant-`w` fast path
+where the single plane holds every row and none of the slice is padding, and
+the adjoint's is never above the forward's.
+
+There are two of them because v0.1.3 (#26) bucketed the plane slices of the
+windowed **adjoint** only. On the review fixtures that took the adjoint's
+ratio to 1.00-1.38 against the forward's unchanged 1.14-4.94 (measured at eps
+1e-6, float64, seed 0, `hermitian=True`, single channel), so the regime where
+a high padding figure sends the `auto` selector to a dense strategy is no
+longer reached by any of them on the adjoint. The forward keeps `ab7fbbd`'s
+code and `ab7fbbd`'s figure: bucketing it as well was measured at 20.3x to
+58.4x *slower* on a GH200 and reverted.
 
 The denominator changed in v0.1.3. Through v0.1.2 it was the mean of the
 per-`(channel, plane)` window lengths, which are measured *after* the builder
@@ -859,11 +914,12 @@ window lengths are plan-time locals and were never stored.
 #### `w_strategy="auto"` (the shipped default)
 
 `"auto"` resolves to one of the four canonical names before the JIT
-boundary, using `plan.n_w`, `plan.w_kernel_width`,
-`plan.window_padding_overhead`, and (on GPU) `plan.n_rows`, plus the
-operator's adjoint flag. Resolution happens in the public wrapper, so
-an `"auto"` call shares a JIT cache entry with the explicit equivalent
-on the same plan. The heuristic is **platform-aware**
+boundary, using `plan.n_w`, `plan.w_kernel_width`, one of
+`plan.window_padding_overhead` (forward) /
+`plan.window_padding_overhead_adjoint` (adjoint), and (on GPU)
+`plan.n_rows`, plus the operator's adjoint flag. Resolution happens in
+the public wrapper, so an `"auto"` call shares a JIT cache entry with the
+explicit equivalent on the same plan. The heuristic is **platform-aware**
 (`jax.devices()[0].platform`):
 
 - **CPU.** Conservative: never picks a windowed forward (no measured
@@ -873,7 +929,12 @@ on the same plan. The heuristic is **platform-aware**
   through v0.1.2, against the pre-v0.1.3 denominator; it was restated so
   that redefining the diagnostic changes no decision on the calibration
   grid, where the worst fixture reads 5.78 on the new scale against 4.93
-  on the old.)
+  on the old. Since #26 the *adjoint* leg of this comparison reads
+  `window_padding_overhead_adjoint` instead, on which that same worst
+  fixture is 1.62 and no repository fixture reaches either cutoff at any
+  epsilon — so on the adjoint this branch no longer fires on one, which is
+  the intended effect, the padding it guards against being what bucketing
+  removes. The forward leg is unchanged.)
 - **GPU** (tuned on the GH200 baseline sweep). Never picks a `_scan`
   variant: across the sweep's 160 scan/vmap pairs the scan family is
   slower in every one, by 1.45x to 32.7x (median 6.1x). Picks
@@ -1537,8 +1598,11 @@ it is picking between, and what to pass if you would rather pin it.
 - **`dense_vmap`** allocates `O(n_w * image_size)` but is usually the
   fastest of the four on CPU at the tested scales.
 - **`windowed_scan`** matches `dense_scan` memory and helps on the
-  adjoint when `n_w >> W` and the `w`-distribution is reasonably
-  uniform (`plan.window_padding_overhead < ~3`).
+  adjoint when `n_w >> W`. Since #26 its *adjoint*'s slice is the plane's
+  own size class rather than the plan's widest window, so a clumped
+  `w`-distribution no longer costs the adjoint what it used to; its
+  forward still slices `max_window_size`, and
+  `plan.window_padding_overhead < ~3` is still the guide there.
 - **`windowed_vmap`** is the high-memory variant of the windowed path;
   marginal wins on most cases, kept primarily for GPU parity.
 

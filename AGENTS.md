@@ -207,7 +207,8 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   frozen dataclass that's also a registered JAX pytree.
 * Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
   w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale, nshift, w0,
-  max_window_size, window_padding_overhead, live_row_count,
+  max_window_size, window_padding_overhead, window_padding_overhead_adjoint,
+  max_window_size_per_chan, window_buckets, live_row_count,
   empty_plane_count, w_extent,
   is_constant_w, hermitian, real_dtype, complex_dtype`) live in the pytree
   aux_data and become part of the JIT cache key. This list must
@@ -228,9 +229,21 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   are different operators and must not share a cache entry. It is also
   read before the JIT boundary, by `dirty2vis`, to refuse a complex
   image.
+  `max_window_size_per_chan` and `window_buckets` (issue #26) are the
+  per-channel window maxima and each channel's planes bucketed by padded
+  window length, `((slice_length, n_planes), ...)` ascending with
+  distinct lengths and `sum(n_planes) == n_w`. They are static because a
+  bucket's `slice_length` *is* a compile-time `dynamic_slice` shape — two
+  plans that bucket differently emit different programs. **They are read
+  by the windowed adjoint only**; the windowed forward slices
+  `max_window_size` per plane, as it did at `ab7fbbd`.
+  `window_padding_overhead_adjoint` (issue #26) is the adjoint's padding
+  ratio, beside `window_padding_overhead` which is the forward's — see
+  section 5.
 * Plan **traced fields** (`uvw_m, inv_lambda, w_centers_rel,
   n_minus_1_shifted, w0_screen, phi_hat_n, sort_perm, window_start,
-  flip_sign` — 9 leaves, in that flatten order) are JAX device arrays.
+  flip_sign, window_plane_order` — 10 leaves, in that flatten order) are
+  JAX device arrays.
   `uvw_m` is `(n_rows, 3)` in **metres**, in input row order, and
   `inv_lambda` is `(n_chan,)` = `freq / c` (issue #23). Nothing per
   `(channel, row)` is stored: the per-channel FINUFFT coordinates and
@@ -256,7 +269,21 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   reintroducing the per-`(channel, row)` allocation issue #23 deleted.
   The operators put the conjugation back per row: the forward on its
   **output**, the adjoint on its **input**, and the windowed adjoint
-  against `flip_sign[sort_perm]` because its visibilities arrive sorted.
+  against `flip_sign[sort_perm]` because its visibilities arrive sorted
+  (taken through an `(n_rows, 1)` view, so that every whole-row gather of
+  a plan leaf lowers at rank 2 and the only rank-1 slice of an
+  `(n_rows,)` array in the emitted program is a w-plane window — which is
+  what `tests/test_window_bucketing.py`'s lowering probe reads).
+  `window_plane_order` (issue #26) is `(n_chan, n_w)` int32: each
+  channel's plane indices ordered ascending by padded window length, so
+  every bucket is a contiguous rank range in it and the windowed
+  **adjoint** can address one with a static slice. Per `(channel, plane)`,
+  never per `(channel, row)`. It is flattened **last**, after `flip_sign`,
+  which is the only leaf whose pytree position is chosen rather than
+  inherited from its declaration order: every leaf is an entry parameter
+  of every lowered operator, so a leaf inserted mid-list renumbers every
+  parameter after it, and appending is what keeps the windowed forward's
+  optimised HLO comparable to `ab7fbbd`'s (section 5).
   `n_minus_1_shifted` (issue #16) is `n_minus_1 + nshift` and is the
   grid the per-plane phase and the `phi_hat` argument are evaluated
   on; the adjoint's `1/n` output factor must keep using the *unshifted*
@@ -282,10 +309,13 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   `max_window_size` and `window_padding_overhead` at plan time.
   Issue #43 added `live_row_count` and `empty_plane_count` to that
   diagnostic and kept them **scalars** for the same reason — two static
-  ints is the whole budget, and reintroducing a `(n_chan, n_w)` array
-  in any form would undo #23. `tests/test_planning.py` pins the leaf
-  set at nine entries (eight before issue #17), which is what makes that
-  a checked constraint rather than an intention; the float64 plan's
+  ints is the whole budget, and reintroducing a `(n_chan, n_rows)` array
+  in any form would undo #23. Issue #26's `window_plane_order` is the one
+  `(n_chan, n_w)` leaf that budget does allow: it is per *plane*, which
+  is what bucketing is about, and it is not diagnostic — the windowed
+  adjoint indexes with it. `tests/test_planning.py` pins the leaf set at ten entries
+  (nine before issue #26, eight before issue #17), which is what makes
+  that a checked constraint rather than an intention; the float64 plan's
   row-proportional cost is 29 B/row (`uvw_m` 24 + `sort_perm` 4 +
   `flip_sign` 1) and `tests/test_hermitian.py` gates the per-row and
   per-channel slopes separately.
@@ -348,15 +378,59 @@ The windowed strategies rely on a contract between
   host and device disagree: one row is rescued by the `±1`-row
   widening on its own, so a one-row fixture gates the margin not at
   all.
-* `plan.max_window_size` is a static int used as the
-  `dynamic_slice` size — must be `>=` every window's length, and is
-  computed from the widened windows above, so it already carries the
-  two extra rows. The per-window lengths themselves are plan-time
-  locals, not a leaf (issue #23 removed `window_size`).
-* `plan.window_padding_overhead` is `n_chan * n_w * max_window_size /
-  plan.live_row_count` (issue #43): the row-work a windowed traversal
-  actually does — every `(channel, plane)` step slices a *static*
-  `max_window_size` rows — over the row-work it cannot avoid.
+* `plan.max_window_size` is a static int — the widest window in the
+  plan, computed from the widened windows above, so it already carries
+  the two extra rows. It is the `dynamic_slice` size every plane of the
+  windowed **forward** pays, unchanged since v0.1.1. The per-window
+  lengths themselves are plan-time locals, not a leaf (issue #23 removed
+  `window_size`).
+* `plan.window_buckets[c]` is issue #26's size classes for channel `c`,
+  and each class's `slice_length` is the `dynamic_slice` size the
+  windowed **adjoint** uses for the planes in it: at most
+  `MAX_WINDOW_BUCKETS` (4) of them, placed by an exact dynamic program
+  over that channel's own sorted padded window sizes so as to minimise
+  `sum(slice_length * n_planes)` (`planning.bucket_window_sizes`). Two
+  properties the windowed adjoint relies on: every class's length is
+  `>=` every window it holds (so no plane can drop a row the dense path
+  weights — the invariant above, restated per bucket), and
+  `max(slice_length)` for channel `c` is that channel's widest window, so
+  `max_window_size` is still the maximum over the whole table. Rounding
+  to powers of two instead was measured and rejected: on the ten review
+  cells it puts seven above issue #26's own 1.5 gate and five *above*
+  their un-bucketed value, because every 600-row window rounds up to a
+  1024 class. The edges have to be placed against the plan's own size
+  distribution.
+* **There are two padding ratios, one per direction, because since issue
+  #26 the two directions do different amounts of padded work.** Both have
+  issue #43's denominator, `plan.live_row_count`.
+  * `plan.window_padding_overhead` = `n_chan * n_w * max_window_size /
+    live_row_count`. The **forward's**, and byte-for-byte what it was at
+    `ab7fbbd`: every calibration figure in `wgridder.py`'s auto-strategy
+    comments and in `tests/test_padding_overhead.py` is on this quantity,
+    and none of them moved.
+  * `plan.window_padding_overhead_adjoint` = `sum over channels and
+    buckets of slice_length * n_planes / live_row_count`. The
+    **adjoint's**, and what issue #26's `<= 1.5` definition-of-done gate
+    reads. Bounded above by the forward's, and equal to it on any plan
+    with a single bucket per channel — which is what the constant-w fast
+    path builds.
+
+  `wgridder._padding_overhead(plan, is_adjoint=...)` is what picks
+  between them, so each `auto` gate compares against the work its own
+  direction would do. Measured on the ten review cells at eps 1e-6,
+  float64, seed 0, `hermitian=True`, `n_chan=1`, CI fixture sizes
+  (forward → adjoint): EDA2 zenith 1.5709 → 1.0368, EDA2 off30 2.5191 →
+  1.2424, MWA_compact zenith 1.1431 → 1.0007, MWA_compact off30 1.7139 →
+  1.0467, MWA_extended zenith 1.5714 → 1.0371, MWA_extended off30 4.9441
+  → 1.3768, MeerKAT zenith 1.1429 → 1.0005, MeerKAT off30 1.8571 →
+  1.0690, GH200_large zenith 1.2857 → 1.0000, GH200_large off30 2.7389 →
+  1.2861. One consequence to know about: over the forty-cell calibration
+  grid (10 cells × 4 epsilons, both geometries) no *adjoint* cell reaches
+  `_CPU_PADDING_CUTOFF` (6.0) or `_GPU_PADDING_CUTOFF` (3.0) — the
+  adjoint maxima are 1.6206 unfolded and 1.4133 folded — so the padding
+  branch of `auto` no longer fires on the adjoint leg of any repository
+  fixture. On the forward leg it fires exactly as it always did (six
+  cells above 3.0 unfolded, four folded).
   `live_row_count` is measured on the **unpadded** support, i.e. from
   a second pair of `searchsorted` calls per channel that see neither
   `boundary_margin` nor the `±1` clamp. That is the whole point: the
@@ -404,10 +478,131 @@ If you touch any of these, run `tests/test_planning.py` and
 | `auto`            | resolves to one below   | matches the resolved choice | matches the resolved choice | **The shipped default** (issue #46). Platform-aware heuristic. |
 | `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | 1.48-1.50x its own forward | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
 | `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | 0.98-1.98x its own forward | v0.1 `"vmap"` is a deprecated alias.           |
-| `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | 1.46-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
-| `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | 0.98-1.98x its own forward | v0.1.1; rare wins, mostly for completeness.    |
+| `windowed_scan`   | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(image_size + n_rows)`    | 1.46-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `windowed_vmap`   | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(n_w * image_size)`       | 0.98-1.98x its own forward | v0.1.1; rare wins, mostly for completeness.    |
 | `chunked`         | `n_rows * W^2`          | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward | issue #25; takes the static `w_chunk` (default 32). |
-| `windowed_chunked`| `max_window_size * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward | issue #25; the windowed half of the same knob. |
+| `windowed_chunked`| fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward | issue #25; the windowed half of the same knob. |
+
+Since issue #26 the windowed **adjoint**'s rows are `bucket_length`, not
+`max_window_size`: each plane slices its own size class's length (at most
+four per channel), which is what took the padded row-work on the review
+fixtures from 1.14-4.94x the irreducible work to 1.00-1.38x. The
+per-bucket loop still branches on nothing but `w_chunk`, and a plan with
+one bucket per channel runs the pre-#26 program.
+
+**Issue #26 was scoped to the adjoint, and the windowed forward is
+`ab7fbbd`'s code.** Bucketing it as well was implemented, measured and
+reverted. On one GH200 (Daint, eps 1e-6, float64, `n_chan = 1`, realistic
+sizes, the `auto` path):
+
+| cell | `auto` fwd resolves to | `ab7fbbd` | bucketed | |
+|---|---|---:|---:|---:|
+| GH200_large zenith 2048²/50k, `n_w=9` | `windowed_vmap` | 16.7 ms | 339.7 ms | **20.3x slower** |
+| MeerKAT off30 2700²/302400, `n_w=14` | `windowed_vmap` | 32.9 ms | 1918.7 ms | **58.4x slower** |
+| MWA_extended zenith 3600²/1.22M, `n_w=13` | `windowed_vmap` | 48.6 ms | timed out at 420 s | — |
+| GH200_large off30 2048²/50k, `n_w=26` | `dense_vmap` | 40.4 ms | 40.1 ms | unaffected |
+
+The adjoint over the same runs was 1.08-1.24x, with its memory win intact.
+`auto` resolves the forward to `windowed_vmap` on most realistic GPU plans,
+so this reached defaulting users. Two diagnosis-and-fix rounds — the second
+traced the accumulate from a batched collision-free scatter to a
+shared-carry `unique_indices = false` one over overlapping index blocks,
+built a lane-capped fix and verified it on CPU HLO — did not move the GPU
+numbers, so the cause is **not understood** and the forward was put back.
+(The overlap that diagnosis rests on is real and measured: at eps 1e-6
+every visibility is inside the w-kernel's nominal support on exactly 7.00
+planes on all ten review cells, and the forward's `max_window_size`
+windows cover each sorted row 8.00-36.98 times on average and 8-118 times
+at the worst row. What is *unestablished* is that the shape of the
+accumulate is what the GPU was charging for.) Reopening this is
+#65's; do not re-land a bucketed forward without GPU numbers.
+(Those four timings are the maintainer's, on hardware this repository's
+suite does not have.)
+
+That revert is checked rather than asserted. Optimised HLO
+(`jax.jit(...).lower(plan, arg).compile().as_text()`, with the `FileNames`
+and `FileLocations` debug sections stripped) was dumped for
+7 `w_strategy` × 2 operators × 10 fixtures = 140 modules against
+`git archive ab7fbbd` and against this tree. **All 70 forward modules
+differ from `ab7fbbd` in exactly three lines and no others** — the
+`entry_computation_layout`, the `ENTRY` signature and the two
+`parameter(N)` declarations — i.e. one appended unused
+`s32[n_chan, n_w]` parameter (`window_plane_order`, which is why that leaf
+is flattened last) and the renumbering of the single operand after it. No
+instruction differs. 37 of the 70 adjoint modules fall in the same class
+and 33 diverge, those being the windowed adjoint cells that bucket. Two
+in-suite cells stand in for that check:
+`tests/test_window_bucketing.py::test_the_lowered_windowed_loop_slices_by_bucket_in_the_adjoint_only`
+pins the forward to a single slice length, and
+`::test_the_windowed_forward_transient_is_unchanged_from_ab7fbbd` pins its
+`temp_size_in_bytes` to `ab7fbbd`'s exact value.
+
+The adjoint's memory win, on the tests' 4000-row, 16², 138-plane NARROW
+fixture (float64, eps 1e-6, seed 0, `hermitian=True`, `max_window_size`
+1072 of 4000 rows), `temp_size_in_bytes` at `ab7fbbd` → here:
+
+| operator | strategy | `ab7fbbd` | here |
+|---|---|---:|---:|
+| `vis2dirty` | `windowed_vmap` | 2,932,224 | **1,038,464** |
+| `vis2dirty` | `windowed_chunked(32)` | 1,143,392 | **787,616** |
+| `vis2dirty` | `windowed_scan` | 106,568 | 106,760 |
+| `dirty2vis` | every strategy | — | byte-identical |
+
+`windowed_scan`'s peak is one bucket's slice and so is set by the *widest*
+bucket — it does not fall, and must not rise.
+
+**Known defect, inherited from `ab7fbbd` and not fixed here.** The
+windowed forward's `windowed_chunked` branch accumulates a whole chunk
+into one shared `(n_rows,)` carry through a single scatter-add over its
+`(w_chunk, max_window_size)` index block. The windows in a chunk overlap
+physically — each visibility is inside the w-kernel's support on 7.00
+planes on every fixture here — so those updates collide and XLA has to
+assume they can. Whether that costs anything on a GPU is exactly the
+question the failed diagnosis above leaves open. It is untested in the
+GH200 A/B above because
+`w_chunk = 32` exceeds `n_w` on both of those fixtures, so
+`windowed_chunked` degenerates to `windowed_vmap` there. Declared by an
+`xfail(strict=True)` cell,
+`tests/test_window_bucketing.py::test_no_two_planes_accumulate_into_one_row_vector_in_the_forward[windowed_chunked]`,
+so that the finding outlives the revert; #65.
+
+**All of the above is `n_chan = 1`, and the multi-channel picture is
+different — for the adjoint only.** A bucket's slice length is a static
+`dynamic_slice` shape, so the channel axis can only be mapped over
+channels that bucket *identically*;
+`wgridder._window_bucket_channel_groups` groups channels by bucket table
+and each group gets its own compiled body, with the results concatenated
+(and, when the groups are not contiguous in channel index, permuted
+back). The forward does not group at all. Bucket edges are placed against
+each channel's own window sizes, so **the group count equals `n_chan` on
+every realistic spectral plan** — the source's "one body per distinct
+table rather than per channel" is a bound, not the observed behaviour.
+Measured (EDA2 off30, seed 0, eps 1e-6, float64, `hermitian=True`,
+`freq = f * linspace(0.95, 1.05, n_chan)`, the ±5% spread
+`tests/test_strategies_equivalent.py` uses, on this machine):
+
+| `n_chan` | groups | `windowed_scan` `vis2dirty` compile | at `ab7fbbd` | `dense_scan` compile | `windowed_scan` `vis2dirty` transient | at `ab7fbbd` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1  | 1  | 0.083 s | 0.056 s | 0.047 s |   135,688 B |   135,496 B |
+| 2  | 2  | 0.133 s | 0.067 s | 0.058 s |   148,808 B |   230,280 B |
+| 4  | 4  | 0.224 s | 0.067 s | 0.059 s |   293,320 B |   374,152 B |
+| 8  | 8  | 0.397 s | 0.080 s | 0.068 s |   582,344 B |   661,896 B |
+| 16 | 16 | 0.656 s | 0.078 s | 0.070 s | 2,035,712 B | 1,237,384 B |
+| 32 | 30 | 1.231 s | 0.077 s | 0.073 s | 4,202,624 B | 2,388,360 B |
+
+So windowed *adjoint* compile time went from O(1) to O(`n_chan`) — 8.4x at
+sixteen channels, 16x at thirty-two, extrapolating to seconds on a
+64-channel cube — and its transient, which is below both baselines to
+eight channels, is +64.5% over `ab7fbbd` and +69.3% over `dense_scan` at
+sixteen (+76.0% / +86.7% at thirty-two), because it concatenates one
+`(n_l, n_m)` output cube per group. `dirty2vis` is unaffected in the
+strongest sense available: its `windowed_scan` transient is byte-identical
+to `ab7fbbd`'s at every one of those six channel counts (141,984 /
+295,936 / 439,808 / 727,552 / 1,243,904 / 2,394,880 B). Nothing in the
+suite measures compile time;
+`tests/test_custom_vjp.py::test_gradient_memory_holds_over_many_windowed_channel_groups`
+is the only memory gate above `n_chan = 2`.
+Issue #34 is where a channel-count-aware `auto` rule belongs.
 
 The last two are not a fifth and sixth algorithm — they are the *general
 form of the other four*, and the other four are values of `w_chunk`.

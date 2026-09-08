@@ -9,6 +9,18 @@ a plane's kernel support, and issue #43 is about which ones:
 
     window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
 
+**Which windowed strategy?** Since issue #26, the FORWARD -- and this whole
+module is about the forward's ratio, which #26 left untouched to the last bit.
+The windowed *adjoint* slices its plane's issue #26 bucket length instead of
+``max_window_size``, so it has a second, strictly smaller ratio of its own,
+``plan.window_padding_overhead_adjoint``. That field's contract, its
+definition-of-done gate and its bucket table are
+``tests/test_window_bucketing.py``'s; what is asserted *here* about it is only
+the relation between the two (:func:`test_the_adjoint_ratio_is_the_forward_ratio_bucketed`)
+and the fact that ``_auto_w_strategy_cpu`` reads the right one per direction
+(:func:`test_cpu_padding_cutoff_is_six_and_still_gates`). Everything else below
+means the forward, and every number below is on the forward's metric.
+
 ``live_row_count`` counts the ``(channel, plane, row)`` incidences with
 ``|w_lambda - w_k| <= w_kernel_scale``, measured on the *unpadded* window and
 on the host's own w. That is the **nominal support**, and the name ``live`` is
@@ -1104,6 +1116,26 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     * **It still gates.** A constant no branch can reach is not a cutoff, so
       exercise the branch on both sides of the value rather than trusting that
       the comparison is still wired up.
+
+    **Issue #26 splits which field the branch reads, and that split is
+    asserted here** because this is the only cell in the suite that drives the
+    padding branch directly. The CPU heuristic can only return
+    ``windowed_scan`` on the adjoint leg, and since #26 the adjoint leg reads
+    ``plan.window_padding_overhead_adjoint`` (the bucketed ratio) while the
+    forward leg reads ``plan.window_padding_overhead`` (this module's, the
+    un-bucketed one). So the substitution below is on the adjoint field, and
+    the forward field is substituted *past* the cutoff at the same time to
+    show that it is inert on this leg -- which is the whole content of
+    ``wgridder._padding_overhead``. Get the two the wrong way round and the
+    third assertion returns ``windowed_scan``.
+
+    The derivation above is untouched by #26: it is entirely about the
+    un-bucketed metric, which #26 keeps reporting under its own name. What #26
+    does change is that no repository fixture reaches 6.0 on the *adjoint*
+    scale (the forty-cell grid's adjoint maximum is measured in
+    ``tests/test_window_bucketing.py``), so on that leg this substitution is
+    the only thing keeping the branch alive. Re-fitting the constant for the
+    bucketed scale is issue #34's business.
     """
     assert _CPU_PADDING_CUTOFF == 6.0
     # The GPU cutoff is unchanged by the redefinition; pin that it did not
@@ -1120,12 +1152,59 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     assert plan.n_w > plan.w_kernel_width + 2
     assert plan.n_w / plan.w_kernel_width > 2.0
 
-    below = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF - 0.001)
-    at = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF)
-    above = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF + 0.001)
+    def substitute(adjoint_ratio: float) -> WGridderPlan:
+        # The forward field is pinned above the cutoff throughout: on the
+        # adjoint leg it must not be read at all (issue #26).
+        return dataclasses.replace(
+            plan,
+            window_padding_overhead_adjoint=adjoint_ratio,
+            window_padding_overhead=_CPU_PADDING_CUTOFF + 1.0,
+        )
+
+    below = substitute(_CPU_PADDING_CUTOFF - 0.001)
+    at = substitute(_CPU_PADDING_CUTOFF)
+    above = substitute(_CPU_PADDING_CUTOFF + 0.001)
     assert _auto_w_strategy_cpu(below, is_adjoint=True) == "windowed_scan"
     assert _auto_w_strategy_cpu(at, is_adjoint=True) == "windowed_scan"  # strict >
     assert _auto_w_strategy_cpu(above, is_adjoint=True) == "dense_scan"
+
+
+@pytest.mark.parametrize("hermitian", [False, True], ids=["unfolded", "folded"])
+@pytest.mark.parametrize(("telescope", "zenith_angle_deg", "epsilon"), _GRID)
+def test_the_adjoint_ratio_is_the_forward_ratio_bucketed(
+    telescope: Telescope, zenith_angle_deg: float, epsilon: float, hermitian: bool
+) -> None:
+    """The two padding ratios stand in the one relation issue #26 guarantees.
+
+    ``window_padding_overhead_adjoint`` shares issue #43's denominator and
+    replaces ``max_window_size`` in the numerator with each plane's own bucket
+    length, so it is bounded above by the forward's ratio on every plan and
+    below by 1.0 -- the bucket DP can always fall back to the single class
+    ``max_window_size``, and a bucket length is never below the window it
+    covers. Asserted over the whole calibration grid rather than on one cell,
+    because "never worse" is a claim about all of them.
+
+    Equality is not a failure: it is what a plan with one bucket per channel
+    gives, and the constant-w fast path is one. The strict inequality is
+    asserted where it is meaningful -- on the fixtures whose padded window
+    sizes actually vary -- by
+    ``tests/test_window_bucketing.py::test_the_reported_overhead_is_the_effective_bucketed_ratio``,
+    which is also where the numerator's exact definition is pinned. This cell
+    is the cheap grid-wide envelope, not a second copy of that contract.
+
+    It rides the same grid parametrisation as the band test below so that the
+    plans come out of the same two-entry cache; built on its own it would
+    rebuild every ``GH200_large`` plan a second time.
+    """
+    plan = _cached_plan(telescope, zenith_angle_deg, epsilon, hermitian)
+    assert plan.window_padding_overhead_adjoint >= 1.0, (
+        f"bucketed padded work is below live work ({plan.window_padding_overhead_adjoint})"
+    )
+    assert plan.window_padding_overhead_adjoint <= plan.window_padding_overhead * (1.0 + 1e-9), (
+        f"the adjoint's bucketed ratio ({plan.window_padding_overhead_adjoint}) is above "
+        f"the forward's un-bucketed one ({plan.window_padding_overhead}), so bucketing "
+        "made the traversal wider than not bucketing at all"
+    )
 
 
 @pytest.mark.parametrize("hermitian", [False, True], ids=["unfolded", "folded"])
@@ -1249,8 +1328,20 @@ def test_auto_picks_survive_the_redefinition_across_seeds() -> None:
     also records what the same sweep measures on folded plans (the two rules
     part company on five of the twelve, always in the direction of keeping the
     windowed adjoint).
+
+    **Issue #26 breaks the agreement on the adjoint leg, deliberately, and
+    only in one direction.** Bucketing applies to the windowed adjoint alone,
+    so on that leg ``_auto_w_strategy_cpu`` reads
+    ``window_padding_overhead_adjoint`` -- a ratio bounded above by the one the
+    forward reads -- and the padding gate can therefore only fire *less* often
+    than the pre-#43 rule, never more. So the assertion is split: the forward
+    leg still asserts equality, which is #43's claim untouched, and the adjoint
+    leg asserts that any disagreement is ``dense_scan -> windowed_scan``. The
+    count of moved seeds is asserted to be non-zero so that the relaxation does
+    not silently become vacuous if bucketing stops working; which seeds move is
+    a property of the draw and is not pinned.
     """
-    fired_new = fired_old = 0
+    fired_new = fired_old = moved_adjoint = 0
     for seed in _EQUIVALENCE_SEEDS:
         uvw = synthetic_uvw(MWA_EXTENDED, _HIGH_OVERHEAD_POINTING, seed=seed)
         plan = _plan_for_uvw(
@@ -1267,14 +1358,31 @@ def test_auto_picks_survive_the_redefinition_across_seeds() -> None:
             expected_cpu, expected_gpu = _pre_43_auto_picks(plan, is_adjoint=is_adjoint)
             got_cpu = _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint)
             got_gpu = _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint)
-            assert got_cpu == expected_cpu, (
-                f"seed {seed}, {'adjoint' if is_adjoint else 'forward'}: the "
-                f"corrected metric ({plan.window_padding_overhead:.4f} vs "
-                f"cutoff {_CPU_PADDING_CUTOFF}) picks {got_cpu!r} where the "
-                f"pre-#43 rule ({_pre_43_padded_overhead(plan):.4f} vs 5.0) "
-                f"picks {expected_cpu!r}"
-            )
+            if is_adjoint and got_cpu != expected_cpu:
+                moved_adjoint += 1
+                assert (expected_cpu, got_cpu) == ("dense_scan", "windowed_scan"), (
+                    f"seed {seed}, adjoint: the pick moved {expected_cpu!r} -> "
+                    f"{got_cpu!r}. Issue #26's bucketing can only take the adjoint "
+                    "off dense and onto windowed -- its ratio "
+                    f"({plan.window_padding_overhead_adjoint:.4f}) is bounded above "
+                    f"by the un-bucketed one ({plan.window_padding_overhead:.4f}) -- "
+                    "so a move in any other direction is a bug"
+                )
+            else:
+                assert got_cpu == expected_cpu, (
+                    f"seed {seed}, {'adjoint' if is_adjoint else 'forward'}: the "
+                    f"corrected metric ({plan.window_padding_overhead:.4f} vs "
+                    f"cutoff {_CPU_PADDING_CUTOFF}) picks {got_cpu!r} where the "
+                    f"pre-#43 rule ({_pre_43_padded_overhead(plan):.4f} vs 5.0) "
+                    f"picks {expected_cpu!r}"
+                )
             assert got_gpu == expected_gpu, f"seed {seed}: GPU pick moved"
+
+    assert moved_adjoint > 0, (
+        "no adjoint pick moved on any of the twelve seeds, so the one-directional "
+        "relaxation above is asserting nothing. Either bucketing stopped lowering "
+        "the adjoint's padding ratio, or this sweep no longer straddles the cutoff"
+    )
 
     # Non-vacuity: the sweep has to straddle the cutoff, or "the two rules
     # agree" would only be a statement about the branch neither of them takes.

@@ -508,12 +508,55 @@ def _resolve_nthreads(
 # sensitivity is issue #34; until it is settled the safe direction is the
 # permissive one, for the reason two paragraphs up.
 #
+# issue #26: the constant does not move, and **every figure in the derivation
+# above still reads exactly as it did**, because the metric this branch compares
+# against it -- ``plan.window_padding_overhead``, the un-bucketed
+# ``n_chan * n_w * max_window_size / live_row_count`` -- is untouched. #26
+# buckets the windowed *adjoint* only, and the bucketed ratio it produces is a
+# separate field (``window_padding_overhead_adjoint``), which this function
+# reads only on the adjoint leg.
+#
+# On that leg the branch does stop firing on the repository's fixtures.
+# Measured this session (macOS arm64, float64 unless stated, seed 0, CI fixture
+# sizes), the bucketed ratio over the same forty-cell calibration grid reads
+# 1.0002 - 1.3998 outside MWA_extended off30 and 1.4215 - 1.6206 on it,
+# unfolded; folded, 1.0000 - 1.2861 and 1.3768 - 1.4133. The seed sweep moves
+# with it: MWA_extended off30 at eps 1e-3, unfolded, spans 1.6102 to 1.7726
+# over seeds 0-11 where the un-bucketed metric over the same denominator spans
+# 5.7843 to 8.0904, so what crosses 6.0 on ten of the twelve draws crosses it
+# on none once bucketed.
+#
+# That is the intended effect rather than a guard going quiet: this branch
+# exists to take a plan off ``windowed_scan`` when padded plane rows would cost
+# more than they save, and bucketing is what stops them costing it. Leaving the
+# constant where it is keeps the branch honest for a distribution bucketing
+# cannot rescue -- four size classes still cannot help a plan whose window
+# sizes are all equal and all near ``n_rows`` -- and keeps it firing unchanged
+# on the forward, which does not bucket. Retuning it for the bucketed scale is
+# issue #34's business, together with teaching ``auto`` about ``chunked``;
+# picking a new number here off one draw is exactly what the paragraphs above
+# argue against.
+#
 # Pinned to this exact value by
 # ``tests/test_padding_overhead.py::test_cpu_padding_cutoff_is_six_and_still_gates``,
-# which also exercises the branch on both sides of it: a cutoff raised far
-# enough to "clear the grid" trivially would disable the guard rather than
-# restate it, and a lower bound alone cannot tell the two apart.
+# which also exercises the branch on both sides of it by substituting the
+# field: a cutoff raised far enough to "clear the grid" trivially would disable
+# the guard rather than restate it, and a lower bound alone cannot tell the two
+# apart.
 _CPU_PADDING_CUTOFF = 6.0
+
+
+def _padding_overhead(plan: WGridderPlan, *, is_adjoint: bool) -> float:
+    """The padding overhead of the direction being planned for (issue #26).
+
+    One field per direction, because since #26 the two windowed loops slice
+    different lengths: the forward takes ``plan.max_window_size`` per plane, as
+    it did at ``ab7fbbd``, and the adjoint takes its bucket's length. Both
+    ``_auto_w_strategy_cpu`` and ``_auto_w_strategy_gpu`` compare this against
+    their platform's cutoff, so the comparison stays a statement about the work
+    the chosen operator would actually do.
+    """
+    return plan.window_padding_overhead_adjoint if is_adjoint else plan.window_padding_overhead
 
 
 def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
@@ -526,11 +569,21 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
       * the windowed forward never measurably beats dense on the v0.1.1
         algorithm, so we never auto-pick a windowed forward.
 
-    A high ``window_padding_overhead`` means windowed traversal would
-    waste enough cycles on padded plane rows that dense wins;
-    :data:`_CPU_PADDING_CUTOFF` is conservative and no cell of the pinned
-    calibration grid reaches it -- though other random draws of the same
-    fixtures do, so this branch is live in practice rather than dead.
+    A high padding overhead means windowed traversal would waste enough cycles
+    on padded plane rows that dense wins; :data:`_CPU_PADDING_CUTOFF` is
+    conservative and no cell of the pinned calibration grid reaches it.
+
+    **Which overhead is read depends on the direction**, because since issue
+    #26 the two directions do different amounts of padded work: the forward
+    slices ``plan.max_window_size`` per plane and so reads
+    ``plan.window_padding_overhead``, while the adjoint slices its bucket's
+    length and so reads ``plan.window_padding_overhead_adjoint``. Feeding the
+    adjoint's bucketed ratio to the forward would understate the forward's
+    padding by up to 3.679x over the forty-cell calibration grid (MWA_extended
+    off30 at eps 1e-9, unfolded: 5.3340 against 1.4500). On the adjoint leg no
+    *other* draw of those fixtures reaches the cutoff either -- measured over
+    twelve seeds of MWA_extended off30, the fixture that crosses it on ten of
+    them un-bucketed. See the constant's own comment.
 
     The constant-w fast path collapses ``n_w`` to one, so the
     small-``n_w`` branch always picks ``dense_scan`` there.
@@ -554,7 +607,7 @@ def _auto_w_strategy_cpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     """
     if plan.n_w <= plan.w_kernel_width + 2:
         return "dense_scan"
-    if plan.window_padding_overhead > _CPU_PADDING_CUTOFF:
+    if _padding_overhead(plan, is_adjoint=is_adjoint) > _CPU_PADDING_CUTOFF:
         return "dense_scan"
     if is_adjoint and plan.n_w / plan.w_kernel_width > 2.0:
         return "windowed_scan"
@@ -601,6 +654,18 @@ _GPU_LARGE_N_ROWS = 10_000
 # rows, and the GPU heuristic's row-count gates send those to ``dense_vmap``
 # before this comparison is reached. The gate that #17 does move is the
 # small-``n_w`` one -- see :func:`_auto_w_strategy_gpu`.
+#
+# issue #26 leaves the number and every figure above alone. All of them are on
+# ``plan.window_padding_overhead``, which #26 does not touch and which is what
+# the *forward* leg of this comparison still reads. The *adjoint* leg reads
+# ``plan.window_padding_overhead_adjoint`` instead (see
+# :func:`_padding_overhead`), a smaller quantity, so on that leg 3.0 is reached
+# less often than before -- measured this session on the forty-cell calibration
+# grid, no adjoint cell reaches it in either geometry (the maxima are 1.6206
+# unfolded and 1.4133 folded), where the un-bucketed metric puts six cells
+# above it unfolded and four folded. That makes the branch less reachable on the
+# adjoint, not differently calibrated; the same reasoning as #17's paragraph
+# above, and the same conclusion, that retuning is issue #34's.
 _GPU_PADDING_CUTOFF = 3.0
 _GPU_FORWARD_RATIO_CUTOFF = 3.0
 
@@ -730,7 +795,7 @@ def _auto_w_strategy_gpu(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
         # ``tests/test_auto_strategy.py`` gates the *condition*, which is
         # load-bearing, and says so.
         return "dense_vmap"
-    if plan.window_padding_overhead > _GPU_PADDING_CUTOFF:
+    if _padding_overhead(plan, is_adjoint=is_adjoint) > _GPU_PADDING_CUTOFF:
         # Windowed wastes too much per-plane work on padded slices;
         # 3.0 is the empirical break-even on GH200.
         return "dense_vmap"
@@ -755,8 +820,9 @@ def _auto_w_strategy(plan: WGridderPlan, *, is_adjoint: bool) -> WStrategy:
     Dispatches to :func:`_auto_w_strategy_cpu` or
     :func:`_auto_w_strategy_gpu` based on ``jax.devices()[0].platform``.
     Both branches share the same input contract (only reads
-    ``plan.n_w``, ``plan.w_kernel_width``,
-    ``plan.window_padding_overhead`` -- plus ``plan.n_rows`` on the
+    ``plan.n_w``, ``plan.w_kernel_width`` and, through
+    :func:`_padding_overhead`, one of ``plan.window_padding_overhead`` /
+    ``plan.window_padding_overhead_adjoint`` -- plus ``plan.n_rows`` on the
     GPU branch -- and the ``is_adjoint`` flag), and both return one of
     :data:`_CANONICAL_W_STRATEGIES`.
 
@@ -1201,6 +1267,148 @@ def _chunk_plane_arrays(
     return tuple(extend(x) for x in xs), keep
 
 
+def _window_bucket_channel_groups(
+    plan: WGridderPlan,
+) -> list[tuple[tuple[tuple[int, int], ...], tuple[int, ...]]]:
+    """Channels grouped by identical issue #26 bucket table, first-appearance order.
+
+    **Read by the windowed adjoint only.** The windowed forward does not
+    bucket (see :func:`_channel_forward_windowed`), so it walks the channel
+    axis with a plain ``vmap`` / ``lax.scan`` exactly as at ``ab7fbbd`` and
+    never calls this.
+
+    A bucket's slice length is a static ``dynamic_slice`` shape, so the channel
+    axis can only be ``vmap``-ed or ``lax.scan``-ed over channels that bucket
+    *identically* -- a mapped body compiles to one program, and two channels
+    with different bucket lengths are two programs. Grouping is what keeps
+    ``channel_strategy`` meaningful anyway: every group is walked by the
+    caller's channel strategy, and only the groups are laid out side by side.
+
+    A single-channel plan, and any multi-channel plan whose channels happen to
+    bucket alike, gives exactly one group -- which the caller runs without any
+    channel indexing at all, i.e. as the pre-#26 program.
+
+    **The cost of item 2 is one compiled body per group, and on a real
+    spectral cube that is one per channel.** "Per distinct table rather than
+    per channel" is the bound, not the observed behaviour: bucket edges are
+    placed against each channel's own window sizes, so two channels share a
+    table only if their whole size distributions coincide. Measured (EDA2
+    off30, seed 0, eps 1e-6, float64, ``hermitian=True``, ``freq = f *
+    linspace(0.95, 1.05, n_chan)`` -- the same +/-5% spread
+    ``tests/test_strategies_equivalent.py`` uses), the group count *equals*
+    ``n_chan`` at every one of ``n_chan`` 1 / 2 / 3 / 4 / 8 / 16 and is 30 at
+    32, and the compile time of
+    ``jit(vis2dirty(..., windowed_scan)).lower(...).compile()`` grows with it
+    -- 0.083 / 0.133 / 0.172 / 0.224 / 0.397 / 0.656 / 1.231 s against
+    ``dense_scan``'s flat 0.047 - 0.073 s on the same plans, and against
+    ``windowed_scan`` at ``ab7fbbd``'s equally flat 0.056 - 0.083 s.
+    Extrapolating linearly puts a 64-channel cube near 2.5 s and a
+    1024-channel one near 40 s, all of it host-side and once per shape.
+    Nothing in the suite measures compile time; issue #34 is where a
+    per-channel-count strategy rule would live.
+
+    The other cost is the adjoint's transient. ``vis2dirty`` ``windowed_scan``
+    ``temp_size_in_bytes`` on the same plans, at ``n_chan``
+    1 / 2 / 3 / 4 / 8 / 16 / 32: 135,688 / 148,808 / 221,064 / 293,320 /
+    582,344 / 2,035,712 / 4,202,624 B, against ``dense_scan`` on the same
+    plans 137,608 / 232,136 / 304,072 / 376,008 / 663,752 / 1,202,376 /
+    2,250,952 and against ``windowed_scan`` at ``ab7fbbd`` 135,496 / 230,280 /
+    302,216 / 374,152 / 661,896 / 1,237,384 / 2,388,360. So multi-group
+    ``vis2dirty`` is *below* both baselines up to eight channels and above
+    them past that: +64.5% over ``ab7fbbd`` and +69.3% over ``dense_scan`` at
+    sixteen, +76.0% and +86.7% at thirty-two. The concatenation of one output
+    cube per group is what it buys. ``dirty2vis`` is unaffected in the
+    strongest sense available -- it does not group at all, and its
+    ``windowed_scan`` transient is byte-identical to ``ab7fbbd``'s at every
+    one of those seven channel counts (141,984 / 295,936 / 367,872 / 439,808 /
+    727,552 / 1,243,904 / 2,394,880 B).
+    ``tests/test_custom_vjp.py::
+    test_gradient_memory_holds_over_many_windowed_channel_groups`` is the gate
+    that holds this.
+    """
+    groups: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    for c, table in enumerate(plan.window_buckets):
+        groups.setdefault(table, []).append(c)
+    return [(table, tuple(chans)) for table, chans in groups.items()]
+
+
+def _map_over_channel_groups(
+    body: Callable[..., Array],
+    mapped: tuple[Array, ...],
+    groups: list[tuple[tuple[tuple[int, int], ...], tuple[int, ...]]],
+    *,
+    channel_strategy: ChannelStrategy,
+) -> Array:
+    """Run ``body`` over every channel, one :func:`_window_bucket_channel_groups` group
+    at a time, and reassemble the results in channel order.
+
+    ``body(*per_channel_leaves, buckets=...)`` returns one channel's result;
+    ``mapped`` are the ``(n_chan, ...)`` arrays it is called on. With one group
+    -- every single-channel plan -- the group's arrays are the originals and no
+    gather or permutation is emitted, so the traced program is the pre-#26 one.
+
+    With more than one group the results come back in group order, which is
+    channel order only when the groups happen to be contiguous ascending runs
+    of channel indices. That is the *common* case and not a guaranteed one:
+    window size is monotone in frequency, so equal bucket tables fall in
+    contiguous runs whenever ``freq`` is ascending -- true of every fixture in
+    this repository -- but ``make_plan`` does not require a sorted ``freq``,
+    and ``freq = f * [1.0, 2.0, 1.0]`` gives groups ``[(0, 2), (1,)]`` whose
+    concatenation is ``[0, 2, 1]``. Dropping the reassembly returns those two
+    channels swapped;
+    ``tests/test_window_bucketing.py::test_interleaved_channel_groups_are_reassembled_in_channel_order``
+    is the cell that catches it, and it is the only one in the suite that can
+    -- every other multi-channel fixture has an ascending ``freq``.
+
+    **The identity skip below makes the reorder rarer, not commoner: on every
+    repository fixture the fast path is the one taken and the ``argsort``
+    never runs at all.** That same cell is therefore the only thing pinning
+    either half of this branch, and it was checked against both mutations --
+    deleting the reassembly outright, and inverting the identity test so the
+    two paths swap -- each of which fails its three ``vis2dirty`` cells,
+    reading ``[2.888e-15 - 2.905e-15, 1.415e+00, 1.562e+00]`` per channel.
+    Its three ``dirty2vis`` cells pass under both, which is the control
+    working rather than a gap: since issue #26 was scoped to the adjoint, the
+    forward does not group and never reaches this function.
+
+    The identity case is skipped for clarity rather than for speed, and the
+    measurement is worth recording because it is the opposite of what one
+    would guess. On EDA2 off30 ``n_chan=16`` at a +/-5% frequency spread
+    (64^2, 400 rows, eps 1e-6, float64, ``hermitian=True``, 16 groups) the
+    ``vis2dirty`` ``windowed_scan`` ``temp_size_in_bytes`` is 2,035,712 B with
+    the gather forced, with it skipped, and with it deleted outright -- all
+    three byte-identical, and the results bit-identical. XLA folds an identity
+    gather away for free. The transient that multi-group plans *do* pay is the
+    ``jnp.concatenate`` and the separate group bodies behind it, which no
+    branch here can avoid: see :func:`_window_bucket_channel_groups` for that
+    cost and its measurements.
+    """
+
+    def run(sub: tuple[Array, ...], buckets: tuple[tuple[int, int], ...]) -> Array:
+        if channel_strategy == "vmap":
+            return jax.vmap(lambda *args: body(*args, buckets=buckets))(*sub)
+        if channel_strategy == "scan":
+
+            def step(_: None, args: tuple[Array, ...]) -> tuple[None, Array]:
+                return None, body(*args, buckets=buckets)
+
+            _, out = jax.lax.scan(step, None, sub)
+            return out
+        raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
+
+    if len(groups) == 1:
+        return run(mapped, groups[0][0])
+
+    parts = [run(tuple(x[np.asarray(chans)] for x in mapped), table) for table, chans in groups]
+    out = jnp.concatenate(parts, axis=0)
+    # Concatenated in group order; put the channels back in their own order,
+    # but only when that is not the identity -- see the docstring.
+    concatenated = np.concatenate([np.asarray(chans) for _, chans in groups])
+    if np.array_equal(concatenated, np.arange(concatenated.size)):
+        return out
+    return out[np.argsort(concatenated)]
+
+
 def _sum_over_planes(
     plane: Callable[..., Array],
     xs: tuple[Array, ...],
@@ -1209,6 +1417,7 @@ def _sum_over_planes(
     shape: tuple[int, ...],
     dtype: Any,
     real_dtype: Any,
+    init: Array | None = None,
 ) -> Array:
     """Sum one contribution per w-plane, at most ``w_chunk`` live at a time.
 
@@ -1217,6 +1426,12 @@ def _sum_over_planes(
     ``n_w`` leading. This is the single w-plane loop of issue #25: both dense
     strategies, the two chunked ones and the windowed adjoint run it, and
     ``w_chunk`` is the only thing it branches on.
+
+    ``init`` is issue #26's addition and the only one: an accumulator to add
+    into rather than starting from zeros, so that the windowed adjoint can
+    thread one running image through its buckets' sub-loops instead of holding
+    one result per bucket. ``None`` -- every pre-#26 call site, and every
+    one-bucket plan -- is the unchanged expression, with no added zero.
 
     Three branches, and two of them are the pre-#25 code verbatim on every
     plan with ``n_w > 1`` (see the note on ``n_w == 1`` below):
@@ -1269,14 +1484,16 @@ def _sum_over_planes(
     """
     n_w = int(xs[0].shape[0])
     if w_chunk >= n_w:
-        return jnp.sum(jax.vmap(plane)(*xs), axis=0)
+        total = jnp.sum(jax.vmap(plane)(*xs), axis=0)
+        return total if init is None else init + total
 
+    start = jnp.zeros(shape, dtype=dtype) if init is None else init
     if w_chunk == 1:
 
         def step(acc: Array, args: tuple[Array, ...]) -> tuple[Array, None]:
             return acc + plane(*args), None
 
-        out, _ = jax.lax.scan(step, jnp.zeros(shape, dtype=dtype), xs)
+        out, _ = jax.lax.scan(step, start, xs)
         return out
 
     chunked_xs, keep = _chunk_plane_arrays(xs, w_chunk=w_chunk, real_dtype=real_dtype)
@@ -1284,7 +1501,7 @@ def _sum_over_planes(
     def chunk_step(acc: Array, args: tuple[Array, ...]) -> tuple[Array, None]:
         return acc + jnp.sum(jax.vmap(plane)(*args), axis=0), None
 
-    out, _ = jax.lax.scan(chunk_step, jnp.zeros(shape, dtype=dtype), (*chunked_xs, keep))
+    out, _ = jax.lax.scan(chunk_step, start, (*chunked_xs, keep))
     return out
 
 
@@ -1390,6 +1607,35 @@ def _channel_forward_windowed(
     possibly faster on GPU), and anything between is ``windowed_chunked`` --
     a scan over chunks with a ``vmap`` inside. ``w_strategy`` names the
     family only.
+
+    **Issue #26 does not touch this function, and that is a decision rather
+    than an omission.** Every plane here slices ``plan.max_window_size``, so
+    the plan's ``window_buckets`` / ``window_plane_order`` are not read on this
+    path and ``plan.window_padding_overhead`` -- the un-bucketed ratio -- is
+    what describes its work. A bucketed forward was implemented and measured
+    at 20.3x to 58.4x slower on a GH200 against this code, on the fixtures
+    ``auto`` sends to ``windowed_vmap``, with one cell timing out; the adjoint
+    over the same runs was 1.08x-1.24x. Two diagnosis-and-fix rounds failed to
+    move the GPU numbers, so the adjoint's win was banked and this was put
+    back. AGENTS.md section 5 has the table and the follow-up issue.
+
+    Two things hold it that way. Its lowered slice length is asserted to be
+    the single ``plan.max_window_size`` in
+    ``tests/test_window_bucketing.py::test_the_lowered_windowed_loop_slices_by_bucket_in_the_adjoint_only``,
+    and its ``windowed_vmap`` transient is asserted *equal* to ``ab7fbbd``'s in
+    ``test_the_windowed_forward_transient_is_unchanged_from_ab7fbbd``.
+
+    Known defect, inherited and not introduced: the ``windowed_chunked``
+    branch below accumulates a whole chunk into one shared ``(n_rows,)`` carry
+    through a single scatter-add over its ``(w_chunk, max_window_size)`` index
+    block. The windows in a chunk overlap physically, so those updates collide
+    and XLA has to assume they can. Whether that shape costs anything on a GPU
+    is exactly what the two failed diagnosis rounds above could not establish;
+    the A/B they ran does not answer it either, because ``w_chunk = 32``
+    exceeds ``n_w`` on both of its fixtures and ``windowed_chunked``
+    degenerates to ``windowed_vmap`` there. Declared by an ``xfail(strict=True)`` cell in
+    ``tests/test_window_bucketing.py::test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``;
+    #65.
     """
     two_pi = 2.0 * jnp.pi
     u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)
@@ -1633,6 +1879,11 @@ def _dirty2vis_forward(
         # ``uvw_lambda_sorted`` leaf paid (n_chan, n_rows, 3) of storage and
         # v0.1.2's u/v gathers paid two (n_rows,) gathers per channel.
         uvw_m_sorted = plan.uvw_m[plan.sort_perm]  # (n_rows, 3)
+        # issue #26 buckets the windowed *adjoint* only, so this loop is
+        # ``ab7fbbd``'s: a plain vmap/scan over channels with no bucket-table
+        # grouping, and a plane slice of ``plan.max_window_size`` throughout.
+        # See :func:`_channel_forward_windowed` and AGENTS.md section 5 for the
+        # GH200 regression that took the forward back off the bucketed path.
         if channel_strategy == "vmap":
             vis_per_chan = jax.vmap(
                 lambda im_c, il_c, ws_c: _channel_forward_windowed(
@@ -1903,11 +2154,13 @@ def _channel_adjoint_windowed(
     flip_sign_sorted: Array,
     inv_lambda_c: Array,
     window_start_c: Array,
+    plane_order_c: Array,
     plan: WGridderPlan,
     opts: Opts,
     w_strategy: WStrategy,
     *,
     w_chunk: int,
+    buckets: tuple[tuple[int, int], ...],
 ) -> Array:
     """Windowed adjoint operator for a single channel.
 
@@ -1916,14 +2169,23 @@ def _channel_adjoint_windowed(
     weight (which zeros out padded entries automatically), run a 2D
     NUFFT type 1 to land an image, and accumulate. As on the dense path,
     ``w_chunk`` chooses the traversal -- scan-over-planes at ``1``
-    (``windowed_scan``), vmap-over-planes at ``plan.n_w``
-    (``windowed_vmap``), scan-over-chunks in between
+    (``windowed_scan``), vmap-over-planes at a value that reaches the bucket's
+    plane count (``windowed_vmap``), scan-over-chunks in between
     (``windowed_chunked``) -- and this direction is a plain sum of
-    image-shaped contributions, so it is :func:`_sum_over_planes` unchanged.
+    image-shaped contributions, so it is :func:`_sum_over_planes` unchanged,
+    once per issue #26 bucket with that bucket's static slice length.
+
+    **This is the one direction issue #26 buckets, and the mirroring stops
+    there**: the forward slices ``plan.max_window_size`` per plane, as it did
+    at ``ab7fbbd``, because a bucketed forward measured 20.3x to 58.4x slower
+    on a GH200 (see :func:`_channel_forward_windowed` and AGENTS.md section 5).
+    The adjoint is 1.08x-1.24x on the same runs, with the memory win in
+    ``tests/test_window_bucketing.py::test_windowed_vmap_temp_memory_falls_with_bucketing``
+    intact, so this half stays.
 
     See :func:`_channel_forward_windowed` for the coord-arg convention.
 
-    ``flip_sign_sorted`` is ``plan.flip_sign[plan.sort_perm]`` (issue #17).
+    ``flip_sign_sorted`` is ``plan.flip_sign`` in sorted row order (issue #17).
     This is the one path where the fold's per-row sign has to be permuted: the
     conjugation happens on the incoming visibilities, which arrive here already
     in sorted-row order, so the unpermuted leaf would conjugate the wrong rows
@@ -1935,8 +2197,9 @@ def _channel_adjoint_windowed(
     u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)
 
     cdtype = vis_sorted_c.dtype
-    max_window_size = plan.max_window_size
-    lo_max = max(plan.n_rows - max_window_size, 0)
+    # issue #26: the planes in bucket order; see _channel_forward_windowed.
+    starts_ordered = window_start_c[plane_order_c]
+    centres_ordered = plan.w_centers_rel[plane_order_c]
 
     # issue #17: on the input, before the nshift compensation, against the
     # *sorted* signs (see the argument note above and _hermitian_conj_rows).
@@ -1946,42 +2209,67 @@ def _channel_adjoint_windowed(
     # order here, so no permutation is involved.
     vis_sorted_c = _apply_nshift_compensation(vis_sorted_c, w_rel_sorted, plan, conjugate=True)
 
-    def plane_to_image(lo_raw: Array, w_k: Array, keep: Array | None = None) -> Array:
-        lo = jnp.clip(lo_raw, 0, lo_max)
+    def make_plane_to_image(window_size: int) -> Callable[..., Array]:
+        """One bucket's per-plane closure, specialised on its slice length."""
+        lo_max = max(plan.n_rows - window_size, 0)
 
-        u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (max_window_size,))
-        v_k = jax.lax.dynamic_slice(v_sorted, (lo,), (max_window_size,))
-        w_rel_window = jax.lax.dynamic_slice(w_rel_sorted, (lo,), (max_window_size,))
-        vis_k = jax.lax.dynamic_slice(vis_sorted_c, (lo,), (max_window_size,))
+        def plane_to_image(lo_raw: Array, w_k: Array, keep: Array | None = None) -> Array:
+            lo = jnp.clip(lo_raw, 0, lo_max)
 
-        z = (w_rel_window - w_k) / plan.w_kernel_scale
-        kernel = phi(z, plan.beta)
-        if keep is not None:  # issue #25's padding mask; see _chunk_plane_arrays
-            kernel = kernel * keep
-        vis_k = vis_k * kernel.astype(cdtype)
+            u_k = jax.lax.dynamic_slice(u_sorted, (lo,), (window_size,))
+            v_k = jax.lax.dynamic_slice(v_sorted, (lo,), (window_size,))
+            w_rel_window = jax.lax.dynamic_slice(w_rel_sorted, (lo,), (window_size,))
+            vis_k = jax.lax.dynamic_slice(vis_sorted_c, (lo,), (window_size,))
 
-        h_k = nufft1(
-            (plan.n_l, plan.n_m),
-            vis_k,
-            u_k,
-            v_k,
-            iflag=+1,
-            eps=_nufft_epsilon(plan.epsilon),
-            opts=opts,
+            z = (w_rel_window - w_k) / plan.w_kernel_scale
+            kernel = phi(z, plan.beta)
+            if keep is not None:  # issue #25's padding mask; see _chunk_plane_arrays
+                kernel = kernel * keep
+            vis_k = vis_k * kernel.astype(cdtype)
+
+            h_k = nufft1(
+                (plan.n_l, plan.n_m),
+                vis_k,
+                u_k,
+                v_k,
+                iflag=+1,
+                eps=_nufft_epsilon(plan.epsilon),
+                opts=opts,
+            )
+            # issue #16: shifted grid, matching the forward's plane phase.
+            phase = (two_pi * w_k) * plan.n_minus_1_shifted
+            shift = jnp.exp((-1j * phase).astype(cdtype))
+            return h_k * shift / plan.phi_hat_n.astype(cdtype)
+
+        return plane_to_image
+
+    # One ``_sum_over_planes`` per bucket, with the running image *threaded
+    # through* them rather than the buckets' results summed at the end. That is
+    # a memory requirement, not a style choice: summing at the end leaves one
+    # image-shaped result of every bucket live at once, and
+    # ``tests/test_custom_vjp.py::test_gradient_memory_is_within_a_small_factor
+    # _of_the_forward`` measures exactly that (it read 2.91x the forward, gate
+    # 2.0x, on a four-bucket MWA_compact off30 plan before this was threaded).
+    # The first bucket starts from ``init=None``, so a one-bucket plan runs the
+    # pre-#26 expression with no added zero.
+    dirty_c: Array | None = None
+    offset = 0
+    for window_size, n_planes in buckets:
+        dirty_c = _sum_over_planes(
+            make_plane_to_image(window_size),
+            (
+                starts_ordered[offset : offset + n_planes],
+                centres_ordered[offset : offset + n_planes],
+            ),
+            w_chunk=w_chunk,
+            shape=(plan.n_l, plan.n_m),
+            dtype=cdtype,
+            real_dtype=plan.real_dtype,
+            init=dirty_c,
         )
-        # issue #16: shifted grid, matching the forward's plane phase.
-        phase = (two_pi * w_k) * plan.n_minus_1_shifted
-        shift = jnp.exp((-1j * phase).astype(cdtype))
-        return h_k * shift / plan.phi_hat_n.astype(cdtype)
-
-    return _sum_over_planes(
-        plane_to_image,
-        (window_start_c, plan.w_centers_rel),
-        w_chunk=w_chunk,
-        shape=(plan.n_l, plan.n_m),
-        dtype=cdtype,
-        real_dtype=plan.real_dtype,
-    )
+        offset += n_planes
+    assert dirty_c is not None  # buckets is non-empty: sum(n_planes) == n_w >= 1
+    return dirty_c
 
 
 def _dirty2vis_adjoint(
@@ -2025,49 +2313,71 @@ def _dirty2vis_adjoint(
         vis_sorted_per_chan = vis_per_chan[:, plan.sort_perm]
         uvw_m_sorted = plan.uvw_m[plan.sort_perm]  # (n_rows, 3)
         # issue #17: the fold's per-row sign in the same sorted order as the
-        # visibilities above. One (n_rows,) int8 gather per call, hoisted out
-        # of the channel loop for the same reason as ``uvw_m_sorted``.
-        flip_sign_sorted = plan.flip_sign[plan.sort_perm]  # (n_rows,)
-        if channel_strategy == "vmap":
-            dirty_per_chan = jax.vmap(
-                lambda v_s_c, il_c, ws_c: _channel_adjoint_windowed(
-                    v_s_c,
-                    uvw_m_sorted,
-                    flip_sign_sorted,
-                    il_c,
-                    ws_c,
-                    plan,
-                    opts,
-                    w_strategy,
-                    w_chunk=w_chunk,
-                )
-            )(vis_sorted_per_chan, plan.inv_lambda, plan.window_start)
-        elif channel_strategy == "scan":
+        # visibilities above. One int8 gather per call, hoisted out of the
+        # channel loop for the same reason as ``uvw_m_sorted``.
+        #
+        # Taken through an ``(n_rows, 1)`` view, and that is not cosmetic. Every
+        # whole-row gather of a plan leaf in this module is rank-2 -- the
+        # visibility cube's is ``(n_chan, n_rows)``, ``uvw_m``'s is
+        # ``(n_rows, 3)`` -- while a w-plane window slice is the only rank-1
+        # slice of an ``(n_rows,)`` array anywhere in the emitted program. That
+        # is the convention ``tests/test_window_bucketing.py``'s lowering probe
+        # reads to check that the windowed loop takes exactly the slice lengths
+        # the plan declares as issue #26 buckets, and a rank-1 gather here
+        # lowers to ``slice_sizes = array<i64: 1>`` on a ``tensor<n_rows x i8>``,
+        # which is character-for-character a one-row window. The reshape is
+        # free -- measured on ``tests/test_window_bucketing.py``'s NARROW
+        # fixture (4000 rows, 16^2, off30, seed 0, eps 1e-6, float64,
+        # ``hermitian=True``, adjoint), this spelling and the plain
+        # ``plan.flip_sign[plan.sort_perm]`` compile to identical
+        # ``temp_size_in_bytes`` (``windowed_scan`` 106,760, ``windowed_vmap``
+        # 1,038,464), identical optimised-HLO line counts (800 / 354),
+        # identical ``copy(`` counts (8 / 0) and bit-identical results -- and
+        # it keeps the one rank-1 row slice in the program the one that means
+        # something.
+        #
+        # Two things to know before touching it. The equally good fix was in
+        # the test rather than here: anchoring that probe's regex on the
+        # operand's element type (``tensor<{n}x(?:f|complex)``) instead of on
+        # ``[a-z]`` would exclude an int8 gather without constraining ``src``
+        # at all. And this convention is enforced by nothing but this comment
+        # -- no test asserts that whole-row gathers are rank 2, only that the
+        # slice lengths found are exactly the declared bucket lengths, so a
+        # future rank-1 leaf gather would surface as a puzzling failure over
+        # in ``test_the_lowered_windowed_loop_takes_more_than_one_slice_length``
+        # rather than as a message about this line.
+        flip_sign_sorted = plan.flip_sign[:, None][plan.sort_perm][:, 0]  # (n_rows,)
 
-            def step_w(
-                _: None,
-                args: tuple[Array, Array, Array],
-            ) -> tuple[None, Array]:
-                v_s_c, il_c, ws_c = args
-                return None, _channel_adjoint_windowed(
-                    v_s_c,
-                    uvw_m_sorted,
-                    flip_sign_sorted,
-                    il_c,
-                    ws_c,
-                    plan,
-                    opts,
-                    w_strategy,
-                    w_chunk=w_chunk,
-                )
-
-            _, dirty_per_chan = jax.lax.scan(
-                step_w,
-                None,
-                (vis_sorted_per_chan, plan.inv_lambda, plan.window_start),
+        # issue #26: see _dirty2vis_forward -- the channel axis is walked one
+        # bucket-table group at a time, by the caller's channel strategy.
+        def channel_body(
+            v_s_c: Array,
+            il_c: Array,
+            ws_c: Array,
+            po_c: Array,
+            *,
+            buckets: tuple[tuple[int, int], ...],
+        ) -> Array:
+            return _channel_adjoint_windowed(
+                v_s_c,
+                uvw_m_sorted,
+                flip_sign_sorted,
+                il_c,
+                ws_c,
+                po_c,
+                plan,
+                opts,
+                w_strategy,
+                w_chunk=w_chunk,
+                buckets=buckets,
             )
-        else:
-            raise ValueError(f"unknown channel_strategy: {channel_strategy!r}")
+
+        dirty_per_chan = _map_over_channel_groups(
+            channel_body,
+            (vis_sorted_per_chan, plan.inv_lambda, plan.window_start, plan.window_plane_order),
+            _window_bucket_channel_groups(plan),
+            channel_strategy=channel_strategy,
+        )
     elif channel_strategy == "vmap":
         dirty_per_chan = jax.vmap(
             lambda v_c, il_c: _channel_adjoint(
