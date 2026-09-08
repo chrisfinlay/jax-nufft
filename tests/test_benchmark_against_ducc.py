@@ -36,6 +36,34 @@ Notes on what the numbers do and don't mean:
   via psutil polling. RSS includes everything the process holds (Python
   interpreter, JAX caches, FINUFFT buffers); the *delta* gives a useful
   comparison point for relative memory pressure between strategies.
+
+Deferred: the chunked strategies (issue #25, implementation-plan item 4)
+------------------------------------------------------------------------
+Item 4 asks for ``chunked`` cells at ``w_chunk in {8, 32, 128}`` in this
+suite and in ``tests/test_benchmark_gpu.py``, with ``memory_analysis`` temp
+bytes recorded. **They are not here, and that is a deliberate deferral, not
+an oversight.** Adding them is not a parametrize edit: the benchmark JSONs
+this suite emits are consumed by ``tests/test_benchmark_claims.py``
+(issue #49), which
+
+* recovers ``w_strategy`` from the pytest-benchmark *test name* by
+  ``tail.rstrip("]").partition("-")``, so a second parameter on these cases
+  changes every existing row's key, and
+* classifies each row with ``_w_family(w_strategy) =
+  w_strategy.rsplit("_", 1)[1]``, which raises ``IndexError`` on
+  ``"chunked"`` and returns a third family ``"chunked"`` on
+  ``"windowed_chunked"`` -- against assertions that pin exactly 160
+  scan/vmap pairs and their spread to three decimals, recomputed from
+  *committed* v0.1.2 JSONs that contain no chunked rows.
+
+So item 4 needs the claims layer taught about a family that is neither scan
+nor vmap, and a decision about whether the committed v0.1.2 baselines are
+re-cut. Until then the chunked curve is measured out-of-band and published
+in ``README.md`` (§``w_chunk``) and ``CHANGELOG.md`` rather than here, and
+issue #25 is **not** fully closed. The in-repo gates that do exist for the
+strategy are ``tests/test_chunked_strategy.py`` (values, endpoints,
+``memory_analysis`` curve, gradients, the balanced chunk grid) -- everything
+except wall-clock.
 """
 
 from __future__ import annotations

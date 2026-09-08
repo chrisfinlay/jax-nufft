@@ -14,6 +14,22 @@ session teardown:
 JSON schema is documented in ``docs/benchmarks/README.md``. ducc rows are
 intentionally omitted from v0.1.2; a future merge script joins this with
 the CPU baseline JSON.
+
+Deferred: the chunked strategies (issue #25, implementation-plan item 4)
+------------------------------------------------------------------------
+The ``w_strategy`` parametrisation below is still the four pre-#25 names.
+Item 4's ``chunked`` cells at ``w_chunk in {8, 32, 128}`` are deferred for
+the reason spelled out in ``tests/test_benchmark_against_ducc.py``'s module
+docstring: ``tests/test_benchmark_claims.py`` classifies every row of these
+JSONs with ``w_strategy.rsplit("_", 1)[1]``, which raises on ``"chunked"``,
+and pins pair counts and spreads to three decimals against committed
+baselines that contain no chunked rows.
+
+The GPU numbers issue #25's definition of done asks for were therefore
+measured out-of-band on a GH200 rather than by this suite, and are published
+in ``README.md`` (§``w_chunk``) with the machine, sizes and protocol stated.
+That table reports the DoD's GPU gate as **breached on one cell** -- see the
+README; do not read its absence from this file as the gate having passed.
 """
 
 from __future__ import annotations

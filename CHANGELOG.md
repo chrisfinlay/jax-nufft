@@ -69,6 +69,72 @@ tagged or released, so its changes appear here for the first time; they are mark
   `windowed_scan` and `windowed_vmap`. Opt-in when introduced, and the default since
   [#46](https://github.com/chrisfinlay/jax-nufft/issues/46). *(v0.1.2 series)*
 
+- **`w_strategy="chunked"` / `"windowed_chunked"` with a static `w_chunk` (default 32)**, making the
+  w-plane loop a memory/compute curve instead of a choice between two points. The loop scans over
+  chunks of at most `w_chunk` planes with a `vmap` inside each, so transient memory follows
+  `w_chunk` rather than `n_w`. The four older names *are* points on that curve — `dense_scan` and
+  `windowed_scan` are `w_chunk=1`, `dense_vmap` and `windowed_vmap` are `w_chunk=n_w` — and share
+  its code, so a call at either end is bit-identical to the old name for it **at equal
+  `nthreads`**. `w_chunk` is part of the JIT key and of the primitives' static configuration, so
+  reverse mode chunks the way its forward did.
+
+  The default `w_chunk = 32` exceeds `n_w` on most, not all, of this repository's fixtures.
+  Measured over every telescope in `tests/conftest.py` at both pointings (seed 0, eps 1e-6,
+  float64, hermitian, one channel): EDA2 11 / **56**, GH200_large 9 / 26, MWA_compact 8 / 12,
+  MWA_extended 11 / **134**, MeerKAT 8 / 13 (zenith / off30). Two of the ten run a real chunk
+  loop at the default, with padding; the other eight clamp to `dense_vmap`.
+
+  Measured on MWA_extended off30 (256², 600 rows, `n_w = 134`, float64, eps 1e-6, `nthreads=1`,
+  single channel, `memory_analysis().temp_size_in_bytes`), in units of one complex image:
+
+  | | `dense_scan` | `chunked(8)` | `chunked(16)` | `chunked(32)` | `dense_vmap` |
+  |---|---:|---:|---:|---:|---:|
+  | forward | 2.01× | 9.08× | 16.15× | **28.26×** | 135.23× |
+  | adjoint | 2.01× | 9.01× | 16.01× | **28.01×** | 268.00× |
+
+  `chunked(32)` there runs 1.01–1.12× (forward) and 0.94–1.26× (adjoint) of `dense_vmap`'s time
+  over **seven** interleaved passes on a 10-core Apple M-series. Read those to one significant
+  figure: the suite's own control — `chunked(1)`, the same compiled program as `dense_scan` —
+  spans 0.92–1.00× against it over the same passes, which is the instrument's resolution at this
+  problem size. The memory rows are exact and reproduce to the byte.
+
+  **On a GH200, where the issue was opened.** MWA_extended off30 at 3600² / 1 219 200 rows
+  (`n_w = 140`, complex image 197.8 MB), eps 1e-6, float64, single channel, defaults for
+  `hermitian`/`nthreads`; median of 5 with warm-up outside the timer:
+
+  | | temp | vs `dense_vmap` | forward | adjoint |
+  |---|---:|---:|---:|---:|
+  | `dense_scan`  |    414 MB | **73.1× less** | 2.35× | 1.94× |
+  | `chunked(8)`  |  1 929 MB | 15.7× less | 1.73× | 1.53× |
+  | `chunked(16)` |  3 659 MB |  8.3× less | 1.35× | 1.24× |
+  | `chunked(32)` |  6 256 MB |  4.8× less | **1.27×** | 1.17× |
+  | `chunked(64)` | 10 367 MB |  2.9× less | 1.10× | 1.06× |
+  | `dense_vmap`  | 30 290 MB |  1.0×      | 1.00× | 1.00× |
+
+  The 30 GB that made this cell need a 96 GB device becomes **6.3 GB** at the default `w_chunk`.
+  Note that the definition of done's GPU gate — "`chunked(32)` within 1.2× of `dense_vmap` on
+  every cell" — is **breached on that forward cell at 1.27×**; its adjoint and every other cell
+  measured pass. Two of the four GPU fixtures cannot inform the gate at all (MWA_extended zenith
+  `n_w = 13`, MeerKAT off30 `n_w = 14`: `w_chunk = 32` clamps and reads 1.00× by construction);
+  EDA2 off30 (150² / 4 896 000 rows, `n_w = 60`) is the other real cell and passes at 1.07× /
+  1.01×. Full tables in `README.md` §`w_chunk`.
+
+  Existing strategies are untouched **on every plan with `n_w > 1`**: the optimised HLO for all
+  four older names, plus `auto`, is byte-identical before and after over both operators and four
+  fixtures. The exception is the constant-w fast path (`n_w == 1`), where the plane loop tests
+  `w_chunk >= n_w` before `w_chunk == 1` and so sends the *scan* names down the single-plane vmap
+  branch instead of `lax.scan` — 24 of 82 optimised-HLO keys differ there, with bit-identical
+  results on every cell and a strictly smaller program.
+
+  **Not done:** implementation-plan item 4 — `chunked` cells at `w_chunk ∈ {8, 32, 128}` in the
+  CPU and GPU benchmark suites. `tests/test_benchmark_claims.py` recovers `w_strategy` from the
+  benchmark test *name* and classifies it with `rsplit("_", 1)[1]`, which raises on `"chunked"`
+  and yields a third family on `"windowed_chunked"`, against pair counts and spreads pinned to
+  three decimals from committed v0.1.2 JSONs. Teaching that layer about a family that is neither
+  scan nor vmap is its own change; until then the curve is measured out-of-band and published
+  above. Issue #25 is therefore **not fully closed** by this entry.
+  ([#25](https://github.com/chrisfinlay/jax-nufft/issues/25))
+
 - **A constant-w fast path.** When every row shares one `w` in wavelengths, the plan collapses to a
   single plane (`plan.n_w == 1`, `plan.is_constant_w`). *(v0.1.2 series)*
 

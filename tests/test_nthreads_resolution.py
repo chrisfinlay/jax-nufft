@@ -13,9 +13,9 @@ helper in ``jax_nufft.wgridder``:
   * an explicit ``nthreads`` (any int, including 0) always passes straight
     through -- resolution never runs, and ``w_strategy="auto"`` never needs
     ``plan`` / ``is_adjoint`` in that case;
-  * otherwise the strategy family decides, from a canonical name: one of
-    the four canonical names is used as-is, and anything else -- ``"auto"``
-    and the deprecated ``"scan"``/``"vmap"`` aliases -- is put through
+  * otherwise the strategy family decides, from a canonical name: a member
+    of ``_CANONICAL_W_STRATEGIES`` is used as-is, and anything else --
+    ``"auto"`` and the deprecated ``"scan"``/``"vmap"`` aliases -- is put through
     ``_canonicalise_w_strategy`` and so resolves the same way it does for
     the strategy dispatch itself. (The already-canonical short-circuit is
     issue #46: with ``w_strategy`` also defaulting to ``"auto"``, the
@@ -30,7 +30,15 @@ helper in ``jax_nufft.wgridder``:
     which re-enters FINUFFT once per w-plane) -> ``1``, and
     ``"dense_vmap"`` / ``"windowed_vmap"`` (the ``vmap`` family, one batched
     FINUFFT call) -> ``0`` (measured to benefit from threads in the issue:
-    0.27 vs 0.62 ms per transform).
+    0.27 vs 0.62 ms per transform);
+  * and, since issue #25, ``"chunked"`` / ``"windowed_chunked"``, which do
+    not belong to a family by name: they get ``1`` when their resolved
+    ``w_chunk`` is ``1`` (one FINUFFT call per plane, exactly the scan
+    family's situation) and ``0`` for any larger chunk (one batched call per
+    chunk). That branch is pinned by :data:`_CHUNKED_RESOLUTION_GRID` below
+    and by nothing else: instrumenting it and running the whole
+    ``--runslow`` suite records **zero** hits, because every chunked call in
+    the suite pins ``nthreads=1`` and no fixture reaches the 100k-row cutoff.
 
 ``_resolve_nthreads`` and ``_NTHREADS_SMALL_N_ROWS`` are imported *inside*
 the ``resolve_nthreads`` / ``small_n_rows_cutoff`` fixtures rather than at
@@ -75,6 +83,7 @@ class _ResolveNthreads(Protocol):
         *,
         plan: object | None = ...,
         is_adjoint: bool | None = ...,
+        w_chunk: int | None = ...,
     ) -> int: ...
 
 
@@ -230,6 +239,89 @@ def test_resolve_nthreads_none_grid(
     resolve_nthreads: _ResolveNthreads, w_strategy: str, n_rows: int, expected: int
 ) -> None:
     assert resolve_nthreads(None, w_strategy, n_rows) == expected
+
+
+# -- the chunked strategies (issue #25): the family is w_chunk's, not the name's
+#
+# (w_strategy, w_chunk, n_rows, expected_nthreads). Same literal-values policy
+# as the grid above. This is the *only* thing that executes the
+# ``_CHUNKED_W_STRATEGIES`` branch of ``_resolve_nthreads``: the branch needs
+# ``nthreads is None`` **and** ``n_rows >= _NTHREADS_SMALL_N_ROWS``, and every
+# chunked call anywhere else in the suite pins ``nthreads=1`` (the operator
+# tests deliberately, to take the thread count out of the endpoint identities)
+# while no fixture in ``tests/conftest.py`` has 100k rows -- GH200_large, the
+# largest, has 50k. Instrumented under ``pytest -q --runslow`` before these
+# rows existed, the branch took 0 hits across the whole suite.
+_CHUNKED_RESOLUTION_GRID: list[tuple[str, int | None, int, int]] = [
+    # -- below the cutoff: the small-n_rows override wins for every chunk ----
+    ("chunked", 1, 600, 1),
+    ("chunked", 8, 600, 1),
+    ("chunked", 32, 600, 1),
+    ("windowed_chunked", 1, 600, 1),
+    ("windowed_chunked", 32, 600, 1),
+    ("chunked", 32, 99_999, 1),
+    # -- at and above the cutoff: w_chunk decides ---------------------------
+    #    w_chunk == 1 is one FINUFFT call per plane -> the scan family's 1
+    ("chunked", 1, 100_000, 1),
+    ("windowed_chunked", 1, 100_000, 1),
+    ("chunked", 1, 500_000, 1),
+    ("windowed_chunked", 1, 500_000, 1),
+    #    any larger chunk is a batched call per chunk -> the vmap family's 0
+    ("chunked", 2, 100_000, 0),
+    ("chunked", 8, 100_000, 0),
+    ("chunked", 32, 100_000, 0),
+    ("chunked", 32, 100_001, 0),
+    ("chunked", 128, 500_000, 0),
+    ("windowed_chunked", 2, 100_000, 0),
+    ("windowed_chunked", 32, 100_000, 0),
+    #    a direct caller who never resolved w_chunk gets the vmap answer,
+    #    matching the shipped default w_chunk = 32
+    ("chunked", None, 100_000, 0),
+    ("windowed_chunked", None, 500_000, 0),
+]
+
+
+@pytest.mark.parametrize(
+    ("w_strategy", "w_chunk", "n_rows", "expected"),
+    _CHUNKED_RESOLUTION_GRID,
+    ids=[f"{s}-c{c}-n{n}-want{e}" for s, c, n, e in _CHUNKED_RESOLUTION_GRID],
+)
+def test_resolve_nthreads_chunked_grid(
+    resolve_nthreads: _ResolveNthreads,
+    w_strategy: str,
+    w_chunk: int | None,
+    n_rows: int,
+    expected: int,
+) -> None:
+    """``chunked`` follows its ``w_chunk``, not its name (issue #25).
+
+    The two chunked strategies span both families -- ``w_chunk = 1`` re-enters
+    FINUFFT once per w-plane the way ``dense_scan`` does, and any larger chunk
+    is one batched call per chunk the way ``dense_vmap`` is -- so the family
+    rule the four older names are looked up by cannot be read off the name.
+    """
+    assert resolve_nthreads(None, w_strategy, n_rows, w_chunk=w_chunk) == expected
+
+
+def test_an_explicit_nthreads_still_wins_over_the_chunked_rule(
+    resolve_nthreads: _ResolveNthreads,
+) -> None:
+    """``w_chunk`` never overrides an explicit ``nthreads`` (issue #25 + #24).
+
+    The pass-through branch is checked before anything strategy-shaped, and
+    adding a strategy family that reads a second keyword must not have moved
+    it. ``0`` is the interesting value: it is falsy, so a pass-through written
+    as a truthiness test rather than an ``is not None`` test would silently
+    fall through to the family rule and return ``1`` on the ``w_chunk = 1``
+    row below.
+    """
+    for w_chunk in (1, 32):
+        for explicit in (0, 1, 4, 16):
+            got = resolve_nthreads(explicit, "chunked", 500_000, w_chunk=w_chunk)
+            assert got == explicit, (
+                f"nthreads={explicit} with w_chunk={w_chunk} resolved to {got}; an "
+                "explicit thread count must pass straight through"
+            )
 
 
 # -- w_strategy="auto" resolves to a canonical strategy first --------------

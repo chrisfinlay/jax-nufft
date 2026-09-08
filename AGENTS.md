@@ -403,9 +403,93 @@ If you touch any of these, run `tests/test_planning.py` and
 |-------------------|-------------------------|-----------------------------|----------------------------|------------------------------------------------|
 | `auto`            | resolves to one below   | matches the resolved choice | matches the resolved choice | **The shipped default** (issue #46). Platform-aware heuristic. |
 | `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | 1.48-1.50x its own forward | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
-| `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | ~1x its own forward        | v0.1 `"vmap"` is a deprecated alias.           |
-| `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | 1.48-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
-| `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | ~1x its own forward        | v0.1.1; rare wins, mostly for completeness.    |
+| `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | 0.98-1.98x its own forward | v0.1 `"vmap"` is a deprecated alias.           |
+| `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | 1.46-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | 0.98-1.98x its own forward | v0.1.1; rare wins, mostly for completeness.    |
+| `chunked`         | `n_rows * W^2`          | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward | issue #25; takes the static `w_chunk` (default 32). |
+| `windowed_chunked`| `max_window_size * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward | issue #25; the windowed half of the same knob. |
+
+The last two are not a fifth and sixth algorithm — they are the *general
+form of the other four*, and the other four are values of `w_chunk`.
+`wgridder._resolve_w_chunk` maps `dense_scan` / `windowed_scan` to
+`w_chunk = 1` and `dense_vmap` / `windowed_vmap` to `w_chunk = plan.n_w`
+in the public wrapper, and `wgridder._sum_over_planes` — the one w-plane
+loop every dense strategy and the windowed adjoint run — then branches on
+nothing but `w_chunk`. So `chunked(1)` and `dense_scan` are the same
+computation in the strict sense, bit-identical on a deterministic backend
+rather than equal to 1e-11, and adding a chunk size between the ends does
+not add a *strategy-level* path — there is no third algorithm and no
+dispatch on the name. It does add two branches: `_sum_over_planes`'s
+padded-scan case and `_channel_forward_windowed`'s `chunk_step`
+scatter-add. `w_chunk` is in `_PRIMITIVE_STATIC`, so the backward chunks
+the way its forward did, by the same construction the rest of that tuple
+relies on.
+
+Two scope notes on "bit-identical", both measured:
+
+* **It is an equality at equal `nthreads`.** On a constant-w plan
+  (`n_w == 1`) with `n_rows >= 100_000` and the default `nthreads=None`,
+  `_resolve_w_chunk` sends every strategy to `w_chunk = 1` but
+  `_resolve_nthreads` then answers `1` for `dense_scan` and for `chunked`
+  and `0` for `dense_vmap`. Measured on a coplanar-uvw plan at 64², eps
+  1e-6, float64, 120 000 rows: `chunked(32)` and `dense_vmap` differ by a
+  relative 1.8e-13, while `chunked(1)` and `dense_scan` stay bit-identical.
+  The cause predates #25 — those two names were already the same
+  computation at `n_w == 1` and already disagreed on `nthreads`.
+* **The constant-w plan is the one class where an existing caller's
+  compiled program changed.** `_sum_over_planes` tests `w_chunk >= n_w`
+  before `w_chunk == 1`, so at `n_w == 1` the *scan* names now take the
+  vmap branch where v0.1.2 emitted a `lax.scan`. Measured on that same
+  plan class at `n_rows` in {96, 120 000}: 24 of 82 optimised-HLO keys
+  differ, all of them `dense_scan` / `windowed_scan` / `auto`, with
+  byte-identical results on every cell — a scan over one element becoming
+  a vmap over one element, i.e. a strictly smaller program for the same
+  values. Everywhere else (`n_w > 1`) the optimised HLO of all four older
+  names plus `auto` is byte-identical before and after, over both
+  operators and four fixtures.
+
+`w_chunk` is an *upper bound* on the planes live at once, not an exact
+count: the loop runs `ceil(n_w / w_chunk)` chunks of
+`ceil(n_w / n_chunks) <= w_chunk` planes, so the padded remainder is at
+most `n_chunks - 1` planes rather than up to `w_chunk - 1`. That
+balancing is measured, not cosmetic — a padded plane runs a full 2D NUFFT
+whose result is multiplied by zero, and the unbalanced version (pad to
+`n_chunks * w_chunk`, as issue #25's plan describes) ran 1.24x
+`dense_vmap` at `w_chunk = 32` and 1.44x at 64 on MWA_extended off30
+(`n_w = 134`), tracking its 19% and 43% wasted planes; balanced, both
+waste one plane and `chunked(32)` runs 1.01-1.12x over seven interleaved
+passes (median 1.06x). Splitting the ragged
+remainder off as a smaller `vmap` after the scan wastes nothing and is
+*worse*: with few full chunks XLA schedules that block alongside the scan,
+measured 13.05x image on MeerKAT off30 at `w_chunk = 8` against
+`dense_vmap`'s 13.12x, i.e. the chunking bought nothing.
+
+**If you touch `_plane_chunk_grid`, the gate is
+`tests/test_chunked_strategy.py::test_the_chunk_grid_is_balanced_so_padding_stays_below_the_chunk_count`**
+(with `test_the_documented_chunk_grids_are_the_ones_the_loop_runs` pinning
+the literal grids the docs quote). Nothing else sees the balancing: the
+values are identical either way — padding is masked to an exact zero — and
+the memory gate has `2 * w_chunk * image` of headroom, which an unbalanced
+chunk of exactly `w_chunk` still fits inside. Measured: reverting the helper
+to `chunk = w_chunk` before those two tests existed left
+`test_chunked_strategy.py` + `test_strategies_equivalent.py` +
+`test_constant_w.py` at 100 passed / 0 failed; with them it is 100 passed /
+2 failed.
+
+**Neither benchmark suite has `chunked` cells yet** (issue #25's
+implementation-plan item 4). That is a recorded deferral, not an oversight:
+`tests/test_benchmark_claims.py` recovers `w_strategy` from the benchmark
+test *name* and classifies it with `rsplit("_", 1)[1]`, which raises on
+`"chunked"` and yields a third family on `"windowed_chunked"`, against pair
+counts and spreads pinned to three decimals from committed v0.1.2 JSONs. The
+reason is restated in both suites' module docstrings. Until item 4 lands the
+chunked curve is measured out-of-band and lives in `README.md`
+§`w_chunk` — including the fact that the CPU 1.2x gate is only non-vacuous
+on one of its five fixtures, and that the GPU 1.2x gate is **breached** at
+1.27x on MWA_extended off30's forward at 3600².
+
+`auto` never resolves to a chunked strategy. Picking a chunk size needs a
+memory budget the heuristic is not given; retuning it is issue #34's.
 
 The `grad` column is issue #21's. Both operators are bound as **linear
 primitives** (`_dirty2vis_p`, `_dirty2vis_transpose_p`, `_vis2dirty_p` at
