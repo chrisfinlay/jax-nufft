@@ -467,16 +467,39 @@ four per channel), which is what took the padded row-work on the review
 fixtures from 1.14-4.94x the irreducible work to 1.00-1.38x. The
 per-bucket loop still branches on nothing but `w_chunk`, and a plan with
 one bucket per channel runs the pre-#26 program. `windowed_vmap`'s
-forward no longer builds one `(n_rows,)` input-order vector per plane and
-sums the stack — it scatter-adds each bucket's
-`(n_planes, bucket_length)` block into a sorted-row carry, so its
-transient scales with the padded row-work rather than with `n_w * n_rows`.
-Measured forward `temp_size_in_bytes` on a 4000-row, 16², 138-plane
-fixture (float64, eps 1e-6, `hermitian=True`, `max_window_size` 1072 of
-4000 rows): 13,565,952 B before, 5,389,696 B with the scatter-add alone,
-1,097,136 B with bucketing as well. `windowed_scan`'s peak is one
-bucket's slice and so is set by the *widest* bucket — it does not fall,
-and must not rise: 128,032 B → 128,224 B on the same fixture.
+forward still gives each plane it holds live a private `(n_rows,)` row
+vector, as it did before #26, but at most
+`wgridder._FORWARD_ROW_LANES` of them at a time: the channel threads one
+`(lanes, n_rows)` stack through its buckets, one plane per lane, and
+reduces it once, so the term is `lanes * n_rows` rather than
+`n_w * n_rows`. Measured forward `temp_size_in_bytes` on a 4000-row, 16²,
+138-plane fixture (float64, eps 1e-6, `hermitian=True`,
+`max_window_size` 1072 of 4000 rows): 13,565,952 B before, 3,134,168 B
+after, of which 2,048,000 B is the 32-lane stack. `windowed_scan`'s peak
+is one bucket's slice and so is set by the *widest* bucket — it does not
+fall, and must not rise: 128,032 B → 128,224 B on the same fixture.
+
+**The lane stack is not a tuning knob, and the forward must not
+accumulate every plane into one shared `(n_rows,)` vector.** A shared
+row accumulator turns the windows' physical overlap — each visibility is
+inside the w-kernel's support on 7.00 planes on every fixture here — into
+a *write* collision, which a CPU absorbs and a GPU does not. Measured on
+one GH200 (Daint, eps 1e-6, float64, `n_chan = 1`, realistic sizes), the
+shared-carry form ran `windowed_vmap`'s forward at 351.9 ms against
+38.9 ms for the lane form on GH200_large off30 (2048², 50k rows,
+`n_w = 26`) and 1842.4 ms against 33.0 ms on MeerKAT off30 (2700²,
+302400 rows, `n_w = 14`) — 9.05x and 55.76x, on *less* NUFFT work. On a
+CPU the same two forms are indistinguishable: measured with both
+compiled into one process and their samples interleaved (macOS arm64,
+nthreads=1, median of 11 rounds), the forward ratio is 0.985 / 1.067 /
+0.712 / 0.683 for `windowed_vmap` on MWA_extended off30 / MeerKAT off30 /
+EDA2 off30 / the tests' 4000-row NARROW fixture — noise, in whichever
+direction the fixture falls. Lowered, the difference is one
+`stablehlo.scatter ... unique_indices = false` over overlapping index
+blocks against a batched, `unique_indices = true` one; the lane cap
+bounds the accumulate only and never the NUFFT batch (see `drain` in
+`wgridder._accumulate_windowed_bucket`). No CPU-only measurement can see
+this, which is why the constant carries its derivation in a comment.
 
 **All of the above is `n_chan = 1`, and the multi-channel picture is
 different.** A bucket's slice length is a static `dynamic_slice` shape, so

@@ -161,8 +161,17 @@ At ``ab7fbbd``:
   the channel grouping;
 * ``test_windowed_vmap_temp_memory_falls_with_bucketing`` fails at
   13,565,952 bytes against a 6,782,976-byte bound;
+* ``test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``
+  splits: its ``windowed_vmap`` cell **passes** (``ab7fbbd``'s forward gives
+  each plane a private row vector, uncapped) and its ``windowed_chunked``
+  cell **fails** on a ``(28, 1072)`` shared-carry scatter. That failure is a
+  pre-existing defect in ``ab7fbbd``'s chunked forward and not something this
+  issue introduced -- it is invisible in the coordinator's GPU A/B only
+  because ``w_chunk = 32`` exceeds ``n_w`` on both of its fixtures, so the
+  chunked strategy degenerates to the vmap one there. Both cells fail at
+  ``f3a7f49``, the state of this branch before that test existed;
 * the equivalence, gradient, vmap/jit and vacuity-guard tests **pass** today
-  (measured: 40 passed, 28 failed of the module's 68 cells at ``ab7fbbd``)
+  (measured: 41 passed, 29 failed of the module's 70 cells at ``ab7fbbd``)
   and are regression protection: they carry the vacuity guard so that they
   are still meaningful once bucketing lands, but they assert nothing that is
   false before it.
@@ -1110,6 +1119,15 @@ _WINDOWED_VMAP_FORWARD_TEMP_AT_AB7FBBD = 13_565_952
 # the model, so it is a statement about the direction and rough size of the
 # change and not a fit to a predicted byte count. Today's value is 100% of
 # itself and fails it by 2x.
+#
+# Shipped: 3,134,168 B, 23.1% of ``ab7fbbd``. Two terms, not one -- the
+# row-slice work the model is about, and 2,048,000 B of
+# ``wgridder._FORWARD_ROW_LANES * n_rows`` row vectors, which is what keeps the
+# per-plane accumulate collision-free (see
+# ``test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``). The
+# lane term is why the gate is not tighter than the model: at an uncapped one
+# lane per plane, which is ``ab7fbbd``'s form, NARROW's widest bucket alone
+# would put 83 of them live.
 _MEMORY_GATE_FRACTION = 0.5
 
 
@@ -1160,6 +1178,124 @@ def test_windowed_vmap_temp_memory_falls_with_bucketing() -> None:
         f"windowed_scan forward transient rose to {scan_temp} bytes from the "
         "128,032 measured at ab7fbbd; a scan's peak is one bucket, so bucketing "
         "should leave it where it is"
+    )
+
+
+# A ``stablehlo.scatter`` with its attribute dict, its region, and the operand
+# type tuple that follows it. The region is matched non-greedily up to the
+# ``}) : (`` that closes it, which is the only place that sequence occurs.
+_SCATTER_OP = re.compile(
+    r'"stablehlo\.scatter"\([^)]*\)\s*<\{(?P<attrs>.*?)\}>\s*\(\{.*?\}\)\s*:\s*'
+    r"\((?P<types>[^)]*)\)\s*->",
+    re.S,
+)
+_TENSOR_DIMS = re.compile(r"tensor<([0-9x]*)x?([a-z][^>]*)>")
+
+
+def _forward_scatters(text: str) -> list[tuple[str, tuple[int, ...]]]:
+    """``(attribute text, updates shape)`` for every scatter in the lowered IR."""
+    found: list[tuple[str, tuple[int, ...]]] = []
+    for match in _SCATTER_OP.finditer(text):
+        tensors = _TENSOR_DIMS.findall(match.group("types"))
+        assert len(tensors) >= 3, (
+            "a stablehlo.scatter takes (operand, indices, updates); this one parsed "
+            f"as {tensors!r}, so the probe is not reading the IR it thinks it is"
+        )
+        dims = tuple(int(d) for d in tensors[-1][0].split("x") if d)
+        found.append((match.group("attrs"), dims))
+    return found
+
+
+@pytest.mark.parametrize("w_strategy", ["windowed_vmap", "windowed_chunked"])
+def test_no_two_planes_accumulate_into_one_row_vector_in_the_forward(w_strategy: str) -> None:
+    """The forward's plane accumulate must be collision-free *in the lowering*.
+
+    The windows of different w-planes overlap, physically: at eps 1e-6 every
+    visibility is inside the w-kernel's support on exactly 7.00 planes, on all
+    ten (telescope, pointing) cells of ``tests/conftest.py`` and on both of
+    :data:`NARROW`, and the padded windows this issue buckets cover each sorted
+    row 7.00-9.70 times on average and 8-81 times at the worst row. So a
+    forward that accumulates every plane into one shared ``(n_rows,)`` vector
+    is asking XLA to combine several writes per element, and XLA has to assume
+    they can collide.
+
+    On a CPU that costs nothing measurable. On a GPU it is the difference
+    between the operator being usable and not: measured on one GH200 (Daint,
+    eps 1e-6, float64, ``n_chan = 1``, realistic sizes), the shared-carry form
+    ran this strategy's forward at 351.9 ms against 38.9 ms for the
+    collision-free form on GH200_large off30 (2048^2, 50k rows, ``n_w = 26``)
+    and at 1842.4 ms against 33.0 ms on MeerKAT off30 (2700^2, 302400 rows,
+    ``n_w = 14``) -- 9.05x and 55.76x, and on *less* NUFFT work, because the
+    bucketing had cut the padded overhead from 2.7389 to 1.2861 and from
+    2.0000 to 1.1158 on those two plans. The adjoint, which accumulates an
+    image and never a row-indexed carry, moved by 1.09x and 1.15x.
+
+    **This cell exists because no other kind of test in this repository can
+    see that.** Every value test passes either way -- the two forms are the
+    same arithmetic in a different reduction order. Every CPU timing passes
+    either way: measured on the review machine (macOS arm64, nthreads=1,
+    median of 11 interleaved rounds, both forms imported into one process so
+    their samples alternate), the forward ratio of this form to the
+    shared-carry one is 0.985 / 1.067 / 0.712 / 0.683 for ``windowed_vmap`` on
+    MWA_extended off30 / MeerKAT off30 / EDA2 off30 / :data:`NARROW` off30 --
+    i.e. the difference the GPU reads as 9-56x reads on a CPU as noise, in
+    whichever direction the fixture happens to fall. And the transient-memory
+    gate above passes either way. The lowering is the only CPU-visible signal,
+    so the lowering is what is asserted.
+
+    What is asserted, precisely: every ``stablehlo.scatter`` in the lowered
+    forward writes updates that XLA can place without combining, by being one
+    of
+
+    * marked ``unique_indices = true`` -- no two updates share an element;
+    * carrying ``input_batching_dims`` -- each batch element owns its own slice
+      of the operand, which is the shape a ``vmap`` over per-plane row vectors
+      takes (and the shape ``ab7fbbd`` had, one lane per plane and uncapped);
+    * or writing exactly ``n_rows`` elements, which is the single sorted-to-
+      input row permutation every windowed forward ends with.
+
+    That is a structural proxy and not a proof of speed -- a scatter can carry
+    batching dims and still collide *within* a batch element, and there is no
+    GPU in this suite to time. It is exact about the thing that regressed: an
+    accumulate whose updates are one ``(n_planes, slice_length)`` block per
+    bucket, unbatched and not unique, matches none of the three.
+
+    Non-vacuity is checked two ways: the fixture's windows are a strict subset
+    of the rows (:func:`_assert_windows_are_strict`), and the plane accumulate
+    has to actually be in the IR -- at least one scatter writing a rank-2 block
+    -- so that a rewrite which lost it would fail here rather than pass
+    silently.
+    """
+    plan = _plan(NARROW, 30.0)
+    _assert_windows_are_strict(plan)
+    image, _ = _inputs(plan, NARROW)
+    n_rows = int(plan.n_rows)
+
+    text = _lowered_text(lambda x: _call("dirty2vis", plan, x, w_strategy=w_strategy), image)
+    scatters = _forward_scatters(text)
+    assert scatters, (
+        "no stablehlo.scatter in the lowered forward at all -- the probe is not "
+        "seeing the operator it thinks it is"
+    )
+    assert any(len(dims) >= 2 for _, dims in scatters), (
+        "no scatter writes a rank-2 block, so the per-plane accumulate is not in "
+        f"this IR and there is nothing here to gate. Shapes seen: "
+        f"{[dims for _, dims in scatters]}"
+    )
+
+    offenders = [
+        dims
+        for attrs, dims in scatters
+        if "unique_indices = true" not in attrs
+        and "input_batching_dims" not in attrs
+        and dims != (n_rows,)
+    ]
+    assert not offenders, (
+        f"{w_strategy} forward: {len(offenders)} scatter(s) with updates of shape "
+        f"{offenders} are neither marked unique, nor per-plane batched, nor the "
+        f"({n_rows},) row permutation. That is the shape of a shared row "
+        "accumulator, which every plane's window writes into and which cost "
+        "9.05x-55.76x on a GH200 -- see this test's docstring."
     )
 
 

@@ -662,12 +662,13 @@ Since v0.1.3 (#26) the windowed strategies slice `bucket_length`, not
 `max_window_size`: each channel's planes are sorted into at most four size
 classes and each class is a sub-loop with its own static slice length, so a
 plane whose window holds 8 rows does not read 155. `windowed_vmap`'s forward
-accumulates each class's `(n_planes, slice_length)` block into a sorted-row
-carry instead of building one `(n_rows,)` vector per plane, so its transient
-scales with the padded row-work; measured forward `temp_size_in_bytes` on a
-4000-row, 16², 138-plane fixture (float64, eps 1e-6), 13,565,952 B before
-against 1,097,136 B after. A scan holds one class's slice at a time, so
-`windowed_scan`'s peak is set by the widest class and is unchanged.
+still gives each plane it holds live its own `(n_rows,)` row vector, but at
+most 32 of them at a time rather than one per plane, so that term is
+`32 * n_rows` instead of `n_w * n_rows`; measured forward
+`temp_size_in_bytes` on a 4000-row, 16², 138-plane fixture (float64,
+eps 1e-6), 13,565,952 B before against 3,134,168 B after. A scan holds one
+class's slice at a time, so `windowed_scan`'s peak is set by the widest class
+and is unchanged.
 
 Those figures, and every other timing quoted for #26, are single-channel.
 A slice length is a static shape, so the channel axis can only be mapped

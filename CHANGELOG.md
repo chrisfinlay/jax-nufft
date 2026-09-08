@@ -180,12 +180,27 @@ tagged or released, so its changes appear here for the first time; they are mark
   something bucketing moves.
 
   `windowed_vmap`'s forward also stopped materialising one `(n_rows,)` vector per plane, which
-  cost `n_w × n_rows` whatever the windows held; it scatter-adds each class's
-  `(n_planes, slice_length)` block into a sorted-row carry instead. Forward
-  `temp_size_in_bytes` on a 4000-row, 16², 138-plane fixture (float64, eps 1e-6): 13,565,952 B →
-  5,389,696 B from the scatter-add alone → 1,097,136 B with bucketing. A scan holds one class's
-  slice at a time, so `windowed_scan`'s peak is set by the widest class and does not fall
-  (128,032 B → 128,224 B on the same fixture).
+  cost `n_w × n_rows` whatever the windows held. It still gives every plane it holds live a
+  private row vector — that is what keeps the accumulate collision-free — but at most 32 of them
+  at a time: the channel threads one `(32, n_rows)` stack through its size classes, one plane per
+  lane, and reduces it once. Forward `temp_size_in_bytes` on a 4000-row, 16², 138-plane fixture
+  (float64, eps 1e-6): 13,565,952 B → 3,134,168 B, of which 2,048,000 B is the lane stack. A scan
+  holds one class's slice at a time, so `windowed_scan`'s peak is set by the widest class and does
+  not fall (128,032 B → 128,224 B on the same fixture).
+
+  The lane stack is load-bearing on GPU and invisible on CPU. Accumulating every plane into a
+  single shared `(n_rows,)` carry turns the windows' physical overlap into a write collision:
+  measured on one GH200 (Daint, eps 1e-6, float64, `n_chan = 1`, realistic sizes) the
+  shared-carry form ran `windowed_vmap`'s forward at 351.9 ms against 38.9 ms for the lane form
+  on GH200_large off30 (2048², 50k rows, `n_w = 26`) and 1842.4 ms against 33.0 ms on MeerKAT
+  off30 (2700², 302400 rows, `n_w = 14`), on *less* NUFFT work. On a CPU the same two forms are
+  indistinguishable: measured with both compiled into one process and their samples interleaved
+  (macOS arm64, nthreads=1, median of 11 rounds), the lane form's forward is 0.985 / 1.067 /
+  0.712 / 0.683 times the shared-carry one for `windowed_vmap` on MWA_extended off30 / MeerKAT
+  off30 / EDA2 off30 / the 4000-row fixture, and 0.997-1.012 for `windowed_scan`, which is
+  untouched. `tests/test_window_bucketing.py::
+  test_no_two_planes_accumulate_into_one_row_vector_in_the_forward` gates the lowering, because
+  no CPU timing can.
 
   **The definition of done's two CPU timing gates, stated as measured rather than as met.**
 

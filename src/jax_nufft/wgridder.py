@@ -141,6 +141,48 @@ _CHUNKED_W_STRATEGIES = ("chunked", "windowed_chunked")
 # only at realistic image sizes.
 DEFAULT_W_CHUNK = 32
 
+# How many w-planes the windowed *forward* accumulates into private row vectors
+# at once. Each plane writes its window into its own row of a
+# ``(lanes, n_rows)`` stack, which is reduced once at the end of the channel,
+# instead of every plane adding into one shared ``(n_rows,)`` vector.
+#
+# This is a lowering constant, not a speed/memory knob on the plane loop: it
+# bounds the *accumulate* only, never the NUFFT batch, which stays
+# ``w_chunk``'s and the caller's business (see ``drain`` in
+# :func:`_accumulate_windowed_bucket`).
+#
+# A shared row accumulator turns the windows' *physical* overlap into a write
+# collision. Measured over all ten (telescope, pointing) cells of
+# ``tests/conftest.py`` plus both of ``test_window_bucketing.NARROW`` (eps 1e-6,
+# float64, seed 0, hermitian, one channel), every visibility is inside the
+# w-kernel's support on exactly 7.00 planes, and the *padded* windows cover each
+# sorted row 7.00-9.70 times on average and 8-81 times at the worst row, the
+# maximum being where the right-edge clamp piles several wide windows on one
+# start. Lowered, a shared accumulator is one
+# ``stablehlo.scatter ... unique_indices = false`` per bucket whose index block
+# is those overlapping windows; per lane it is a ``dynamic_update_slice``, which
+# JAX's batching rule turns into a scatter marked ``unique_indices = true``,
+# ``indices_are_sorted = true``, with the lane as an ``input_batching_dim`` --
+# a form that cannot collide. ``ab7fbbd`` had the same collision-free shape,
+# with one lane per plane and no cap.
+#
+# On a CPU the difference is nil to mildly favourable. On a GPU it is the whole
+# ballgame: on one GH200 (Daint, coordinator's A/B, eps 1e-6, float64, n_chan=1,
+# realistic sizes) the colliding form cost 0.70-0.76 us *per element written*,
+# putting ``windowed_vmap``'s forward at 351.9 ms against ``ab7fbbd``'s 38.9 ms
+# on GH200_large off30 (2048^2, 50k rows, n_w=26) and 1842.4 ms against 33.0 ms
+# on MeerKAT off30 (2700^2, 302400 rows, n_w=14).
+#
+# The cap exists because the stack is ``lanes * n_rows`` complex numbers held
+# live. Measured on ``tests/test_window_bucketing.py``'s NARROW fixture (4000
+# rows, 138 planes, off30, eps 1e-6, float64), forward ``windowed_vmap``
+# transient: 1.47 MB at 8 lanes, 2.04 at 16, 3.13 at 32, 5.52 at 64, against
+# that module's 6.78 MB gate and ``ab7fbbd``'s uncapped 13.57 MB. 32 leaves
+# that gate a factor of two of margin, is enough lanes that every bucket of
+# every fixture here bar NARROW's widest folds in a single group, and matches
+# :data:`DEFAULT_W_CHUNK`.
+_FORWARD_ROW_LANES = 32
+
 # Smallest epsilon FINUFFT can honour in double precision; asking for less
 # makes it warn and clamp, and ``filterwarnings = ["error"]`` turns that into a
 # hard failure.
@@ -1370,8 +1412,23 @@ def _map_over_channel_groups(
     return out[np.argsort(concatenated)]
 
 
+def _forward_row_lanes(buckets: tuple[tuple[int, int], ...], w_chunk: int) -> int:
+    """How many row vectors the windowed forward accumulates into, ``0`` for one.
+
+    ``0`` means the single shared ``(n_rows,)`` carry, which is what
+    ``w_chunk == 1`` -- ``windowed_scan`` -- wants: its planes are sequential by
+    construction, so they cannot collide with each other and a lane stack would
+    only cost memory. Anything else gets
+    ``min(w_chunk, _FORWARD_ROW_LANES, widest bucket)`` lanes, capped at the
+    widest bucket because a lane no bucket can fill is dead space.
+    """
+    if w_chunk == 1:
+        return 0
+    return min(w_chunk, _FORWARD_ROW_LANES, max(n_planes for _, n_planes in buckets))
+
+
 def _accumulate_windowed_bucket(
-    vis_sorted: Array,
+    acc: Array,
     plane_to_window: Callable[..., tuple[Array, Array]],
     starts_b: Array,
     centres_b: Array,
@@ -1380,54 +1437,129 @@ def _accumulate_windowed_bucket(
     w_chunk: int,
     real_dtype: Any,
 ) -> Array:
-    """Add one bucket's per-plane row contributions into the sorted-row carry.
+    """Add one bucket's per-plane row contributions into the forward's carry.
 
     The windowed forward's counterpart to :func:`_sum_over_planes`, and it
-    branches on ``w_chunk`` in exactly the same three ways; it is separate only
-    because this direction accumulates into ``(n_rows,)`` at a *per-plane
-    offset* rather than summing equally-shaped contributions. ``n_planes`` is
-    the bucket's plane count, i.e. the length of ``starts_b``, and
-    ``window_size`` its static slice length.
+    branches the same way; it is separate only because this direction
+    accumulates at a *per-plane offset* rather than summing equally-shaped
+    contributions. ``n_planes`` is the bucket's plane count, i.e. the length of
+    ``starts_b``, and ``window_size`` its static slice length.
+
+    ``acc`` is either the single ``(n_rows,)`` carry (``w_chunk == 1``) or the
+    ``(lanes, n_rows)`` stack :func:`_forward_row_lanes` sizes, and its rank is
+    what selects the traversal. In the stack, **one lane holds one plane at a
+    time**: the accumulate is a plain ``dynamic_update_slice`` into a lane
+    nothing else is writing, rather than every plane adding into one shared row
+    vector. See :data:`_FORWARD_ROW_LANES` for why that matters -- the windows
+    of different planes overlap physically, so a shared accumulator makes that
+    overlap a *write* collision, which is nearly free on a CPU and costs ~0.7 us
+    per element on a GPU. Collisions between planes that share a lane are
+    between different ``lax.scan`` steps, i.e. sequential by construction.
 
     Module level rather than nested in the bucket loop so that the closures
     below capture arguments instead of a loop variable.
     """
     n_planes = int(starts_b.shape[0])
-    offsets = jnp.arange(window_size)
 
-    if w_chunk >= n_planes:
-        los, contribs = jax.vmap(plane_to_window)(starts_b, centres_b)
-        return vis_sorted.at[los[:, None] + offsets[None, :]].add(contribs)
+    if acc.ndim == 1:
+        offsets = jnp.arange(window_size)
+        if n_planes == 1:
+            # Nothing to scan over. Kept as the one-shot form the whole loop
+            # used before issue #26's buckets, so that a constant-w plan
+            # (``n_w == 1``) lowers exactly as it did.
+            los, contribs = jax.vmap(plane_to_window)(starts_b, centres_b)
+            return acc.at[los[:, None] + offsets[None, :]].add(contribs)
 
-    if w_chunk == 1:
         # Keep the carry in sorted-row order so each plane touches only its
         # ``(window_size,)`` slice: the per-step dynamic_slice + add +
         # dynamic_update_slice is O(window_size) where a full-row zero and
         # scatter would be O(n_rows) per plane.
-        def step(acc: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
+        def step(carry: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
             lo_raw, w_k = args
             lo, contrib = plane_to_window(lo_raw, w_k)
-            old = jax.lax.dynamic_slice(acc, (lo,), (window_size,))
-            return jax.lax.dynamic_update_slice(acc, old + contrib, (lo,)), None
+            old = jax.lax.dynamic_slice(carry, (lo,), (window_size,))
+            return jax.lax.dynamic_update_slice(carry, old + contrib, (lo,)), None
 
-        out, _ = jax.lax.scan(step, vis_sorted, (starts_b, centres_b))
+        out, _ = jax.lax.scan(step, acc, (starts_b, centres_b))
         return out
 
-    # Scan over chunks, ``vmap`` over the chunk's planes. The windows of a
-    # chunk start at different rows, so a single dynamic_update_slice cannot
-    # serve them and the accumulate is a scatter-add over the chunk's
-    # ``(w_chunk, window_size)`` index block. Windows overlap, which is exactly
-    # what a scatter-*add* is for; issue #25's padding planes contribute hard
-    # zeros, so they add nothing wherever their (repeated) window lands.
+    lane_cap = int(acc.shape[0])
+
+    def lane_add(lane: Array, lo: Array, contrib: Array) -> Array:
+        old = jax.lax.dynamic_slice(lane, (lo,), (window_size,))
+        return jax.lax.dynamic_update_slice(lane, old + contrib, (lo,))
+
+    def drain(carry: Array, los: Array, contribs: Array) -> Array:
+        """Fold already-computed ``(p, window_size)`` windows into the lanes.
+
+        The lane cap is a *memory* bound on the stack, not on the plane batch:
+        it is applied here, to the accumulate, and never to the NUFFT above.
+        Chunking the NUFFT is ``w_chunk``'s job and the caller's choice --
+        ``windowed_vmap`` asks for every plane at once and still gets it, with
+        only this trivial fold walked in groups. On a GPU that distinction is
+        the difference between issue #25's measured ``chunked8`` (1.73x
+        ``dense_vmap`` on MWA_extended off30, one GH200) and ``dense_vmap``
+        itself; the fold has no NUFFT in it and costs nothing to walk.
+
+        That separation is structural -- ``lane_cap`` is read only inside this
+        function, and the two ``jax.vmap(plane_to_window)`` call sites above are
+        batched by ``n_planes`` and by ``w_chunk`` -- and it is checked: the
+        lowered FINUFFT custom calls are byte-identical at
+        ``_FORWARD_ROW_LANES`` 8 and 32. Measured on NARROW off30
+        (``n_w = 138``, buckets 83/25/15/15) the ``windowed_vmap`` batches are
+        ``83x1x37``, ``25x1x333``, ``15x1x754``, ``15x1x1072`` at *both* caps --
+        i.e. still one call per bucket over all of its planes, with an 8-lane
+        cap in force -- and ``windowed_chunked(32)``'s first bucket is
+        ``28x1x37`` at both, which is :func:`_plane_chunk_grid`'s balancing of
+        the caller's 32 and nothing to do with the lanes.
+
+        The groups are padded to exactly ``lane_cap`` rather than balanced the
+        way :func:`_plane_chunk_grid` balances a *plane* chunk, and with zeros
+        rather than with a repeat of the last window. Both follow from the
+        padding being free here: no NUFFT runs on it, a zero window adds
+        nothing so no mask is needed, and a uniform ``lane_cap`` keeps every
+        fold reading and writing the whole stack -- a narrower group would take
+        ``carry[:group]`` and put it back, which is a copy of the stack per
+        bucket (measured on NARROW off30, forward, ``windowed_vmap``, 32 lanes:
+        6.08 MB of transient that way against 3.13 MB this way).
+        """
+        p = int(los.shape[0])
+        n_groups = -(-p // lane_cap)
+        pad = n_groups * lane_cap - p
+        if pad:
+            los = jnp.concatenate([los, jnp.zeros((pad,), dtype=los.dtype)])
+            contribs = jnp.concatenate(
+                [contribs, jnp.zeros((pad, window_size), dtype=contribs.dtype)]
+            )
+        los = los.reshape((n_groups, lane_cap))
+        contribs = contribs.reshape((n_groups, lane_cap, window_size))
+
+        if n_groups == 1:
+            return jax.vmap(lane_add)(carry, los[0], contribs[0])
+
+        def fold(sub: Array, args: tuple[Array, Array]) -> tuple[Array, None]:
+            return jax.vmap(lane_add)(sub, *args), None
+
+        updated, _ = jax.lax.scan(fold, carry, (los, contribs))
+        return updated
+
+    if w_chunk >= n_planes:
+        los, contribs = jax.vmap(plane_to_window)(starts_b, centres_b)
+        return drain(acc, los, contribs)
+
+    # ``windowed_chunked``: ``w_chunk`` bounds the *plane batch* (issue #25), so
+    # the NUFFT is walked in chunks and each chunk's windows are folded into the
+    # lanes as they arrive. issue #25's padding planes contribute hard zeros, so
+    # their (repeated) window adds nothing wherever it lands.
     chunked_xs, keep = _chunk_plane_arrays(
         (starts_b, centres_b), w_chunk=w_chunk, real_dtype=real_dtype
     )
 
-    def chunk_step(acc: Array, args: tuple[Array, ...]) -> tuple[Array, None]:
+    def chunk_step(carry: Array, args: tuple[Array, ...]) -> tuple[Array, None]:
         los, contribs = jax.vmap(plane_to_window)(*args)
-        return acc.at[los[:, None] + offsets[None, :]].add(contribs), None
+        return drain(carry, los, contribs), None
 
-    out, _ = jax.lax.scan(chunk_step, vis_sorted, (*chunked_xs, keep))
+    out, _ = jax.lax.scan(chunk_step, acc, (*chunked_xs, keep))
     return out
 
 
@@ -1639,14 +1771,18 @@ def _channel_forward_windowed(
     between is ``windowed_chunked`` -- a scan over chunks with a ``vmap``
     inside. ``w_strategy`` names the family only.
 
-    All three accumulate into the same sorted-row carry (issue #26). The
-    ``vmap`` branch used to build one ``(n_rows,)`` input-order vector per
-    plane and sum the stack, which costs ``n_w * n_rows`` whatever the windows
-    hold -- measured on the tests' NARROW fixture (4000 rows, 138 planes,
-    float64) that term alone is 8.83 MB of a 13.57 MB forward transient, so
-    bucketing could not have moved it. Scatter-adding each bucket's
-    ``(n_planes, slice_length)`` block into the carry instead makes the whole
-    traversal scale with the padded row-work, which is what issue #26 shrinks.
+    All three end in the same sorted-row total (issue #26), but they do not all
+    reach it the same way. ``ab7fbbd``'s ``vmap`` branch built one ``(n_rows,)``
+    input-order vector per plane and summed the stack, which costs
+    ``n_w * n_rows`` whatever the windows hold -- measured on the tests' NARROW
+    fixture (4000 rows, 138 planes, float64) that term alone is 8.83 MB of a
+    13.57 MB forward transient, so bucketing could not have moved it. What
+    replaces it is a *bounded* version of the same thing: at most
+    :data:`_FORWARD_ROW_LANES` planes hold a private row vector at once, and
+    ``lax.scan`` walks a bucket that has more. The intermediate step of
+    accumulating every plane into a single shared ``(n_rows,)`` carry is what
+    the GPU could not afford -- see :data:`_FORWARD_ROW_LANES` and
+    :func:`_accumulate_windowed_bucket`.
     """
     two_pi = 2.0 * jnp.pi
     u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)
@@ -1701,11 +1837,15 @@ def _channel_forward_windowed(
 
         return plane_to_window
 
-    vis_sorted = jnp.zeros((n_rows,), dtype=cdtype)
+    # One accumulator for the whole channel, threaded through the buckets: a
+    # stack of ``lanes`` row vectors, or the single shared row vector when
+    # ``lanes`` is 0. See :func:`_forward_row_lanes`.
+    lanes = _forward_row_lanes(buckets, w_chunk)
+    acc = jnp.zeros(((lanes, n_rows) if lanes else (n_rows,)), dtype=cdtype)
     offset = 0
     for window_size, n_planes in buckets:
-        vis_sorted = _accumulate_windowed_bucket(
-            vis_sorted,
+        acc = _accumulate_windowed_bucket(
+            acc,
             make_plane_to_window(window_size),
             starts_ordered[offset : offset + n_planes],
             centres_ordered[offset : offset + n_planes],
@@ -1714,6 +1854,7 @@ def _channel_forward_windowed(
             real_dtype=plan.real_dtype,
         )
         offset += n_planes
+    vis_sorted = acc if lanes == 0 else jnp.sum(acc, axis=0)
     # issue #16: applied here, in sorted-row order, where ``vis_sorted`` and
     # ``w_rel_sorted`` already agree -- i.e. before the unsort rather than
     # across it.
