@@ -57,6 +57,14 @@ def _plan_stub_from_row(row: dict) -> SimpleNamespace:
         n_w=row["n_w"],
         w_kernel_width=row["w_kernel_width"],
         window_padding_overhead=row["window_padding_overhead"],
+        # issue #26 split the padding field by direction. The baselines these
+        # rows come from predate it and record one number, which is the
+        # un-bucketed one the forward still reads; mirroring it onto the
+        # adjoint field is what keeps this a replay of the recorded sweep
+        # rather than a re-derivation of it. A bucketed value here would be
+        # asserting how the *current* planner would bucket a plan the JSON
+        # does not describe.
+        window_padding_overhead_adjoint=row["window_padding_overhead"],
         n_rows=row["n_rows"],
     )
 

@@ -1,10 +1,8 @@
-"""Issue #26: per-channel window sizes and w-plane size bucketing.
+"""Issue #26: per-channel window sizes and w-plane size bucketing, on the ADJOINT.
 
-**Status: this module is written against a feature that does not exist yet.**
-The structural half of it fails at ``ab7fbbd``; the equivalence half passes
-today and is the regression net the change has to keep green. "What fails
-today, and how" at the foot of this docstring is the implementer's target
-list.
+**Scope.** Bucketing is applied to the windowed *adjoint* only. The windowed
+forward is ``ab7fbbd``'s code, unchanged, and this module asserts that it is --
+see "What the forward does instead" below for the measurement that decided it.
 
 What the feature is
 -------------------
@@ -18,8 +16,39 @@ Three things, from the issue's implementation plan:
 3. **Bucketing.** Sort a channel's planes into a small number of size
    classes and give each class its own static slice length, so a plane whose
    window holds 24 rows does not slice 1072.
-4. **Report the effective ratio.** ``plan.window_padding_overhead`` becomes
-   the work bucketing actually does over the work it cannot avoid.
+4. **Report the effective ratio.** ``plan.window_padding_overhead_adjoint``
+   is the work bucketing actually does over the work it cannot avoid.
+   ``plan.window_padding_overhead`` keeps issue #43's un-bucketed definition
+   and describes the forward.
+
+What the forward does instead
+-----------------------------
+Bucketing the forward as well was implemented, measured, and reverted. On one
+GH200 (Daint, eps 1e-6, float64, ``n_chan = 1``, realistic sizes, the ``auto``
+path), the bucketed forward against ``ab7fbbd``'s:
+
+===================================  ==================  ========  ==========
+cell                                 auto fwd resolves   ab7fbbd   bucketed
+===================================  ==================  ========  ==========
+GH200_large zenith 2048^2/50k n_w=9  ``windowed_vmap``    16.7 ms   339.7 ms
+MeerKAT off30 2700^2/302400 n_w=14   ``windowed_vmap``    32.9 ms  1918.7 ms
+MWA_extended zenith 3600^2/1.22M     ``windowed_vmap``    48.6 ms  timed out
+GH200_large off30 2048^2/50k n_w=26  ``dense_vmap``       40.4 ms    40.1 ms
+===================================  ==================  ========  ==========
+
+-- 20.3x and 58.4x on the first two, and a timeout at 420 s on the third,
+against 1.08x-1.24x on the *adjoint* over the same runs. ``auto`` resolves the
+forward to ``windowed_vmap`` on most realistic GPU plans, so this reached
+defaulting users. Two diagnosis-and-fix rounds failed to move the GPU numbers,
+so the forward was put back on ``ab7fbbd``'s path and the cause left open
+(TODO(#NN): follow-up issue). Those four numbers are the maintainer's, not
+this session's, and are quoted rather than reproduced -- this suite has no GPU.
+
+What this module asserts about the forward is therefore the *negative*: that
+it takes one slice length and not the plan's bucket lengths
+(``test_the_lowered_windowed_loop_slices_by_bucket_in_the_adjoint_only``),
+and that its transient is byte-for-byte ``ab7fbbd``'s
+(``test_the_windowed_forward_transient_is_unchanged_from_ab7fbbd``).
 
 The plan surface this module pins
 ---------------------------------
@@ -44,12 +73,26 @@ mean is fixed:
     of the widest slice any strategy takes. It is what the pre-#26 metric is
     recomputed from below, so the baseline stays visible after the change.
 ``plan.window_padding_overhead``
-    Redefined from ``n_chan * n_w * max_window_size / live_row_count``
-    (issue #43) to ``sum over channels and buckets of
-    slice_length * n_planes / live_row_count``. Same denominator, same
-    meaning -- padded row-work over irreducible row-work -- and it collapses
-    to the #43 form when every channel has exactly one bucket, which is
-    where the plan builder is today.
+    **Unchanged**, and unchanged deliberately: still issue #43's
+    ``n_chan * n_w * max_window_size / live_row_count``, and now explicitly
+    the *forward's* ratio, since the forward still slices ``max_window_size``
+    per plane. Every calibration figure in ``wgridder.py``'s auto-strategy
+    comments and in ``tests/test_padding_overhead.py`` is on this quantity
+    and none of them moved.
+``plan.window_padding_overhead_adjoint``
+    New, and the one the definition-of-done's ``<= 1.5`` gate reads:
+    ``sum over channels and buckets of slice_length * n_planes /
+    live_row_count``, the work the bucketed *adjoint* traversal does. Same
+    denominator, same meaning -- padded row-work over irreducible row-work --
+    bounded above by ``window_padding_overhead`` and equal to it when every
+    channel has exactly one bucket.
+
+    Two fields rather than one redefined field, because
+    ``wgridder._auto_w_strategy_{cpu,gpu}`` compare a padding ratio against a
+    cutoff in *both* directions. A single bucketed number would feed the
+    forward's gate a figure that does not describe the forward, and would
+    change the forward's lowered program under ``auto`` -- which is exactly
+    what the scope decision is trying not to do.
 
 Measured starting point
 -----------------------
@@ -58,6 +101,11 @@ arm64 10-core, CPU backend, ``pixi run -e test``, jax 0.9.2), float64,
 ``epsilon = 1e-6``, ``synthetic_uvw(..., seed=0)``, ``n_chan = 1``, the
 shipped ``hermitian=True``, at the CI fixture sizes in ``tests/conftest.py``
 -- *not* at the realistic sizes the issue's second comment also tabulates.
+
+The ``overhead today`` column below is ``window_padding_overhead`` at
+``ab7fbbd`` **and** today -- it is the same field with the same value -- and
+``<=4-bucket`` is ``window_padding_overhead_adjoint``, which is what issue #26
+added.
 
 ===================  ======  =====  ======  =============  ==============  =========
 fixture              n_rows    n_w     mws  mws / n_rows   overhead today  <=4-bucket
@@ -129,52 +177,42 @@ Two measurement caveats found while writing this module
   so its peak is set by the *largest* bucket, which is still
   ``max_window_size``. Only the strategies that hold every plane's slice at
   once pay ``sum over planes``; that is ``windowed_vmap``, and it is the one
-  the memory gate below is written on. Measured on :data:`NARROW`, forward,
-  ``temp_size_in_bytes``: ``windowed_vmap`` 13,565,952 against
-  ``windowed_scan`` 128,032 and ``dense_scan`` 72,328.
+  the memory gate below is written on. Measured on :data:`NARROW` at
+  ``ab7fbbd``, ``temp_size_in_bytes``, **adjoint** (the direction that
+  buckets): ``windowed_vmap`` 2,932,224 against ``windowed_scan`` 106,568 and
+  ``dense_scan`` 136,264.
 
-What fails today, and how
--------------------------
-At ``ab7fbbd``:
+What each direction reads, and where
+------------------------------------
+The module is easiest to read by keeping the two directions apart:
 
-* every test that calls :func:`_bucket_layout` or
-  :func:`_max_window_size_per_chan` fails with :data:`_MISSING_FEATURE`,
-  because ``WGridderPlan`` has no such attribute --
-  ``test_the_bucket_layout_is_well_formed`` (4 cells),
+* **adjoint** -- ``test_effective_padding_overhead_is_at_most_one_and_a_half``
+  (the DoD gate, on ``window_padding_overhead_adjoint``),
   ``test_the_reported_overhead_is_the_effective_bucketed_ratio``,
-  ``test_equivalence_still_holds_once_the_windows_are_actually_bucketed``
-  (2 cells) and
-  ``test_per_channel_window_sizes_are_used_rather_than_one_global_max``;
-* ``test_effective_padding_overhead_is_at_most_one_and_a_half`` fails on
-  seven of its ten cells on the number itself (1.5709, 2.5191, 1.7139,
-  1.5714, 4.9441, 1.8571, 2.7389), and passes on MWA_compact zenith
-  (1.1431), MeerKAT zenith (1.1429) and GH200_large zenith (1.2857);
-* ``test_the_lowered_windowed_loop_takes_more_than_one_slice_length`` fails
-  on all six of its cells, but not all six the same way: the three
-  ``dirty2vis`` cells fail on "still takes a single slice length [1072]",
-  while the three ``vis2dirty`` ones find ``{1, 1072}`` -- the extra ``1``
-  being the adjoint's ``flip_sign`` row gather and not a window -- so they
-  clear that assertion and fail at :func:`_bucket_layout` instead. See the
-  test's own docstring;
-* ``test_interleaved_channel_groups_are_reassembled_in_channel_order`` fails
-  on all six of its cells at :func:`_bucket_layout`, that being how it reads
-  the channel grouping;
-* ``test_windowed_vmap_temp_memory_falls_with_bucketing`` fails at
-  13,565,952 bytes against a 6,782,976-byte bound;
-* ``test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``
-  splits: its ``windowed_vmap`` cell **passes** (``ab7fbbd``'s forward gives
-  each plane a private row vector, uncapped) and its ``windowed_chunked``
-  cell **fails** on a ``(28, 1072)`` shared-carry scatter. That failure is a
-  pre-existing defect in ``ab7fbbd``'s chunked forward and not something this
-  issue introduced -- it is invisible in the coordinator's GPU A/B only
-  because ``w_chunk = 32`` exceeds ``n_w`` on both of its fixtures, so the
-  chunked strategy degenerates to the vmap one there. Both cells fail at
-  ``f3a7f49``, the state of this branch before that test existed;
-* the equivalence, gradient, vmap/jit and vacuity-guard tests **pass** today
-  (measured: 41 passed, 29 failed of the module's 70 cells at ``ab7fbbd``)
-  and are regression protection: they carry the vacuity guard so that they
-  are still meaningful once bucketing lands, but they assert nothing that is
-  false before it.
+  ``test_the_lowered_windowed_loop_slices_by_bucket_in_the_adjoint_only``'s
+  ``vis2dirty`` cells, ``test_windowed_vmap_temp_memory_falls_with_bucketing``,
+  and ``test_interleaved_channel_groups_are_reassembled_in_channel_order``
+  (the channel-group reassembly is adjoint-only code since the forward stopped
+  grouping);
+* **forward** -- the same lowering cell's ``dirty2vis`` cells,
+  ``test_the_windowed_forward_transient_is_unchanged_from_ab7fbbd``, and
+  ``test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``. All
+  three assert that the forward is ``ab7fbbd``'s program; none of them asserts
+  anything issue #26 added;
+* **both** -- the plan-surface, equivalence, gradient, jit/vmap and
+  vacuity-guard cells, which are direction-agnostic.
+
+The one cell that fails, and why it is left failing
+---------------------------------------------------
+``test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``'s
+``windowed_chunked`` cell is ``xfail(strict=True)``. It fails on a
+``(28, 1072)`` shared-carry scatter in ``ab7fbbd``'s chunked forward -- the
+colliding accumulate shape the cell is written to catch. **That is a defect
+in ``ab7fbbd``, found while working this issue and not introduced by it**;
+the reverted forward inherits it. It is untested in the maintainer's GPU
+A/B only because ``w_chunk = 32`` exceeds ``n_w`` on both of those fixtures,
+so ``windowed_chunked`` degenerates to ``windowed_vmap`` there. Declared
+rather than deleted so the finding outlives the revert; TODO(#NN).
 """
 
 from __future__ import annotations
@@ -270,34 +308,39 @@ _MISSING_FEATURE = (
     "((slice_length, n_planes), ...) ascending in slice_length with distinct "
     "lengths and sum(n_planes) == plan.n_w. ``max_window_size_per_chan`` is a "
     "(n_chan,) tuple of ints, channel c's widest padded window (a property "
-    "over window_buckets is fine). ``plan.max_window_size`` stays the global "
-    "int it is today, and ``plan.window_padding_overhead`` becomes "
-    "sum(slice_length * n_planes) / plan.live_row_count."
+    "over window_buckets is fine). ``plan.max_window_size`` and "
+    "``plan.window_padding_overhead`` both stay exactly what they are today "
+    "(the forward does not bucket), and ``plan.window_padding_overhead_adjoint`` "
+    "is the new sum(slice_length * n_planes) / plan.live_row_count."
 )
 
 
 # --- fixtures ----------------------------------------------------------------
 
 # A synthetic telescope built for the memory gate, because no repo fixture can
-# carry it. ``windowed_vmap``'s transient is dominated by the plane stack of
-# images on every one of the eight review cells: measured at eps 1e-6,
-# float64, seed 0, hermitian=True, forward, ``n_w * image`` is 74.53% of the
-# transient on EDA2 zenith, 88.62% / 88.64% / 88.64% on EDA2 off30 and the two
-# MWA_compact cells, and 96.90% / 98.86% / 96.90% / 96.90% on the four
-# 256^2 cells. Bucketing cannot move that term, so a memory gate written on any
-# of them would be measuring the wrong thing.
+# carry it. ``windowed_vmap``'s adjoint transient -- the adjoint being the
+# direction issue #26 buckets -- is dominated by the plane stack of images on
+# every one of the eight review cells: measured at ``ab7fbbd``, eps 1e-6,
+# float64, seed 0, hermitian=True, ``n_w * image`` is 83.66% of the transient
+# on EDA2 zenith, 50.00% on EDA2 off30, 96.47% on both MWA_compact cells and
+# 99.09% on MWA_extended zenith and both MeerKAT cells, with MWA_extended off30
+# the second 50.00%. Bucketing cannot move that term, so a memory gate written
+# on any of them would be measuring at best half of the wrong thing.
 #
 # This fixture reuses MWA_extended's uv distribution -- which is what produces
 # the narrow windows (measured ``max_window_size / n_rows`` 0.258 there, 0.268
 # here) -- with 4000 rows instead of 600 and a 16^2 image instead of 256^2, so
 # the ratio inverts. Measured at eps 1e-6, float64, off30, seed 0,
 # hermitian=True: n_w = 138, max_window_size = 1072, live_row_count = 28001,
-# overhead 5.2832, 85 distinct padded window sizes spanning 2 to 1072 with a
-# median of 24, no empty planes. One image plane is 4096 bytes, so
-# ``n_w * image`` is 565,248 bytes -- 4.17% of ``windowed_vmap``'s measured
-# 13,565,952-byte forward transient, the rest of which is
-# ``n_w * max_window_size`` row-shaped traffic at a measured 91.70 bytes per
-# (plane, row).
+# forward overhead 5.2832, 85 distinct padded window sizes spanning 2 to 1072
+# with a median of 24, no empty planes. One image plane is 4096 bytes, so
+# ``n_w * image`` is 565,248 bytes -- 19.28% of ``windowed_vmap``'s measured
+# 2,932,224-byte adjoint transient at ``ab7fbbd``, the rest of which is
+# ``n_w * max_window_size`` row-shaped traffic at a measured 16.00 bytes per
+# (plane, row). (On the *forward*, whose 13,565,952 bytes this fixture was
+# originally sized against, the same plane stack is 4.17% and the row traffic
+# 87.88 bytes per (plane, row) -- but the forward does not bucket, so that
+# split is now only the reason the fixture is shaped the way it is.)
 NARROW = Telescope(
     name="i26_narrow",
     freq_hz=150e6,
@@ -597,24 +640,32 @@ def test_effective_padding_overhead_is_at_most_one_and_a_half(
 ) -> None:
     """Issue #26's definition of done, with the pre-change value pinned beside it.
 
-    Three assertions, in the order that makes a failure readable:
+    **The gate is read on the ADJOINT's ratio**, ``window_padding_overhead_adjoint``,
+    because the adjoint is the only direction issue #26 buckets -- see the
+    module docstring's "What the forward does instead". The forward's
+    ``window_padding_overhead`` is asserted here too, and asserted to be
+    *unchanged*: it is still issue #43's un-bucketed metric to the last bit, so
+    the baseline column of the module docstring's table is simultaneously the
+    ``ab7fbbd`` measurement and today's value of that field.
+
+    Four assertions, in the order that makes a failure readable:
 
     1. the *pre-bucketing* metric, recomputed from the plan's own fields as
        issue #43 defines it, still equals the value measured at ``ab7fbbd``
        (module docstring table). This is the regression tripwire: it is what
        says the plan geometry has not moved under the gate;
-    2. the reported ``window_padding_overhead`` is no worse than that. A
-       bucketing that made the ratio go up is a bug, and on the three cells
-       already under the gate (MWA_compact zenith 1.1431, MeerKAT zenith
-       1.1429, GH200_large zenith 1.2857) this is the only thing the gate
-       itself would check;
-    3. the reported ratio meets the ``<= 1.5`` gate.
+    2. ``plan.window_padding_overhead`` still *is* that metric, i.e. the
+       forward's reported overhead did not move when the adjoint's did;
+    3. the reported adjoint ratio is no worse than it. A bucketing that made
+       the ratio go up is a bug, and on the three cells already under the gate
+       (MWA_compact zenith 1.1431, MeerKAT zenith 1.1429, GH200_large zenith
+       1.2857) this is the only thing the gate itself would check;
+    4. the reported adjoint ratio meets the ``<= 1.5`` gate.
 
     Measured at ``ab7fbbd``, float64, eps 1e-6, seed 0, hermitian=True,
-    n_chan=1: assertion 3 fails on seven of these ten cells -- everything
+    n_chan=1: assertion 4 fails on seven of these ten cells -- everything
     except the three named above -- and the worst is MWA_extended off30 at
-    4.9441. Assertion 1 passes today by construction:
-    ``window_padding_overhead`` *is* the pre-bucketing metric at ``ab7fbbd``.
+    4.9441.
     """
     plan = _cached_plan(telescope, zenith_angle_deg, (1.0,), True)
     baseline = _BASELINE_OVERHEAD_AT_AB7FBBD[(telescope.name, zenith_angle_deg)]
@@ -624,37 +675,47 @@ def test_effective_padding_overhead_is_at_most_one_and_a_half(
         "the plan geometry changed, so the gate below is no longer being read "
         "against the fixture it was calibrated on"
     )
-    assert plan.window_padding_overhead <= _unbucketed_overhead(plan) * (1.0 + 1e-9), (
-        f"bucketing made the padding overhead worse: "
-        f"{plan.window_padding_overhead} > {_unbucketed_overhead(plan)}"
+    assert plan.window_padding_overhead == pytest.approx(_unbucketed_overhead(plan), rel=1e-12), (
+        "plan.window_padding_overhead is no longer issue #43's un-bucketed "
+        f"metric ({plan.window_padding_overhead} != {_unbucketed_overhead(plan)}). "
+        "It describes the windowed FORWARD, which issue #26 does not bucket, and "
+        "every calibration figure in wgridder.py's auto-strategy comments is on it."
     )
-    assert plan.window_padding_overhead <= PADDING_OVERHEAD_GATE, (
-        f"{telescope.name} at {zenith_angle_deg} deg: effective padding overhead "
-        f"{plan.window_padding_overhead:.4f} exceeds issue #26's gate of "
-        f"{PADDING_OVERHEAD_GATE}. Measured achievable with at most four size "
-        "classes on this cell: see the module docstring's last column."
+    assert plan.window_padding_overhead_adjoint <= _unbucketed_overhead(plan) * (1.0 + 1e-9), (
+        f"bucketing made the padding overhead worse: "
+        f"{plan.window_padding_overhead_adjoint} > {_unbucketed_overhead(plan)}"
+    )
+    assert plan.window_padding_overhead_adjoint <= PADDING_OVERHEAD_GATE, (
+        f"{telescope.name} at {zenith_angle_deg} deg: effective adjoint padding "
+        f"overhead {plan.window_padding_overhead_adjoint:.4f} exceeds issue #26's "
+        f"gate of {PADDING_OVERHEAD_GATE}. Measured achievable with at most four "
+        "size classes on this cell: see the module docstring's last column."
     )
 
 
 @requires_x64
 def test_the_reported_overhead_is_the_effective_bucketed_ratio() -> None:
-    """Pin the metric's definition, which issue #43 already moved once.
+    """Pin both metrics' definitions, and which direction each one is about.
 
-    ``window_padding_overhead`` has had two denominators and now gets a new
-    numerator, so the tests that read it have to say which one they mean. The
-    contract asserted here is
+    issue #26 does not redefine ``window_padding_overhead``; it adds a second
+    field beside it, because bucketing reached only one of the two directions.
+    The contract asserted here is therefore a pair:
 
-        window_padding_overhead
+        window_padding_overhead              # the FORWARD, unchanged from #43
+            == n_chan * n_w * max_window_size / live_row_count
+
+        window_padding_overhead_adjoint      # the ADJOINT, issue #26
             == sum over channels and buckets of slice_length * n_planes
                / live_row_count
 
     with the denominator left exactly as issue #43 built it (nominal support,
-    excluding both ``window_boundary_margin`` and the ``+/-1`` clamp).
+    excluding both ``window_boundary_margin`` and the ``+/-1`` clamp) and
+    shared by both.
 
-    Also asserted: on a plan whose windows genuinely vary the new numerator is
-    strictly smaller than issue #43's ``n_chan * n_w * max_window_size``, so
-    the redefinition is not a rename. Measured at ``ab7fbbd`` on EDA2 off30,
-    float64, eps 1e-6, hermitian=True, n_chan=1: the old numerator is
+    Also asserted: on a plan whose windows genuinely vary the adjoint's
+    numerator is strictly smaller than the forward's, so the second field is
+    not a rename of the first. Measured at ``ab7fbbd`` on EDA2 off30, float64,
+    eps 1e-6, hermitian=True, n_chan=1: the forward numerator is
     56 * 126 = 7056 rows against a live count of 2801, i.e. the 2.5191 in the
     table, while the per-plane floor (every plane its own length) is 1.035 and
     at most four size classes reach 1.2424.
@@ -662,21 +723,29 @@ def test_the_reported_overhead_is_the_effective_bucketed_ratio() -> None:
     plan = _cached_plan(EDA2, 30.0, (1.0,), True)
     _assert_windows_are_strict(plan)
 
+    assert plan.window_padding_overhead == pytest.approx(_unbucketed_overhead(plan), rel=1e-12), (
+        "window_padding_overhead is not issue #43's un-bucketed ratio: expected "
+        f"{_unbucketed_padded_work(plan)} / {plan.live_row_count} = "
+        f"{_unbucketed_overhead(plan)!r}, got {plan.window_padding_overhead!r}. "
+        "It describes the windowed forward, which issue #26 does not bucket."
+    )
+
     effective = _effective_padded_work(plan)
-    assert plan.window_padding_overhead == pytest.approx(
+    assert plan.window_padding_overhead_adjoint == pytest.approx(
         effective / plan.live_row_count, rel=1e-12
     ), (
-        "window_padding_overhead is not the effective bucketed ratio: expected "
-        f"{effective} / {plan.live_row_count} = "
-        f"{effective / plan.live_row_count!r}, got {plan.window_padding_overhead!r}"
+        "window_padding_overhead_adjoint is not the effective bucketed ratio: "
+        f"expected {effective} / {plan.live_row_count} = "
+        f"{effective / plan.live_row_count!r}, got "
+        f"{plan.window_padding_overhead_adjoint!r}"
     )
     assert effective < _unbucketed_padded_work(plan), (
         "the bucketed numerator equals the un-bucketed one on a plan whose "
         "window sizes vary, so nothing was bucketed"
     )
-    assert plan.window_padding_overhead >= 1.0, (
+    assert plan.window_padding_overhead_adjoint >= 1.0, (
         "padded work cannot be below live work; the lower bound "
-        "tests/test_padding_overhead.py pins must survive the redefinition"
+        "tests/test_padding_overhead.py pins holds for the adjoint's ratio too"
     )
 
 
@@ -874,7 +943,7 @@ def test_interleaved_channel_groups_are_reassembled_in_channel_order(
     """Channels that share a bucket table need not be adjacent in the plan.
 
     A bucket's slice length is a static shape, so the channel axis can only be
-    mapped over channels that bucket identically; the implementation therefore
+    mapped over channels that bucket identically; the **adjoint** therefore
     groups channels by bucket table, runs each group, concatenates the results
     **in group order** and permutes them back into channel order. That last
     step is a no-op on every fixture this repository can build, which is
@@ -883,6 +952,15 @@ def test_interleaved_channel_groups_are_reassembled_in_channel_order(
     byte-identical, pass for pass and skip for skip, because with an ascending
     ``freq`` the groups are already contiguous ascending runs. See
     :data:`_NON_MONOTONE_FREQ_FACTORS` for how far that was checked.
+
+    **The ``dirty2vis`` cells are a control, not a second copy of the claim.**
+    The forward does not bucket and therefore does not group -- it walks the
+    channel axis with a plain ``vmap``/``scan``, exactly as at ``ab7fbbd`` --
+    so on this fixture it must come back in channel order with no reassembly
+    to perform. They are kept parametrised alongside the adjoint because a
+    plan with a non-monotone ``freq`` is a shape nothing else in the suite
+    runs the forward on, and because they are what would notice if grouping
+    leaked back into the forward and got the order wrong.
 
     The implementation skips the permutation when it *is* the identity, which
     makes the reordering branch rarer still -- on every repository fixture the
@@ -898,16 +976,20 @@ def test_interleaved_channel_groups_are_reassembled_in_channel_order(
     array only if the channels happen to be equal -- and, more usefully,
     because a per-channel report names *which* channels were swapped.
 
-    Measured on this fixture (EDA2 off30, ``freq = f * [1.0, 2.0, 1.0]``,
-    seed 0, eps 1e-6, float64, ``hermitian=True``, ``max_window_size`` 126 of
-    400 rows, per-channel maxima 126 / 72 / 126, groups ``[(0, 2), (1,)]``),
-    worst per-channel disagreement with ``dense_scan`` over the three windowed
-    strategies: forward 1.323e-16, adjoint 3.464e-15. Under either mutation
-    channels 1 and 2 come back swapped and all six cells fail, at the same
-    readings both times -- forward ``[1.323e-16, 1.477e+00, 1.373e+00]`` and
-    adjoint ``[2.888e-15, 1.415e+00, 1.562e+00]``, channel 0 (which is first
-    in its own group and therefore lands in the right slot either way) being
-    the one that stays correct.
+    Measured this session on this fixture (EDA2 off30,
+    ``freq = f * [1.0, 2.0, 1.0]``, seed 0, eps 1e-6, float64,
+    ``hermitian=True``, ``max_window_size`` 126 of 400 rows, per-channel
+    maxima 126 / 72 / 126, groups ``[(0, 2), (1,)]``), worst per-channel
+    disagreement with ``dense_scan`` over the three windowed strategies:
+    forward 1.323e-16, adjoint 3.464e-15. Under either mutation of the
+    adjoint's reassembly -- deleting it outright, or inverting the identity
+    test so the two paths swap -- channels 1 and 2 come back swapped and all
+    three ``vis2dirty`` cells fail, reading
+    ``[2.888e-15 - 2.905e-15, 1.415e+00, 1.562e+00]``; channel 0, which is first in its
+    own group and therefore lands in the right slot either way, is the one
+    that stays correct. The three ``dirty2vis`` cells are unaffected by both
+    mutations, which is the control working: the forward does not go through
+    that code at all.
     """
     plan = _plan(EDA2, 30.0, freq_factors=_NON_MONOTONE_FREQ_FACTORS)
     _assert_windows_are_strict(plan)
@@ -1017,10 +1099,19 @@ def test_per_channel_window_sizes_are_used_rather_than_one_global_max() -> None:
 @requires_x64
 @pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
 @pytest.mark.parametrize("w_strategy", WINDOWED_STRATEGIES)
-def test_the_lowered_windowed_loop_takes_more_than_one_slice_length(
+def test_the_lowered_windowed_loop_slices_by_bucket_in_the_adjoint_only(
     w_strategy: str, op: str
 ) -> None:
     """Rows outside a bucket's slice are never touched -- read off the lowering.
+
+    **The two operators assert opposite things, and that is the scope of issue
+    #26 as shipped.** ``vis2dirty`` must take more than one slice length, and
+    only lengths the plan declares as buckets. ``dirty2vis`` must take exactly
+    one, ``plan.max_window_size``, which is ``ab7fbbd``'s program: the bucketed
+    forward regressed by 20.3x to 58.4x on a GH200 and was reverted (module
+    docstring, "What the forward does instead"). So the forward cells here are
+    not disabled -- they are the cell that would notice if bucketing leaked
+    back into the forward without a GPU measurement to justify it.
 
     "Untouched" has no numerical signature: a row outside a plane's window
     gets a zero kernel weight anyway, which is precisely why bucketing is
@@ -1082,6 +1173,17 @@ def test_the_lowered_windowed_loop_takes_more_than_one_slice_length(
         "windowed loop stopped slicing the w-sorted arrays or the StableHLO "
         "spelling this probe matches has changed"
     )
+    assert max(found) <= plan.max_window_size
+
+    if op == "dirty2vis":
+        assert found == {plan.max_window_size}, (
+            f"{w_strategy} dirty2vis takes slice lengths {sorted(found)}; issue #26 "
+            f"buckets the ADJOINT only, so the forward must take exactly "
+            f"{{{plan.max_window_size}}} -- ab7fbbd's single static window. A "
+            "bucketed forward is a 20.3x-58.4x GPU regression on the fixtures the "
+            "module docstring tabulates; do not re-land one without GPU numbers."
+        )
+        return
 
     assert len(found) > 1, (
         f"{w_strategy} {op} still takes a single slice length {sorted(found)} on a "
@@ -1089,7 +1191,6 @@ def test_the_lowered_windowed_loop_takes_more_than_one_slice_length(
         "distinct padded window sizes: every plane is reading the widest window's "
         "worth of rows"
     )
-    assert max(found) <= plan.max_window_size
 
     bucket_lengths = {length for per_chan in _bucket_layout(plan) for length, _ in per_chan}
     assert found <= bucket_lengths, (
@@ -1102,32 +1203,35 @@ def test_the_lowered_windowed_loop_takes_more_than_one_slice_length(
 # 5. memory
 # =============================================================================
 
-# ``windowed_vmap`` forward transient on the NARROW fixture at ``ab7fbbd``
+# ``windowed_vmap`` **adjoint** transient on the NARROW fixture at ``ab7fbbd``
 # (macOS arm64 CPU backend, float64, eps 1e-6, seed 0, hermitian=True,
-# n_chan=1, AGENTS.md section 6's memory protocol). The comparison numbers on
-# the same call: dense_scan 72,328, windowed_scan 128,032, windowed_chunked(32)
-# 1,272,104, dense_vmap 17,664,000.
+# n_chan=1, AGENTS.md section 6's memory protocol). The adjoint, because that
+# is the direction issue #26 buckets. The comparison numbers on the same call
+# at ``ab7fbbd``: dense_scan 136,264, windowed_scan 106,568, windowed_chunked(32)
+# 1,143,392, dense_vmap 9,397,248.
+_WINDOWED_VMAP_ADJOINT_TEMP_AT_AB7FBBD = 2_932_224
+
+# The forward's, at ``ab7fbbd`` and therefore also today: issue #26 leaves the
+# windowed forward alone, so this number is asserted for *equality* below and
+# not as a bound. The comparison numbers on the same call: dense_scan 72,328,
+# windowed_scan 128,032, windowed_chunked(32) 1,272,104, dense_vmap 17,664,000
+# -- all five measured byte-identical on this branch and at ``ab7fbbd``.
 _WINDOWED_VMAP_FORWARD_TEMP_AT_AB7FBBD = 13_565_952
 
-# The bound, derived rather than chosen. On this fixture the transient splits
-# into a plane-stack term ``n_w * image = 138 * 4096 = 565,248`` bytes (4.17%),
-# which bucketing does not touch, and a row-slice term of 92.0% or more which
-# scales with the padded row-work. Section 1's gate caps the effective overhead
-# at 1.5 against a measured 5.2832 here, so the row-slice term may keep at most
-# 1.5 / 5.2832 = 28.4% of its size and the modelled total is
-# 0.0417 + 0.9583 * 0.284 = 31.4% of today's. The gate is set at 50%, i.e. 1.6x
-# the model, so it is a statement about the direction and rough size of the
-# change and not a fit to a predicted byte count. Today's value is 100% of
-# itself and fails it by 2x.
+# The bound, derived rather than chosen. On this fixture the adjoint transient
+# splits into a plane-stack term ``n_w * image = 138 * 4096 = 565,248`` bytes
+# (19.3% of the 2,932,224 above), which bucketing does not touch, and a
+# row-slice term of 80.7% which scales with the padded row-work. Section 1's
+# gate caps the effective overhead at 1.5 against a measured 5.2832 here, so
+# the row-slice term may keep at most 1.5 / 5.2832 = 28.4% of its size and the
+# modelled total is 0.193 + 0.807 * 0.284 = 42.2% of ``ab7fbbd``'s. The gate is
+# set at 50%, i.e. 1.18x the model, so it is a statement about the direction
+# and rough size of the change and not a fit to a predicted byte count.
+# ``ab7fbbd``'s own value is 100% of itself and fails it by 2x.
 #
-# Shipped: 3,134,168 B, 23.1% of ``ab7fbbd``. Two terms, not one -- the
-# row-slice work the model is about, and 2,048,000 B of
-# ``wgridder._FORWARD_ROW_LANES * n_rows`` row vectors, which is what keeps the
-# per-plane accumulate collision-free (see
-# ``test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``). The
-# lane term is why the gate is not tighter than the model: at an uncapped one
-# lane per plane, which is ``ab7fbbd``'s form, NARROW's widest bucket alone
-# would put 83 of them live.
+# Shipped: 1,038,464 B, 35.4% of ``ab7fbbd`` -- inside the model rather than
+# merely inside the gate. The forward's 13,565,952 is unchanged, which is what
+# the equality assertion below records.
 _MEMORY_GATE_FRACTION = 0.5
 
 
@@ -1137,12 +1241,13 @@ def test_windowed_vmap_temp_memory_falls_with_bucketing() -> None:
 
     ``windowed_vmap`` is the right subject and the only one: a scan holds one
     plane's slice at a time, so its peak is the *largest* bucket, which is
-    still ``max_window_size``. Measured at ``ab7fbbd`` on this fixture the two
-    forward transients are 13,565,952 (vmap) and 128,032 (scan) bytes, and the
-    vmap number is 91.70 bytes per ``(plane, row)`` of
+    still ``max_window_size``. The **adjoint** is the right direction and,
+    since issue #26 was scoped to it, the only one: measured at ``ab7fbbd`` on
+    this fixture the two adjoint transients are 2,932,224 (vmap) and 106,568
+    (scan) bytes, and the vmap number is 19.82 bytes per ``(plane, row)`` of
     ``n_w * max_window_size = 138 * 1072 = 147,936`` -- i.e. it tracks the
-    padded row-work almost exactly, which is what makes a bound derivable from
-    section 1's gate. See the constants above for the derivation.
+    padded row-work, which is what makes a bound derivable from section 1's
+    gate. See the constants above for the derivation.
 
     ``windowed_scan`` is asserted here too, but only not to *regress*: nothing
     in issue #26 should make the one-plane-at-a-time peak bigger, and if
@@ -1151,11 +1256,9 @@ def test_windowed_vmap_temp_memory_falls_with_bucketing() -> None:
     """
     plan = _plan(NARROW, 30.0)
     _assert_windows_are_strict(plan)
-    image, _ = _inputs(plan, NARROW)
+    _, vis = _inputs(plan, NARROW)
 
-    vmap_temp = _temp_bytes(
-        lambda x: _call("dirty2vis", plan, x, w_strategy="windowed_vmap"), image
-    )
+    vmap_temp = _temp_bytes(lambda x: _call("vis2dirty", plan, x, w_strategy="windowed_vmap"), vis)
     plane_stack = plan.n_w * plan.n_l * plan.n_m * np.dtype(plan.complex_dtype).itemsize
     assert vmap_temp > plane_stack, (
         "sanity: the measured transient is below one plane stack, so this "
@@ -1163,21 +1266,57 @@ def test_windowed_vmap_temp_memory_falls_with_bucketing() -> None:
         "derived from anything"
     )
 
-    bound = int(_MEMORY_GATE_FRACTION * _WINDOWED_VMAP_FORWARD_TEMP_AT_AB7FBBD)
+    bound = int(_MEMORY_GATE_FRACTION * _WINDOWED_VMAP_ADJOINT_TEMP_AT_AB7FBBD)
     assert vmap_temp <= bound, (
-        f"windowed_vmap forward transient is {vmap_temp} bytes, above the "
+        f"windowed_vmap adjoint transient is {vmap_temp} bytes, above the "
         f"{bound}-byte bound derived from the {PADDING_OVERHEAD_GATE} padding "
-        f"gate and the {_WINDOWED_VMAP_FORWARD_TEMP_AT_AB7FBBD} bytes measured "
+        f"gate and the {_WINDOWED_VMAP_ADJOINT_TEMP_AT_AB7FBBD} bytes measured "
         "at ab7fbbd"
     )
 
-    scan_temp = _temp_bytes(
-        lambda x: _call("dirty2vis", plan, x, w_strategy="windowed_scan"), image
-    )
-    assert scan_temp <= 1.1 * 128_032, (
-        f"windowed_scan forward transient rose to {scan_temp} bytes from the "
-        "128,032 measured at ab7fbbd; a scan's peak is one bucket, so bucketing "
+    scan_temp = _temp_bytes(lambda x: _call("vis2dirty", plan, x, w_strategy="windowed_scan"), vis)
+    assert scan_temp <= 1.1 * 106_568, (
+        f"windowed_scan adjoint transient rose to {scan_temp} bytes from the "
+        "106,568 measured at ab7fbbd; a scan's peak is one bucket, so bucketing "
         "should leave it where it is"
+    )
+
+
+@requires_x64
+def test_the_windowed_forward_transient_is_unchanged_from_ab7fbbd() -> None:
+    """The other half of the scope decision, asserted as an equality.
+
+    Issue #26 buckets the adjoint and leaves the forward exactly as it was, so
+    the forward's transient must not move *in either direction* -- a fall would
+    mean bucketing had leaked into the forward, which is the 20.3x-58.4x GPU
+    regression the module docstring tabulates, and a rise would mean the plan's
+    extra leaf had started costing something the forward pays for.
+
+    ``windowed_vmap`` is the strategy with something to lose: it is the one
+    that holds every plane's row slice at once, so it is where a change of
+    slice length would show. Measured on this fixture (macOS arm64 CPU backend,
+    float64, eps 1e-6, seed 0, hermitian=True, n_chan=1), this branch and
+    ``git archive ab7fbbd`` both read 13,565,952 bytes, and so do all four of
+    the other strategies on the same call -- dense_scan 72,328, windowed_scan
+    128,032, windowed_chunked(32) 1,272,104, dense_vmap 17,664,000.
+
+    Exact equality and not a band, because the claim is that the forward is
+    ``ab7fbbd``'s program and not merely a similar one. The optimised-HLO
+    comparison behind that claim is in AGENTS.md section 5; this cell is the
+    cheap in-suite version of it.
+    """
+    plan = _plan(NARROW, 30.0)
+    _assert_windows_are_strict(plan)
+    image, _ = _inputs(plan, NARROW)
+
+    vmap_temp = _temp_bytes(
+        lambda x: _call("dirty2vis", plan, x, w_strategy="windowed_vmap"), image
+    )
+    assert vmap_temp == _WINDOWED_VMAP_FORWARD_TEMP_AT_AB7FBBD, (
+        f"windowed_vmap forward transient is {vmap_temp} bytes against "
+        f"{_WINDOWED_VMAP_FORWARD_TEMP_AT_AB7FBBD} at ab7fbbd. The windowed "
+        "forward is supposed to be ab7fbbd's program unchanged; a fall here "
+        "means bucketing reached it, which is a 20.3x-58.4x GPU regression."
     )
 
 
@@ -1206,42 +1345,81 @@ def _forward_scatters(text: str) -> list[tuple[str, tuple[int, ...]]]:
     return found
 
 
-@pytest.mark.parametrize("w_strategy", ["windowed_vmap", "windowed_chunked"])
+@pytest.mark.parametrize(
+    "w_strategy",
+    [
+        "windowed_vmap",
+        pytest.param(
+            "windowed_chunked",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "pre-existing defect in ab7fbbd's chunked forward, not introduced "
+                    "by issue #26 and not fixed by it: _channel_forward_windowed's "
+                    "w_chunk < n_w branch accumulates a whole chunk into one shared "
+                    "(n_rows,) carry with a single scatter-add over its "
+                    "(w_chunk, max_window_size) index block. TODO(#NN): follow-up "
+                    "issue -- fix "
+                    "the chunked forward's accumulate, or document the strategy as "
+                    "GPU-hostile."
+                ),
+            ),
+        ),
+    ],
+)
 def test_no_two_planes_accumulate_into_one_row_vector_in_the_forward(w_strategy: str) -> None:
     """The forward's plane accumulate must be collision-free *in the lowering*.
 
-    The windows of different w-planes overlap, physically: at eps 1e-6 every
-    visibility is inside the w-kernel's support on exactly 7.00 planes, on all
-    ten (telescope, pointing) cells of ``tests/conftest.py`` and on both of
-    :data:`NARROW`, and the padded windows this issue buckets cover each sorted
-    row 7.00-9.70 times on average and 8-81 times at the worst row. So a
-    forward that accumulates every plane into one shared ``(n_rows,)`` vector
-    is asking XLA to combine several writes per element, and XLA has to assume
-    they can collide.
+    **Status after issue #26 was rescoped to the adjoint.** The forward is
+    ``ab7fbbd``'s program again, so this cell asserts a property of ``ab7fbbd``
+    rather than of anything #26 added, and it splits the way ``ab7fbbd``
+    splits:
 
-    On a CPU that costs nothing measurable. On a GPU it is the difference
-    between the operator being usable and not: measured on one GH200 (Daint,
-    eps 1e-6, float64, ``n_chan = 1``, realistic sizes), the shared-carry form
-    ran this strategy's forward at 351.9 ms against 38.9 ms for the
-    collision-free form on GH200_large off30 (2048^2, 50k rows, ``n_w = 26``)
-    and at 1842.4 ms against 33.0 ms on MeerKAT off30 (2700^2, 302400 rows,
-    ``n_w = 14``) -- 9.05x and 55.76x, and on *less* NUFFT work, because the
-    bucketing had cut the padded overhead from 2.7389 to 1.2861 and from
-    2.0000 to 1.1158 on those two plans. The adjoint, which accumulates an
-    image and never a row-indexed carry, moved by 1.09x and 1.15x.
+    * ``windowed_vmap`` **passes**. Its ``w_chunk >= n_w`` branch gives every
+      plane a private ``(n_rows,)`` row vector and sums the stack, which
+      lowers to a per-plane batched scatter that cannot collide. That form
+      costs 13,565,952 bytes of transient on this fixture, which is why issue
+      #26 wanted to replace it -- but a bounded replacement measured 20.3x to
+      58.4x *slower* on a GH200, so it stays.
+    * ``windowed_chunked`` **fails, and is marked ``xfail(strict=True)``**.
+      Its branch accumulates each chunk into one shared ``(n_rows,)`` carry
+      with a single ``(w_chunk, max_window_size)`` scatter-add -- exactly the
+      colliding shape this cell is written to catch. **That is a defect in
+      ``ab7fbbd``, found while working this issue and not introduced by it**;
+      it is invisible in the GPU A/B behind the numbers below only because
+      ``w_chunk = 32`` exceeds ``n_w`` on both of those fixtures, so
+      ``windowed_chunked`` degenerates to ``windowed_vmap`` there. It is left
+      failing-and-declared rather than deleted so that the finding survives the
+      revert; fixing it is the follow-up issue's, TODO(#NN).
+
+    The windows of different w-planes overlap, physically. Measured this
+    session at eps 1e-6, float64, seed 0, ``hermitian=True``, one channel, over
+    all ten (telescope, pointing) cells of ``tests/conftest.py`` and both of
+    :data:`NARROW`: every visibility is inside the w-kernel's nominal support
+    on exactly 7.00 planes on all twelve, and the forward's ``max_window_size``
+    windows cover each sorted row 8.00-36.98 times on average and 8-118 times
+    at the worst row, the maximum being where the right-edge clamp piles
+    several windows on one start. So a forward that accumulates every plane
+    into one shared ``(n_rows,)`` vector is asking XLA to combine several
+    writes per element, and XLA has to assume they can collide.
+
+    On a CPU that costs nothing measurable; on a GPU a colliding accumulate is
+    expensive. The evidence for that is second-hand and is labelled as such:
+    the maintainer's GH200 A/B of a *bucketed* forward against ``ab7fbbd``'s
+    (module docstring) read 20.3x and 58.4x, and an earlier round of the same
+    branch attributed a comparable gap to the shared-carry accumulate
+    specifically. **Neither this session nor this suite can reproduce those
+    measurements -- there is no GPU here -- and the second attribution did not
+    survive: a fix built on it moved the GPU numbers not at all.** So what
+    follows is a structural assertion whose *motivation* is uncertain, not a
+    measured speed claim.
 
     **This cell exists because no other kind of test in this repository can
-    see that.** Every value test passes either way -- the two forms are the
-    same arithmetic in a different reduction order. Every CPU timing passes
-    either way: measured on the review machine (macOS arm64, nthreads=1,
-    median of 11 interleaved rounds, both forms imported into one process so
-    their samples alternate), the forward ratio of this form to the
-    shared-carry one is 0.985 / 1.067 / 0.712 / 0.683 for ``windowed_vmap`` on
-    MWA_extended off30 / MeerKAT off30 / EDA2 off30 / :data:`NARROW` off30 --
-    i.e. the difference the GPU reads as 9-56x reads on a CPU as noise, in
-    whichever direction the fixture happens to fall. And the transient-memory
-    gate above passes either way. The lowering is the only CPU-visible signal,
-    so the lowering is what is asserted.
+    see the property at all.** Every value test passes either way -- a shared
+    and a private accumulator are the same arithmetic in a different reduction
+    order. Every CPU timing passes either way. The transient-memory gates pass
+    either way. The lowering is the only CPU-visible signal, so the lowering is
+    what is asserted.
 
     What is asserted, precisely: every ``stablehlo.scatter`` in the lowered
     forward writes updates that XLA can place without combining, by being one
@@ -1250,15 +1428,15 @@ def test_no_two_planes_accumulate_into_one_row_vector_in_the_forward(w_strategy:
     * marked ``unique_indices = true`` -- no two updates share an element;
     * carrying ``input_batching_dims`` -- each batch element owns its own slice
       of the operand, which is the shape a ``vmap`` over per-plane row vectors
-      takes (and the shape ``ab7fbbd`` had, one lane per plane and uncapped);
+      takes, and the shape ``ab7fbbd``'s ``w_chunk >= n_w`` branch has;
     * or writing exactly ``n_rows`` elements, which is the single sorted-to-
       input row permutation every windowed forward ends with.
 
     That is a structural proxy and not a proof of speed -- a scatter can carry
-    batching dims and still collide *within* a batch element, and there is no
-    GPU in this suite to time. It is exact about the thing that regressed: an
-    accumulate whose updates are one ``(n_planes, slice_length)`` block per
-    bucket, unbatched and not unique, matches none of the three.
+    batching dims and still collide *within* a batch element. It is exact about
+    the shape it excludes: an accumulate whose updates are one
+    ``(w_chunk, max_window_size)`` block, unbatched and not unique, matches
+    none of the three.
 
     Non-vacuity is checked two ways: the fixture's windows are a strict subset
     of the rows (:func:`_assert_windows_are_strict`), and the plane accumulate
@@ -1294,8 +1472,8 @@ def test_no_two_planes_accumulate_into_one_row_vector_in_the_forward(w_strategy:
         f"{w_strategy} forward: {len(offenders)} scatter(s) with updates of shape "
         f"{offenders} are neither marked unique, nor per-plane batched, nor the "
         f"({n_rows},) row permutation. That is the shape of a shared row "
-        "accumulator, which every plane's window writes into and which cost "
-        "9.05x-55.76x on a GH200 -- see this test's docstring."
+        "accumulator, which every plane's window writes into -- see this test's "
+        "docstring for what is and is not known about what that costs."
     )
 
 

@@ -9,6 +9,18 @@ a plane's kernel support, and issue #43 is about which ones:
 
     window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
 
+**Which windowed strategy?** Since issue #26, the FORWARD -- and this whole
+module is about the forward's ratio, which #26 left untouched to the last bit.
+The windowed *adjoint* slices its plane's issue #26 bucket length instead of
+``max_window_size``, so it has a second, strictly smaller ratio of its own,
+``plan.window_padding_overhead_adjoint``. That field's contract, its
+definition-of-done gate and its bucket table are
+``tests/test_window_bucketing.py``'s; what is asserted *here* about it is only
+the relation between the two (:func:`test_the_adjoint_ratio_is_the_forward_ratio_bucketed`)
+and the fact that ``_auto_w_strategy_cpu`` reads the right one per direction
+(:func:`test_cpu_padding_cutoff_is_six_and_still_gates`). Everything else below
+means the forward, and every number below is on the forward's metric.
+
 ``live_row_count`` counts the ``(channel, plane, row)`` incidences with
 ``|w_lambda - w_k| <= w_kernel_scale``, measured on the *unpadded* window and
 on the host's own w. That is the **nominal support**, and the name ``live`` is
@@ -353,24 +365,7 @@ def _independent_padded_sizes(plan: WGridderPlan) -> np.ndarray:
 
 
 def _windowed_row_work(plan: WGridderPlan) -> int:
-    """Rows a windowed traversal touches: one static slice per (channel, plane).
-
-    issue #26: that slice is the plane's *bucket* length, not
-    ``max_window_size``, so this is the sum of ``slice_length * n_planes`` over
-    every channel's bucket table. It collapses to the pre-#26
-    ``n_chan * n_w * max_window_size`` on any plan with one bucket per channel,
-    which is what the constant-w fast path builds.
-    """
-    return sum(length * count for buckets in plan.window_buckets for length, count in buckets)
-
-
-def _unbucketed_row_work(plan: WGridderPlan) -> int:
-    """The pre-#26 numerator: one ``max_window_size`` slice per (channel, plane).
-
-    Still computable from the plan's own fields -- issue #26 leaves
-    ``max_window_size`` alone precisely so that it is -- and used by the tests
-    below that need the quantity the #43 calibration was measured on.
-    """
+    """Rows a windowed traversal touches: one static slice per (channel, plane)."""
     return plan.n_chan * plan.n_w * plan.max_window_size
 
 
@@ -1052,33 +1047,14 @@ def test_padding_overhead_is_never_below_one() -> None:
 # measures the windowed adjoint win on. See the derivation comment on
 # ``_CPU_PADDING_CUTOFF`` in ``wgridder.py``.
 #
-# **Every number above in this comment -- the four-cell table included -- is
-# the pre-#26 un-bucketed metric, and stays exactly reproducible as such**:
-# ``n_chan * n_w * max_window_size / live_row_count``, all three terms of which
-# #26 leaves in place. Re-measured on this branch, the table reads
-# 1.0769 - 3.1720 / 5.1729 - 5.7843 unfolded and 1.0769 - 2.7649 /
-# 4.9441 - 5.0762 folded on that metric, and the seed sweep reads
-# 5.0762 - 6.4661 float64 and
-# 5.0741 - 6.4688 float32 over the same twelve folded seeds, crossing 6.0 on
-# four of them in both legs. What #26 changes is that the *shipped* metric is
-# no longer that quantity: on the same twelve seeds it reads 1.3867 - 1.5569
-# (float64) / 1.3867 - 1.5581 (float32) and crosses 6.0 on none. So the
-# argument above is preserved as a record of how 6.0 was arrived at, and the
-# cutoff's present status -- unreachable on the scale it is actually compared
-# against, retune deferred to issue #34 -- is stated on
-# ``test_cpu_padding_cutoff_is_six_and_still_gates`` below.
-#
-# ``_GPU_PADDING_CUTOFF`` does not move either, and since issue #26 the
-# reported metric does not reach it anywhere: no cell of this forty-cell grid
-# is above 3.0 in either geometry, the maximum being 1.6206 unfolded and
-# 1.4133 folded. On the un-bucketed metric the old picture is unchanged and
-# still reproduces: unfolded, six cells sit above 3.0 (MWA_compact off30 3.050
-# and MeerKAT off30 3.172 at eps 1e-3, plus all four MWA_extended off30 cells
-# at 5.173 - 5.784); folded, the maximum outside MWA_extended off30 is 2.765,
-# so only that one fixture is above the cutoff. Both of the ordinary cells
-# that crossed are on plans of 600 rows, which the GPU heuristic sends to
-# ``dense_vmap`` on the row-count gate before the padding branch is consulted,
-# so no GPU pick depended on it either way even then.
+# ``_GPU_PADDING_CUTOFF`` does not move either, and on the folded grid it stops
+# being reachable at all: unfolded, three cells sit above 3.0 (MWA_compact
+# off30 3.050 and MeerKAT off30 3.172 at eps 1e-3, plus the MWA_extended off30
+# column); folded, the maximum outside MWA_extended off30 is 2.765, so only
+# that one fixture is above the cutoff. Both cells that cross are on plans of
+# 600 rows, which the GPU heuristic sends to ``dense_vmap`` on the row-count
+# gate before the padding branch is consulted, so no GPU pick depends on it
+# either way.
 
 _FIXTURES = [EDA2, MWA_COMPACT, MWA_EXTENDED, MEERKAT, GH200_LARGE]
 _POINTINGS = [0.0, 30.0]
@@ -1109,41 +1085,8 @@ _HIGH_OVERHEAD_POINTING = 30.0
 # fold is not a perturbation of these numbers, it moves the high band down by
 # roughly 0.7 and pulls the ordinary band's ceiling from 3.17 to 2.77, so one
 # pair of bands wide enough for both geometries would gate neither.
-#
-# issue #26 re-measures all four bands, because it changed the metric's
-# NUMERATOR: every (channel, plane) now slices its own bucket length instead of
-# ``max_window_size``, so the same forty cells read far lower. Measured on this
-# grid, float64 (the float32 leg runs the ten eps 1e-3 cells and agrees to
-# within 0.13%: unfolded high 1.6226 against 1.6206, folded high 1.4127 against
-# 1.4133, ordinary maxima 1.3998 / 1.2866 against 1.3998 / 1.2861):
-#
-#                        every cell except      MWA_extended off30
-#                        MWA_extended off30
-#   hermitian=False        1.000 - 1.400          1.422 - 1.621
-#   hermitian=True         1.000 - 1.286          1.377 - 1.413
-#
-# Two consequences worth stating rather than leaving to be noticed. First,
-# ``MWA_extended off30`` is barely the outlier it was: the two unfolded
-# populations are now 1.3998 and 1.4215, a gap of 1.55%, where they used to be
-# separated by 1.8. **The unfolded bands therefore overlap on [1.41, 1.42]**,
-# and that is a statement about the fixtures rather than slack in the bands --
-# no assignment of round numbers with usable rounding room on both sides can
-# separate two populations 1.55% apart. The overlap costs nothing operationally
-# (the test picks a band by fixture identity, never by membership) but it does
-# mean the unfolded leg no longer demonstrates that MWA_extended off30 is a
-# distinguishable regime. The folded leg -- the shipped geometry -- still does,
-# at 1.2861 against 1.3768 with a clean 1.32 / 1.35 cut.
-# Second, **no cell of this grid comes near either cutoff any more** -- the
-# worst is 1.621 against ``_CPU_PADDING_CUTOFF`` 6.0 and ``_GPU_PADDING_CUTOFF``
-# 3.0 -- so the padding branch of the ``auto`` selector no longer fires on any
-# repository fixture, at any epsilon, in either geometry. That is the intended
-# effect of issue #26 (the padding it guarded against is what bucketing
-# removes) and not a loosening of the guard: the cutoffs are unchanged and
-# ``test_cpu_padding_cutoff_is_six_and_still_gates`` still exercises the branch
-# on both sides by substituting the field. It does mean the cutoffs are now
-# pinned by that substitution test alone; see its docstring, and issue #34.
-_ORDINARY_OVERHEAD_RANGE = {False: (1.0, 1.42), True: (1.0, 1.32)}
-_HIGH_OVERHEAD_RANGE = {False: (1.41, 1.70), True: (1.35, 1.45)}
+_ORDINARY_OVERHEAD_RANGE = {False: (1.0, 3.3), True: (1.0, 2.9)}
+_HIGH_OVERHEAD_RANGE = {False: (5.0, 5.9), True: (4.8, 5.2)}
 
 
 def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
@@ -1152,34 +1095,47 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     Stated as its own test so the number is auditable without running the
     forty-cell sweep. Two halves, and the second is the one that matters:
 
-    * **6.0 exactly -- on the scale it was derived for, which since issue #26
-      is no longer the scale it is compared against.** The derivation is
-      #43's and it still reproduces exactly, but every quantity in it is now
-      the *un-bucketed* metric ``n_chan * n_w * max_window_size /
-      live_row_count``, which #26 kept recomputable (it left
-      ``max_window_size`` and ``live_row_count`` alone) but stopped reporting.
-      Re-measured on this grid, float64, unfolded: the un-bucketed metric
-      reaches 5.7843 on MWA_extended off30 (5.7915 on the float32 leg), the
-      worst un-bucketed-to-pre-#43 inflation is still 5.7843 / 4.8089 =
-      1.2028, and 5.0 x 1.2028 = 6.014 still rounds down to 6.0. Folded, the
-      un-bucketed maximum is still 5.0762, which 6.0 still clears by 18.2%.
+    * **6.0 exactly.** On the *unfolded* geometry the corrected metric reaches
+      5.784 (float64) / 5.792 (float32) on MWA_extended off30, so anything at
+      or below that flips the measured CPU win to ``dense_scan``. That is a
+      *lower* bound, and a lower bound alone is satisfied by 100.0 -- which
+      would clear the grid by switching the guard off. The upper bound is the
+      derivation: the worst padded-to-live inflation on the grid is
+      5.7843 / 4.8089 = 1.2028, so carrying the shipped 5.0 across the change
+      of scale gives 6.014, and 6.0 is that rounded down to the nearest tenth.
+      The construction yields 6.014, not 6.0; 6.0 is the round number just
+      below it, which is what keeps the restatement from loosening the cutoff.
 
-      What no longer holds is the *connection* between that derivation and
-      the constant's use. ``plan.window_padding_overhead`` is now the
-      bucketed ratio, and on this grid it reads 1.4215 - 1.6206 unfolded and
-      1.3768 - 1.4133 folded on the same MWA_extended off30 cells -- a lower
-      bound of 6.0 on a quantity whose grid maximum is 1.62 is not a
-      calibration, it is a switch in the off position. So the honest status
-      is: 6.0 is pinned by the assertion below and by nothing else, no
-      repository fixture can reach it at any epsilon in either geometry, and
-      re-fitting it onto the bucketed scale is issue #34's business, not a
-      change to smuggle in here. It is left where it is so that the value
-      does not move twice.
+      Issue #17's fold does not re-open that derivation, and the reason is
+      that #43 changed the metric's *denominator* while #17 changes only the
+      geometry measured under it: there is no change of scale to restate
+      across a second time. What it does change is the headroom -- the folded
+      grid's maximum is 5.076, so 6.0 now clears the worst shipped cell by
+      18.2% where it cleared the unfolded one by 3.7%. See the grid comment
+      above for why that headroom is not re-fitted onto 5.076.
     * **It still gates.** A constant no branch can reach is not a cutoff, so
       exercise the branch on both sides of the value rather than trusting that
-      the comparison is still wired up. With the grid no longer reaching 6.0
-      this is the *only* thing keeping the branch alive, which is why it
-      substitutes the field rather than looking for a fixture.
+      the comparison is still wired up.
+
+    **Issue #26 splits which field the branch reads, and that split is
+    asserted here** because this is the only cell in the suite that drives the
+    padding branch directly. The CPU heuristic can only return
+    ``windowed_scan`` on the adjoint leg, and since #26 the adjoint leg reads
+    ``plan.window_padding_overhead_adjoint`` (the bucketed ratio) while the
+    forward leg reads ``plan.window_padding_overhead`` (this module's, the
+    un-bucketed one). So the substitution below is on the adjoint field, and
+    the forward field is substituted *past* the cutoff at the same time to
+    show that it is inert on this leg -- which is the whole content of
+    ``wgridder._padding_overhead``. Get the two the wrong way round and the
+    third assertion returns ``windowed_scan``.
+
+    The derivation above is untouched by #26: it is entirely about the
+    un-bucketed metric, which #26 keeps reporting under its own name. What #26
+    does change is that no repository fixture reaches 6.0 on the *adjoint*
+    scale (the forty-cell grid's adjoint maximum is measured in
+    ``tests/test_window_bucketing.py``), so on that leg this substitution is
+    the only thing keeping the branch alive. Re-fitting the constant for the
+    bucketed scale is issue #34's business.
     """
     assert _CPU_PADDING_CUTOFF == 6.0
     # The GPU cutoff is unchanged by the redefinition; pin that it did not
@@ -1196,12 +1152,59 @@ def test_cpu_padding_cutoff_is_six_and_still_gates() -> None:
     assert plan.n_w > plan.w_kernel_width + 2
     assert plan.n_w / plan.w_kernel_width > 2.0
 
-    below = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF - 0.001)
-    at = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF)
-    above = dataclasses.replace(plan, window_padding_overhead=_CPU_PADDING_CUTOFF + 0.001)
+    def substitute(adjoint_ratio: float) -> WGridderPlan:
+        # The forward field is pinned above the cutoff throughout: on the
+        # adjoint leg it must not be read at all (issue #26).
+        return dataclasses.replace(
+            plan,
+            window_padding_overhead_adjoint=adjoint_ratio,
+            window_padding_overhead=_CPU_PADDING_CUTOFF + 1.0,
+        )
+
+    below = substitute(_CPU_PADDING_CUTOFF - 0.001)
+    at = substitute(_CPU_PADDING_CUTOFF)
+    above = substitute(_CPU_PADDING_CUTOFF + 0.001)
     assert _auto_w_strategy_cpu(below, is_adjoint=True) == "windowed_scan"
     assert _auto_w_strategy_cpu(at, is_adjoint=True) == "windowed_scan"  # strict >
     assert _auto_w_strategy_cpu(above, is_adjoint=True) == "dense_scan"
+
+
+@pytest.mark.parametrize("hermitian", [False, True], ids=["unfolded", "folded"])
+@pytest.mark.parametrize(("telescope", "zenith_angle_deg", "epsilon"), _GRID)
+def test_the_adjoint_ratio_is_the_forward_ratio_bucketed(
+    telescope: Telescope, zenith_angle_deg: float, epsilon: float, hermitian: bool
+) -> None:
+    """The two padding ratios stand in the one relation issue #26 guarantees.
+
+    ``window_padding_overhead_adjoint`` shares issue #43's denominator and
+    replaces ``max_window_size`` in the numerator with each plane's own bucket
+    length, so it is bounded above by the forward's ratio on every plan and
+    below by 1.0 -- the bucket DP can always fall back to the single class
+    ``max_window_size``, and a bucket length is never below the window it
+    covers. Asserted over the whole calibration grid rather than on one cell,
+    because "never worse" is a claim about all of them.
+
+    Equality is not a failure: it is what a plan with one bucket per channel
+    gives, and the constant-w fast path is one. The strict inequality is
+    asserted where it is meaningful -- on the fixtures whose padded window
+    sizes actually vary -- by
+    ``tests/test_window_bucketing.py::test_the_reported_overhead_is_the_effective_bucketed_ratio``,
+    which is also where the numerator's exact definition is pinned. This cell
+    is the cheap grid-wide envelope, not a second copy of that contract.
+
+    It rides the same grid parametrisation as the band test below so that the
+    plans come out of the same two-entry cache; built on its own it would
+    rebuild every ``GH200_large`` plan a second time.
+    """
+    plan = _cached_plan(telescope, zenith_angle_deg, epsilon, hermitian)
+    assert plan.window_padding_overhead_adjoint >= 1.0, (
+        f"bucketed padded work is below live work ({plan.window_padding_overhead_adjoint})"
+    )
+    assert plan.window_padding_overhead_adjoint <= plan.window_padding_overhead * (1.0 + 1e-9), (
+        f"the adjoint's bucketed ratio ({plan.window_padding_overhead_adjoint}) is above "
+        f"the forward's un-bucketed one ({plan.window_padding_overhead}), so bucketing "
+        "made the traversal wider than not bucketing at all"
+    )
 
 
 @pytest.mark.parametrize("hermitian", [False, True], ids=["unfolded", "folded"])
@@ -1218,17 +1221,9 @@ def test_calibration_grid_padding_overhead(
       #43's redefinition;
     * the ``True`` leg is the shipped geometry (issue #17). Its bands are
       *narrower* and lower, so they are a real re-measurement rather than the
-      unfolded ones with slack added: re-measured on this branch, the folded
-      high cells read 1.3768 - 1.4133 against an unfolded 1.4215 - 1.6206 (on
-      the pre-#26 un-bucketed metric the same cells are 4.9441 - 5.0762 folded
-      against 5.1729 - 5.7843 unfolded, which is where the older figures in
-      this module come from), and a plan that silently stopped folding would
-      read outside its band.
-
-    What the bands no longer pin is that MWA_extended off30 is a separable
-    regime on the unfolded leg: see the comment on
-    ``_ORDINARY_OVERHEAD_RANGE`` for why the two unfolded bands now overlap on
-    [1.41, 1.42].
+      unfolded ones with slack added: the folded high band is 4.944 - 5.076
+      against an unfolded 5.173 - 5.784, and a plan that silently stopped
+      folding would read outside it.
 
     Both legs are swept because the grid is cheap (host-side plan building
     only) and because the cutoff derivation quotes numbers from each.
@@ -1266,32 +1261,10 @@ def test_calibration_grid_auto_picks_survive_the_redefinition(
     denominator, against the old 5.0 / 3.0 cutoffs -- rather than written down
     as a table of strategy names, so what is asserted is *equivalence*: not
     which strategy each cell gets, but that redefining the diagnostic and
-    restating the cutoff moved none of them. The bite *was* the four
-    MWA_extended off30 adjoint cells: on the metric #43 shipped they read
-    5.17 - 5.79 against a padded 4.71 - 4.93, so any ``_CPU_PADDING_CUTOFF``
-    at or below 5.79 flipped them to ``dense_scan`` and this failed.
-
-    Since issue #26 the CPU half of that bite is gone, and that is worth
-    saying plainly rather than leaving the paragraph above to imply otherwise.
-    Re-measured on this branch, the same four cells read 1.4215 - 1.6206 on
-    the shipped metric (the 5.1729 - 5.7843 figures survive as the un-bucketed
-    metric ``n_chan * n_w * max_window_size / live_row_count``). The old
-    rule's CPU padding branch does not fire either -- the padded metric it
-    reads spans 1.0766 - 4.9328 over this grid, under its own 5.0 -- so the
-    two CPU rules now agree because neither fires, and what this test pins on
-    that side is the *rest* of the selector (the small-``n_w`` and ``n_w / W``
-    gates). Issue #34 is where the cutoffs get re-fitted onto the bucketed
-    scale, and this test regains its CPU bite there.
-
-    The GPU half still has one. The old rule's 3.0 on the padded metric fires
-    on six of the forty cells (MWA_compact off30 3.0256 and MeerKAT off30
-    3.1419 at eps 1e-3, and all four MWA_extended off30 cells at
-    4.7116 - 4.9328) where the shipped rule's does not, so the two GPU rules
-    reach the padding comparison with different answers and still return the
-    same pick -- because every one of those cells is a 600-row plan that
-    ``plan.n_rows < 10_000`` has already sent to ``dense_vmap``. That is a
-    real agreement between two rules that disagree on the branch, and it is
-    the part of this test that has not gone quiet.
+    restating the cutoff moved none of them. The bite is the four
+    MWA_extended off30 adjoint cells: their corrected overhead is 5.17 - 5.79
+    against a padded 4.71 - 4.93, so any ``_CPU_PADDING_CUTOFF`` at or below
+    5.79 flips them to ``dense_scan`` and this fails.
 
     **``hermitian=False``, and this is the one place in the module where that
     is the right geometry rather than a legacy one.** What is compared here is
@@ -1325,51 +1298,50 @@ def test_calibration_grid_auto_picks_survive_the_redefinition(
 # The seed sweep below. The forty-cell grid above is a single draw of each
 # fixture (``synthetic_uvw(..., seed=0)``), and on MWA_extended off30 the draw
 # moves the metric a long way: measured over seeds 0-11 at eps 1e-3 the
-# *un-bucketed* numerator over the live denominator spans 5.784 to 8.090
-# against a seed-0 value of 5.784, so ten of the twelve would sit above
-# ``_CPU_PADDING_CUTOFF`` where seed 0 sits below it. After issue #26's
-# bucketing the same twelve draws span 1.610 to 1.773 and none of them
-# reaches the cutoff -- the spread that used to decide the strategy is
-# precisely the padding bucketing removes. That the pinned grid happens to draw
-# the gentlest seed is issue #34's subject, not this module's.
+# corrected overhead spans 5.784 to 8.090 against a seed-0 value of 5.784, so
+# ten of the twelve sit *above* ``_CPU_PADDING_CUTOFF`` where seed 0 sits below
+# it. That the pinned grid happens to draw the gentlest seed is issue #34's
+# subject, not this module's; what belongs here is that the equivalence this
+# change promises survives the spread rather than being an artefact of one
+# draw.
 _EQUIVALENCE_SEEDS = tuple(range(12))
 
 
 def test_auto_picks_survive_the_redefinition_across_seeds() -> None:
-    """Where the pre-#43 rule and the shipped one differ, the difference goes one way.
+    """The two rules agree on every seed, on both sides of both cutoffs.
 
-    This was issue #43's equivalence test: redefining the metric's denominator
-    and restating the cutoff from 5.0 to 6.0 moved no ``auto`` decision, on any
-    of twelve draws. **Issue #26 breaks that equivalence deliberately**, and
-    the test's subject changes with it rather than the test being deleted.
-
-    What #26 changed is the metric's *numerator* -- padded row-work is now what
-    the bucketed traversal actually does -- and on this fixture that is a large
-    move: measured at eps 1e-3, float64, ``hermitian=False``, over seeds 0-11,
-    the reported overhead spans 1.610 to 1.773 where the un-bucketed numerator
-    over the same denominator spans 5.784 to 8.090 and the pre-#43 padded
-    metric spans 4.807 to 6.675. So the pre-#43 rule crosses its 5.0 cutoff on
-    ten of the twelve seeds while the shipped rule crosses 6.0 on none of them,
-    and the two therefore *must* disagree.
-
-    What is asserted is the direction. All ten disagreements are the CPU
-    adjoint pick, and every one of them is the shipped rule keeping
-    ``windowed_scan`` where the pre-#43 rule would have taken it to
-    ``dense_scan`` -- which is the direction AGENTS.md section 9 measures as
-    the CPU win on this exact fixture, and it is now backed by the padded work
-    really being 1.6x the live work rather than 4.8x. No GPU pick moves on any
-    seed. A disagreement the other way -- the shipped rule abandoning a
-    windowed strategy the old one kept -- would be a regression and fails here.
+    The central claim of issue #43 is that redefining the metric and restating
+    the cutoff moves no ``auto`` decision. On the pinned grid that claim is
+    tested against one draw per fixture, and on the fixture that matters most
+    the seed-0 draw is the one that stays below the cutoff -- so the grid
+    exercises the "below" branch and never the "above" one. This sweeps the
+    draw and asserts only the agreement, never which strategy a seed gets:
+    which side of a cutoff a random draw lands on is a property of the draw.
 
     Cheap enough for the fast leg (twelve 600-row plans) and precision-
-    independent, so no ``requires_x64``.
+    independent: the two rules agree on all twelve seeds in float64 and in
+    float32, so no ``requires_x64``.
 
     ``hermitian=False`` for the reason given at
-    ``test_calibration_grid_auto_picks_survive_the_redefinition``: both rules
-    being compared were calibrated on the unfolded geometry.
+    ``test_calibration_grid_auto_picks_survive_the_redefinition`` -- both rules
+    being compared were calibrated on the unfolded geometry -- and that comment
+    also records what the same sweep measures on folded plans (the two rules
+    part company on five of the twelve, always in the direction of keeping the
+    windowed adjoint).
+
+    **Issue #26 breaks the agreement on the adjoint leg, deliberately, and
+    only in one direction.** Bucketing applies to the windowed adjoint alone,
+    so on that leg ``_auto_w_strategy_cpu`` reads
+    ``window_padding_overhead_adjoint`` -- a ratio bounded above by the one the
+    forward reads -- and the padding gate can therefore only fire *less* often
+    than the pre-#43 rule, never more. So the assertion is split: the forward
+    leg still asserts equality, which is #43's claim untouched, and the adjoint
+    leg asserts that any disagreement is ``dense_scan -> windowed_scan``. The
+    count of moved seeds is asserted to be non-zero so that the relaxation does
+    not silently become vacuous if bucketing stops working; which seeds move is
+    a property of the draw and is not pinned.
     """
-    fired_new = fired_old = 0
-    disagreements = 0
+    fired_new = fired_old = moved_adjoint = 0
     for seed in _EQUIVALENCE_SEEDS:
         uvw = synthetic_uvw(MWA_EXTENDED, _HIGH_OVERHEAD_POINTING, seed=seed)
         plan = _plan_for_uvw(
@@ -1386,40 +1358,42 @@ def test_auto_picks_survive_the_redefinition_across_seeds() -> None:
             expected_cpu, expected_gpu = _pre_43_auto_picks(plan, is_adjoint=is_adjoint)
             got_cpu = _auto_w_strategy_cpu(plan, is_adjoint=is_adjoint)
             got_gpu = _auto_w_strategy_gpu(plan, is_adjoint=is_adjoint)
-            if got_cpu != expected_cpu:
-                disagreements += 1
-                assert got_cpu.startswith("windowed") and not expected_cpu.startswith("windowed"), (
+            if is_adjoint and got_cpu != expected_cpu:
+                moved_adjoint += 1
+                assert (expected_cpu, got_cpu) == ("dense_scan", "windowed_scan"), (
+                    f"seed {seed}, adjoint: the pick moved {expected_cpu!r} -> "
+                    f"{got_cpu!r}. Issue #26's bucketing can only take the adjoint "
+                    "off dense and onto windowed -- its ratio "
+                    f"({plan.window_padding_overhead_adjoint:.4f}) is bounded above "
+                    f"by the un-bucketed one ({plan.window_padding_overhead:.4f}) -- "
+                    "so a move in any other direction is a bug"
+                )
+            else:
+                assert got_cpu == expected_cpu, (
                     f"seed {seed}, {'adjoint' if is_adjoint else 'forward'}: the "
-                    f"bucketed metric ({plan.window_padding_overhead:.4f} vs "
+                    f"corrected metric ({plan.window_padding_overhead:.4f} vs "
                     f"cutoff {_CPU_PADDING_CUTOFF}) picks {got_cpu!r} where the "
                     f"pre-#43 rule ({_pre_43_padded_overhead(plan):.4f} vs 5.0) "
-                    f"picks {expected_cpu!r} -- issue #26 may only move picks "
-                    "towards the windowed strategies, never away from them"
+                    f"picks {expected_cpu!r}"
                 )
             assert got_gpu == expected_gpu, f"seed {seed}: GPU pick moved"
 
-    # Non-vacuity, in both directions.
-    #
-    # The pre-#43 rule has to straddle its cutoff, or "the shipped rule keeps
-    # windowed where the old one did not" would be a statement about a branch
-    # the old rule never takes. It fires on ten of the twelve seeds in both
-    # precision legs; the count is asserted loosely, since which seeds land
-    # where is a property of the draw.
+    assert moved_adjoint > 0, (
+        "no adjoint pick moved on any of the twelve seeds, so the one-directional "
+        "relaxation above is asserting nothing. Either bucketing stopped lowering "
+        "the adjoint's padding ratio, or this sweep no longer straddles the cutoff"
+    )
+
+    # Non-vacuity: the sweep has to straddle the cutoff, or "the two rules
+    # agree" would only be a statement about the branch neither of them takes.
+    # Both rules fire on ten of the twelve seeds and clear on two, in both
+    # precision legs -- the counts are asserted loosely, since which seeds land
+    # where is not the property under test.
+    assert 0 < fired_new < len(_EQUIVALENCE_SEEDS), (
+        f"the corrected metric crossed its cutoff on {fired_new} of "
+        f"{len(_EQUIVALENCE_SEEDS)} seeds; the sweep must cover both branches"
+    )
     assert 0 < fired_old < len(_EQUIVALENCE_SEEDS), (
         f"the pre-#43 metric crossed its cutoff on {fired_old} of "
         f"{len(_EQUIVALENCE_SEEDS)} seeds; the sweep must cover both branches"
-    )
-    # And the bucketed metric has to clear the cutoff everywhere on this
-    # sweep -- measured 1.610 to 1.773 against 6.0 -- because that is the claim
-    # issue #26 makes about the fixture whose padding was worst.
-    assert fired_new == 0, (
-        f"the bucketed metric crossed {_CPU_PADDING_CUTOFF} on {fired_new} of "
-        f"{len(_EQUIVALENCE_SEEDS)} seeds; issue #26 measured every one of them "
-        "between 1.610 and 1.773"
-    )
-    # The disagreement itself is the subject, so it must exist.
-    assert disagreements > 0, (
-        "no auto pick moved on any seed, so the direction asserted above was "
-        "never exercised; the pre-#43 rule fires on ten of these twelve draws "
-        "and the bucketed one on none, so some pick has to differ"
     )

@@ -665,14 +665,6 @@ _EXPECTED_LEAF_FIELDS: tuple[str, ...] = (
     "phi_hat_n",
     "sort_perm",
     "window_start",
-    # issue #26: the plane order that makes each channel's window-size buckets
-    # a contiguous rank range, (n_chan, n_w) int32 -- the same shape and dtype
-    # as ``window_start``, and per (channel, plane) rather than per
-    # (channel, row), which is the axis issue #23 removed. It is the TENTH
-    # leaf and the only one that issue may add: the bucket *table* itself is
-    # static (it is a set of compile-time slice lengths), but which planes are
-    # in which bucket is data the windowed loops index with.
-    "window_plane_order",
     # issue #17: the Hermitian w-sign fold's per-row sign, (n_rows,) int8 in
     # {+1, -1}. This is the NINTH leaf and the only one this issue may add: the
     # fold needs per-row information, which is inherently (n_rows,), but it must
@@ -685,6 +677,24 @@ _EXPECTED_LEAF_FIELDS: tuple[str, ...] = (
     # here and in test_plan_footprint's docstring in the same commit --
     # AGENTS.md sec 4's plan-field checklist covers exactly that.
     "flip_sign",
+    # issue #26: the plane order that makes each channel's window-size buckets
+    # a contiguous rank range, (n_chan, n_w) int32 -- the same shape and dtype
+    # as ``window_start``, and per (channel, plane) rather than per
+    # (channel, row), which is the axis issue #23 removed. It is the TENTH leaf
+    # and the only one that issue may add: the bucket *table* itself is static
+    # (it is a set of compile-time slice lengths), but which planes are in which
+    # bucket is data the windowed adjoint indexes with.
+    #
+    # **Its position in this tuple is load-bearing and is why it is written
+    # after ``flip_sign`` rather than beside ``window_start``, which is where it
+    # belongs by subject.** Every leaf is an entry parameter of every lowered
+    # operator, so a leaf inserted in the middle renumbers every parameter after
+    # it; appending keeps the eight ``ab7fbbd`` parameters at the ``ab7fbbd``
+    # indices, which is what makes the windowed forward's optimised HLO
+    # comparable to ``ab7fbbd``'s at all. See the field's comment in
+    # ``planning.py`` and
+    # ``tests/test_window_bucketing.py::test_the_windowed_forward_is_ab7fbbds_program_plus_one_unused_leaf``.
+    "window_plane_order",
 )
 
 # Static (aux_data) fields, each with a way to produce a *different* value of
@@ -707,6 +717,10 @@ _STATIC_FIELD_PROBES: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("w0", lambda v: v + 1.0),  # issue #16 follow-up
     ("max_window_size", lambda v: v + 1),
     ("window_padding_overhead", lambda v: v + 1.0),
+    # issue #26: the adjoint's bucketed twin of the line above. Static for the
+    # same reason and diagnostic in the same way -- it gates the adjoint leg of
+    # ``wgridder._padding_overhead`` and nothing else.
+    ("window_padding_overhead_adjoint", lambda v: v + 1.0),
     # issue #26: the per-channel window sizes and the bucket table. Static
     # because each bucket's slice length is a compile-time ``dynamic_slice``
     # shape -- two plans that bucket differently emit different programs and
@@ -1040,14 +1054,18 @@ def test_window_builder_matches_independent_reference(freq: np.ndarray) -> None:
     # all; here it is enough that the identity holds and that the padding is
     # visibly excluded.
     #
-    # issue #26: the numerator is no longer ``n_chan * n_w * max_window_size``
-    # but the work the *bucketed* traversal does, so it is rebuilt here from
-    # this file's own reference sizes and the plan's declared bucket table --
-    # which keeps the identity a check on a number rather than a restatement of
-    # ``make_plan``'s expression. The table has to cover the reference (no
-    # plane bucketed below its own window, which would silently drop rows the
-    # dense path weights) and its widest length has to be that channel's widest
-    # reference window.
+    # issue #26 adds a second numerator and leaves the first alone. The
+    # forward's ``window_padding_overhead`` is still
+    # ``n_chan * n_w * max_window_size`` over the live count, because the
+    # windowed forward still slices ``max_window_size`` per plane; the
+    # *adjoint* slices its plane's bucket length, and
+    # ``window_padding_overhead_adjoint`` is the sum of those. The adjoint's
+    # numerator is rebuilt here from this file's own reference sizes and the
+    # plan's declared bucket table -- which keeps the identity a check on a
+    # number rather than a restatement of ``make_plan``'s expression. The table
+    # has to cover the reference (no plane bucketed below its own window, which
+    # would silently drop rows the dense path weights) and its widest length
+    # has to be that channel's widest reference window.
     padded_work = 0
     for c, buckets in enumerate(plan.window_buckets):
         lengths = np.array([length for length, _ in buckets])
@@ -1060,7 +1078,10 @@ def test_window_builder_matches_independent_reference(freq: np.ndarray) -> None:
         assert int(lengths.max()) == int(expected_size[c].max())
         padded_work += int(expanded.sum())
 
-    assert plan.window_padding_overhead == pytest.approx(padded_work / plan.live_row_count)
+    assert plan.window_padding_overhead == pytest.approx(
+        plan.n_chan * plan.n_w * plan.max_window_size / plan.live_row_count
+    )
+    assert plan.window_padding_overhead_adjoint == pytest.approx(padded_work / plan.live_row_count)
     assert padded_work < plan.n_chan * plan.n_w * plan.max_window_size, (
         "the bucketed row-work equals the pre-#26 one on a plan whose window "
         "sizes vary, so nothing was bucketed"
@@ -1270,16 +1291,23 @@ def test_window_builder_clumped_distribution(pixsize: float) -> None:
 
     assert unbucketed(plan_clumped) > unbucketed(plan_uniform)
 
-    # issue #26: both plans keep an overhead of at least one -- padded work
-    # cannot fall below live work -- and the clumped plan, which is the one
+    # ``window_padding_overhead`` *is* that expression -- issue #26 buckets the
+    # windowed adjoint only, and reports the bucketed ratio under its own name
+    # -- so pin that too, or the ordering above would be asserted on a quantity
+    # nothing else in this test names.
+    for plan in (plan_clumped, plan_uniform):
+        assert plan.window_padding_overhead == pytest.approx(unbucketed(plan), rel=1e-12)
+
+    # issue #26: both plans keep an adjoint overhead of at least one -- padded
+    # work cannot fall below live work -- and the clumped plan, which is the one
     # whose padding the crossover analysis says is worst, is the one bucketing
     # helps most.
     for plan in (plan_clumped, plan_uniform):
-        assert plan.window_padding_overhead >= 1.0
-        assert plan.window_padding_overhead < unbucketed(plan)
+        assert plan.window_padding_overhead_adjoint >= 1.0
+        assert plan.window_padding_overhead_adjoint < unbucketed(plan)
 
-    clumped_gain = unbucketed(plan_clumped) / plan_clumped.window_padding_overhead
-    uniform_gain = unbucketed(plan_uniform) / plan_uniform.window_padding_overhead
+    clumped_gain = unbucketed(plan_clumped) / plan_clumped.window_padding_overhead_adjoint
+    uniform_gain = unbucketed(plan_uniform) / plan_uniform.window_padding_overhead_adjoint
     assert clumped_gain > uniform_gain, (
         f"bucketing removed {clumped_gain:.2f}x of the clumped plan's padded "
         f"row-work and {uniform_gain:.2f}x of the uniform plan's; the clumped "

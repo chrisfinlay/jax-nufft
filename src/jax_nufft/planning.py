@@ -310,25 +310,43 @@ class WGridderPlan:
     w0: float
     # v0.1.1 windowed-scan fields:
     # ``max_window_size`` is the worst-case window length across all
-    # (channel, plane) pairs. It is the widest slice any windowed strategy
-    # takes, and issue #26 leaves it exactly as it was so that the pre-#26
-    # metric ``n_chan * n_w * max_window_size / live_row_count`` (issue #43's
-    # definition) stays recomputable from the plan's own fields and the
-    # measured baselines stay comparable.
+    # (channel, plane) pairs -- the static slice length the *unbucketed*
+    # windowed traversal pays per plane. ``window_padding_overhead`` is the
+    # factor by which that traversal exceeds the irreducible row-work,
     #
-    # ``window_padding_overhead`` is the factor by which a windowed traversal
-    # exceeds the irreducible row-work. issue #26 changed its NUMERATOR from
-    # that product to the work the *bucketed* traversal actually does,
+    #     n_chan * n_w * max_window_size / live_row_count
+    #
+    # **Both are exactly what they were at ``ab7fbbd``, and both describe the
+    # windowed FORWARD**, which issue #26 does not touch: bucketing was
+    # restricted to the adjoint when the bucketed forward was measured 20.3x
+    # to 58.4x slower than this one on a GH200 (see the field below and
+    # AGENTS.md section 5). Every calibration figure in this repository that
+    # names an "overhead" without qualification is on this metric.
+    #
+    # It is purely diagnostic (it gates the *forward's* ``auto`` strategy
+    # choice in ``wgridder._auto_w_strategy_*`` and nothing else).
+    max_window_size: int
+    window_padding_overhead: float
+    # issue #26: the same ratio for the windowed ADJOINT, which is the one
+    # direction that buckets. Its numerator is the row-work the bucketed
+    # traversal actually does,
     #
     #     sum over channels and buckets of slice_length * n_planes
     #       / live_row_count
     #
-    # keeping issue #43's denominator unchanged and collapsing to the pre-#26
-    # form on any plan with one bucket per channel. It is purely diagnostic (it
-    # gates the ``auto`` strategy choice in ``wgridder._auto_w_strategy_*`` and
-    # nothing else).
-    max_window_size: int
-    window_padding_overhead: float
+    # keeping issue #43's denominator unchanged. It collapses to
+    # ``window_padding_overhead`` exactly on any plan with one bucket per
+    # channel (a constant-w plan, or one whose windows are all the same
+    # length), and is never larger: the DP that places the buckets can always
+    # fall back to the single class ``max_window_size``.
+    #
+    # Separate field rather than a redefinition of the one above, because the
+    # two directions now do different amounts of work and one number cannot
+    # honestly describe both -- ``_auto_w_strategy_*`` reads this one when
+    # ``is_adjoint`` and the one above otherwise. issue #26's
+    # definition-of-done gate (``<= 1.5``) and the padding tables in
+    # AGENTS.md section 5 read this field.
+    window_padding_overhead_adjoint: float
     # issue #26 item 2: the widest padded window *per channel*. A high-frequency
     # channel spreads the same baselines over more planes and so gets narrower
     # windows -- measured on EDA2 off30 at 1.0 / 1.3 / 1.6 / 2.0 times the
@@ -341,6 +359,10 @@ class WGridderPlan:
     # ``sum(n_planes) == n_w``. Built by :func:`bucket_window_sizes`; the plane
     # membership is the ``window_plane_order`` leaf below, in which each bucket
     # is a contiguous rank range.
+    #
+    # **Read by the windowed adjoint only.** The windowed forward ignores this
+    # table and slices ``max_window_size`` per plane exactly as it did at
+    # ``ab7fbbd``; see ``window_padding_overhead_adjoint`` above.
     #
     # Per channel and not global, because a global table makes the per-channel
     # sizing above unreachable: every channel's widest bucket would be the
@@ -511,9 +533,10 @@ class WGridderPlan:
     # issue #26: for each channel, the plane indices ordered ascending by padded
     # window length, so that ``window_buckets[c]``'s classes are the contiguous
     # rank ranges ``window_plane_order[c][offset : offset + n_planes]``. The
-    # windowed loops gather ``window_start[c]`` and ``w_centers_rel`` through
-    # it, one bucket at a time; without it a bucket's planes would not be
-    # addressable as a static slice.
+    # windowed *adjoint* gathers ``window_start[c]`` and ``w_centers_rel``
+    # through it, one bucket at a time; without it a bucket's planes would not
+    # be addressable as a static slice. The windowed forward does not read it
+    # (see ``window_buckets`` above).
     #
     # ``(n_chan, n_w)`` int32 -- the same shape and dtype as ``window_start``,
     # which is what issue #23's budget allows here: it is per (channel, plane),
@@ -521,6 +544,20 @@ class WGridderPlan:
     # (32 kB on a 64-channel, 128-plane plan, against 31 MB of leaves at
     # 64 channels x 1M rows). A leaf and not aux data so that it stays out of
     # the JIT cache key, which the bucket table above already covers.
+    #
+    # **It is flattened LAST**, after ``flip_sign``, which is the only field
+    # in this class whose pytree position is chosen rather than inherited from
+    # its declaration order. Every leaf is an entry parameter of every lowered
+    # operator, including the ones that never read it, so inserting a leaf in
+    # the middle renumbers every parameter after it and makes two lowered
+    # modules textually incomparable even when they compute the same thing.
+    # Appending it instead keeps the ``ab7fbbd`` parameters at the
+    # ``ab7fbbd`` indices, so the windowed forward's optimised HLO differs
+    # from ``ab7fbbd``'s in exactly one respect -- a trailing unused
+    # ``s32[n_chan, n_w]`` parameter -- and that is a claim a diff can check.
+    # ``tests/test_window_bucketing.py::
+    # test_the_windowed_forward_is_ab7fbbds_program_plus_one_unused_leaf`` is
+    # the cell that holds it.
     window_plane_order: Array = field()  # (n_chan, n_w) int32
     # issue #17: the Hermitian fold's per-row sign, ``+1`` for a row stored as
     # given and ``-1`` for one stored at ``(-u, -v, -w)`` with a conjugated
@@ -656,6 +693,7 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.w0,
         plan.max_window_size,
         plan.window_padding_overhead,
+        plan.window_padding_overhead_adjoint,
         plan.max_window_size_per_chan,
         plan.window_buckets,
         plan.live_row_count,
@@ -685,6 +723,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0,
         max_window_size,
         window_padding_overhead,
+        window_padding_overhead_adjoint,
         max_window_size_per_chan,
         window_buckets,
         live_row_count,
@@ -704,8 +743,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         phi_hat_n,
         sort_perm,
         window_start,
-        window_plane_order,
         flip_sign,
+        window_plane_order,
     ) = children
     return WGridderPlan(
         n_l=n_l,
@@ -723,6 +762,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0=w0,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
+        window_padding_overhead_adjoint=window_padding_overhead_adjoint,
         max_window_size_per_chan=max_window_size_per_chan,
         window_buckets=window_buckets,
         live_row_count=live_row_count,
@@ -757,8 +797,9 @@ jax.tree_util.register_pytree_node(
             p.phi_hat_n,
             p.sort_perm,
             p.window_start,
-            p.window_plane_order,
             p.flip_sign,
+            # issue #26: LAST, deliberately -- see the field's own comment.
+            p.window_plane_order,
         ),
         _plan_aux(p),
     ),
@@ -1358,8 +1399,9 @@ def make_plan(
         window_padding_overhead = 1.0
         # issue #26: one plane, so one bucket per channel holding it, and the
         # per-channel maximum is the single window. The bucketed numerator
-        # ``n_chan * n_rows`` equals ``live_row_count``, so the redefined
-        # overhead is 1.0 here exactly as the pre-#26 one was.
+        # ``n_chan * n_rows`` equals ``live_row_count``, so the adjoint's
+        # overhead is 1.0 here too.
+        window_padding_overhead_adjoint = 1.0
         max_window_size_per_chan = (max_window_size,) * n_chan
         window_buckets = (((max_window_size, 1),),) * n_chan
         plane_order_np = np.zeros((n_chan, 1), dtype=np.int32)
@@ -1457,9 +1499,9 @@ def make_plan(
         # contiguous slice; ``searchsorted`` finds the boundaries.
         window_start_np = np.zeros((n_chan, n_w), dtype=np.int32)
         # ``window_size`` is plan-time bookkeeping only -- it feeds
-        # ``max_window_size`` and ``window_padding_overhead``, both static, and
-        # no operator path ever read it -- so since issue #23 it is a local,
-        # not a leaf.
+        # ``max_window_size``, the two ``window_padding_overhead*`` ratios and
+        # (since issue #26) ``window_buckets``, all static, and no operator
+        # path ever read it -- so since issue #23 it is a local, not a leaf.
         window_size_np = np.zeros((n_chan, n_w), dtype=np.int32)
         # issue #43: the denominator of ``window_padding_overhead``, and the
         # emptiness count, are accumulated as Python scalars across the channel
@@ -1549,6 +1591,10 @@ def make_plan(
         # :func:`bucket_window_sizes`), per channel and not globally, so a
         # channel whose windows are narrower than the plan's widest is charged
         # its own maximum rather than the plan's.
+        #
+        # **Consumed by the windowed adjoint alone**; the windowed forward is
+        # ``ab7fbbd``'s, unbucketed. The table is still built for every plan
+        # because it is plan metadata and costs microseconds on the host.
         plane_order_np = np.zeros((n_chan, n_w), dtype=np.int32)
         buckets_per_chan: list[tuple[tuple[int, int], ...]] = []
         for c in range(n_chan):
@@ -1566,21 +1612,27 @@ def make_plan(
         #
         # Every (channel, plane) step slices a *static* number of rows out of
         # the w-sorted array -- the shape has to be static for ``lax.scan`` /
-        # ``vmap``. Before issue #26 that number was ``max_window_size`` for
-        # every step, so a windowed traversal touched
-        # ``n_chan * n_w * max_window_size`` rows however narrow the individual
-        # windows were; with bucketing it is the plane's own bucket length, and
-        # the numerator is the sum of those. ``live_row_count`` is how many of
-        # them are inside nominal support.
+        # ``vmap``. Which static number depends on the direction, and since
+        # issue #26 was rescoped to the adjoint the two differ:
         #
-        # Through v0.1.2 this was ``max_window_size`` over the mean of the
-        # nonzero ``window_size``, which measured the widest window against the
+        # * the FORWARD slices ``max_window_size`` on every step, so it touches
+        #   ``n_chan * n_w * max_window_size`` rows however narrow the
+        #   individual windows are -- ``window_padding_overhead``;
+        # * the ADJOINT slices the plane's own bucket length, so it touches
+        #   ``sum(length * count)`` -- ``window_padding_overhead_adjoint``.
+        #
+        # ``live_row_count`` is how many of those rows are inside nominal
+        # support, and it is the same denominator for both.
+        #
+        # Through v0.1.2 the denominator was the mean of the nonzero
+        # ``window_size``, which measured the widest window against the
         # average *padded* one. That denominator contains the clamp rows, i.e.
         # it counts padding as work that cannot be avoided, and the "nonzero"
         # filter had become a no-op once the clamp guaranteed
         # ``window_size >= 1``. See the ``live_row_count`` field comment.
         if live_row_count > 0:
-            window_padding_overhead = padded_row_work / live_row_count
+            window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
+            window_padding_overhead_adjoint = padded_row_work / live_row_count
         else:
             # Defensive, and unreachable through ``make_plan``: the plane grid
             # spans the whole w-range with a support half-width of ``W/2``
@@ -1590,6 +1642,7 @@ def make_plan(
             # a future change to the plane spacing or to ``w_kernel_scale``
             # would land here rather than on a ZeroDivisionError.
             window_padding_overhead = 1.0
+            window_padding_overhead_adjoint = 1.0
         # Clamp max_window_size to at least 1 so the static dynamic_slice
         # shape is well-defined (e.g. n_rows >= 1 always).
         max_window_size = max(max_window_size, 1)
@@ -1634,6 +1687,7 @@ def make_plan(
         w0=float(w0),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
+        window_padding_overhead_adjoint=float(window_padding_overhead_adjoint),
         max_window_size_per_chan=max_window_size_per_chan,
         window_buckets=window_buckets,
         live_row_count=int(live_row_count),

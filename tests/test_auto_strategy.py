@@ -12,8 +12,10 @@ GH200-tuned heuristic) and the platform dispatch in
 :func:`jax_nufft.wgridder._auto_w_strategy`.
 
 The heuristic helpers only read a handful of fields off the plan
-(``n_w``, ``w_kernel_width``, ``window_padding_overhead`` -- plus
-``n_rows`` on the GPU branch), so for the unit tests we build
+(``n_w``, ``w_kernel_width``, and one of
+``window_padding_overhead`` / ``window_padding_overhead_adjoint`` by
+direction since issue #26 -- plus ``n_rows`` on the GPU branch), so for
+the unit tests we build
 lightweight ``SimpleNamespace`` stand-ins rather than running
 ``make_plan``. The integration tests use a small real plan so they
 cover the public API end-to-end.
@@ -33,6 +35,7 @@ from jax_nufft.kernel import kernel_params
 from jax_nufft.wgridder import (
     _CPU_PADDING_CUTOFF,
     _GPU_LARGE_N_ROWS,
+    _GPU_PADDING_CUTOFF,
     _auto_w_strategy,
     _auto_w_strategy_cpu,
     _auto_w_strategy_gpu,
@@ -57,6 +60,7 @@ def _stub_plan(
     n_w: int,
     w_kernel_width: int = _TYPICAL_W_KERNEL_WIDTH,
     window_padding_overhead: float = 1.0,
+    window_padding_overhead_adjoint: float | None = None,
     n_rows: int = 600,
 ):
     """Minimal stand-in exposing the fields both heuristics read.
@@ -64,11 +68,26 @@ def _stub_plan(
     The defaults match a typical eps=1e-6 plan (``w_kernel_width`` = 7 under the
     issue #9 width rule, no windowed padding waste) on a small-row fixture. The
     GPU branch also reads ``n_rows``; CPU branch ignores it.
+
+    Since issue #26 the heuristics read a *different* padding field per
+    direction -- ``window_padding_overhead`` on the forward and
+    ``window_padding_overhead_adjoint`` on the adjoint, via
+    ``wgridder._padding_overhead`` -- because only the adjoint buckets its
+    plane slices. ``window_padding_overhead_adjoint`` therefore defaults to
+    ``window_padding_overhead``, which is the real plan's degenerate case (one
+    bucket per channel) and keeps every existing caller of this helper saying
+    what it said: "this plan has this much padding, in whichever direction you
+    ask". Pass the two separately only to test the split itself.
     """
     return SimpleNamespace(
         n_w=n_w,
         w_kernel_width=w_kernel_width,
         window_padding_overhead=window_padding_overhead,
+        window_padding_overhead_adjoint=(
+            window_padding_overhead
+            if window_padding_overhead_adjoint is None
+            else window_padding_overhead_adjoint
+        ),
         n_rows=n_rows,
     )
 
@@ -258,6 +277,49 @@ def test_cpu_padding_overhead_boundary_is_strict() -> None:
         n_w=200, w_kernel_width=8, window_padding_overhead=_CPU_PADDING_CUTOFF + 0.001
     )
     assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "dense_scan"
+
+
+def test_each_direction_reads_its_own_padding_overhead() -> None:
+    """issue #26: the forward and the adjoint compare different fields.
+
+    Only the windowed adjoint buckets its plane slices, so only the adjoint's
+    padded row-work fell; the forward still slices ``max_window_size`` per
+    plane exactly as it did at ``ab7fbbd``. ``wgridder._padding_overhead`` is
+    what keeps each direction's gate reading the work that direction would
+    actually do, and this is the cell that pins it -- every other padding cell
+    in this module passes the two fields the same value, which is the real
+    plan's degenerate case and cannot tell the wiring apart.
+
+    The stub is built the way a bucketable plan reads: padding far above the
+    cutoff un-bucketed, far below it once bucketed. Cross the two fields over
+    and both assertions below flip.
+    """
+    plan = _stub_plan(
+        n_w=200,
+        w_kernel_width=8,
+        window_padding_overhead=_CPU_PADDING_CUTOFF + 1.0,
+        window_padding_overhead_adjoint=1.1,
+    )
+    assert _auto_w_strategy_cpu(plan, is_adjoint=True) == "windowed_scan", (
+        "the adjoint's gate is reading the forward's un-bucketed overhead; it "
+        "should read window_padding_overhead_adjoint, which is 1.1 here"
+    )
+    # The CPU forward never picks windowed anyway, so the forward half of the
+    # split is checked on the GPU heuristic, where a windowed forward exists.
+    gpu = _stub_plan(
+        n_w=8,
+        w_kernel_width=8,
+        n_rows=50_000,
+        window_padding_overhead=_GPU_PADDING_CUTOFF + 1.0,
+        window_padding_overhead_adjoint=1.1,
+    )
+    assert _auto_w_strategy_gpu(gpu, is_adjoint=False) == "dense_vmap", (
+        "the forward's gate is reading the adjoint's bucketed overhead; it "
+        "should read window_padding_overhead, which is above the cutoff here"
+    )
+    assert _auto_w_strategy_gpu(gpu, is_adjoint=True) == "windowed_vmap", (
+        "the adjoint's gate on GPU is reading the forward's overhead too"
+    )
 
 
 # -- Part 6.3: GPU heuristic ------------------------------------------------

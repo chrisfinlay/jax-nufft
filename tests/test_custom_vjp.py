@@ -156,18 +156,25 @@ GRAD_MEMORY_FACTOR_VMAP = 1.5
 # and the *ratio* between them is what this gate measures.
 #
 # Measured on EDA2 off30 at ``n_chan = 8``, ``freq = f * linspace(0.95, 1.05,
-# 8)``, eight distinct bucket tables, ``windowed_scan``, ``nthreads=1``, this
-# machine, and identical on both precision legs -- at HEAD against ``ab7fbbd``:
+# 8)``, eight distinct bucket tables, ``windowed_scan``, ``nthreads=1``,
+# float64, this machine -- at HEAD against ``git archive ab7fbbd``:
 #
-#     dirty2vis channel_strategy=scan   1.67x   (1.64x at ab7fbbd)
-#     vis2dirty channel_strategy=scan   1.99x   (1.66x)
-#     dirty2vis channel_strategy=vmap   1.67x   (1.42x)
-#     vis2dirty channel_strategy=vmap   1.84x   (1.10x)
+#     dirty2vis channel_strategy=scan   1.64x   (1.64x at ab7fbbd)
+#     vis2dirty channel_strategy=scan   1.89x   (1.66x)
+#     dirty2vis channel_strategy=vmap   1.42x   (1.42x)
+#     vis2dirty channel_strategy=vmap   2.04x   (1.10x)
 #
-# and on MWA_extended off30 at the same eight channels (float64): vis2dirty
-# 2.00x scan (1.77x at ab7fbbd) and 1.98x vmap (1.04x). So the worst reading is
-# 2.00x against a 2.0 gate -- 0.06% of margin, which is a coin toss and not a
-# test. 2.5 is 25% above the worst measured value.
+# and on MWA_extended off30 at the same eight channels: vis2dirty 1.99x scan
+# (1.77x at ab7fbbd) and 2.12x vmap (1.04x). So the worst reading is 2.12x
+# against a 2.0 gate -- outside it. 2.5 is 18% above that worst value.
+#
+# The two ``dirty2vis`` rows are unchanged to the byte because issue #26 was
+# scoped to the adjoint: the forward's transients on these four cells read
+# 727,552 / 1,258,936 B (EDA2) and 10,592,960 / 18,039,480 B (MWA_extended) at
+# both revisions. The ratio moves on ``vis2dirty`` only, and it moves because
+# bucketing lowers the *forward* transient in the denominator (EDA2 vmap
+# 1,224,072 -> 630,728 B) more than it lowers the backward's, which carries the
+# concatenated image cube.
 #
 # It is still a gate and not a licence: the regime it excludes is a backward
 # that saves one image-sized residual per (channel, plane), which on the cell
@@ -364,6 +371,12 @@ def test_gradient_memory_holds_over_many_windowed_channel_groups(
     :data:`GRAD_MEMORY_FACTOR_SCAN`; see that constant for the measured
     before/after table and for why 2.0 is no longer a number this regime can
     be held to.
+
+    Issue #26 was scoped to the adjoint, so only the ``vis2dirty`` cells here
+    exercise the grouping; the two ``dirty2vis`` cells are a control, and they
+    read the same ratios as ``ab7fbbd`` off byte-identical transients. They are
+    kept parametrised rather than dropped because they are what would notice if
+    grouping leaked back into the forward.
     """
     dtype = _active_dtype()
     n_chan = 8

@@ -130,6 +130,12 @@ def _stub_plan(
         n_w=n_w,
         w_kernel_width=w_kernel_width,
         window_padding_overhead=window_padding_overhead,
+        # issue #26: the adjoint leg reads its own bucketed ratio. Mirrored at
+        # the un-bucketed value, which is a real plan's degenerate case (one
+        # bucket per channel) and keeps this stub saying "this plan has this
+        # much padding, in whichever direction you ask". The split itself is
+        # gated in ``tests/test_auto_strategy.py``.
+        window_padding_overhead_adjoint=window_padding_overhead,
         n_rows=n_rows,
     )
 

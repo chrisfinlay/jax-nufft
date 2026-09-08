@@ -798,6 +798,12 @@ def test_the_heuristic_picks_the_measured_winner_in_every_cell_and_slice() -> No
             n_w=rows[0]["n_w"],
             w_kernel_width=rows[0]["w_kernel_width"],
             window_padding_overhead=rows[0]["window_padding_overhead"],
+            # issue #26 split the padding field by direction; these rows are a
+            # pre-#26 sweep and record only the un-bucketed number, which is
+            # what the forward still reads. Mirroring it keeps this a replay of
+            # the recorded sweep rather than a re-derivation of how the current
+            # planner would bucket a plan the JSON does not describe.
+            window_padding_overhead_adjoint=rows[0]["window_padding_overhead"],
             n_rows=rows[0]["n_rows"],
         )
         picked = _auto_w_strategy_gpu(plan, is_adjoint=op == "vis2dirty")
@@ -952,6 +958,12 @@ def test_the_auto_pick_meets_the_fifteen_percent_bar_by_being_the_best() -> None
             n_w=rows[0]["n_w"],
             w_kernel_width=rows[0]["w_kernel_width"],
             window_padding_overhead=rows[0]["window_padding_overhead"],
+            # issue #26 split the padding field by direction; these rows are a
+            # pre-#26 sweep and record only the un-bucketed number, which is
+            # what the forward still reads. Mirroring it keeps this a replay of
+            # the recorded sweep rather than a re-derivation of how the current
+            # planner would bucket a plan the JSON does not describe.
+            window_padding_overhead_adjoint=rows[0]["window_padding_overhead"],
             n_rows=rows[0]["n_rows"],
         )
         picked = _auto_w_strategy_gpu(plan, is_adjoint=op == "vis2dirty")

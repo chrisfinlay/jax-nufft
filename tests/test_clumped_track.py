@@ -104,7 +104,6 @@ import pytest
 
 from jax_nufft import dirty2vis, make_plan, vis2dirty
 from jax_nufft._utils import SPEED_OF_LIGHT
-from jax_nufft.planning import WGridderPlan
 from tests.conftest import X64, Telescope, clumped_track, requires_x64, synthetic_uvw
 
 ducc0_wgridder = pytest.importorskip("ducc0.wgridder")
@@ -306,35 +305,18 @@ def test_the_clumped_plan_is_a_harder_windowed_plan_than_the_gaussian_one(
 ) -> None:
     """The clumped geometry costs the windowed path what a Gaussian one does not.
 
-    The quantity is the ratio of the row-work a windowed traversal does to the
-    row-work it cannot avoid (AGENTS.md section 4). A clumped w-distribution
-    makes the two diverge when every plane pays the widest window:
-    ``max_window_size`` is set by the clump while most planes hold nothing.
-    Pinning the ordering is what makes the parity tests below a statement about
-    a regime, not just about one more random fixture.
-
-    issue #26 moves the assertion onto the un-bucketed form of the ratio,
-    ``n_chan * n_w * max_window_size / live_row_count``, which is the one the
-    regime claim is about -- and which stays computable, because #26 leaves
-    every term of it on the plan. Bucketing gives each plane its own slice
-    length, so the plan that had the most padding to lose loses the most of it
-    and the *reported* overhead orders the other way round. Measured on this
-    machine at eps=1e-4, EDA2, seed 0 (clumped / Gaussian off30), un-bucketed
-    then reported:
-
-        float64, hermitian=True   15.326 / 2.6177  ->  1.1505 / 1.2754
-        float64, hermitian=False  14.595 / 2.6487  ->  1.2044 / 1.3563
-        float32, hermitian=True   15.334 / 2.6177  ->  1.1511 / 1.2754
-        float32, hermitian=False  14.595 / 2.6487  ->  1.2044 / 1.3563
-
-    with 22 / 0, 76 / 0, 23 / 0 and 76 / 0 empty planes. The ``> 2x`` guard
-    below therefore has a ~5.5x margin on the un-bucketed ratio, and the
-    bucketed one is asserted for what it now is: bucketing removes far more of
-    the clumped plan's padding (13.3x and 12.1x) than of the Gaussian one's
-    (2.05x and 1.95x).
+    ``window_padding_overhead`` is the ratio of the row-work a windowed
+    traversal does (``n_chan * n_w * max_window_size``) to the row-work it
+    cannot avoid (AGENTS.md section 4). A clumped w-distribution makes the two
+    diverge: ``max_window_size`` is set by the clump while most planes hold
+    nothing. Pinning the ordering is what makes the parity tests below a
+    statement about a regime, not just about one more random fixture.
 
     Both ``hermitian`` settings, because the fold changes the plane grid rather
-    than the summation order.
+    than the summation order. Measured on this machine at eps=1e-4, float64,
+    EDA2, seed 0 (clumped / Gaussian off30): ``hermitian=True`` overhead
+    15.33 / 2.62 with 22 / 0 empty planes, ``hermitian=False`` 14.59 / 2.65
+    with 76 / 0. The ``> 2x`` guard below therefore has a ~5.5x margin on both.
     """
     tel = clumped_track_telescope
     freq = np.array([tel.freq_hz])
@@ -358,28 +340,12 @@ def test_the_clumped_plan_is_a_harder_windowed_plan_than_the_gaussian_one(
     assert plan_clumped.empty_plane_count > 0
     assert plan_gauss.empty_plane_count == 0
 
-    def unbucketed(plan: WGridderPlan) -> float:
-        """Issue #43's overhead: one ``max_window_size`` slice per (channel, plane)."""
-        return plan.n_chan * plan.n_w * plan.max_window_size / plan.live_row_count
-
-    assert unbucketed(plan_clumped) > 2.0 * unbucketed(plan_gauss), (
-        f"{tel.name} (hermitian={hermitian}): clumped un-bucketed padding overhead "
-        f"{unbucketed(plan_clumped):.2f} vs Gaussian {unbucketed(plan_gauss):.2f} -- "
-        "the clumped fixture is no longer stressing the windowed traversal any "
-        "harder than the Gaussian one"
+    assert plan_clumped.window_padding_overhead > 2.0 * plan_gauss.window_padding_overhead, (
+        f"{tel.name} (hermitian={hermitian}): clumped padding overhead "
+        f"{plan_clumped.window_padding_overhead:.2f} vs Gaussian "
+        f"{plan_gauss.window_padding_overhead:.2f} -- the clumped fixture is "
+        "no longer stressing the windowed traversal any harder than the Gaussian one"
     )
-
-    # issue #26: and the clumped plan is where bucketing pays, by a wide
-    # margin, for exactly the reason the ordering above holds.
-    clumped_gain = unbucketed(plan_clumped) / plan_clumped.window_padding_overhead
-    gauss_gain = unbucketed(plan_gauss) / plan_gauss.window_padding_overhead
-    assert clumped_gain > 2.0 * gauss_gain, (
-        f"{tel.name} (hermitian={hermitian}): bucketing removed {clumped_gain:.2f}x "
-        f"of the clumped plan's padded row-work and {gauss_gain:.2f}x of the "
-        "Gaussian one's"
-    )
-    for plan in (plan_clumped, plan_gauss):
-        assert plan.window_padding_overhead >= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +426,7 @@ def test_clumped_track_matches_ducc(
     What the four traversals cover here is plane *placement and accumulation*
     at the deepest stacks in the repository -- ``n_w`` 214 folded / 461
     unfolded against 134 for the deepest Gaussian, with 90 / 312 empty planes
-    and an un-bucketed padding overhead of 29.50 against 4.94 (1.21 against
-    1.38 on the metric issue #26 reports) -- and the ``vmap`` variants
+    and a padding overhead of 29.50 against 4.94 -- and the ``vmap`` variants
     place their planes through a different (batched) composition than the
     ``scan`` ones. Window-bound coverage lives in
     :func:`test_multi_channel_spread_w_matches_ducc` (0.417 / 0.260).
@@ -532,10 +497,8 @@ def test_clumped_track_matches_ducc_long(
 
     MWA_extended clumped is the extreme cell. Measured on this machine at
     eps=1e-6, float64, seed 0: ``n_w = 214`` folded against the Gaussian off30
-    fixture's 134, with 90 of those planes empty and an un-bucketed padding
-    overhead of 29.50 against 4.94 -- 1.21 against 1.38 on the bucketed metric
-    issue #26 reports, both re-measured on this branch; unfolded it is 461
-    planes with 312 empty.
+    fixture's 134, with 90 of those planes empty and a padding overhead of
+    29.50 against 4.94; unfolded it is 461 planes with 312 empty.
     """
     eps = 1e-6 if X64 else 1e-4
     tel = long_clumped_track_telescope
