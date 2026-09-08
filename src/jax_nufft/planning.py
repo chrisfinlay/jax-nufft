@@ -95,8 +95,119 @@ WINDOW_BOUNDARY_MARGIN_EPS = 4.0
 # issue #12). Neither affects a float64 plan.
 FLOAT32_EPSILON_FLOOR = 1e-5
 
+# issue #26: the most size classes a channel's w-planes may be bucketed into.
+#
+# Four, and the number is measured rather than inherited. The DP below is exact
+# for any bound, so the only question is what the extra classes buy against the
+# extra compiled sub-loops they cost. Measured this session (macOS arm64,
+# float64, eps 1e-6, seed 0, hermitian=True, n_chan=1, CI fixture sizes), the
+# optimal ``window_padding_overhead`` on the worst of the ten review cells
+# (MWA_extended off30) as the bound grows: 4.9441 at one class, 1.8781 at two,
+# 1.5130 at three, 1.3768 at four, 1.2709 at five, 1.2352 at six. Four is the
+# smallest bound that clears issue #26's 1.5 gate on every cell, and it does so
+# with 8% of headroom on that worst cell. Each extra class is a separately
+# compiled sub-loop, and the DP takes the fewest classes that reach its
+# optimum, so cells with little to gain stay cheap -- MWA_compact zenith and
+# MeerKAT zenith use two classes (1.1431 -> 1.0007 / 1.0005) and
+# GH200_large zenith four (1.2857 -> 1.0000).
+MAX_WINDOW_BUCKETS = 4
+
+# Upper bound on the number of candidate bucket edges the DP searches over.
+# The DP is O(MAX_WINDOW_BUCKETS * m^2) in the number ``m`` of *distinct*
+# padded window sizes a channel has, and ``m <= n_w``. Every plan in this
+# repository and every realistic one tabulated in issue #26 has ``n_w`` in the
+# tens or low hundreds (worst: 501 planes on MWA_extended off30 at eps 1e-12),
+# so the cap below is never reached in practice; it exists so that a plan with
+# thousands of planes degrades to a restricted search rather than to a
+# quadratic-in-n_w plan-build time. Restricting the candidate edges only
+# shrinks the search space -- the cost of any partition it does consider is
+# still exact -- so the result stays a valid bucketing, merely not provably
+# optimal.
+_BUCKET_DP_MAX_EDGES = 1024
+
 # Veltkamp splitting constant for :func:`_two_product`: 2**ceil(53/2) + 1.
 _VELTKAMP_SPLIT = float(2**27 + 1)
+
+
+def bucket_window_sizes(
+    sizes: npt.NDArray[np.integer[Any]], *, max_buckets: int = MAX_WINDOW_BUCKETS
+) -> tuple[tuple[tuple[int, int], ...], npt.NDArray[np.int32]]:
+    """Partition one channel's padded window sizes into at most ``max_buckets`` classes.
+
+    Returns ``(buckets, order)`` where ``buckets`` is
+    ``((slice_length, n_planes), ...)`` ascending in ``slice_length`` with
+    distinct lengths and ``sum(n_planes) == sizes.size``, and ``order`` is the
+    plane indices sorted ascending by window size, so that bucket ``b``'s
+    planes are the contiguous rank range ``order[offset : offset + n_planes]``.
+
+    What is minimised is ``sum(slice_length * n_planes)`` -- the rows a bucketed
+    windowed traversal touches, which is the numerator of
+    ``window_padding_overhead``. Sorting first is what makes an exact dynamic
+    program possible: an optimal partition is contiguous in *sorted size* order
+    (moving a plane out of a class whose length already covers it can only
+    raise some other class's length), so the DP only has to choose at most
+    ``max_buckets - 1`` cut points among the distinct sizes.
+
+    **Not the power-of-two rounding issue #26's item 2 suggests.** Measured on
+    the ten review cells (macOS arm64, float64, eps 1e-6, seed 0,
+    ``hermitian=True``, ``n_chan=1``, CI fixture sizes) rounding each window up
+    to a power of two puts seven of the ten above the issue's own 1.5 gate and
+    five of them *above* the un-bucketed value they start from, because every
+    600-row window rounds up to a 1024 class -- MWA_compact zenith goes from
+    1.1431 to 1.7075. The edges have to be placed against the plan's own size
+    distribution, which is what this function does.
+
+    ``sizes`` must be positive; the window builder's ``lo - 1`` / ``hi + 1``
+    clamp guarantees that, and the constant-w fast path passes a single
+    ``n_rows``.
+    """
+    n = int(np.asarray(sizes).size)
+    if n == 0:  # pragma: no cover - ``n_w >= 1`` on every path through make_plan
+        return (), np.zeros(0, dtype=np.int32)
+    order = np.argsort(np.asarray(sizes), kind="stable").astype(np.int32)
+    sorted_sizes = np.asarray(sizes, dtype=np.int64)[order]
+    # ``vals`` ascending distinct sizes; ``pref[j]`` the number of planes whose
+    # size is among the first ``j`` distinct values, so a class ending at
+    # distinct value ``j`` holds ``pref[j] - pref[i]`` planes of length
+    # ``vals[j - 1]``.
+    vals, first = np.unique(sorted_sizes, return_index=True)
+    m = int(vals.size)
+    pref = np.concatenate(([0], first[1:], [n])).astype(np.int64)
+
+    edges = (
+        np.arange(1, m + 1, dtype=np.int64)
+        if m <= _BUCKET_DP_MAX_EDGES
+        else np.unique(np.linspace(1, m, _BUCKET_DP_MAX_EDGES).round().astype(np.int64))
+    )
+    n_edges = int(edges.size)
+    edge_vals = vals[edges - 1].astype(np.int64)
+    edge_pref = np.concatenate(([0], pref[edges]))  # (n_edges + 1,), position 0 = empty
+
+    n_buckets_max = min(int(max_buckets), n_edges)
+    inf = np.inf
+    # ``cost[b][t]``: least padded row-work covering the first ``edges[t - 1]``
+    # distinct sizes with exactly ``b`` classes; ``t = 0`` is the empty prefix.
+    cost = np.full((n_buckets_max + 1, n_edges + 1), inf)
+    back = np.zeros((n_buckets_max + 1, n_edges + 1), dtype=np.int64)
+    cost[0, 0] = 0.0
+    for b in range(1, n_buckets_max + 1):
+        for t in range(1, n_edges + 1):
+            trial = cost[b - 1, :t] + edge_vals[t - 1] * (edge_pref[t] - edge_pref[:t])
+            i = int(np.argmin(trial))
+            cost[b, t] = trial[i]
+            back[b, t] = i
+
+    # Fewest classes first among equal costs: an extra class is an extra
+    # compiled sub-loop and buys nothing when it does not lower the work.
+    best_b = min(range(1, n_buckets_max + 1), key=lambda b: (cost[b, n_edges], b))
+    buckets: list[tuple[int, int]] = []
+    t = n_edges
+    for b in range(best_b, 0, -1):
+        i = int(back[b, t])
+        buckets.append((int(edge_vals[t - 1]), int(edge_pref[t] - edge_pref[i])))
+        t = i
+    buckets.reverse()
+    return tuple(buckets), order
 
 
 def _two_product(a: npt.ArrayLike, b: npt.ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -191,16 +302,44 @@ class WGridderPlan:
     w0: float
     # v0.1.1 windowed-scan fields:
     # ``max_window_size`` is the worst-case window length across all
-    # (channel, plane) pairs -- the static slice length every windowed
-    # strategy pays per plane. ``window_padding_overhead`` is the factor by
-    # which that traversal exceeds the irreducible row-work,
+    # (channel, plane) pairs. It is the widest slice any windowed strategy
+    # takes, and issue #26 leaves it exactly as it was so that the pre-#26
+    # metric ``n_chan * n_w * max_window_size / live_row_count`` (issue #43's
+    # definition) stays recomputable from the plan's own fields and the
+    # measured baselines stay comparable.
     #
-    #     n_chan * n_w * max_window_size / live_row_count
+    # ``window_padding_overhead`` is the factor by which a windowed traversal
+    # exceeds the irreducible row-work. issue #26 changed its NUMERATOR from
+    # that product to the work the *bucketed* traversal actually does,
     #
-    # and is purely diagnostic (it gates the ``auto`` strategy choice in
-    # ``wgridder._auto_w_strategy_*`` and nothing else).
+    #     sum over channels and buckets of slice_length * n_planes
+    #       / live_row_count
+    #
+    # keeping issue #43's denominator unchanged and collapsing to the pre-#26
+    # form on any plan with one bucket per channel. It is purely diagnostic (it
+    # gates the ``auto`` strategy choice in ``wgridder._auto_w_strategy_*`` and
+    # nothing else).
     max_window_size: int
     window_padding_overhead: float
+    # issue #26 item 2: the widest padded window *per channel*. A high-frequency
+    # channel spreads the same baselines over more planes and so gets narrower
+    # windows -- measured on EDA2 off30 at 1.0 / 1.3 / 1.6 / 2.0 times the
+    # telescope frequency (eps 1e-6, float64, seed 0, hermitian=True): 126 /
+    # 103 / 84 / 72, a 1.75x spread that one global maximum charges every
+    # channel for. ``max_window_size == max(max_window_size_per_chan)``.
+    max_window_size_per_chan: tuple[int, ...]
+    # issue #26 item 3: each channel's planes bucketed by padded window length,
+    # ``((slice_length, n_planes), ...)`` ascending with distinct lengths and
+    # ``sum(n_planes) == n_w``. Built by :func:`bucket_window_sizes`; the plane
+    # membership is the ``window_plane_order`` leaf below, in which each bucket
+    # is a contiguous rank range.
+    #
+    # Per channel and not global, because a global table makes the per-channel
+    # sizing above unreachable: every channel's widest bucket would be the
+    # plan's widest bucket. Static because each bucket's ``slice_length`` is a
+    # static ``dynamic_slice`` shape, i.e. the thing the windowed loops are
+    # compiled around.
+    window_buckets: tuple[tuple[tuple[int, int], ...], ...]
     # issue #43: the denominator above, and the emptiness the window builder's
     # insurance clamp hides.
     #
@@ -361,6 +500,20 @@ class WGridderPlan:
     # v0.1.2 already did this for ``u_finufft`` / ``v_finufft``).
     sort_perm: Array = field()  # (n_rows,) int — argsort(uvw_m[:, 2]) ascending
     window_start: Array = field()  # (n_chan, n_w) int — start idx in sorted array
+    # issue #26: for each channel, the plane indices ordered ascending by padded
+    # window length, so that ``window_buckets[c]``'s classes are the contiguous
+    # rank ranges ``window_plane_order[c][offset : offset + n_planes]``. The
+    # windowed loops gather ``window_start[c]`` and ``w_centers_rel`` through
+    # it, one bucket at a time; without it a bucket's planes would not be
+    # addressable as a static slice.
+    #
+    # ``(n_chan, n_w)`` int32 -- the same shape and dtype as ``window_start``,
+    # which is what issue #23's budget allows here: it is per (channel, plane),
+    # never per (channel, row), and it adds four bytes per plane per channel
+    # (32 kB on a 64-channel, 128-plane plan, against 31 MB of leaves at
+    # 64 channels x 1M rows). A leaf and not aux data so that it stays out of
+    # the JIT cache key, which the bucket table above already covers.
+    window_plane_order: Array = field()  # (n_chan, n_w) int32
     # issue #17: the Hermitian fold's per-row sign, ``+1`` for a row stored as
     # given and ``-1`` for one stored at ``(-u, -v, -w)`` with a conjugated
     # value. All ``+1`` when ``hermitian`` is False.
@@ -495,6 +648,8 @@ def _plan_aux(plan: WGridderPlan) -> tuple[Any, ...]:
         plan.w0,
         plan.max_window_size,
         plan.window_padding_overhead,
+        plan.max_window_size_per_chan,
+        plan.window_buckets,
         plan.live_row_count,
         plan.empty_plane_count,
         plan.w_extent,
@@ -522,6 +677,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0,
         max_window_size,
         window_padding_overhead,
+        max_window_size_per_chan,
+        window_buckets,
         live_row_count,
         empty_plane_count,
         w_extent,
@@ -539,6 +696,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         phi_hat_n,
         sort_perm,
         window_start,
+        window_plane_order,
         flip_sign,
     ) = children
     return WGridderPlan(
@@ -557,6 +715,8 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         w0=w0,
         max_window_size=max_window_size,
         window_padding_overhead=window_padding_overhead,
+        max_window_size_per_chan=max_window_size_per_chan,
+        window_buckets=window_buckets,
         live_row_count=live_row_count,
         empty_plane_count=empty_plane_count,
         w_extent=w_extent,
@@ -572,6 +732,7 @@ def _plan_unflatten(aux: tuple[Any, ...], children: tuple[Array, ...]) -> WGridd
         phi_hat_n=phi_hat_n,
         sort_perm=sort_perm,
         window_start=window_start,
+        window_plane_order=window_plane_order,
         flip_sign=flip_sign,
     )
 
@@ -588,6 +749,7 @@ jax.tree_util.register_pytree_node(
             p.phi_hat_n,
             p.sort_perm,
             p.window_start,
+            p.window_plane_order,
             p.flip_sign,
         ),
         _plan_aux(p),
@@ -1186,6 +1348,13 @@ def make_plan(
         # ``n_rows >= 1``, and the single plane holds all of them.
         empty_plane_count = 0
         window_padding_overhead = 1.0
+        # issue #26: one plane, so one bucket per channel holding it, and the
+        # per-channel maximum is the single window. The bucketed numerator
+        # ``n_chan * n_rows`` equals ``live_row_count``, so the redefined
+        # overhead is 1.0 here exactly as the pre-#26 one was.
+        max_window_size_per_chan = (max_window_size,) * n_chan
+        window_buckets = (((max_window_size, 1),),) * n_chan
+        plane_order_np = np.zeros((n_chan, 1), dtype=np.int32)
     else:
         # --- number of w-planes ---
         # Sample w with step dw = x0 / max|n-1|, matching ducc's choice for
@@ -1364,14 +1533,37 @@ def make_plan(
             window_size_np[c] = (hi - lo).astype(np.int32)
 
         max_window_size = int(window_size_np.max(initial=0))
+        # --- issue #26: bucket each channel's planes by padded window size ---
+        #
+        # Each bucket gets its own static slice length, so a plane whose window
+        # holds 24 rows no longer slices ``max_window_size``. The classes are
+        # placed by an exact DP against this channel's own sorted sizes (see
+        # :func:`bucket_window_sizes`), per channel and not globally, so a
+        # channel whose windows are narrower than the plan's widest is charged
+        # its own maximum rather than the plan's.
+        plane_order_np = np.zeros((n_chan, n_w), dtype=np.int32)
+        buckets_per_chan: list[tuple[tuple[int, int], ...]] = []
+        for c in range(n_chan):
+            buckets_c, order_c = bucket_window_sizes(window_size_np[c])
+            buckets_per_chan.append(buckets_c)
+            plane_order_np[c] = order_c
+        window_buckets = tuple(buckets_per_chan)
+        max_window_size_per_chan = tuple(
+            max(length for length, _ in buckets_c) for buckets_c in window_buckets
+        )
+        padded_row_work = sum(
+            length * count for buckets_c in window_buckets for length, count in buckets_c
+        )
         # --- padding overhead: windowed row-work over irreducible row-work ---
         #
-        # Every (channel, plane) step slices a *static* ``max_window_size``
-        # rows out of the w-sorted array -- the shape has to be static for
-        # ``lax.scan`` / ``vmap`` -- so a windowed traversal touches
+        # Every (channel, plane) step slices a *static* number of rows out of
+        # the w-sorted array -- the shape has to be static for ``lax.scan`` /
+        # ``vmap``. Before issue #26 that number was ``max_window_size`` for
+        # every step, so a windowed traversal touched
         # ``n_chan * n_w * max_window_size`` rows however narrow the individual
-        # windows are. ``live_row_count`` is how many of those are inside
-        # nominal support.
+        # windows were; with bucketing it is the plane's own bucket length, and
+        # the numerator is the sum of those. ``live_row_count`` is how many of
+        # them are inside nominal support.
         #
         # Through v0.1.2 this was ``max_window_size`` over the mean of the
         # nonzero ``window_size``, which measured the widest window against the
@@ -1380,7 +1572,7 @@ def make_plan(
         # filter had become a no-op once the clamp guaranteed
         # ``window_size >= 1``. See the ``live_row_count`` field comment.
         if live_row_count > 0:
-            window_padding_overhead = n_chan * n_w * max_window_size / live_row_count
+            window_padding_overhead = padded_row_work / live_row_count
         else:
             # Defensive, and unreachable through ``make_plan``: the plane grid
             # spans the whole w-range with a support half-width of ``W/2``
@@ -1434,6 +1626,8 @@ def make_plan(
         w0=float(w0),
         max_window_size=int(max_window_size),
         window_padding_overhead=float(window_padding_overhead),
+        max_window_size_per_chan=max_window_size_per_chan,
+        window_buckets=window_buckets,
         live_row_count=int(live_row_count),
         empty_plane_count=int(empty_plane_count),
         w_extent=float(w_extent),
@@ -1453,8 +1647,9 @@ def make_plan(
         phi_hat_n=jnp.asarray(phi_hat_n_np),
         sort_perm=jnp.asarray(sort_perm_np),
         window_start=jnp.asarray(window_start_np),
+        window_plane_order=jnp.asarray(plane_order_np),
         flip_sign=jnp.asarray(flip_sign_np),
     )
 
 
-__all__ = ["WGridderPlan", "make_plan", "window_boundary_margin"]
+__all__ = ["WGridderPlan", "bucket_window_sizes", "make_plan", "window_boundary_margin"]

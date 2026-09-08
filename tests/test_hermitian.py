@@ -461,7 +461,8 @@ def _row_bytes_and_other_bytes(plan: WGridderPlan) -> tuple[int, int]:
 
     ``other`` is the exact sum of the non-row leaves as ``_footprint_bound_bytes``
     in ``tests/test_planning.py`` accounts for them (``inv_lambda``,
-    ``w_centers_rel``, the three image-sized arrays, ``window_start``), so the
+    ``w_centers_rel``, the three image-sized arrays, ``window_start`` and
+    issue #26's ``window_plane_order``), so the
     remainder is precisely what the plan spends per row. Computed from the plan's
     own static fields rather than from leaf names, so a renamed or added row leaf
     still shows up in the row half.
@@ -475,6 +476,7 @@ def _row_bytes_and_other_bytes(plan: WGridderPlan) -> tuple[int, int]:
         + plan.complex_dtype.itemsize * plan.n_l * plan.n_m  # w0_screen
         + real_itemsize * plan.n_l * plan.n_m  # phi_hat_n
         + 4 * plan.n_chan * plan.n_w  # window_start (int32)
+        + 4 * plan.n_chan * plan.n_w  # window_plane_order (int32, issue #26)
     )
     return total - other, other
 

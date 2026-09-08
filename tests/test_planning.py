@@ -663,6 +663,14 @@ _EXPECTED_LEAF_FIELDS: tuple[str, ...] = (
     "phi_hat_n",
     "sort_perm",
     "window_start",
+    # issue #26: the plane order that makes each channel's window-size buckets
+    # a contiguous rank range, (n_chan, n_w) int32 -- the same shape and dtype
+    # as ``window_start``, and per (channel, plane) rather than per
+    # (channel, row), which is the axis issue #23 removed. It is the TENTH
+    # leaf and the only one that issue may add: the bucket *table* itself is
+    # static (it is a set of compile-time slice lengths), but which planes are
+    # in which bucket is data the windowed loops index with.
+    "window_plane_order",
     # issue #17: the Hermitian w-sign fold's per-row sign, (n_rows,) int8 in
     # {+1, -1}. This is the NINTH leaf and the only one this issue may add: the
     # fold needs per-row information, which is inherently (n_rows,), but it must
@@ -697,6 +705,12 @@ _STATIC_FIELD_PROBES: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("w0", lambda v: v + 1.0),  # issue #16 follow-up
     ("max_window_size", lambda v: v + 1),
     ("window_padding_overhead", lambda v: v + 1.0),
+    # issue #26: the per-channel window sizes and the bucket table. Static
+    # because each bucket's slice length is a compile-time ``dynamic_slice``
+    # shape -- two plans that bucket differently emit different programs and
+    # must not share a JIT cache entry.
+    ("max_window_size_per_chan", lambda v: tuple(x + 1 for x in v)),
+    ("window_buckets", lambda v: (((1, 1),), *v[1:])),
     # issue #43: the two ints that replaced the padded ``window_size`` mean as
     # the diagnostic's denominator. They are STATIC on purpose -- issue #23
     # (PR #42) removed the per-(channel, plane) ``window_size`` leaf to cut
@@ -1023,8 +1037,31 @@ def test_window_builder_matches_independent_reference(freq: np.ndarray) -> None:
     # pinned against a reference that does not go through ``searchsorted`` at
     # all; here it is enough that the identity holds and that the padding is
     # visibly excluded.
-    assert plan.window_padding_overhead == pytest.approx(
-        plan.n_chan * plan.n_w * plan.max_window_size / plan.live_row_count
+    #
+    # issue #26: the numerator is no longer ``n_chan * n_w * max_window_size``
+    # but the work the *bucketed* traversal does, so it is rebuilt here from
+    # this file's own reference sizes and the plan's declared bucket table --
+    # which keeps the identity a check on a number rather than a restatement of
+    # ``make_plan``'s expression. The table has to cover the reference (no
+    # plane bucketed below its own window, which would silently drop rows the
+    # dense path weights) and its widest length has to be that channel's widest
+    # reference window.
+    padded_work = 0
+    for c, buckets in enumerate(plan.window_buckets):
+        lengths = np.array([length for length, _ in buckets])
+        counts = np.array([count for _, count in buckets])
+        assert int(counts.sum()) == plan.n_w
+        expanded = np.repeat(lengths, counts)
+        assert np.all(expanded >= np.sort(expected_size[c])), (
+            f"channel {c}: a plane is bucketed below its own window length"
+        )
+        assert int(lengths.max()) == int(expected_size[c].max())
+        padded_work += int(expanded.sum())
+
+    assert plan.window_padding_overhead == pytest.approx(padded_work / plan.live_row_count)
+    assert padded_work < plan.n_chan * plan.n_w * plan.max_window_size, (
+        "the bucketed row-work equals the pre-#26 one on a plan whose window "
+        "sizes vary, so nothing was bucketed"
     )
     assert plan.live_row_count < int(expected_size.sum())
 
@@ -1093,6 +1130,30 @@ def test_window_builder_clumped_distribution(pixsize: float) -> None:
     moves ``n_w`` back below the crossover, this fixture stops measuring what
     the test claims and that must fail loudly instead of silently passing at
     one lucky resolution.
+
+    issue #26 moves the claim onto the quantity it was derived for. The
+    crossover analysis above is about ``n_w * max_window_size``, i.e. the work
+    an *un-bucketed* windowed traversal does, and that is what the ordering is
+    asserted on; ``window_padding_overhead`` is now the work the bucketed
+    traversal does, and on this fixture the ordering there is the other way
+    round -- bucketing helps the clumped plan far more than the uniform one,
+    which is the whole point of it. Measured at eps 1e-6, float64,
+    ``hermitian=False``, seed 2 (the ``pixsize`` sweep in order), un-bucketed
+    against bucketed:
+
+        pixsize   n_w c/u    clumped              uniform
+        5.0e-3     23 / 36    1.6505 -> 1.0111    1.4266 -> 1.1353
+        6.0e-3     29 / 49    2.0810 -> 1.0154    1.3470 -> 1.1228
+        8.0e-3     47 / 83    3.3739 -> 1.0454    1.4229 -> 1.1575
+        1.0e-2     71 / 128   5.0968 -> 1.1207    1.5080 -> 1.1782
+        1.2e-2    101 / 187   7.2478 -> 1.1714    1.6690 -> 1.2213
+        1.5e-2    163 / 304  11.6969 -> 1.3135    1.9536 -> 1.3299
+
+    So the two statements asserted below are (a) the pre-#26 ordering, on the
+    pre-#26 quantity, and (b) that bucketing removes strictly more of the
+    clumped plan's padding than of the uniform plan's -- which is what makes
+    (a) stop showing up in the reported metric, stated on the same two plans
+    rather than left as an explanation.
     """
     uvw, uvw_uniform = _clumped_and_uniform_uvw()
     freq = np.array([1.4e9])
@@ -1125,7 +1186,27 @@ def test_window_builder_clumped_distribution(pixsize: float) -> None:
         nominal = plan.n_rows * plan.w_kernel_width
         assert abs(plan.live_row_count - nominal) <= plan.n_w
 
-    assert plan_clumped.window_padding_overhead > plan_uniform.window_padding_overhead
+    def unbucketed(plan: WGridderPlan) -> float:
+        """Issue #43's overhead: one ``max_window_size`` slice per (channel, plane)."""
+        return plan.n_chan * plan.n_w * plan.max_window_size / plan.live_row_count
+
+    assert unbucketed(plan_clumped) > unbucketed(plan_uniform)
+
+    # issue #26: both plans keep an overhead of at least one -- padded work
+    # cannot fall below live work -- and the clumped plan, which is the one
+    # whose padding the crossover analysis says is worst, is the one bucketing
+    # helps most.
+    for plan in (plan_clumped, plan_uniform):
+        assert plan.window_padding_overhead >= 1.0
+        assert plan.window_padding_overhead < unbucketed(plan)
+
+    clumped_gain = unbucketed(plan_clumped) / plan_clumped.window_padding_overhead
+    uniform_gain = unbucketed(plan_uniform) / plan_uniform.window_padding_overhead
+    assert clumped_gain > uniform_gain, (
+        f"bucketing removed {clumped_gain:.2f}x of the clumped plan's padded "
+        f"row-work and {uniform_gain:.2f}x of the uniform plan's; the clumped "
+        "fixture is the one with the padding to remove"
+    )
 
     # The clumped plan is the one with dead planes; the uniform one has none
     # at these resolutions. Under the pre-#43 definition both read zero,
@@ -1201,9 +1282,10 @@ def _footprint_bound_bytes(n_chan: int, n_rows: int, n_w: int, n_l: int, n_m: in
         phi_hat_n           (n_l, n_m)     float64      8 * n_l * n_m
         sort_perm           (n_rows,)      int32        4 * n_rows
         window_start        (n_chan, n_w)  int32        4 * n_chan * n_w
+        window_plane_order  (n_chan, n_w)  int32        4 * n_chan * n_w
         flip_sign           (n_rows,)      int8         1 * n_rows
                                                         -------------------
-        total = 29*n_rows + 8*n_chan + 8*n_w + 32*n_l*n_m + 4*n_chan*n_w
+        total = 29*n_rows + 8*n_chan + 8*n_w + 32*n_l*n_m + 8*n_chan*n_w
 
     This is an *exact* target, not a loose ceiling: every term above is
     achieved by exactly one leaf, so there is no slack for a removed leaf
@@ -1232,8 +1314,15 @@ def _footprint_bound_bytes(n_chan: int, n_rows: int, n_w: int, n_l: int, n_m: in
     form would put ``n_chan`` bytes on every row, which is the allocation
     issue #23 exists to have deleted. ``tests/test_hermitian.py`` gates the
     per-row and per-channel slopes directly; this bound gates the total.
+
+    issue #26 adds the ``window_plane_order`` term, and it is the second and
+    last ``4 * n_chan * n_w``: bucketing needs to know which planes are in
+    which size class, which is inherently per (channel, plane). Per *plane*,
+    not per row -- on the 16-channel, 10k-row fixture below it is 8,512 B
+    against 290,000 B of row-shaped leaves (measured), and the axis issue #23
+    exists to have deleted is ``n_rows``, which this term does not carry.
     """
-    return 29 * n_rows + 8 * n_chan + 8 * n_w + 32 * n_l * n_m + 4 * n_chan * n_w
+    return 29 * n_rows + 8 * n_chan + 8 * n_w + 32 * n_l * n_m + 8 * n_chan * n_w
 
 
 @requires_x64

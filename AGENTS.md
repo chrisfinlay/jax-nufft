@@ -207,7 +207,8 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   frozen dataclass that's also a registered JAX pytree.
 * Plan **static fields** (`n_l, n_m, n_chan, n_rows, n_w,
   w_kernel_width, beta, epsilon, pixsize_*, w_kernel_scale, nshift, w0,
-  max_window_size, window_padding_overhead, live_row_count,
+  max_window_size, window_padding_overhead, max_window_size_per_chan,
+  window_buckets, live_row_count,
   empty_plane_count, w_extent,
   is_constant_w, hermitian, real_dtype, complex_dtype`) live in the pytree
   aux_data and become part of the JIT cache key. This list must
@@ -228,9 +229,16 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   are different operators and must not share a cache entry. It is also
   read before the JIT boundary, by `dirty2vis`, to refuse a complex
   image.
+  `max_window_size_per_chan` and `window_buckets` (issue #26) are the
+  per-channel window maxima and each channel's planes bucketed by padded
+  window length, `((slice_length, n_planes), ...)` ascending with
+  distinct lengths and `sum(n_planes) == n_w`. They are static because a
+  bucket's `slice_length` *is* a compile-time `dynamic_slice` shape — two
+  plans that bucket differently emit different programs.
 * Plan **traced fields** (`uvw_m, inv_lambda, w_centers_rel,
   n_minus_1_shifted, w0_screen, phi_hat_n, sort_perm, window_start,
-  flip_sign` — 9 leaves, in that flatten order) are JAX device arrays.
+  window_plane_order, flip_sign` — 10 leaves, in that flatten order) are
+  JAX device arrays.
   `uvw_m` is `(n_rows, 3)` in **metres**, in input row order, and
   `inv_lambda` is `(n_chan,)` = `freq / c` (issue #23). Nothing per
   `(channel, row)` is stored: the per-channel FINUFFT coordinates and
@@ -256,7 +264,16 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   reintroducing the per-`(channel, row)` allocation issue #23 deleted.
   The operators put the conjugation back per row: the forward on its
   **output**, the adjoint on its **input**, and the windowed adjoint
-  against `flip_sign[sort_perm]` because its visibilities arrive sorted.
+  against `flip_sign[sort_perm]` because its visibilities arrive sorted
+  (taken through an `(n_rows, 1)` view, so that every whole-row gather of
+  a plan leaf lowers at rank 2 and the only rank-1 slice of an
+  `(n_rows,)` array in the emitted program is a w-plane window — which is
+  what `tests/test_window_bucketing.py`'s lowering probe reads).
+  `window_plane_order` (issue #26) is `(n_chan, n_w)` int32: each
+  channel's plane indices ordered ascending by padded window length, so
+  every bucket is a contiguous rank range in it and the windowed loops
+  can address one with a static slice. Per `(channel, plane)`, never per
+  `(channel, row)`.
   `n_minus_1_shifted` (issue #16) is `n_minus_1 + nshift` and is the
   grid the per-plane phase and the `phi_hat` argument are evaluated
   on; the adjoint's `1/n` output factor must keep using the *unshifted*
@@ -282,10 +299,13 @@ dirty = vis2dirty(plan, vis)            # JIT-cached separately
   `max_window_size` and `window_padding_overhead` at plan time.
   Issue #43 added `live_row_count` and `empty_plane_count` to that
   diagnostic and kept them **scalars** for the same reason — two static
-  ints is the whole budget, and reintroducing a `(n_chan, n_w)` array
-  in any form would undo #23. `tests/test_planning.py` pins the leaf
-  set at nine entries (eight before issue #17), which is what makes that
-  a checked constraint rather than an intention; the float64 plan's
+  ints is the whole budget, and reintroducing a `(n_chan, n_row)` array
+  in any form would undo #23. Issue #26's `window_plane_order` is the one
+  `(n_chan, n_w)` leaf that budget does allow: it is per *plane*, which
+  is what bucketing is about, and it is not diagnostic — the loops index
+  with it. `tests/test_planning.py` pins the leaf set at ten entries
+  (nine before issue #26, eight before issue #17), which is what makes
+  that a checked constraint rather than an intention; the float64 plan's
   row-proportional cost is 29 B/row (`uvw_m` 24 + `sort_perm` 4 +
   `flip_sign` 1) and `tests/test_hermitian.py` gates the per-row and
   per-channel slopes separately.
@@ -348,15 +368,47 @@ The windowed strategies rely on a contract between
   host and device disagree: one row is rescued by the `±1`-row
   widening on its own, so a one-row fixture gates the margin not at
   all.
-* `plan.max_window_size` is a static int used as the
-  `dynamic_slice` size — must be `>=` every window's length, and is
-  computed from the widened windows above, so it already carries the
-  two extra rows. The per-window lengths themselves are plan-time
-  locals, not a leaf (issue #23 removed `window_size`).
-* `plan.window_padding_overhead` is `n_chan * n_w * max_window_size /
-  plan.live_row_count` (issue #43): the row-work a windowed traversal
-  actually does — every `(channel, plane)` step slices a *static*
-  `max_window_size` rows — over the row-work it cannot avoid.
+* `plan.max_window_size` is a static int — the widest window in the
+  plan, computed from the widened windows above, so it already carries
+  the two extra rows. Issue #26 leaves it exactly as it was, so the
+  pre-#26 metric stays recomputable and the measured baselines stay
+  comparable; it is no longer the `dynamic_slice` size every plane pays.
+  The per-window lengths themselves are plan-time locals, not a leaf
+  (issue #23 removed `window_size`).
+* `plan.window_buckets[c]` is issue #26's size classes for channel `c`,
+  and each class's `slice_length` **is** the `dynamic_slice` size for
+  the planes in it: at most `MAX_WINDOW_BUCKETS` (4) of them, placed by
+  an exact dynamic program over that channel's own sorted padded window
+  sizes so as to minimise `sum(slice_length * n_planes)`
+  (`planning.bucket_window_sizes`). Two properties the windowed loops
+  rely on: every class's length is `>=` every window it holds (so no
+  plane can drop a row the dense path weights — the invariant above,
+  restated per bucket), and `max(slice_length)` for channel `c` is that
+  channel's widest window, so `max_window_size` is still the maximum
+  over the whole table. Rounding to powers of two instead was measured
+  and rejected: on the ten review cells it puts seven above issue #26's
+  own 1.5 gate and five *above* their un-bucketed value, because every
+  600-row window rounds up to a 1024 class. The edges have to be placed
+  against the plan's own size distribution.
+* `plan.window_padding_overhead` is `sum over channels and buckets of
+  slice_length * n_planes / plan.live_row_count` (issue #26, over issue
+  #43's denominator): the row-work a windowed traversal actually does —
+  every `(channel, plane)` step slices a *static* number of rows, its
+  bucket's length — over the row-work it cannot avoid. Before #26 that
+  number was `max_window_size` for every step and the numerator was
+  `n_chan * n_w * max_window_size`; the new form collapses to the old
+  one on any plan with a single bucket per channel, which is what the
+  constant-w fast path builds. Measured on the ten review cells at eps
+  1e-6, float64, seed 0, `hermitian=True`, `n_chan=1`, CI fixture sizes,
+  before → after: EDA2 zenith 1.5709 → 1.0368, EDA2 off30 2.5191 →
+  1.2424, MWA_compact zenith 1.1431 → 1.0007, MWA_compact off30 1.7139 →
+  1.0467, MWA_extended zenith 1.5714 → 1.0371, MWA_extended off30 4.9441
+  → 1.3768, MeerKAT zenith 1.1429 → 1.0005, MeerKAT off30 1.8571 →
+  1.0690, GH200_large zenith 1.2857 → 1.0000, GH200_large off30 2.7389 →
+  1.2861. One consequence to know about: `_CPU_PADDING_CUTOFF` (6.0) and
+  `_GPU_PADDING_CUTOFF` (3.0) are now unreachable on every repository
+  fixture, so the `auto` selector's padding branch no longer fires on
+  any of them.
   `live_row_count` is measured on the **unpadded** support, i.e. from
   a second pair of `searchsorted` calls per channel that see neither
   `boundary_margin` nor the `±1` clamp. That is the whole point: the
@@ -404,10 +456,27 @@ If you touch any of these, run `tests/test_planning.py` and
 | `auto`            | resolves to one below   | matches the resolved choice | matches the resolved choice | **The shipped default** (issue #46). Platform-aware heuristic. |
 | `dense_scan`      | `n_rows * W^2`          | `O(image_size + n_rows)`    | 1.48-1.50x its own forward | The default through v0.1.2. v0.1 `"scan"` is a deprecated alias. |
 | `dense_vmap`      | `n_rows * W^2`          | `O(n_w * image_size)`       | 0.98-1.98x its own forward | v0.1 `"vmap"` is a deprecated alias.           |
-| `windowed_scan`   | `max_window_size * W^2` | `O(image_size + n_rows)`    | 1.46-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
-| `windowed_vmap`   | `max_window_size * W^2` | `O(n_w * image_size)`       | 0.98-1.98x its own forward | v0.1.1; rare wins, mostly for completeness.    |
+| `windowed_scan`   | `bucket_length * W^2`   | `O(image_size + n_rows)`    | 1.46-1.50x its own forward | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `windowed_vmap`   | `bucket_length * W^2`   | `O(n_w * image_size + padded_rows)` | 0.98-1.98x its own forward | v0.1.1; rare wins, mostly for completeness.    |
 | `chunked`         | `n_rows * W^2`          | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward | issue #25; takes the static `w_chunk` (default 32). |
-| `windowed_chunked`| `max_window_size * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward | issue #25; the windowed half of the same knob. |
+| `windowed_chunked`| `bucket_length * W^2`   | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward | issue #25; the windowed half of the same knob. |
+
+Since issue #26 the windowed rows are `bucket_length`, not
+`max_window_size`: each plane slices its own size class's length (at most
+four per channel), which is what took the padded row-work on the review
+fixtures from 1.14-4.94x the irreducible work to 1.00-1.38x. The
+per-bucket loop still branches on nothing but `w_chunk`, and a plan with
+one bucket per channel runs the pre-#26 program. `windowed_vmap`'s
+forward no longer builds one `(n_rows,)` input-order vector per plane and
+sums the stack — it scatter-adds each bucket's
+`(n_planes, bucket_length)` block into a sorted-row carry, so its
+transient scales with the padded row-work rather than with `n_w * n_rows`.
+Measured forward `temp_size_in_bytes` on a 4000-row, 16², 138-plane
+fixture (float64, eps 1e-6, `hermitian=True`, `max_window_size` 1072 of
+4000 rows): 13,565,952 B before, 5,389,696 B with the scatter-add alone,
+1,097,136 B with bucketing as well. `windowed_scan`'s peak is one
+bucket's slice and so is set by the *widest* bucket — it does not fall,
+and must not rise: 128,032 B → 128,224 B on the same fixture.
 
 The last two are not a fifth and sixth algorithm — they are the *general
 form of the other four*, and the other four are values of `w_chunk`.

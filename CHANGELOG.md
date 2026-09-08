@@ -56,6 +56,17 @@ tagged or released, so its changes appear here for the first time; they are mark
   ([#23](https://github.com/chrisfinlay/jax-nufft/issues/23),
   [PR #42](https://github.com/chrisfinlay/jax-nufft/pull/42))
 
+- **`window_padding_overhead` now measures the *bucketed* row-work**, `sum(slice_length ×
+  n_planes) / live_row_count` instead of `n_chan × n_w × max_window_size / live_row_count`.
+  Values on this scale are not comparable with those from before this change; the old figure is
+  still recomputable from the plan, because `max_window_size` is unchanged. Two things follow for
+  code that reads the plan: `WGridderPlan` gains the static `window_buckets` and
+  `max_window_size_per_chan` and a tenth leaf `window_plane_order`, and the `auto` selector's
+  padding branch (`_CPU_PADDING_CUTOFF` 6.0, `_GPU_PADDING_CUTOFF` 3.0) no longer fires on any
+  repository fixture, so plans that used to fall back to a dense strategy on a high padding figure
+  now stay windowed.
+  ([#26](https://github.com/chrisfinlay/jax-nufft/issues/26))
+
 ### Added
 
 - **`divide_by_n` on both operators.** `dirty2vis` and `vis2dirty` each take a keyword-only
@@ -134,6 +145,51 @@ tagged or released, so its changes appear here for the first time; they are mark
   scan nor vmap is its own change; until then the curve is measured out-of-band and published
   above. Issue #25 is therefore **not fully closed** by this entry.
   ([#25](https://github.com/chrisfinlay/jax-nufft/issues/25))
+
+- **The windowed strategies bucket their w-planes by window size.** Each channel's planes are
+  sorted into at most four size classes, placed by an exact dynamic program over that channel's
+  own padded window lengths, and each class is a sub-loop with its own static slice length — so a
+  plane whose window holds 8 rows no longer reads 155. The class table is per channel, so a
+  high-frequency channel (narrower windows) is no longer charged the plan-wide maximum.
+
+  Padded row-work over irreducible row-work on the ten review cells (eps 1e-6, float64, seed 0,
+  `hermitian=True`, `n_chan = 1`, CI fixture sizes), before → after:
+
+  | fixture | before | after | classes |
+  |---|---:|---:|---:|
+  | EDA2 zenith | 1.5709 | 1.0368 | 4 |
+  | EDA2 off30 | 2.5191 | 1.2424 | 4 |
+  | MWA_compact zenith | 1.1431 | 1.0007 | 2 |
+  | MWA_compact off30 | 1.7139 | 1.0467 | 4 |
+  | MWA_extended zenith | 1.5714 | 1.0371 | 4 |
+  | MWA_extended off30 | 4.9441 | **1.3768** | 4 |
+  | MeerKAT zenith | 1.1429 | 1.0005 | 2 |
+  | MeerKAT off30 | 1.8571 | 1.0690 | 4 |
+  | GH200_large zenith | 1.2857 | 1.0000 | 4 |
+  | GH200_large off30 | 2.7389 | 1.2861 | 4 |
+
+  Runtime, CPU `nthreads=1`, macOS arm64 10-core, median of 9 interleaved calls with the plan and
+  one warm-up outside the timer (AGENTS.md §6). MWA_extended off30 (`n_w = 134`): forward
+  `windowed_vmap` 107.2 → 96.8 ms and `windowed_chunked(32)` 111.5 → 107.3 ms; adjoint
+  `windowed_scan` 170.6 → 153.8 ms, `windowed_vmap` 145.0 → 128.4 ms, `windowed_chunked(32)`
+  137.3 → 125.4 ms. MeerKAT off30 (`n_w = 13`): forward `windowed_vmap` 11.60 → 8.96 ms and
+  `windowed_chunked(32)` 11.66 → 8.98 ms. Against the best dense strategy on the same cell,
+  `windowed_vmap` and `windowed_chunked` land at 0.85–1.07× on all four (fixture, operator) cells;
+  `windowed_scan` is 1.16–1.44×, which is the scan family's own standing gap on these two
+  fixtures — `dense_scan` is 1.28–1.47× of the best dense strategy on the same runs — and not
+  something bucketing moves.
+
+  `windowed_vmap`'s forward also stopped materialising one `(n_rows,)` vector per plane, which
+  cost `n_w × n_rows` whatever the windows held; it scatter-adds each class's
+  `(n_planes, slice_length)` block into a sorted-row carry instead. Forward
+  `temp_size_in_bytes` on a 4000-row, 16², 138-plane fixture (float64, eps 1e-6): 13,565,952 B →
+  5,389,696 B from the scatter-add alone → 1,097,136 B with bucketing. A scan holds one class's
+  slice at a time, so `windowed_scan`'s peak is set by the widest class and does not fall
+  (128,032 B → 128,224 B on the same fixture).
+
+  **Not done:** the definition of done's GPU gate, which needs a CUDA jax-finufft build. The CPU
+  gates above are met; the GPU cell is pending.
+  ([#26](https://github.com/chrisfinlay/jax-nufft/issues/26))
 
 - **A constant-w fast path.** When every row shares one `w` in wavelengths, the plan collapses to a
   single plane (`plan.n_w == 1`, `plan.is_constant_w`). *(v0.1.2 series)*
