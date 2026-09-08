@@ -107,6 +107,14 @@ small plan does, and ``chunked(n_w) == dense_vmap`` forces it to exist,
 because a user pinning ``w_chunk=32`` must get an answer on a plan with
 ``n_w = 11``.
 
+"Short fixture" is load-bearing in both sentences: the *repository* is not all
+under 32. Measured over every telescope in ``tests/conftest.py`` at both
+pointings (seed 0, eps 1e-6, float64, hermitian, one channel) the plane counts
+are EDA2 11 / **56**, GH200_large 9 / 26, MWA_compact 8 / 12, MWA_extended
+11 / **134**, MeerKAT 8 / 13. Two of the ten are at or above 32, and one of
+them -- MWA_extended off30 -- is the long fixture this module's memory,
+endpoint and padding tests are measured on precisely because it is.
+
 What is *not* claimed here
 --------------------------
 Timing. The definition of done's "``chunked(32)`` within 1.2x of
@@ -242,8 +250,10 @@ def _chunk_sizes(n_w: int) -> tuple[int, ...]:
     every ``n_w >= 3`` -- it is the element that *guarantees* the padding path
     is exercised with more than one chunk, rather than hoping some fixture
     happens to be indivisible. ``max(32, n_w + 3)`` is the spec default 32 on
-    every CI-sized plan (all of which have ``n_w < 32``) and stays above ``n_w``
-    if a future fixture is larger.
+    every *short* fixture this module uses (all of which have ``n_w < 32`` --
+    see the module docstring; the repository as a whole does not, EDA2 off30
+    being 56 and MWA_extended off30 134) and stays above ``n_w`` on the long
+    fixture and on any future one that is larger.
 
     ``test_chunk_sizes_span_the_curve`` pins these properties directly, so a
     later edit to this helper that quietly made every size a divisor of ``n_w``
@@ -510,8 +520,10 @@ def test_both_operators_take_a_keyword_only_w_chunk_defaulting_to_32(op: str) ->
     a positional fifth argument would be a silent hazard next to ``weights``
     on ``vis2dirty``. The default is the issue's own spec value; it is pinned
     here because it is also the value the definition of done's memory gate is
-    written against, and because on every CI-sized fixture (``n_w < 32``, see
-    the module docstring) it is the ``w_chunk > n_w`` path.
+    written against, and because on every *short* fixture (``n_w < 32``, see
+    the module docstring) it is the ``w_chunk > n_w`` path -- while on the
+    module's long fixture, MWA_extended off30, it is not (``n_w = 134``, five
+    chunks of 27), so both regimes are covered.
     """
     params = inspect.signature(_op_fn(op)).parameters
     assert "w_chunk" in params, (
@@ -573,6 +585,117 @@ def test_chunk_sizes_span_the_curve() -> None:
             "padding path (n_w % w_chunk != 0) would not be exercised at all"
         )
         assert [s for s in sizes if s > n_w], f"n_w={n_w}: no chunk size above n_w"
+
+
+# The (n_w, w_chunk) grid the balancing gate below runs over. ``n_w`` covers
+# every fixture plane count this repository produces (8-134 at eps 1e-6, plus
+# the eps 1e-4/1e-8 neighbours and two larger values for headroom); ``w_chunk``
+# covers the spec default, its neighbours, and the sizes the README table and
+# ``_plane_chunk_grid``'s own docstring quote.
+_BALANCE_N_W = (6, 8, 9, 11, 12, 13, 15, 16, 19, 26, 27, 33, 56, 64, 100, 134, 140, 261, 515)
+_BALANCE_W_CHUNK = (2, 3, 4, 5, 7, 8, 16, 24, 32, 48, 64, 128)
+
+
+def test_the_chunk_grid_is_balanced_so_padding_stays_below_the_chunk_count() -> None:
+    """``_plane_chunk_grid`` spreads the planes evenly -- the deviation from the issue's plan.
+
+    Issue #25's implementation plan says "pad ``w_centers`` to a multiple of
+    ``w_chunk``". The shipped loop does not: it takes the ``n_chunks =
+    ceil(n_w / w_chunk)`` that number implies and then *rebalances* to
+    ``chunk = ceil(n_w / n_chunks) <= w_chunk``, so the padding is at most
+    ``n_chunks - 1`` planes rather than up to ``w_chunk - 1``.
+
+    That deviation is the whole subject of ``_plane_chunk_grid``'s docstring,
+    of the README's `w_chunk` section and of AGENTS.md §5, and it is worth
+    real time -- a padded plane runs a full 2D NUFFT whose result is then
+    multiplied by zero, and the unbalanced form measured 1.24x `dense_vmap`
+    at `w_chunk = 32` and 1.44x at 64 on MWA_extended off30 against the
+    balanced 1.04-1.16x. **Nothing else in this suite pins it.** Reverting
+    the helper's second line to ``chunk = w_chunk`` leaves every other test
+    in this module, in ``test_strategies_equivalent.py`` and in
+    ``test_constant_w.py`` passing: the values are unchanged (padding is
+    masked to an exact zero either way), and the memory gate above has
+    ``2 * w_chunk * image`` of headroom, which an unbalanced chunk of exactly
+    ``w_chunk`` still fits inside. Only the padding count sees it, so the
+    padding count is what this asserts.
+
+    Four properties, all of which the unbalanced form breaks or trivialises:
+
+    1. ``pad <= n_chunks - 1`` -- the balancing claim itself, and the only
+       one ``chunk = w_chunk`` actually fails.
+    2. ``chunk <= w_chunk`` -- the *upper bound* the public docstrings
+       promise. ``chunk = w_chunk`` satisfies this, so it is not the
+       discriminating gate, but a "balancing" that overshot the caller's
+       budget would be worse than no balancing at all.
+    3. ``n_chunks == ceil(n_w / w_chunk)`` -- the balancing must spend its
+       budget on smaller chunks, not on *more* of them; a grid that ran more
+       chunks would pay more FINUFFT plans and sorts for the same memory.
+    4. ``n_chunks * chunk >= n_w`` and ``pad == n_chunks * chunk - n_w`` --
+       every real plane is covered exactly once and the reported padding is
+       the real padding.
+    """
+    grid = wgridder._plane_chunk_grid
+    saved = 0
+    for n_w in _BALANCE_N_W:
+        for w_chunk in _BALANCE_W_CHUNK:
+            if w_chunk >= n_w:
+                continue  # the unpadded `w_chunk >= n_w` branch, not this loop
+            n_chunks, chunk, pad = grid(n_w, w_chunk)
+            want_chunks = -(-n_w // w_chunk)
+            assert n_chunks == want_chunks, (
+                f"n_w={n_w}, w_chunk={w_chunk}: {n_chunks} chunks, expected "
+                f"ceil({n_w}/{w_chunk}) = {want_chunks}. Balancing must reduce the "
+                "chunk size, not increase the number of FINUFFT plans."
+            )
+            assert chunk <= w_chunk, (
+                f"n_w={n_w}, w_chunk={w_chunk}: chunk={chunk} exceeds the caller's "
+                "w_chunk, which both operator docstrings promise is an upper bound "
+                "on the planes held live."
+            )
+            assert n_chunks * chunk >= n_w, (
+                f"n_w={n_w}, w_chunk={w_chunk}: {n_chunks} x {chunk} = "
+                f"{n_chunks * chunk} does not cover {n_w} planes"
+            )
+            assert pad == n_chunks * chunk - n_w, (
+                f"n_w={n_w}, w_chunk={w_chunk}: reported pad={pad}, actual {n_chunks * chunk - n_w}"
+            )
+            assert pad <= n_chunks - 1, (
+                f"n_w={n_w}, w_chunk={w_chunk}: {pad} padded planes over {n_chunks} "
+                f"chunks of {chunk}. The balanced grid pads at most n_chunks - 1 = "
+                f"{n_chunks - 1}; padding to a multiple of w_chunk (issue #25's plan "
+                f"verbatim, chunk = w_chunk) would pad "
+                f"{n_chunks * w_chunk - n_w} here. Each padded plane is a full 2D "
+                "NUFFT multiplied by zero -- see wgridder._plane_chunk_grid."
+            )
+            saved += (n_chunks * w_chunk - n_w) - pad
+
+    # Anti-vacuity: the gate must be discriminating on this grid, i.e. the
+    # unbalanced form really would pad more somewhere. Without this a
+    # _plane_chunk_grid that happened to be exact everywhere on the grid
+    # would pass the loop above while asserting nothing about balancing.
+    assert saved > 0, (
+        "no cell in the grid distinguishes the balanced chunk from chunk = w_chunk, "
+        "so this test cannot fail under the reversion it exists to catch"
+    )
+
+
+def test_the_documented_chunk_grids_are_the_ones_the_loop_runs() -> None:
+    """The literal grids quoted in the docs, pinned as values.
+
+    ``_plane_chunk_grid``'s docstring, both operator docstrings, the README
+    and AGENTS.md all quote "5 chunks of 27" for MWA_extended off30's
+    ``n_w = 134`` at ``w_chunk = 32``, and "3 chunks of 45" at 64. A prose
+    claim about a number is worth what a test of that number is worth.
+    """
+    assert wgridder._plane_chunk_grid(134, 32) == (5, 27, 1), (
+        "MWA_extended off30 at the default w_chunk: the docs say 5 chunks of 27 "
+        "with one padded plane"
+    )
+    assert wgridder._plane_chunk_grid(134, 64) == (3, 45, 1), (
+        "the docs say 3 chunks of 45 with one padded plane"
+    )
+    # EDA2 off30, the other fixture the default does not clamp on.
+    assert wgridder._plane_chunk_grid(56, 32) == (2, 28, 0)
 
 
 # ---------------------------------------------------------------------------

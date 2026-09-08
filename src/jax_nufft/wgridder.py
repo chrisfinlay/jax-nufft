@@ -132,10 +132,13 @@ _CHUNKED_W_STRATEGIES = ("chunked", "windowed_chunked")
 # (issue #25's implementation plan, item 1). It is a memory/compute knob, not
 # a tuned optimum: 32 planes of a 3600^2 complex128 image is 3.2 GB, against
 # the 29.6 GB the whole plane stack costs on MWA_extended off30 at that size
-# (issue #25's own measurement on a GH200). Note that every fixture in this
-# repository has ``n_w < 32``, so the default is the ``w_chunk >= n_w`` path
-# -- i.e. ``dense_vmap`` -- on all of them; it starts to bite only at
-# realistic image sizes.
+# (issue #25's own measurement on a GH200). Measured over every telescope in
+# ``tests/conftest.py`` at both pointings (seed 0, eps 1e-6, float64,
+# hermitian, one channel), ``n_w`` is 8-26 on eight of the ten fixtures and
+# 56 (EDA2 off30) / 134 (MWA_extended off30) on the other two, so the default
+# is the ``w_chunk >= n_w`` path -- i.e. ``dense_vmap`` -- on eight of them
+# and a genuine 2-5 chunk loop on the other two. It starts to bite in earnest
+# only at realistic image sizes.
 DEFAULT_W_CHUNK = 32
 
 # Smallest epsilon FINUFFT can honour in double precision; asking for less
@@ -180,10 +183,12 @@ def _canonicalise_w_strategy(
 
     ``"auto"`` is resolved here -- in the public wrapper, before the JIT
     boundary -- via :func:`_auto_w_strategy`. The static arg fed into
-    :func:`_dirty2vis_jit` / :func:`_vis2dirty_jit` is therefore always
-    one of the four canonical names, so two callers using ``"auto"`` on
-    the same plan still share a JIT cache entry with each other and with
-    the explicit canonical caller.
+    :func:`_dirty2vis_jit` / :func:`_vis2dirty_jit` is therefore always a
+    member of ``_CANONICAL_W_STRATEGIES`` (six names since issue #25; the
+    heuristic itself still only ever returns one of the original four, since
+    picking a chunk size needs a memory budget it is not given), so two
+    callers using ``"auto"`` on the same plan still share a JIT cache entry
+    with each other and with the explicit canonical caller.
 
     Emits :class:`DeprecationWarning` for the v0.1 names.
     """
@@ -260,6 +265,23 @@ def _resolve_w_chunk(w_strategy: WStrategy, w_chunk: Any, plan: WGridderPlan) ->
 
     Runs in the public wrapper, ahead of the JIT boundary, so the value
     reaching the primitive is always a concrete ``int`` in ``[1, n_w]``.
+
+    The one caveat on "bit-identical", and it is not this function's
+    ---------------------------------------------------------------
+    The identity is over the *plane loop*; it does not extend to the other
+    resolved statics. On a constant-w plan (``n_w == 1``) with ``n_rows >=
+    _NTHREADS_SMALL_N_ROWS`` and the shipped ``nthreads=None``, every strategy
+    here resolves to ``w_chunk = 1``, but :func:`_resolve_nthreads` then
+    answers ``1`` for ``dense_scan`` and for ``chunked`` (whose ``w_chunk`` is
+    now ``1``) and ``0`` for ``dense_vmap``. Two different FINUFFT thread
+    counts is two different reductions: measured on a coplanar-uvw plan at
+    64^2, eps 1e-6, float64, 120000 rows, ``chunked(32)`` and ``dense_vmap``
+    differ by a relative 1.8e-13 while ``chunked(1)`` and ``dense_scan`` stay
+    bit-identical. The cause predates issue #25 -- ``dense_scan`` and
+    ``dense_vmap`` are already the same computation at ``n_w == 1`` and
+    already disagree on ``nthreads`` -- and #25's aliasing is what exposes it.
+    Pin ``nthreads`` explicitly (as ``tests/test_chunked_strategy.py`` does)
+    for the identity to hold unconditionally.
     """
     value = _validate_w_chunk(w_chunk)
     if w_strategy in ("dense_scan", "windowed_scan"):
@@ -343,10 +365,12 @@ def _resolve_nthreads(
       * otherwise ``w_strategy`` is canonicalised via
         :func:`_canonicalise_w_strategy` (resolving ``"auto"`` and the
         deprecated ``"scan"`` / ``"vmap"`` aliases the same way the
-        strategy dispatch itself does) *unless it is already one of the
-        four canonical names*, in which case it is used as-is and the
-        canonicalisation is skipped entirely -- see the note below on why
-        that skip is a correctness guarantee rather than an optimisation.
+        strategy dispatch itself does) *unless it is already in
+        ``_CANONICAL_W_STRATEGIES``* -- six names since issue #25, i.e. the
+        two chunked ones as well as the original four -- in which case it is
+        used as-is and the canonicalisation is skipped entirely; see the note
+        below on why that skip is a correctness guarantee rather than an
+        optimisation.
         Then:
           - if ``n_rows < _NTHREADS_SMALL_N_ROWS``, the plane loop is short
             enough that spinning up a thread pool per call isn't worth it
@@ -382,7 +406,7 @@ def _resolve_nthreads(
 
     That is a guarantee, not a micro-optimisation. Re-canonicalising a
     canonical name happens to be a no-op *today* -- the function is a fixed
-    point on those four strings -- but relying on that makes an invariant
+    point on all six of those strings -- but relying on that makes an invariant
     of what is really an implementation detail of another function: any
     future change that gave ``_canonicalise_w_strategy`` a plan-dependent
     branch, or made it re-consult the heuristic, would silently start
@@ -1194,14 +1218,17 @@ def _sum_over_planes(
     strategies, the two chunked ones and the windowed adjoint run it, and
     ``w_chunk`` is the only thing it branches on.
 
-    Three branches, and two of them are the pre-#25 code verbatim:
+    Three branches, and two of them are the pre-#25 code verbatim on every
+    plan with ``n_w > 1`` (see the note on ``n_w == 1`` below):
 
     ``w_chunk >= n_w``
         one ``vmap`` over every plane and one sum -- the ``*_vmap``
         strategies, and what ``chunked`` does whenever the caller's chunk size
-        reaches the plane count (which, on every fixture in this repository,
-        the default 32 does). No padding is built, so an over-size ``w_chunk``
-        costs nothing rather than running empty planes.
+        reaches the plane count (which the default 32 does on eight of the ten
+        fixtures in this repository; the exceptions are EDA2 off30 at
+        ``n_w = 56`` and MWA_extended off30 at ``n_w = 134``, which run 2 and
+        5 chunks respectively). No padding is built, so an over-size
+        ``w_chunk`` costs nothing rather than running empty planes.
     ``w_chunk == 1``
         ``lax.scan`` over planes with an image-sized (or row-sized) carry --
         the ``*_scan`` strategies.
@@ -1217,6 +1244,28 @@ def _sum_over_planes(
     ``chunked(1)`` and ``dense_scan`` bit-identical rather than merely equal
     to 1e-11, and it keeps an over-size ``w_chunk`` from paying for padding
     planes it does not need.
+
+    The one plan class where "the pre-#25 code verbatim" does *not* hold
+    -------------------------------------------------------------------
+    The branches are tested in the order written, so ``w_chunk >= n_w`` is
+    reached before ``w_chunk == 1``. On the constant-w fast path
+    (``plan.n_w == 1``, ``plan.is_constant_w``) the scan strategies resolve to
+    ``w_chunk = 1``, which is also ``>= n_w = 1``, so they take the *vmap*
+    branch here where at v0.1.2 they took ``lax.scan``. The values are
+    bit-identical (a scan over one element and a vmap over one element sum the
+    same single term) and the emitted program is strictly smaller -- measured
+    on a coplanar-uvw plan at 64^2, eps 1e-6, float64, ``n_rows`` in
+    {96, 120000}: 24 of 82 recorded optimised-HLO keys differ, all of them
+    ``dense_scan`` / ``windowed_scan`` / ``auto`` entries, with byte-identical
+    results on every cell.
+
+    No branch order fixes both ends. At ``n_w == 1`` the two pre-#25 names
+    compiled two *different* programs for what is arithmetically the same sum,
+    and one unified loop cannot be both; reordering to put ``w_chunk == 1``
+    first would simply move the discrepancy onto ``dense_vmap`` /
+    ``chunked(n_w)``, which is the worse trade (it is the endpoint the memory
+    story is told against). The reordering is therefore deliberate and the
+    claim is scoped rather than the code changed.
     """
     n_w = int(xs[0].shape[0])
     if w_chunk >= n_w:
@@ -1768,15 +1817,28 @@ def dirty2vis(
         plane loop then branches on nothing else. So the two chunked names
         are a continuum whose ends are the four old ones, and a call at
         either end is bit-identical to the old name for it on a
-        deterministic backend.
+        deterministic backend -- at equal ``nthreads``. With ``nthreads``
+        left at its default the two ends can resolve to different thread
+        counts on a constant-w plan (``n_w == 1``) with ``n_rows >= 100000``,
+        where the ``chunked`` name gets the scan family's ``1`` and
+        ``dense_vmap`` gets ``0``; measured there, ``chunked(32)`` and
+        ``dense_vmap`` differ by a relative 1.8e-13. Pin ``nthreads`` if you
+        depend on the identity.
 
         Transient memory goes as ``w_chunk`` rather than as ``n_w``, and
         compute goes the other way (one FINUFFT plan and sort per chunk
-        instead of per plane). Values above ``plan.n_w`` are clamped to it,
-        which is what the default 32 does on every fixture in this
-        repository (all have ``n_w < 32``); there is no padding and no
-        wasted plane in that regime, and such calls share one JIT cache
-        entry.
+        instead of per plane). Values above ``plan.n_w`` are clamped to it;
+        in that regime there is no padding and no wasted plane, and such
+        calls share one JIT cache entry.
+
+        Whether the default 32 lands in that regime is a property of the
+        plan, not of this repository's fixtures being small. Measured over
+        every telescope in ``tests/conftest.py`` at both pointings (seed 0,
+        eps 1e-6, float64, hermitian, one channel): EDA2 zenith 11 /
+        off30 **56**, GH200_large zenith 9 / off30 26, MWA_compact zenith 8 /
+        off30 12, MWA_extended zenith 11 / off30 **134**, MeerKAT zenith 8 /
+        off30 13. So ``w_chunk = 32`` clamps to ``n_w`` on eight of the ten
+        and runs a real chunk loop -- with padding -- on the other two.
 
         It is an **upper bound** on the planes held live, not an exact
         count: the loop runs ``ceil(n_w / w_chunk)`` chunks of
@@ -1788,7 +1850,22 @@ def dirty2vis(
         :func:`_plane_chunk_grid`. On MWA_extended off30 at 256^2
         (``n_w = 134``) ``w_chunk = 32`` therefore runs 5 chunks of 27 and
         costs 28.3 x image of transient against ``dense_vmap``'s 135.2 x
-        (forward) and 268.0 x (adjoint), for 1.04x / 0.98x of its time.
+        (forward) and 268.0 x (adjoint), for 1.01-1.12x / 0.94-1.26x of its
+        time over seven interleaved passes -- a spread to read to one
+        significant figure, since the ``chunked(1)`` control (the same
+        compiled program as ``dense_scan``) spans 0.92-1.00x against it over
+        the same passes.
+
+        At realistic size the trade is the point rather than the noise.
+        Measured on one GH200 at 3600^2 / 1219200 rows (MWA_extended off30,
+        ``n_w = 140``, eps 1e-6, float64, one channel): transient 30 290 MB
+        for ``dense_vmap`` against 6 256 MB at ``w_chunk = 32`` (4.8x less)
+        for 1.27x the forward time and 1.17x the adjoint, 1 929 MB at
+        ``w_chunk = 8`` (15.7x less) for 1.73x / 1.53x, and 414 MB on
+        ``dense_scan`` (73x less) for 2.35x / 1.94x. See README.md's
+        ``w_chunk`` section for the full curve; note that the 1.27x forward
+        cell **breaches** issue #25's "within 1.2x of ``dense_vmap``" GPU
+        gate as that gate is written.
 
         Static (part of the JIT cache key -- it sets the shape of every
         intermediate in the plane loop), and carried in
@@ -2201,15 +2278,28 @@ def vis2dirty(
         plane loop then branches on nothing else. So the two chunked names
         are a continuum whose ends are the four old ones, and a call at
         either end is bit-identical to the old name for it on a
-        deterministic backend.
+        deterministic backend -- at equal ``nthreads``. With ``nthreads``
+        left at its default the two ends can resolve to different thread
+        counts on a constant-w plan (``n_w == 1``) with ``n_rows >= 100000``,
+        where the ``chunked`` name gets the scan family's ``1`` and
+        ``dense_vmap`` gets ``0``; measured there, ``chunked(32)`` and
+        ``dense_vmap`` differ by a relative 1.8e-13. Pin ``nthreads`` if you
+        depend on the identity.
 
         Transient memory goes as ``w_chunk`` rather than as ``n_w``, and
         compute goes the other way (one FINUFFT plan and sort per chunk
-        instead of per plane). Values above ``plan.n_w`` are clamped to it,
-        which is what the default 32 does on every fixture in this
-        repository (all have ``n_w < 32``); there is no padding and no
-        wasted plane in that regime, and such calls share one JIT cache
-        entry.
+        instead of per plane). Values above ``plan.n_w`` are clamped to it;
+        in that regime there is no padding and no wasted plane, and such
+        calls share one JIT cache entry.
+
+        Whether the default 32 lands in that regime is a property of the
+        plan, not of this repository's fixtures being small. Measured over
+        every telescope in ``tests/conftest.py`` at both pointings (seed 0,
+        eps 1e-6, float64, hermitian, one channel): EDA2 zenith 11 /
+        off30 **56**, GH200_large zenith 9 / off30 26, MWA_compact zenith 8 /
+        off30 12, MWA_extended zenith 11 / off30 **134**, MeerKAT zenith 8 /
+        off30 13. So ``w_chunk = 32`` clamps to ``n_w`` on eight of the ten
+        and runs a real chunk loop -- with padding -- on the other two.
 
         It is an **upper bound** on the planes held live, not an exact
         count: the loop runs ``ceil(n_w / w_chunk)`` chunks of
@@ -2221,7 +2311,22 @@ def vis2dirty(
         :func:`_plane_chunk_grid`. On MWA_extended off30 at 256^2
         (``n_w = 134``) ``w_chunk = 32`` therefore runs 5 chunks of 27 and
         costs 28.3 x image of transient against ``dense_vmap``'s 135.2 x
-        (forward) and 268.0 x (adjoint), for 1.04x / 0.98x of its time.
+        (forward) and 268.0 x (adjoint), for 1.01-1.12x / 0.94-1.26x of its
+        time over seven interleaved passes -- a spread to read to one
+        significant figure, since the ``chunked(1)`` control (the same
+        compiled program as ``dense_scan``) spans 0.92-1.00x against it over
+        the same passes.
+
+        At realistic size the trade is the point rather than the noise.
+        Measured on one GH200 at 3600^2 / 1219200 rows (MWA_extended off30,
+        ``n_w = 140``, eps 1e-6, float64, one channel): transient 30 290 MB
+        for ``dense_vmap`` against 6 256 MB at ``w_chunk = 32`` (4.8x less)
+        for 1.27x the forward time and 1.17x the adjoint, 1 929 MB at
+        ``w_chunk = 8`` (15.7x less) for 1.73x / 1.53x, and 414 MB on
+        ``dense_scan`` (73x less) for 2.35x / 1.94x. See README.md's
+        ``w_chunk`` section for the full curve; note that the 1.27x forward
+        cell **breaches** issue #25's "within 1.2x of ``dense_vmap``" GPU
+        gate as that gate is written.
 
         Static (part of the JIT cache key -- it sets the shape of every
         intermediate in the plane loop), and carried in

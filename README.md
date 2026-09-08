@@ -615,11 +615,11 @@ four, and the two v0.1 names are kept as deprecated aliases:
 | `w_strategy`      | Per-plane work               | Peak transient memory       | `grad` memory               | Notes                                          |
 |-------------------|------------------------------|-----------------------------|-----------------------------|------------------------------------------------|
 | `"dense_scan"`    | `n_rows * W^2`               | `O(image_size + n_rows)`    | 1.48-1.50x its own forward  | the default through v0.1.2; v0.1 `"scan"` is a deprecated alias. |
-| `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | ~1x its own forward         | v0.1 `"vmap"` is a deprecated alias.           |
-| `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | 1.48-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
-| `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | ~1x its own forward         | v0.1.1; rare wins, mostly for completeness.    |
-| `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | ~1x its own forward         | v0.1.3 (#25); takes `w_chunk` (default 32).    |
-| `"windowed_chunked"` | `max_window_size * W^2`   | `O(w_chunk * image_size)`   | ~1x its own forward         | v0.1.3 (#25); the windowed half of the same knob. |
+| `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1 `"vmap"` is a deprecated alias.           |
+| `"windowed_scan"` | `max_window_size * W^2`      | `O(image_size + n_rows)`    | 1.46-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
+| `"windowed_vmap"` | `max_window_size * W^2`      | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1.1; rare wins, mostly for completeness.    |
+| `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward  | v0.1.3 (#25); takes `w_chunk` (default 32).    |
+| `"windowed_chunked"` | `max_window_size * W^2`   | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward  | v0.1.3 (#25); the windowed half of the same knob. |
 | `"auto"`          | resolves to one of the first four | matches the resolved choice | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
@@ -632,7 +632,13 @@ w-plane loop scans over chunks of at most `w_chunk` planes with a `vmap`
 inside each chunk, and `dense_scan` / `windowed_scan` **are** `w_chunk = 1`
 while `dense_vmap` / `windowed_vmap` **are** `w_chunk = n_w`. They share the
 code, not merely the answer, so a call at either end is bit-identical to the
-old name for it on a deterministic backend.
+old name for it on a deterministic backend *at equal `nthreads`*. The one
+exception is worth stating: on a constant-w plan (`n_w == 1`) with
+`n_rows >= 100_000` and `nthreads` left at its default, the `chunked` name
+resolves to `1` thread and `dense_vmap` to `0`, and two thread counts is two
+reductions — measured on a coplanar-uvw plan at 64², eps 1e-6, float64,
+120 000 rows, `chunked(32)` and `dense_vmap` differ by a relative 1.8e-13
+there. Pass an explicit `nthreads` if you depend on the identity.
 
 ```python
 # 32 planes live at once instead of all n_w of them.
@@ -646,18 +652,123 @@ live at once, not an exact count: the loop runs `ceil(n_w / w_chunk)` chunks
 of `ceil(n_w / n_chunks) <= w_chunk` planes, so at most `n_chunks - 1` planes
 of padding are run and thrown away rather than up to `w_chunk - 1`.
 
+Whether the default clamps is a property of the plan. Measured over every
+telescope in `tests/conftest.py` at both pointings (seed 0, eps 1e-6,
+float64, hermitian, one channel), `n_w` is EDA2 11 / **56**, GH200_large
+9 / 26, MWA_compact 8 / 12, MWA_extended 11 / **134**, MeerKAT 8 / 13
+(zenith / off30) — so `w_chunk = 32` clamps to `dense_vmap` on eight of the
+ten and runs a genuine 2- or 5-chunk loop, with one padded plane, on the
+other two. At the realistic sizes below it never clamps.
+
 Measured on MWA_extended off30 (256&sup2;, 600 rows, `n_w = 134`, float64,
 eps 1e-6, `nthreads=1`, single channel, `memory_analysis().temp_size_in_bytes`
 on the CPU backend), in units of one complex image, with wall-clock as a
 ratio against `dense_vmap` on the same machine (10-core Apple M-series, plan
-and warm-up outside the timer, 9-11 interleaved rounds, median):
+and warm-up outside the timer, median of the interleaved rounds within a
+pass, then the span over **7 independent passes** — 4 of 11 rounds and 3 of
+15):
 
 | | `dense_scan` | `chunked(8)` | `chunked(16)` | `chunked(32)` | `dense_vmap` |
 |---|---:|---:|---:|---:|---:|
 | forward temp | 2.01x | 9.08x | 16.15x | 28.26x | 135.23x |
 | adjoint temp | 2.01x | 9.01x | 16.01x | 28.01x | 268.00x |
-| forward time | 1.61-1.72x | 1.23-1.26x | 1.09-1.17x | 1.04-1.16x | 1.00x |
-| adjoint time | 1.33-1.41x | 1.13x | 0.99x | 0.98-1.00x | 1.00x |
+| forward time | 1.49-1.70x | 1.10-1.31x | 1.02-1.22x | 1.01-1.12x | 1.00x |
+| adjoint time | 1.29-1.45x | 1.02-1.26x | 0.92-1.14x | 0.94-1.26x | 1.00x |
+
+**Read the time rows to one significant figure, not two.** The suite carries
+its own control — `chunked(1)` is the *same compiled program* as
+`dense_scan`, so their ratio measures nothing but the instrument. Over the
+same 7 passes that ratio spans 0.92-1.00 here, and 0.72-1.06 on the small
+MeerKAT off30 fixture. A ±0.1 resolution on a 256&sup2; / 600-row problem is
+what this machine gives, so the honest reading of the table is "`dense_scan`
+costs about 1.5x, the chunked cells about 1.0-1.3x and get closer to
+`dense_vmap` as `w_chunk` grows", not any particular two-decimal figure. The
+memory rows carry no such caveat: `memory_analysis` is exact and reproduces
+to the byte.
+
+(The two-pass ranges published in the first cut of this table —
+`chunked(8)` 1.23-1.26x forward, `chunked(16)` 1.09-1.17x — sit inside the
+7-pass spans above but implied a precision of ±0.015 that the measurement
+does not have. Widening them, and stating the control, is the correction.)
+
+##### The CPU timing gate, and what it actually demonstrates
+
+Issue #25's definition of done asks for `chunked(32)` within 1.2x of
+`dense_vmap` on the five timing fixtures. Measured over the same 7 passes,
+ratio against `dense_vmap` in the same run (median per pass, span across
+passes):
+
+| fixture | `n_w` | forward | adjoint | |
+|---|---:|---:|---:|---|
+| MWA_extended off30 | 134 | 1.01-1.12x | 0.94-1.26x | real chunking (5 x 27) |
+| MeerKAT off30 | 13 | 0.96-1.08x | 0.96-1.02x | *clamped* — is `dense_vmap` |
+| MWA_compact off30 | 12 | 0.97-1.09x | 0.93-1.03x | *clamped* — is `dense_vmap` |
+| EDA2 zenith | 11 | 0.92-1.03x | 0.91-1.11x | *clamped* — is `dense_vmap` |
+| MWA_extended zenith | 11 | 0.91-1.02x | 0.95-1.02x | *clamped* — is `dense_vmap` |
+
+The gate passes, and **four of the five cells cannot fail it**: their `n_w`
+is under 32, so `w_chunk` clamps to `n_w`, `chunked(32)` *is* `dense_vmap`
+bit for bit, and 1.00x is arithmetic rather than measurement. Only
+MWA_extended off30 tests anything, and there the medians are 1.06x forward
+and 0.96x adjoint — comfortably inside 1.2x. (One adjoint pass of seven read
+1.26x; with a control that spans 0.92-1.00 on the identical program, that is
+the instrument, not the strategy.)
+
+Where chunking is real on all five — `w_chunk = 8` — the picture is
+different and worth stating plainly: forward medians 1.20-1.32x and adjoint
+1.08-1.41x, with individual passes reaching 1.65x (EDA2 zenith, forward) and
+1.74x (EDA2 zenith, adjoint). **A small chunk on a CI-sized plan does not
+meet 1.2x.** That is the trade the knob exists to offer — the caller asked
+for `n_w/8` times less memory — but the DoD's single 1.2x figure describes
+`w_chunk = 32` on plans where 32 exceeds `n_w`, and should not be read as a
+property of chunking in general.
+
+##### On a GPU, at a realistic size
+
+The 256&sup2; table above is the shape of the curve, not its stakes. Measured
+on one GH200 (Daint `nid006544`, single device, eps 1e-6, float64, single
+channel, `hermitian` and `nthreads` at their defaults; `n_pix` chosen as
+`FoV / (lambda / (3 B_max))` rounded to the next 5-smooth size and
+`n_rows = 150 x N_baselines`; temp is
+`memory_analysis().temp_size_in_bytes`, time is the median of 5 with warm-up
+outside the timer and `block_until_ready`):
+
+**MWA_extended off30, 3600&sup2; / 1 219 200 rows, `n_w = 140`** (complex
+image 197.8 MB) — the cell the issue was opened about:
+
+| | temp | vs `dense_vmap` | forward time | adjoint time |
+|---|---:|---:|---:|---:|
+| `dense_scan`    |    414 MB | **73.1x less** | 2.35x | 1.94x |
+| `chunked(8)`    |  1 929 MB | 15.7x less | 1.73x | 1.53x |
+| `chunked(16)`   |  3 659 MB |  8.3x less | 1.35x | 1.24x |
+| `chunked(32)`   |  6 256 MB |  4.8x less | **1.27x** | 1.17x |
+| `chunked(64)`   | 10 367 MB |  2.9x less | 1.10x | 1.06x |
+| `dense_vmap`    | 30 290 MB |  1.0x      | 1.00x | 1.00x |
+
+The curve is the deliverable: 30 GB of transient — which is why this cell
+needed a 96 GB GH200 at all — becomes **6.3 GB at `w_chunk = 32`** for 27%
+more forward time, or 1.9 GB at `w_chunk = 8` for 73% more, or 0.4 GB on
+`dense_scan` for 2.35x. Pick the point your device has room for.
+
+**The definition of done's GPU gate is breached on that one cell, as
+written.** The gate asks for `chunked(32)` within 1.2x of `dense_vmap` on
+every cell of the sweep; the MWA_extended off30 *forward* measures 1.27x.
+Its adjoint (1.17x) and every other cell measured pass. The gate is not
+restated to fit — 1.27x is the number, and whether 27% of the time for 4.8x
+of the memory is the right trade is a judgement the curve above lets a
+reader make for themselves.
+
+Two of the four fixtures cannot inform that gate either way, for the same
+reason two of the five CPU timing fixtures cannot: **MWA_extended zenith**
+(`n_w = 13`) and **MeerKAT off30** (`n_w = 14`) clamp every `w_chunk >= 16`
+to `n_w`, so their `chunked(32)` *is* `dense_vmap` and reads 1.00x by
+construction rather than by measurement. Only MWA_extended off30
+(`n_w = 140`) and **EDA2 off30** (150&sup2; / 4 896 000 rows, `n_w = 60`)
+exercise chunking at the default. EDA2 off30 passes the gate on the real
+path — `chunked(32)` 1.07x forward / 1.01x adjoint at 2.0x less memory, and
+`chunked(8)` 1.65x / 1.16x at 7.5x less — and it is also where `dense_scan`
+is worst, at 5.97x forward, because its 4.9M rows make the per-plane
+re-entry dominate.
 
 `w_strategy="auto"` never resolves to a chunked strategy: choosing a chunk
 size needs a memory budget the heuristic is not given.
@@ -666,7 +777,33 @@ The `grad` column is new in v0.1.3 (issue #21) and is a *ratio against the
 same strategy's forward*, not an absolute size: both operators are now bound
 as linear primitives whose transposes are each other, so reverse mode is one
 call to the other operator at the forward's own settings rather than a
-transposed replay of the w-plane loop. Before that change the scan strategies'
+transposed replay of the w-plane loop.
+
+That mechanism is also why the vmap and chunked rows carry a *range* rather
+than a flat `~1x`: since `grad` is one call to the **other** operator, the
+ratio it reports is that operator's transient over this one's, and the two
+are only equal where the two operators allocate alike. Measured with the same
+`memory_analysis().temp_size_in_bytes` protocol at eps 1e-6, float64,
+`nthreads=1`, single channel, over EDA2 zenith, MWA_compact off30, MeerKAT
+off30 and MWA_extended off30:
+
+| strategy | `grad(dirty2vis)` / forward | `grad(vis2dirty)` / adjoint |
+|---|---|---|
+| `dense_scan` / `windowed_scan` | 1.46–1.50x | 1.01–1.14x |
+| `dense_vmap` / `windowed_vmap` | 0.98–1.98x | 1.00–1.16x |
+| `chunked` (`w_chunk` 2, 4, 8, 16, 32, 64) | 1.03–1.96x | 1.00–1.33x |
+| `windowed_chunked` (`w_chunk` 2, 8, 32) | 1.03–1.33x | 1.03–1.34x |
+
+The chunked spread has both ends, and they have different causes. At small
+`w_chunk` the *forward* transient is small enough that the adjoint's fixed
+extra costs show: `w_chunk = 2` measures 1.32x on MWA_extended off30, 1.25x
+on EDA2 zenith. At the *large* end the adjoint's own transient stops being
+`~1 · chunk · image` and becomes `~2 · chunk · image` — on MWA_extended off30
+(`n_w = 134`) that happens between the balanced chunk 27 (`w_chunk = 32`,
+1.03x) and the balanced chunk 45 (`w_chunk = 64`, **1.96x**, the same place
+`dense_vmap` sits at 1.98x). The `~1x` the middle of the curve gives —
+1.10x at `w_chunk = 8`, 1.05x at 16, 1.03x at 32 — is the default's regime,
+not the whole of it. Before that change the scan strategies'
 gradient cost `O(n_w * image_size)` like the vmap ones — measured with
 `memory_analysis().temp_size_in_bytes` on `grad(0.5 ||A x||^2)` at eps 1e-6 in
 float64, 1.72 MB against a 0.138 MB forward on EDA2 zenith (`n_w` = 11), 7.21
