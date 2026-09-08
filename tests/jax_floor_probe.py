@@ -20,10 +20,21 @@ not been attempted -- hence a probe rather than an environment.
 Two checks, in order:
 
 ``check_symbols``
-    Every ``jax`` symbol ``src/`` and ``tests/`` touch is imported and
-    ``getattr``-ed. The list is **derived** by walking the AST of every module
-    -- it is never maintained by hand, because a hand-maintained list is the
-    same failure mode as a hand-maintained version floor.
+    Every module-level ``jax.*`` attribute chain ``src/`` and ``tests/`` touch
+    is imported and ``getattr``-ed. The list is **derived** by walking the AST
+    of every module -- it is never maintained by hand, because a
+    hand-maintained list is the same failure mode as a hand-maintained version
+    floor.
+
+    "Module-level attribute chain" is the exact scope, and it is narrower than
+    "every ``jax`` symbol the repository uses": a ``Call`` terminates a chain,
+    so methods of a *returned* object -- ``jax.typeof(...).to_tangent_aval()``,
+    ``jax.jit(...).lower()``, ``jnp.zeros(...).at[...]``, ``.astype``,
+    ``.real``, ``.reshape`` -- are not in the derived set and cannot be. A
+    static scan does not know the type a call returns, and resolving those
+    names would mean calling arbitrary repository code inside the probe. They
+    are covered by ``check_primitive_pattern`` instead, which calls them for
+    real; see the list there.
 
 ``check_primitive_pattern``
     A miniature of ``wgridder.py``'s three linear primitives on a 3x3 matmul:
@@ -33,6 +44,13 @@ Two checks, in order:
     driven through ``jit``, ``grad``, ``jvp``, ``linear_transpose``, nested
     ``vmap`` inside ``grad``, ``grad(grad(...))`` and ``disable_jit``. Symbol
     availability says the name resolves; this says the pattern behaves.
+
+    It is also where the method surfaces above get exercised, since the scan
+    cannot see them: ``.to_tangent_aval()`` (the jvp rule is invoked directly
+    with an ``ad.Zero`` tangent, because no transform below reaches that branch
+    on its own), ``jax.jit(...).lower()``, ``.at[...].set()``, ``.astype()``,
+    ``.real`` and ``.reshape()`` -- the six method names ``src/`` and
+    ``tests/`` call on jax return values, across nine distinct call surfaces.
 
 ``jax.core.get_aval`` is deprecated in recent jax and warns, which under this
 repository's ``filterwarnings = ["error"]`` is a failure; ``jax.typeof(...)
@@ -56,6 +74,7 @@ import ast
 import importlib
 import re
 import sys
+import traceback
 from pathlib import Path
 
 import tomllib
@@ -78,8 +97,11 @@ class ProbeError(AssertionError):
 # PEP 508: the name runs until the first extras bracket, comparison operator,
 # marker semicolon or whitespace. Anchored and negative-lookahead'd so that
 # ``jax-finufft>=1.3.0`` -- the other requirement starting with "jax" -- does
-# not match.
-_JAX_REQUIREMENT = re.compile(r"^jax(?![\w.-])\s*(?:\[[^\]]*\])?\s*(?P<spec>[^;]*)")
+# not match. ``spec`` stops at the marker semicolon and ``marker`` takes the
+# rest, so a marker is *seen* rather than silently swallowed (see below).
+_JAX_REQUIREMENT = re.compile(
+    r"^jax(?![\w.-])\s*(?:\[[^\]]*\])?\s*(?P<spec>[^;]*)(?P<marker>;.*)?$"
+)
 _LOWER_BOUND = re.compile(r">=\s*(?P<version>[0-9][^,\s]*)")
 
 
@@ -89,6 +111,22 @@ def declared_floor(pyproject: Path | None = None) -> str:
     Read rather than hard-coded, so this probe follows the declaration
     automatically. A probe carrying its own copy of the version could go stale
     against ``pyproject.toml``, which is precisely the bug being fixed.
+
+    Only ``>=`` is accepted, and everything else raises. ``jax~=0.6.0`` and
+    ``jax==0.6.0`` do each imply a minimum, so rejecting them is stricter than
+    PEP 508 requires -- deliberately. This probe installs ``jax==<floor>`` and
+    asserts the installed version *is* that floor, which is a statement about a
+    ``>=`` bound and not about a compatible-release or pinned one; guessing a
+    floor out of ``~=`` would make the job's claim about what it exercised
+    quietly wrong. The failure is loud (non-zero exit, named requirement), so
+    it cannot hide a bad floor; a maintainer who wants ``~=`` has to teach this
+    function what the job should then install.
+
+    An environment marker is rejected for the same reason. Evaluating one needs
+    ``packaging.markers``, and this module is stdlib-plus-jax by design so that
+    CI can run it before installing anything; silently ignoring the marker
+    would let a ``jax>=…; sys_platform == "win32"`` entry set the floor for a
+    Linux job that the requirement does not even apply to.
     """
     path = pyproject or (REPO_ROOT / "pyproject.toml")
     with path.open("rb") as handle:
@@ -98,11 +136,19 @@ def declared_floor(pyproject: Path | None = None) -> str:
         match = _JAX_REQUIREMENT.match(requirement.strip())
         if match is None:
             continue
+        if match.group("marker"):
+            raise ProbeError(
+                f"{path} declares {requirement!r} with an environment marker. This probe "
+                "is stdlib-only and cannot evaluate markers, so it will not guess whether "
+                "the requirement applies to the job's platform. Declare 'jax' unconditionally."
+            )
         bound = _LOWER_BOUND.search(match.group("spec"))
         if bound is None:
             raise ProbeError(
                 f"{path} declares {requirement!r} with no '>=' lower bound; "
-                "there is no floor for this probe to exercise."
+                "there is no floor for this probe to exercise. Only '>=' is read: "
+                "the job installs 'jax==<floor>' and asserts that is what ran, which "
+                "'~=' and '==' do not state. Write 'jax>=X.Y.Z' or teach declared_floor()."
             )
         return bound.group("version")
     raise ProbeError(f"{path} has no 'jax' entry in [project] dependencies.")
@@ -220,6 +266,57 @@ def jax_symbols(root: Path | None = None, scan_dirs: tuple[str, ...] = SCAN_DIRS
     return {symbol for symbol in symbols if symbol == "jax" or symbol.startswith("jax.")}
 
 
+def jax_return_value_methods(
+    root: Path | None = None, scan_dirs: tuple[str, ...] = SCAN_DIRS
+) -> dict[str, set[str]]:
+    """Methods the sources call on the *return value* of a ``jax`` call.
+
+    The complement of :func:`jax_symbols`, and the reason that function's
+    docstring is careful to say "module attribute". A ``Call`` terminates an
+    attribute chain, so ``jax.typeof(x).to_tangent_aval()`` records
+    ``jax.typeof`` and drops ``to_tangent_aval`` -- correctly, because the
+    scanner has no way to know what type the call returned, and resolving the
+    method would mean executing repository code inside the probe.
+
+    Those methods are still jax API, they still move between releases (``.at``,
+    ``.lower()`` and ``.to_tangent_aval()`` especially), and something has to
+    watch them. They cannot be watched by ``getattr``, so they are watched by
+    :func:`check_primitive_pattern` calling them for real -- and this function
+    is what says *which*, so that list is derived rather than hand-kept and a
+    newly used method surface cannot slip in unprobed. See
+    ``tests/test_jax_floor.py::test_miniature_exercises_every_method_surface``.
+
+    Returns ``{method name: {"jax.typeof(...).to_tangent_aval", ...}}`` -- the
+    name to probe, and the call surfaces that motivate it.
+
+    One level only: in ``jax.jit(f).lower(x).compile()`` the ``.lower`` is
+    recorded and ``.compile`` is not, because the receiver of ``.compile`` is
+    itself a call whose type is just as unknowable. The miniature runs that
+    whole chain anyway; it is only the *enumeration* that stops at one.
+    """
+    base = root or REPO_ROOT
+    surfaces: dict[str, set[str]] = {}
+    for scan_dir in scan_dirs:
+        for path in _python_files(base / scan_dir):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            aliases = _jax_aliases(tree)
+            if not aliases:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Call):
+                    continue
+                dotted = _dotted(node.value.func)
+                if dotted is None:
+                    continue
+                head, _, tail = dotted.partition(".")
+                if head not in aliases:
+                    continue
+                called = f"{aliases[head]}.{tail}" if tail else aliases[head]
+                if called == "jax" or called.startswith("jax."):
+                    surfaces.setdefault(node.attr, set()).add(f"{called}(...).{node.attr}")
+    return surfaces
+
+
 def resolve_symbol(symbol: str) -> object:
     """Import-and-``getattr`` one dotted symbol, raising ``AttributeError`` if absent.
 
@@ -271,6 +368,23 @@ def check_symbols(root: Path | None = None) -> list[str]:
 # --------------------------------------------------------------------------
 # 3. A miniature of the wgridder's primitive pattern
 # --------------------------------------------------------------------------
+
+
+def close(got: object, want: object, what: str) -> None:
+    """Raise :class:`ProbeError` unless ``got`` matches ``want`` elementwise.
+
+    Module level rather than nested inside :func:`check_primitive_pattern` for
+    one reason: it is the single comparison every numeric assertion in the
+    miniature funnels through, so a comparator that silently stops comparing
+    kills the whole check while leaving it green. As a nested closure no test
+    could reach its failure path; here one can, and does
+    (``test_probe_comparator_rejects_a_mismatch``).
+    """
+    import jax.numpy as jnp
+
+    # float32-safe: the standalone probe runs without the suite's x64 switch.
+    if not bool(jnp.allclose(jnp.asarray(got), jnp.asarray(want), rtol=1e-5, atol=1e-5)):
+        raise ProbeError(f"primitive pattern: {what} gave {got!r}, expected {want!r}")
 
 
 def check_primitive_pattern() -> None:
@@ -353,11 +467,6 @@ def check_primitive_pattern() -> None:
     ct = jnp.asarray([0.5, 1.5, -1.0])
     want_fwd = matrix @ x0
     want_bwd = matrix.T @ ct
-    rtol = 1e-5  # float32-safe: this runs without the suite's x64 switch
-
-    def close(got, want, what):
-        if not bool(jnp.allclose(jnp.asarray(got), jnp.asarray(want), rtol=rtol, atol=1e-5)):
-            raise ProbeError(f"primitive pattern: {what} gave {got!r}, expected {want!r}")
 
     def battery(label):
         close(jax.jit(fwd)(x0), want_fwd, f"{label}: jit")
@@ -377,9 +486,48 @@ def check_primitive_pattern() -> None:
 
         close(jax.grad(jax.grad(scalar))(1.0), 2.0 * jnp.sum(want_fwd**2), f"{label}: grad(grad)")
 
+        # The ``ad.Zero`` branch of the jvp rule, driven by hand. No transform
+        # above reaches it -- JAX dead-code-eliminates the primitive before a
+        # symbolically-zero tangent can arrive -- so left to the battery alone
+        # the branch runs zero times, and with it the only *executed* use of
+        # ``jax.typeof(...).to_tangent_aval()``, which the AST scan cannot see
+        # either (a ``Call`` terminates a chain). Invoking the registered rule
+        # directly is what makes both true statements: the line runs, and the
+        # aval it builds is the one the contract requires.
+        zero_in = ad.Zero(jax.typeof(x0).to_tangent_aval())
+        out, tangent_out = ad.primitive_jvps[fwd_p]((x0,), (zero_in,), batch_shape=())
+        close(out, want_fwd, f"{label}: jvp rule, ad.Zero tangent (primal)")
+        if not isinstance(tangent_out, ad.Zero):
+            raise ProbeError(
+                f"primitive pattern: {label}: jvp rule given an ad.Zero tangent returned "
+                f"{type(tangent_out).__name__}, expected ad.Zero -- the branch that spells "
+                "jax.typeof(out).to_tangent_aval() did not run."
+            )
+        close(tangent_out.aval.shape, (3,), f"{label}: ad.Zero tangent aval shape")
+
+        # Methods called on jax return values, which check_symbols cannot
+        # reach: these are every such surface src/ and tests/ use.
+        close(jnp.zeros(3).at[1].set(2.0), jnp.asarray([0.0, 2.0, 0.0]), f"{label}: .at[].set()")
+        close(
+            jnp.zeros_like(x0).at[0].add(1.0).astype(jnp.float32).real.reshape((3,)),
+            jnp.asarray([1.0, 0.0, 0.0]),
+            f"{label}: .at[].add() / .astype() / .real / .reshape()",
+        )
+
     battery("jit enabled")
     with jax.disable_jit():
         battery("disable_jit")
+
+    # The AOT chain tests/test_chunked_strategy.py:369 uses, in full:
+    # jax.jit(fn).lower(*args).compile().memory_analysis(). Every link of it is
+    # a method on a return value, so none of it is in the derived set. Outside
+    # the battery because jax itself refuses the AOT path under disable_jit
+    # ("Disable jit is not supported in the AOT path"), so there is only one
+    # leg to run it on. ``memory_analysis`` returns None on backends that do
+    # not expose it, which the caller there also tolerates.
+    compiled = jax.jit(fwd).lower(x0).compile()
+    close(compiled(x0), want_fwd, "AOT: jit(...).lower().compile()")
+    compiled.memory_analysis()
 
 
 # --------------------------------------------------------------------------
@@ -394,17 +542,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    floor = declared_floor()
-    if args.print_floor:
-        print(floor)
-        return 0
-
     def say(message: str) -> None:
         # Flushed, so the ordered narrative survives being interleaved with the
         # stderr failure line in a CI log.
         print(message, flush=True)
 
     try:
+        # Inside the try, including for --print-floor: an unreadable floor is a
+        # ProbeError naming the requirement, and that message is more use to
+        # the reader of a CI log than the traceback it would otherwise become.
+        # Either way stdout stays empty and the exit code is 1, so the
+        # workflow's `version="$(...)"` under `set -euo pipefail` fails the step
+        # rather than writing an empty pin.
+        floor = declared_floor()
+        if args.print_floor:
+            print(floor)
+            return 0
         installed = check_installed_is_floor(floor)
         say(f"jax {installed} == declared floor (pyproject.toml: jax>={floor})")
         symbols = check_symbols()
@@ -412,13 +565,30 @@ def main(argv: list[str] | None = None) -> int:
         check_primitive_pattern()
         say(
             "primitive pattern: jit / grad / jvp / linear_transpose / vmap-in-grad / "
-            "grad(grad) / disable_jit all agree with the dense 3x3"
+            "grad(grad) / disable_jit / ad.Zero jvp / AOT lower+compile all agree "
+            f"with the dense 3x3, and {len(jax_return_value_methods())} method surfaces "
+            "the symbol scan cannot see ran"
         )
     except ProbeError as exc:
+        # Self-describing by construction -- every ProbeError message names the
+        # file, the requirement or the symbol -- so a traceback would only bury
+        # it.
         print(f"FAIL: {exc}", file=sys.stderr, flush=True)
         return 1
     except Exception as exc:
+        # Anything else is a *jax* failure at the floor, which is the outcome
+        # this job exists to diagnose, and the useful part of it is the frame:
+        # jax 0.5.0's `AttributeError: module 'jax' has no attribute 'typeof'`
+        # says nothing about which of the two spellings raised until you can
+        # see the line. One-line summary first so the log's last words are
+        # still readable, then the frames.
         print(f"FAIL: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        if not (isinstance(exc, ModuleNotFoundError) and exc.name == "jax"):
+            # jax not being installed at all needs no frame -- the pip step
+            # above it has already gone red and the message says everything.
+            # Any other failure is a version incompatibility, and then where it
+            # bit is the whole answer.
+            traceback.print_exc()
         return 1
     say(f"jax floor probe: OK at jax {floor}")
     return 0

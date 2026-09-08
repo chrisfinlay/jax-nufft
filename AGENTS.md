@@ -881,13 +881,19 @@ pixi run -e dev typecheck              # mypy (best-effort)
   `0.5.0` while `wgridder.py` called `jax.typeof`, exported in 0.6.0
   (issue #21). The job installs **jax alone** at the declared version
   and runs `tests/jax_floor_probe.py`, which reads the floor out of
-  `pyproject.toml`, derives the list of `jax` symbols `src/` and
-  `tests/` use by walking their ASTs, `getattr`s every one, and then
-  drives a 3x3-matmul miniature of `wgridder.py`'s primitive pattern
-  through `jit` / `grad` / `jvp` / `linear_transpose` / `vmap`-in-`grad`
-  / `grad(grad(...))` / `disable_jit`. Neither the version nor the
-  symbol list is written down by hand; both are read from the repo, so
-  neither can go stale. The probe is stdlib + `jax` only &mdash; no
+  `pyproject.toml`, derives every module-level `jax.*` attribute chain
+  `src/` and `tests/` touch by walking their ASTs, `getattr`s every one,
+  and then drives a 3x3-matmul miniature of `wgridder.py`'s primitive
+  pattern through `jit` / `grad` / `jvp` / `linear_transpose` /
+  `vmap`-in-`grad` / `grad(grad(...))` / `disable_jit`. A `Call` ends an
+  attribute chain, so methods called on a *returned* object
+  (`jax.typeof(...).to_tangent_aval()`, `jax.jit(...).lower()`,
+  `.at`, `.astype`, `.real`, `.reshape`) are outside the derived set by
+  construction &mdash; a static scan cannot know what a call returns
+  &mdash; and the miniature calls them for real instead; which ones is
+  derived too, by `jax_return_value_methods()`. Neither the version, the
+  symbol list nor the method list is written down by hand; all three are
+  read from the repo, so none can go stale. The probe is stdlib + `jax` only &mdash; no
   `jax_nufft`, no `jax-finufft`, no `pytest` &mdash; so the job is one
   `pip install` and a few seconds. Running the *whole suite* at the
   floor instead would need a conda-forge `jax-finufft` that solves
@@ -896,7 +902,16 @@ pixi run -e dev typecheck              # mypy (best-effort)
   it in all three places (`pyproject.toml`, `feature.cpu`,
   `feature.gpu`); `tests/test_jax_floor.py` fails if they disagree, and
   also pins the derived symbol scan against returning nothing, which
-  would make the probe green at every jax ever released.
+  would make the probe green at every jax ever released. The job's
+  `python-version` is the sibling hazard: `actions/setup-python` takes
+  no expression, so unlike the jax floor it is written out by hand, and
+  a `tests/test_jax_floor.py` cell parses the workflow and fails if it
+  stops matching `requires-python`. If you raise `requires-python`,
+  raise that too. Every mechanism in the probe has a cell that watches
+  it *fail* &mdash; deleting `jax.typeof` off the installed module
+  reproduces jax 0.5.0's `AttributeError` in process, so both checks are
+  seen failing without a second jax anywhere. Keep that property: a
+  check only ever seen to pass is not known to be a check.
 * Telescope fixtures live in `conftest.py`. `short_telescope_pointing`
   runs by default; `long_telescope_pointing` is gated behind
   `--runslow`. `bench_telescope_pointing` is gated behind `--runbench`.

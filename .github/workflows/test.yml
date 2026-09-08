@@ -87,6 +87,13 @@ jobs:
           # The oldest interpreter the project supports (`requires-python`),
           # paired with the oldest jax it supports: the combination most
           # likely to be missing something.
+          #
+          # setup-python takes no expressions here, so unlike the jax floor
+          # this one has to be written out. `test_jax_floor.py` parses this
+          # file and fails if it stops matching `requires-python`'s lower
+          # bound -- hard-coding a floor that nothing checks is the bug the
+          # whole job exists to prevent, and the python axis is no different
+          # from the jax one.
           python-version: "3.11"
 
       - name: Read the declared jax floor
