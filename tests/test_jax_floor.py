@@ -152,6 +152,82 @@ def test_declared_floor_rejects_non_ge_pins_loudly(tmp_path: Path, requirement: 
         declared_floor(pyproject)
 
 
+def _floor_of(tmp_path: Path, *requirements: str) -> str:
+    """``declared_floor`` on a fabricated ``[project].dependencies``."""
+    pyproject = tmp_path / "pyproject.toml"
+    listed = ", ".join(f'"{requirement}"' for requirement in requirements)
+    pyproject.write_text(f"[project]\ndependencies = [{listed}]\n")
+    return declared_floor(pyproject)
+
+
+@pytest.mark.parametrize(
+    ("requirement", "message"),
+    [
+        # Two lower bounds: the effective floor is the *highest*, and reading
+        # the first installs a version the requirement forbids outright.
+        ("jax>=0.6.0,>=0.9.0", "2 '>=' lower bounds"),
+        # The returned floor is the one version explicitly excluded.
+        ("jax>=0.6.0,!=0.6.0", "does not satisfy its own !=0.6.0"),
+        # Same, written with padding: PEP 440 says 0.6 and 0.6.0 are one version.
+        ("jax>=0.6.0,!=0.6", "does not satisfy its own !=0.6"),
+        # An upper bound that excludes the floor, and a strict lower bound above it.
+        ("jax>=0.6.0,<0.6.0", "does not satisfy its own <0.6.0"),
+        ("jax>=0.6.0,>0.6.0", "does not satisfy its own >0.6.0"),
+        # '>=' combined with a pin. Each of these also smuggles the floor past
+        # the deliberate bare-'~=' / bare-'==' rejection below, which only ever
+        # fired because those specifiers have no '>=' clause at all.
+        ("jax>=0.6.0,==0.9.0", "combining '>=' with ==0.9.0"),
+        ("jax>=0.6.0,~=0.6.0", "combining '>=' with ~=0.6.0"),
+        ("jax>=0.6.0,===0.6.0", "combining '>=' with ===0.6.0"),
+        # A clause this probe cannot order without ``packaging``.
+        ("jax>=0.6.0,!=0.6.*", "cannot order"),
+        # A clause with no operator at all: unparsed, therefore refused.
+        ("jax>=0.6.0,0.9.0", "not a comparison this probe can parse"),
+    ],
+)
+def test_declared_floor_refuses_a_constraint_set_it_has_not_intersected(
+    tmp_path: Path, requirement: str, message: str
+) -> None:
+    """Fail closed on anything past a single ``>=`` that the floor does not satisfy.
+
+    The CI job installs ``jax==<floor>`` **alone** -- deliberately, since that
+    is what makes the probe a few seconds rather than a conda solve -- so none
+    of the project's other requirements are present to correct a floor read out
+    of half a specifier. A parser that found the first ``>=`` and ignored the
+    rest would hand the job a version the requirement itself excludes, and the
+    green tick would mean less than nothing: it would assert that the declared
+    floor works while running something the project forbids. That is the same
+    shape as issue #21 -- a declared fact nothing verified.
+    """
+    with pytest.raises(ProbeError, match=re.escape(message)):
+        _floor_of(tmp_path, requirement)
+
+
+@pytest.mark.parametrize("requirement", ["jax>=0.6.0,<0.10", "jax>=0.6.0,!=0.7.0"])
+def test_declared_floor_accepts_a_compound_the_floor_does_satisfy(
+    tmp_path: Path, requirement: str
+) -> None:
+    """The refusal above is about the intersection, not about the comma.
+
+    Without this cell "reject compound specifiers" would be indistinguishable
+    from "reject every specifier containing a comma", and an upper bound -- the
+    one extra clause a project is actually likely to write -- would fail a job
+    it should pass. ``0.6.0 < 0.10`` also pins that the comparison is on release
+    *numbers* and not on strings, where ``"0.10" < "0.6.0"``.
+    """
+    assert _floor_of(tmp_path, requirement) == "0.6.0"
+
+
+def test_declared_floor_rejects_a_second_jax_requirement(tmp_path: Path) -> None:
+    """Two ``jax`` entries intersect exactly like two clauses of one entry.
+
+    The loop used to return on the first match, so a second entry raising the
+    bound was invisible in precisely the way ``jax>=0.6.0,>=0.9.0`` was.
+    """
+    with pytest.raises(ProbeError, match="declares 'jax' 2 times"):
+        _floor_of(tmp_path, "jax>=0.6.0", "jax>=0.9.0")
+
+
 def test_declared_floor_rejects_an_environment_marker(tmp_path: Path) -> None:
     """A marker is refused rather than ignored.
 
@@ -544,6 +620,47 @@ def test_main_exits_one_when_either_check_fails(
     captured = capsys.readouterr()
     assert f"FAIL: deliberate failure in {failing}" in captured.err
     assert f"deliberate failure in {failing}" not in captured.out
+
+
+def test_main_exits_one_and_runs_nothing_when_the_installed_jax_is_not_the_floor(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """``main`` must *call* the version assertion, and stop dead when it fails.
+
+    Every other ``main`` cell stubs ``check_installed_is_floor`` with something
+    that succeeds, because the pixi environments deliberately track a current
+    jax -- which left the one line that ties the run to the declared floor
+    unwatched. Dropping the call entirely (``installed = floor``) kept all of
+    them green: the job would print "jax <floor> == declared floor", run both
+    checks against whatever pip happened to resolve, and exit 0. A newer jax
+    passing says nothing about the floor, so that is a report of a fact nobody
+    checked -- issue #21's bug wearing the probe's own clothes.
+
+    Both later checks are replaced by recorders rather than left alone, so the
+    cell asserts the order too: a failed version assertion means the run is
+    over, and neither check gets to contribute a status line to a log that is
+    about to say FAIL.
+    """
+    ran: list[str] = []
+
+    def refuse(floor: str) -> str:
+        raise ProbeError(f"deliberate: jax 9.9.9 is not the declared floor {floor}")
+
+    def record_symbols(*args: object, **kwargs: object) -> list[str]:
+        ran.append("check_symbols")
+        return []
+
+    def record_pattern(*args: object, **kwargs: object) -> None:
+        ran.append("check_primitive_pattern")
+
+    monkeypatch.setattr("tests.jax_floor_probe.check_installed_is_floor", refuse)
+    monkeypatch.setattr("tests.jax_floor_probe.check_symbols", record_symbols)
+    monkeypatch.setattr("tests.jax_floor_probe.check_primitive_pattern", record_pattern)
+    assert main([]) == 1
+    captured = capsys.readouterr()
+    assert ran == [], f"main ran {ran} after the version assertion failed"
+    assert "deliberate: jax 9.9.9 is not the declared floor" in captured.err
+    assert captured.out == "", captured.out
 
 
 def test_main_exits_one_and_shows_frames_for_a_non_probe_error(

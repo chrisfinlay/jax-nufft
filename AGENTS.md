@@ -900,7 +900,15 @@ pixi run -e dev typecheck              # mypy (best-effort)
   against a jax that old on all three platforms; issue #53 puts that out
   of scope and it has not been attempted. If you raise the floor, raise
   it in all three places (`pyproject.toml`, `feature.cpu`,
-  `feature.gpu`); `tests/test_jax_floor.py` fails if they disagree, and
+  `feature.gpu`), and write the `pyproject.toml` one as a single
+  `jax>=X.Y.Z`. The probe reads that specifier *fail-closed*: a second
+  `>=`, a second `jax` entry, a `==`/`~=` alongside the `>=`, or any
+  clause the floor does not satisfy (`jax>=0.6.0,!=0.6.0`) is refused
+  rather than half-read, because the job installs `jax==<floor>` **alone**
+  and none of the project's other requirements are there to correct a
+  floor taken out of half a specifier &mdash; a green tick on a version
+  the project excludes is worse than no job. An upper bound the floor does
+  satisfy (`jax>=0.6.0,<0.10`) is fine. `tests/test_jax_floor.py` fails if the three declarations disagree, and
   also pins the derived symbol scan against returning nothing, which
   would make the probe green at every jax ever released. The job's
   `python-version` is the sibling hazard: `actions/setup-python` takes

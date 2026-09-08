@@ -102,7 +102,124 @@ class ProbeError(AssertionError):
 _JAX_REQUIREMENT = re.compile(
     r"^jax(?![\w.-])\s*(?:\[[^\]]*\])?\s*(?P<spec>[^;]*)(?P<marker>;.*)?$"
 )
-_LOWER_BOUND = re.compile(r">=\s*(?P<version>[0-9][^,\s]*)")
+# One clause of a comma-separated version specifier. ``===`` and the two-char
+# operators come first so the alternation cannot bite off just ``=`` or ``<``.
+_CLAUSE = re.compile(r"^(?P<op>===|==|!=|~=|<=|>=|<|>)\s*(?P<version>\S+)$")
+# Release segments only. Anything with an epoch, a wildcard, a pre/post/dev
+# suffix or a local version fails to match, and the caller then refuses to
+# reason about the constraint rather than guessing at PEP 440 ordering.
+_NUMERIC_RELEASE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+
+
+def _release(version: str) -> tuple[int, ...] | None:
+    """``(0, 6, 0)`` for a plain dotted release, else ``None`` for "cannot compare".
+
+    Deliberately not a PEP 440 implementation. ``packaging`` is not importable
+    here -- the module is stdlib-plus-jax so CI can read the floor before
+    installing anything -- and a half-right ordering that silently mis-ranks
+    ``0.6.0rc1`` would be worse than no ordering at all. ``None`` makes the
+    caller fail closed.
+    """
+    if _NUMERIC_RELEASE.fullmatch(version) is None:
+        return None
+    return tuple(int(part) for part in version.split("."))
+
+
+def _satisfies(floor: str, op: str, version: str) -> bool | None:
+    """Does ``floor`` satisfy the clause ``op version``? ``None`` if uncomparable.
+
+    Zero-padded release comparison, which is what PEP 440 specifies for the
+    release segment: ``0.6`` and ``0.6.0`` are the same version, so ``!=0.6``
+    does exclude a floor written ``0.6.0``.
+    """
+    left, right = _release(floor), _release(version)
+    if left is None or right is None:
+        return None
+    width = max(len(left), len(right))
+    left += (0,) * (width - len(left))
+    right += (0,) * (width - len(right))
+    return {
+        ">=": left >= right,
+        ">": left > right,
+        "<=": left <= right,
+        "<": left < right,
+        "!=": left != right,
+    }[op]
+
+
+def _floor_from_spec(path: Path, requirement: str, spec: str) -> str:
+    """The single ``>=`` bound of ``spec``, or a ``ProbeError`` saying why not.
+
+    The rule is *fail closed*: the probe returns a floor only when it has
+    understood every clause and checked that the floor it is about to hand to
+    ``pip install jax==<floor>`` actually satisfies all of them. The job
+    installs that pin **alone**, with none of the project's other requirements
+    to correct it, so a floor read out of half a specifier is a green tick on a
+    version the project itself excludes -- ``jax>=0.6.0,!=0.6.0`` being the
+    sharp case, and ``jax>=0.6.0,>=0.9.0`` (the real floor is 0.9.0) the easy
+    one to write by accident when raising a bound.
+    """
+    clauses: list[tuple[str, str]] = []
+    for raw in spec.split(","):
+        clause = raw.strip()
+        if not clause:
+            continue
+        parsed = _CLAUSE.match(clause)
+        if parsed is None:
+            raise ProbeError(
+                f"{path} declares {requirement!r}, whose clause {clause!r} is not a "
+                "comparison this probe can parse. It will not guess at a floor from a "
+                "specifier it has not understood. Write 'jax>=X.Y.Z' or teach "
+                "declared_floor()."
+            )
+        clauses.append((parsed.group("op"), parsed.group("version")))
+
+    lower = [version for op, version in clauses if op == ">="]
+    if not lower:
+        raise ProbeError(
+            f"{path} declares {requirement!r} with no '>=' lower bound; "
+            "there is no floor for this probe to exercise. Only '>=' is read: "
+            "the job installs 'jax==<floor>' and asserts that is what ran, which "
+            "'~=' and '==' do not state. Write 'jax>=X.Y.Z' or teach declared_floor()."
+        )
+    if len(lower) > 1:
+        raise ProbeError(
+            f"{path} declares {requirement!r} with {len(lower)} '>=' lower bounds "
+            f"({', '.join(lower)}). The effective floor is the highest of them, and a "
+            "probe that took the first would install and then claim to have exercised a "
+            "version the project does not even allow. Declare one '>=' bound."
+        )
+    floor = lower[0]
+
+    # A single bare '>=' is the whole specifier: nothing to intersect, and the
+    # version string goes through untouched (a pre-release floor stays legal).
+    if len(clauses) == 1:
+        return floor
+
+    for op, version in clauses:
+        if op in {"==", "~=", "==="}:
+            raise ProbeError(
+                f"{path} declares {requirement!r}, combining '>=' with {op}{version}. "
+                f"A '>=' bound says the job may install {floor}; {op}{version} says it may "
+                "not, and this probe will not pick a winner -- that is how a pin the "
+                "project excludes gets a green tick. Declare a single 'jax>=X.Y.Z'."
+            )
+        ok = _satisfies(floor, op, version)
+        if ok is None:
+            raise ProbeError(
+                f"{path} declares {requirement!r}, and this probe cannot order "
+                f"{floor!r} against {version!r} without 'packaging'. It is stdlib-only "
+                "by design, so it refuses the requirement rather than shipping a floor "
+                "it has not checked. Declare a single 'jax>=X.Y.Z'."
+            )
+        if not ok:
+            raise ProbeError(
+                f"{path} declares {requirement!r}, whose '>=' bound {floor} does not "
+                f"satisfy its own {op}{version} clause. The job installs 'jax=={floor}' "
+                "alone -- none of the project's other requirements are there to correct "
+                "it -- so it would pass on a version this requirement excludes."
+            )
+    return floor
 
 
 def declared_floor(pyproject: Path | None = None) -> str:
@@ -127,11 +244,17 @@ def declared_floor(pyproject: Path | None = None) -> str:
     CI can run it before installing anything; silently ignoring the marker
     would let a ``jax>=…; sys_platform == "win32"`` entry set the floor for a
     Linux job that the requirement does not even apply to.
+
+    Everything past the ``>=`` is refused rather than ignored, for the same
+    reason and by the same rule -- see :func:`_floor_from_spec`. A second
+    ``jax`` entry is refused too: two requirements intersect exactly like two
+    clauses of one, and taking the first is the same silent guess.
     """
     path = pyproject or (REPO_ROOT / "pyproject.toml")
     with path.open("rb") as handle:
         data = tomllib.load(handle)
     requirements = data.get("project", {}).get("dependencies", [])
+    matched: list[tuple[str, re.Match[str]]] = []
     for requirement in requirements:
         match = _JAX_REQUIREMENT.match(requirement.strip())
         if match is None:
@@ -142,16 +265,18 @@ def declared_floor(pyproject: Path | None = None) -> str:
                 "is stdlib-only and cannot evaluate markers, so it will not guess whether "
                 "the requirement applies to the job's platform. Declare 'jax' unconditionally."
             )
-        bound = _LOWER_BOUND.search(match.group("spec"))
-        if bound is None:
-            raise ProbeError(
-                f"{path} declares {requirement!r} with no '>=' lower bound; "
-                "there is no floor for this probe to exercise. Only '>=' is read: "
-                "the job installs 'jax==<floor>' and asserts that is what ran, which "
-                "'~=' and '==' do not state. Write 'jax>=X.Y.Z' or teach declared_floor()."
-            )
-        return bound.group("version")
-    raise ProbeError(f"{path} has no 'jax' entry in [project] dependencies.")
+        matched.append((requirement, match))
+    if not matched:
+        raise ProbeError(f"{path} has no 'jax' entry in [project] dependencies.")
+    if len(matched) > 1:
+        listed = ", ".join(repr(requirement) for requirement, _ in matched)
+        raise ProbeError(
+            f"{path} declares 'jax' {len(matched)} times ({listed}). The effective "
+            "requirement is their intersection; reading the first would let the job "
+            "install a version another entry forbids. Declare 'jax' once."
+        )
+    requirement, match = matched[0]
+    return _floor_from_spec(path, requirement, match.group("spec"))
 
 
 def check_installed_is_floor(floor: str) -> str:
