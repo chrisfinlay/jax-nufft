@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jax-nufft"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Pure-JAX wgridder for radio interferometric imaging, built on jax-finufft."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -55,6 +55,16 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/chrisfinlay/jax-nufft"
 Issues = "https://github.com/chrisfinlay/jax-nufft/issues"
+
+[tool.hatch.version]
+# Single source of truth. Before this, ``[project] version`` was a static
+# literal that hatchling read and ``_version.py`` was a second literal that
+# nothing read, so ``jax_nufft.__version__`` said 0.1.2 while the wheel,
+# sdist and ``pip show`` all said 0.1.1 -- the v0.1.2 series bumped one and
+# not the other and was never tagged (issue #59). Keeping ``_version.py`` as
+# the source rather than deriving ``__version__`` from importlib.metadata is
+# deliberate: it keeps ``__version__`` working from a source checkout.
+path = "src/jax_nufft/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jax_nufft"]
