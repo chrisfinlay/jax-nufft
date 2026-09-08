@@ -262,6 +262,23 @@ tagged or released, so its changes appear here for the first time; they are mark
 
 - **CI covers Python 3.13 and 3.14.** *(v0.1.2 series)*
 
+- **A CI job that runs the declared JAX floor.** Every other job runs the single `jax` the pixi
+  lockfile resolves, so the `jax>=` bound in `pyproject.toml` was exercised by nothing — which is
+  how it came to say `0.5.0` while `src/` called `jax.typeof` (see the floor bump above). The
+  `jax floor probe` job installs **jax alone** at the declared version and runs
+  `tests/jax_floor_probe.py`, which reads the floor out of `pyproject.toml`, derives every
+  module-level `jax.*` attribute chain `src/` and `tests/` touch by walking their ASTs (84 of
+  them, measured on this branch; issue #53 records the earlier #21 review as having checked 18 by
+  hand), imports and `getattr`s each, and then drives a 3×3-matmul miniature of the wgridder's
+  primitive pattern through `jit`, `grad`, `jvp`, `linear_transpose`, `vmap` inside `grad`,
+  `grad(grad(...))` and `disable_jit`. A `Call` terminates an attribute chain, so methods of a
+  *returned* object — `jax.typeof(...).to_tangent_aval()`, `jax.jit(...).lower()`,
+  `jnp.zeros(...).at[...]`, `.astype`, `.real`, `.reshape` — are outside the derived set and
+  cannot be in it; the miniature calls all six for real instead, and which six is itself derived.
+  Neither the version, the symbol list nor the method list is maintained by hand. With the floor
+  reverted to `>=0.5.0` the job fails, naming `jax.typeof` as the one missing symbol of the 84.
+  ([#53](https://github.com/chrisfinlay/jax-nufft/issues/53))
+
 ### Fixed
 
 - **`jax.grad` through either operator no longer costs `O(n_w · image)` memory.** Both operators are
