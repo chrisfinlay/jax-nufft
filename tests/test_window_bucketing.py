@@ -41,7 +41,7 @@ against 1.08x-1.24x on the *adjoint* over the same runs. ``auto`` resolves the
 forward to ``windowed_vmap`` on most realistic GPU plans, so this reached
 defaulting users. Two diagnosis-and-fix rounds failed to move the GPU numbers,
 so the forward was put back on ``ab7fbbd``'s path and the cause left open
-(TODO(#NN): follow-up issue). Those four numbers are the maintainer's, not
+(#65: follow-up issue). Those four numbers are the maintainer's, not
 this session's, and are quoted rather than reproduced -- this suite has no GPU.
 
 What this module asserts about the forward is therefore the *negative*: that
@@ -212,7 +212,7 @@ in ``ab7fbbd``, found while working this issue and not introduced by it**;
 the reverted forward inherits it. It is untested in the maintainer's GPU
 A/B only because ``w_chunk = 32`` exceeds ``n_w`` on both of those fixtures,
 so ``windowed_chunked`` degenerates to ``windowed_vmap`` there. Declared
-rather than deleted so the finding outlives the revert; TODO(#NN).
+rather than deleted so the finding outlives the revert; #65.
 """
 
 from __future__ import annotations
@@ -1358,7 +1358,7 @@ def _forward_scatters(text: str) -> list[tuple[str, tuple[int, ...]]]:
                     "by issue #26 and not fixed by it: _channel_forward_windowed's "
                     "w_chunk < n_w branch accumulates a whole chunk into one shared "
                     "(n_rows,) carry with a single scatter-add over its "
-                    "(w_chunk, max_window_size) index block. TODO(#NN): follow-up "
+                    "(w_chunk, max_window_size) index block. #65: follow-up "
                     "issue -- fix "
                     "the chunked forward's accumulate, or document the strategy as "
                     "GPU-hostile."
@@ -1390,7 +1390,7 @@ def test_no_two_planes_accumulate_into_one_row_vector_in_the_forward(w_strategy:
       ``w_chunk = 32`` exceeds ``n_w`` on both of those fixtures, so
       ``windowed_chunked`` degenerates to ``windowed_vmap`` there. It is left
       failing-and-declared rather than deleted so that the finding survives the
-      revert; fixing it is the follow-up issue's, TODO(#NN).
+      revert; fixing it is the follow-up issue's, #65.
 
     The windows of different w-planes overlap, physically. Measured this
     session at eps 1e-6, float64, seed 0, ``hermitian=True``, one channel, over

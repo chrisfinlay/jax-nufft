@@ -515,7 +515,7 @@ planes on all ten review cells, and the forward's `max_window_size`
 windows cover each sorted row 8.00-36.98 times on average and 8-118 times
 at the worst row. What is *unestablished* is that the shape of the
 accumulate is what the GPU was charging for.) Reopening this is
-TODO(#NN)'s; do not re-land a bucketed forward without GPU numbers.
+#65's; do not re-land a bucketed forward without GPU numbers.
 (Those four timings are the maintainer's, on hardware this repository's
 suite does not have.)
 
@@ -564,7 +564,7 @@ GH200 A/B above because
 `windowed_chunked` degenerates to `windowed_vmap` there. Declared by an
 `xfail(strict=True)` cell,
 `tests/test_window_bucketing.py::test_no_two_planes_accumulate_into_one_row_vector_in_the_forward[windowed_chunked]`,
-so that the finding outlives the revert; TODO(#NN).
+so that the finding outlives the revert; #65.
 
 **All of the above is `n_chan = 1`, and the multi-channel picture is
 different — for the adjoint only.** A bucket's slice length is a static

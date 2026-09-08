@@ -1635,7 +1635,7 @@ def _channel_forward_windowed(
     exceeds ``n_w`` on both of its fixtures and ``windowed_chunked``
     degenerates to ``windowed_vmap`` there. Declared by an ``xfail(strict=True)`` cell in
     ``tests/test_window_bucketing.py::test_no_two_planes_accumulate_into_one_row_vector_in_the_forward``;
-    TODO(#NN).
+    #65.
     """
     two_pi = 2.0 * jnp.pi
     u_sorted, v_sorted, w_rel_sorted = _channel_ft_coords(uvw_m_sorted, inv_lambda_c, plan)

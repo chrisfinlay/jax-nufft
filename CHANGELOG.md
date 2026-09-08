@@ -161,7 +161,7 @@ tagged or released, so its changes appear here for the first time; they are mark
   at 420 s on MWA_extended zenith (3600²/1.22M) against 48.6 ms — while the adjoint over the same
   runs was 1.08-1.24x. `auto` resolves the forward to `windowed_vmap` on most realistic GPU plans,
   so this reached defaulting users. **The cause is not understood** and is left open as
-  TODO(#NN); two diagnosis-and-fix rounds did not move the GPU numbers. The forward therefore
+  #65; two diagnosis-and-fix rounds did not move the GPU numbers. The forward therefore
   keeps the previous release's code, its `max_window_size` slice and its
   `window_padding_overhead` figure, and its optimised HLO is that code's: over 7 `w_strategy` x
   10 fixtures, all 70 forward modules differ from the previous revision in nothing but one
@@ -229,7 +229,7 @@ tagged or released, so its changes appear here for the first time; they are mark
   162.5 — i.e. **bucketing is what takes this cell from 1.02x to 0.68x**. Gate met, by 1.47x.
 
   **Not done:** the definition of done's GPU gate, which needs a CUDA jax-finufft build; and the
-  windowed forward, which is TODO(#NN)'s.
+  windowed forward, which is #65's.
 
   **Known defect, inherited rather than introduced.** The windowed forward's `windowed_chunked`
   branch accumulates a whole chunk into one shared `(n_rows,)` carry through a single scatter-add
@@ -239,7 +239,7 @@ tagged or released, so its changes appear here for the first time; they are mark
   the question the failed diagnosis above leaves open; the GH200 A/B does not answer it, because
   `w_chunk = 32` exceeds `n_w` on both of those fixtures and `windowed_chunked` degenerates to
   `windowed_vmap` there. It is declared by an `xfail(strict=True)` cell rather than fixed here;
-  TODO(#NN).
+  #65.
 
   **Not measured by any gate:** the multi-channel path. Every figure above is `n_chan = 1`, which
   is one bucket-table group and emits the previous release's program. A plan whose channels
