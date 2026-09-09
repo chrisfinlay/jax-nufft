@@ -27,6 +27,15 @@ permissions:
   contents: read
 
 jobs:
+  # The full suite, against the commit being released. Without this the only
+  # thing standing between a release and PyPI is that the package builds:
+  # test.yml runs on pushes to main and on pull requests, neither of which is
+  # a release, so a release cut from an untested commit -- or while main was
+  # red -- would publish happily. PyPI will not let a filename be replaced, so
+  # there is no taking it back.
+  test:
+    uses: ./.github/workflows/test.yml
+
   build:
     name: build sdist + wheel
     runs-on: ubuntu-latest
@@ -77,7 +86,7 @@ jobs:
   testpypi:
     name: upload to TestPyPI
     if: github.event_name == 'workflow_dispatch'
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -99,7 +108,7 @@ jobs:
   pypi:
     name: upload to PyPI
     if: github.event_name == 'release'
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     environment:
       name: pypi

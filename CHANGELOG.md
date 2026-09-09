@@ -384,7 +384,10 @@ tagged or released, so its changes appear here for the first time; they are mark
   the sdist and wheel and uploads them to PyPI via Trusted Publishing when a GitHub Release is
   published. A tag alone does not trigger it, and `workflow_dispatch` targets TestPyPI only, so a
   version number cannot be spent by accident.
-- The release is gated on the tag agreeing with the built artifacts
+- The upload is gated on **the full test suite running against the released commit**, not on
+  main having been green at some earlier point: `test.yml` gained a `workflow_call` trigger and
+  `publish.yml` calls it, so a release cut from an untested commit cannot reach PyPI. It is also
+  gated on the tag agreeing with the built artifacts
   ([`.github/scripts/check_release_version.py`](.github/scripts/check_release_version.py)) and on
   `twine check --strict`. Publishing a `.dev` or pre-release version is refused. This is the
   automated form of the check that #59 was filed for.
