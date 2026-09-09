@@ -310,6 +310,11 @@ def _reference_lmn_grids(
 
     See ``tests/test_against_dft.py::reference_lmn_grids`` for the same
     computation (duplicated here -- see the module docstring for why).
+
+    The inside-disc branch is the cancellation-free ``-r2 / (sqrt(1 - r2) + 1)``
+    rather than ``sqrt(1 - r2) - 1``: see
+    ``tests/conftest.py::reference_lmn_grids`` for why an oracle may not carry
+    the ``ulp(1)/2`` absolute error that issue #12 removed from the operator.
     """
     n_l, n_m = image_shape
     i = np.arange(n_l) - n_l // 2
@@ -317,7 +322,8 @@ def _reference_lmn_grids(
     ll, mm = np.meshgrid(i * pixsize_l, j * pixsize_m, indexing="ij")
     r2 = ll * ll + mm * mm
     inside_disc = r2 <= 1.0
-    inside_val = np.sqrt(np.where(inside_disc, 1.0 - r2, 0.0)) - 1.0
+    x = np.where(inside_disc, r2, 0.0)
+    inside_val = -x / (np.sqrt(1.0 - x) + 1.0)
     outside_val = -np.sqrt(np.where(inside_disc, 0.0, r2 - 1.0)) - 1.0
     return ll, mm, np.where(inside_disc, inside_val, outside_val)
 

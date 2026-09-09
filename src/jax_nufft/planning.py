@@ -1060,19 +1060,50 @@ def _n_minus_1_grid(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> n
     # ([Higham2002] Ch. 1) evaluates the same quantity with no subtraction of
     # near-equal numbers: 3.73e-16 at 5e-3, 3.73e-16 at 1e-6, 3.55e-16 at 1e-8.
     #
-    # This is a *relative* improvement on values that are already tiny. The
-    # ABSOLUTE error was and remains ~8e-17 on a narrow field, below a float64
-    # ulp of everything this feeds, so no measured number downstream moves --
-    # which is why it was safe to land late. ``n - 1`` enters as
-    # ``exp(2i pi w (n-1))``, and that phase depends on the absolute error.
+    # The gain is not only relative. The ABSOLUTE error falls too, because the
+    # cancelled term *was* the absolute error: whole-grid max |error| against
+    # the same oracle goes 8.08e-17 -> 2.57e-18 at pixsize 5e-3 and
+    # 8.30e-17 -> 1.06e-25 at 1e-6. That matters downstream, because ``n - 1``
+    # enters as ``exp(2i pi w (n-1))`` and the phase error is ``2 pi w`` times
+    # the absolute one: at a VLBI pixel scale and |w| ~ 1e6 wavelengths the old
+    # form cost 1.99e-10 relative on an exactly range-reduced DFT and the new
+    # one costs 7.9e-20 (tests/test_planning.py::
+    # test_nm1_downstream_phase_accuracy_at_large_w).
+    #
+    # What this change does NOT move, measured over 78 plans x 4 operator calls
+    # spanning the eight review fixtures plus five synthetic geometries, both
+    # dtypes, two epsilons and both hermitian settings (2026-09-09): every
+    # structural quantity is bit-identical -- n_w, W, beta, w_kernel_scale, w0,
+    # w_extent, the whole window layout, sort_perm, flip_sign, uvw_m,
+    # inv_lambda, w_centers_rel, all 0/78. What does move: n_minus_1_shifted
+    # (60/78, by <= half an ulp of 1.0 absolute), nshift (38/78, worst 3.17e-17
+    # absolute / 3.70e-13 relative on a named fixture), w0_screen, phi_hat_n,
+    # and 224 of 312 operator outputs bitwise -- with sum|output| moving by at
+    # most 2.4e-14 relative on the review fixtures. "It moves nothing" is false;
+    # "it moves nothing structural, and nothing numeric by more than half an ulp
+    # of 1.0 on n - 1" is the claim, and the accuracy sweep was re-run.
     #
     # Not fixed here, because a different mechanism: a pixel landing on the disc
     # edge (``l^2 + m^2 == 1``) carries ~``sqrt(ulp(1))`` relative error in both
     # forms, since ``n`` is infinitely ill-conditioned in ``l^2 + m^2`` there
     # (``dn/d(r^2) = -1/(2n)``). Measured 4.36e-09 for both at pixsize 2.5e-2.
-    x = np.where(inside_disc, eps_lm, 0.0)
-    inside_val = -x / (np.sqrt(1.0 - x) + 1.0)
+    #
+    # Written in place, and ``outside_val`` computed first, purely for the host
+    # budget this function's docstring exists to protect: the readable spelling
+    # ``x = np.where(...); -x / (np.sqrt(1 - x) + 1)`` keeps ``x`` live across
+    # three more image-sized temporaries and measured 172.03 MB peak at 2048^2
+    # against 138.48 MB for the pre-#12 one-liner (``tracemalloc``, 2026-09-09).
+    # This spelling is back at 138.48 MB and bit-identical to the readable one,
+    # signed zero at the phase centre included, on all nine test geometries.
     outside_val = -np.sqrt(np.where(inside_disc, 0.0, eps_lm - 1.0)) - 1.0
+    # ``eps_lm`` becomes ``x``: masking by multiplication is exact here
+    # (``0.0 * finite == 0.0``) and matches ``np.where(inside_disc, eps_lm, 0)``
+    # bit for bit, while the ``np.where`` needs a second array.
+    np.multiply(eps_lm, inside_disc, out=eps_lm)
+    inside_val = np.sqrt(1.0 - eps_lm)
+    inside_val += 1.0
+    np.divide(eps_lm, inside_val, out=inside_val)
+    np.negative(inside_val, out=inside_val)
     return np.where(inside_disc, inside_val, outside_val)
 
 

@@ -100,13 +100,36 @@ def reference_lmn_grids(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(l, m, n - 1)`` on the image grid, matching ``planning.make_plan``.
 
-    Inside the unit disc this is the usual ``n - 1 = sqrt(1 - l^2 - m^2) - 1``.
+    Inside the unit disc this is ``n - 1 = sqrt(1 - l^2 - m^2) - 1``, evaluated
+    in the cancellation-free form ``-r2 / (sqrt(1 - r2) + 1)`` ([Higham2002]
+    Ch. 1) -- see the note on oracle conditioning below.
     Outside it (reachable for wide-FoV fixtures such as EDA2's 120-degree
     field) we use the same analytic extension as ducc and
     :func:`jax_nufft.planning.make_plan`, ``n - 1 = -sqrt(l^2 + m^2 - 1) - 1``.
     Clipping to ``n - 1 = -1`` there instead would make the reference disagree
     with the operator under test by O(1) on the corner pixels, which has
     nothing to do with the gridding accuracy we are trying to measure.
+
+    Why the inside branch is not written ``sqrt(1 - r2) - 1``
+    --------------------------------------------------------
+    That spelling cancels catastrophically as ``r2 -> 0`` and carries an
+    absolute error of up to ``ulp(1) / 2 = 1.11e-16`` on ``n - 1`` (issue #12).
+    ``n - 1`` enters this reference only through ``exp(2 pi i w (n - 1))``, so
+    that absolute error becomes a phase error of ``2 pi w delta`` -- at
+    MeerKAT's ``|w| ~ 1e3`` wavelengths, of order 1e-12 relative on the
+    reference itself, which is the same size as the tightest epsilon the
+    accuracy sweep asks for.
+
+    Before issue #12 that error was harmless *by accident*: ``planning`` used
+    the same spelling, the operator and this reference shared the term, and it
+    cancelled out of their difference. Measured this session (2026-09-09,
+    ``tests/test_accuracy_sweep.py``, MeerKAT off30 / eps 1e-12 / forward),
+    fixing ``planning`` alone moved the reported error from 1.19x eps to 1.59x
+    eps against the old spelling of this reference, while against this one it
+    goes the other way -- 1.55x eps before the fix to 1.19x after. The operator
+    improved either way; only the instrument regressed. An oracle may restate
+    the convention independently, but it may not be less accurate than the
+    thing it certifies.
 
     The pixel-centre offset below is ``n_l // 2`` -- **floor** division, the
     convention ``planning._n_minus_1_grid`` implements and the README states.
@@ -127,7 +150,8 @@ def reference_lmn_grids(
     ll, mm = np.meshgrid(i * pixsize_l, j * pixsize_m, indexing="ij")
     r2 = ll * ll + mm * mm
     inside_disc = r2 <= 1.0
-    inside_val = np.sqrt(np.where(inside_disc, 1.0 - r2, 0.0)) - 1.0
+    x = np.where(inside_disc, r2, 0.0)
+    inside_val = -x / (np.sqrt(1.0 - x) + 1.0)
     outside_val = -np.sqrt(np.where(inside_disc, 0.0, r2 - 1.0)) - 1.0
     return ll, mm, np.where(inside_disc, inside_val, outside_val)
 

@@ -592,10 +592,16 @@ def _dft_lmn_grids() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     is 0.115), which the caller asserts, so the analytic extension
     ``tests/test_against_dft.py::reference_lmn_grids`` needs for EDA2's
     120-degree field is not reproduced here.
+
+    ``n - 1`` is the cancellation-free ``-r2 / (sqrt(1 - r2) + 1)`` rather than
+    ``sqrt(1 - r2) - 1``: see ``tests/conftest.py::reference_lmn_grids`` for
+    why an oracle may not carry the ``ulp(1)/2`` absolute error that issue #12
+    removed from the operator.
     """
     i = np.arange(_DFT_N_PIX) - _DFT_N_PIX // 2
     ll, mm = np.meshgrid(i * _DFT_PIXSIZE, i * _DFT_PIXSIZE, indexing="ij")
-    return ll, mm, np.sqrt(1.0 - ll * ll - mm * mm) - 1.0
+    r2 = ll * ll + mm * mm
+    return ll, mm, -r2 / (np.sqrt(1.0 - r2) + 1.0)
 
 
 def _dft_forward(image: np.ndarray, uvw: np.ndarray) -> np.ndarray:
