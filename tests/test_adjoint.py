@@ -46,6 +46,13 @@ def _reference_adjoint(
 
     vis:    (n_rows, n_chan) complex
     Returns: dirty (n_chan, n_l, n_m) real.
+
+    ``n - 1`` is the cancellation-free ``-r2 / (sqrt(1 - r2) + 1)`` on the
+    clipped radius ``min(l^2 + m^2, 1)`` -- algebraically ``sqrt(1 - r2) - 1``,
+    and bit-identical to it on the clipped region (``r2 = 1`` gives exactly
+    -1 in both), but without the ``ulp(1)/2`` cancellation error that issue #12
+    removed from ``planning``. See ``tests/conftest.py::reference_lmn_grids``
+    for why an oracle may not be less accurate than the operator it certifies.
     """
     n_l, n_m = image_shape
     n_rows, n_chan = vis.shape
@@ -54,8 +61,8 @@ def _reference_adjoint(
     ll = i * pixsize_l
     mm = j * pixsize_m
     LL, MM = np.meshgrid(ll, mm, indexing="ij")
-    inside = np.maximum(1.0 - LL**2 - MM**2, 0.0)
-    nm1 = np.sqrt(inside) - 1.0
+    r2 = np.minimum(LL**2 + MM**2, 1.0)
+    nm1 = -r2 / (np.sqrt(1.0 - r2) + 1.0)
     n_grid = nm1 + 1.0
     out = np.zeros((n_chan, n_l, n_m), dtype=np.float64)
     for c in range(n_chan):

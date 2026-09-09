@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import decimal
 import math
 import pathlib
 import re
@@ -16,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import Array
+from jax.typing import DTypeLike
 
 import jax_nufft
 from jax_nufft import dirty2vis, vis2dirty
@@ -25,6 +27,7 @@ from jax_nufft.planning import (
     MAX_WINDOW_BUCKETS,
     W_OVERSAMPLE_X0,
     WGridderPlan,
+    _n_minus_1_grid,
     bucket_window_sizes,
     make_plan,
     window_boundary_margin,
@@ -499,6 +502,14 @@ def _nm1_extremes(
     analytic extension outside the unit disc (``n - 1 = -sqrt(l^2+m^2-1) - 1``),
     which ``make_plan`` uses so full-sky images (large ``l^2+m^2 > 1`` region,
     e.g. EDA2's 120-degree FoV) get a well-defined ``n - 1`` everywhere.
+
+    The inside-disc branch is the cancellation-free ``-r2 / (sqrt(1 - r2) + 1)``
+    rather than ``sqrt(1 - r2) - 1``: see
+    ``tests/conftest.py::reference_lmn_grids`` for why an oracle may not carry
+    the ``ulp(1)/2`` absolute error that issue #12 removed from the operator.
+    Independence of *convention* was never meant to mean a different *rounding
+    error*. (``_nm1_naive_pre_issue_12`` below is the one deliberate exception:
+    it is a frozen historical record, not an oracle.)
     """
     n_l, n_m = image_shape
     i = np.arange(n_l) - n_l // 2
@@ -507,7 +518,8 @@ def _nm1_extremes(
     mm = (j * pixsize_m)[None, :]
     r2 = ll * ll + mm * mm
     inside_disc = r2 <= 1.0
-    inside_val = np.sqrt(np.where(inside_disc, 1.0 - r2, 0.0)) - 1.0
+    x = np.where(inside_disc, r2, 0.0)
+    inside_val = -x / (np.sqrt(1.0 - x) + 1.0)
     outside_val = -np.sqrt(np.where(inside_disc, 0.0, r2 - 1.0)) - 1.0
     nm1 = np.where(inside_disc, inside_val, outside_val)
     return float(nm1.max()), float(nm1.min())
@@ -566,6 +578,1042 @@ def test_nshift_matches_geometry(telescope: Telescope, zenith_angle_deg: float) 
     nm1_max, nm1_min = _nm1_extremes(image_shape, telescope.pixsize, telescope.pixsize)
     expected_nshift = -(nm1_max + nm1_min) / 2.0
     assert plan.nshift == pytest.approx(expected_nshift, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# issue #12: cancellation-free ``n - 1``
+# ---------------------------------------------------------------------------
+# ``planning._n_minus_1_grid`` evaluates ``n - 1 = sqrt(1 - l^2 - m^2) - 1``
+# inside the unit disc. That subtraction cancels catastrophically as
+# ``l^2 + m^2 -> 0``: the phase centre pixel is exactly ``n - 1 = 0`` and its
+# neighbours are ``-pixsize^2 / 2``, so for a fine enough pixel the true value
+# sits far below ``ulp(1)`` while the formula can only return a multiple of
+# ``ulp(1) / 2 = 1.11e-16``. The cancellation-free rewrite is
+# ``sqrt(1 - x) - 1 = -x / (sqrt(1 - x) + 1)`` ([Higham2002] Ch. 1), which
+# never forms the difference. The analytic extension used *outside* the disc,
+# ``n - 1 = -sqrt(l^2 + m^2 - 1) - 1``, has no cancellation and is untouched.
+#
+# All measurements in this section were taken on 2026-09-08 at ``ef509c5``,
+# CPython 3.12 / numpy on macOS arm64 (Apple M-series), against the
+# ``decimal``-based oracle below. The float64 arithmetic they characterise is
+# IEEE-754 correctly-rounded ``+ - * /`` and ``sqrt`` throughout, so the
+# numbers are platform-independent even though the machine is not.
+
+# The exact oracle's working precision, in significant decimal digits. Sixty is
+# ~44 digits past float64, so the oracle contributes nothing measurable to any
+# error below; it is not a tuned number.
+_NM1_ORACLE_PREC = 60
+
+
+def _nm1_exact(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> np.ndarray:
+    """``n - 1`` on the image grid to ~60 significant digits, as ``Decimal``.
+
+    **Not** ``numpy.longdouble``, which is what issue #12's definition of done
+    names. ``np.longdouble`` is 80-bit extended on Linux x86-64 and 128-bit on
+    Linux aarch64, but it is a plain **alias for float64 on macOS arm64** --
+    measured here: ``np.finfo(np.longdouble).eps == 2.220446049250313e-16``,
+    bit-for-bit ``np.finfo(np.float64).eps``. On that platform a longdouble
+    "oracle" for this quantity is the cancellation-free float64 form itself, so
+    it scores that form a perfect 0.0 by construction and the gate below would
+    be checking the implementation against a copy of itself. ``decimal`` is
+    stdlib, exact by construction, and the same on every platform.
+
+    The grid convention is restated here rather than imported (this
+    repository's convention -- see ``_nm1_extremes`` above and
+    ``tests/conftest.py::reference_lmn_grids``), including the ``// 2``
+    floor-division pixel-centre offset that issue #14 pinned.
+
+    ``Decimal(float)`` is exact, so the pixel coordinates ``(i - n_l // 2) *
+    pixsize`` are the exact real products of an exact integer and the exact
+    binary value of ``pixsize`` -- deliberately *not* the float64-rounded
+    coordinate the implementation forms. Rounding of the coordinate itself is
+    therefore part of what is measured, which is why the wide-field absolute
+    errors below (1.6e-15 on EDA2) are an order of magnitude above the
+    ``ulp(1)``-scale errors of the narrow-field grids: on EDA2 ``l`` reaches
+    1.05 and ``ulp(l)`` is already 2.2e-16 before any square root is taken.
+
+    **Every** arithmetic operation below goes through ``ctx`` explicitly,
+    including the negations. A bare unary ``-`` on a ``Decimal`` is a
+    context-sensitive operation performed under the *ambient thread* context,
+    not under ``ctx``: measured 2026-09-09, ``len(r2.as_tuple().digits)`` is
+    60 while ``len((-r2).as_tuple().digits)`` is 28 -- ``decimal``'s default
+    ``prec``. Written that way this "60-digit" oracle ran at 28 digits (still
+    12 past float64, so no assertion here ever moved, but it silently inherited
+    a global that a ``decimal.setcontext`` anywhere in the process could
+    rescale). Checked against an independent exact ``fractions.Fraction``
+    oracle (exact rational pixel coordinates, square roots by ``math.isqrt``
+    scaled by 10^200) on the EDA2, MeerKAT and 1e-8 grids: with the bare
+    unary minus the relative residual is 2.95e-28 to 4.41e-28, with
+    ``ctx.minus`` it is 8.6e-60 to 1.6e-59, i.e. at the declared working
+    precision.
+    """
+    ctx = decimal.Context(prec=_NM1_ORACLE_PREC)
+    one = decimal.Decimal(1)
+    d_l = decimal.Decimal(pixsize_l)
+    d_m = decimal.Decimal(pixsize_m)
+    out = np.empty((n_l, n_m), dtype=object)
+    for a in range(n_l):
+        ll = ctx.multiply(decimal.Decimal(a - n_l // 2), d_l)
+        l2 = ctx.multiply(ll, ll)
+        for b in range(n_m):
+            mm = ctx.multiply(decimal.Decimal(b - n_m // 2), d_m)
+            r2 = ctx.add(l2, ctx.multiply(mm, mm))
+            if r2 <= one:
+                # Cancellation-free by construction: the oracle may not be
+                # written in the form under test.
+                out[a, b] = ctx.divide(ctx.minus(r2), ctx.add(ctx.sqrt(ctx.subtract(one, r2)), one))
+            else:
+                out[a, b] = ctx.subtract(ctx.minus(ctx.sqrt(ctx.subtract(r2, one))), one)
+    return out
+
+
+def _nm1_naive_pre_issue_12(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> np.ndarray:
+    """``n - 1`` by the pre-issue-#12 arithmetic, ``sqrt(1 - l^2 - m^2) - 1``, float64.
+
+    **Frozen on purpose.** This is a historical record of the formula
+    ``planning._n_minus_1_grid`` used before issue #12, not a second statement
+    of the current convention, and it must NOT be updated when ``planning``
+    changes. It is the one deliberate exception to this repository's rule that
+    an oracle restates the convention independently: every *other* ``n - 1``
+    under ``tests/`` was moved to the cancellation-free spelling with the
+    operator (see ``tests/conftest.py::reference_lmn_grids``). **Four** tests
+    below need it, and all four go quiet, not red, if it is "kept in sync":
+
+    * ``test_nm1_relative_accuracy_across_pixel_scales`` needs a witness that a
+      given ``pixsize`` really does trigger the cancellation, rather than
+      assuming it from a docstring; synced, six of its seven rows fail on
+      ``naive_clears_gate`` and the EDA2 control row passes;
+    * ``test_nm1_absolute_error_stays_at_ulp_scale``'s naive arm becomes a
+      duplicate of its live arm and passes;
+    * ``test_nm1_outside_disc_branch_is_bit_identical`` compares the untouched
+      outside branch, which is bit-identical either way, and passes;
+    * ``test_plan_n_minus_1_does_not_move_at_imaging_pixel_scales`` -- the cell
+      that carries this PR's central claim -- becomes
+      ``|plan.n_minus_1 - plan.n_minus_1|`` and passes as a **tautology**.
+
+    Measured 2026-09-09 by mutating this helper's inside branch to the stable
+    form and running ``tests/test_planning.py``: **11 failed** -- the direct
+    freeze cell, all seven rows of the pixel-scale cell (including the EDA2
+    control row, which the old one-sided ``pytest.approx(v, rel=1.0)`` let
+    through), both rows of the exact-zero cell, and the downstream w-phase
+    cell's anti-vacuity assertion. As the section was first written the same
+    mutation cost 6 failures, all in one cell and none of them in the cell that
+    most needs the freeze.
+    """
+    i = np.arange(n_l) - n_l // 2
+    j = np.arange(n_m) - n_m // 2
+    ll = (i * pixsize_l)[:, None]
+    mm = (j * pixsize_m)[None, :]
+    r2 = ll * ll + mm * mm
+    inside_disc = r2 <= 1.0
+    inside_val = np.sqrt(np.where(inside_disc, 1.0 - r2, 0.0)) - 1.0
+    outside_val = -np.sqrt(np.where(inside_disc, 0.0, r2 - 1.0)) - 1.0
+    return np.where(inside_disc, inside_val, outside_val)
+
+
+def _nm1_horizon_gap(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> float:
+    """``min |1 - (l^2 + m^2)|`` over the grid -- how close a pixel gets to the horizon."""
+    return float(
+        np.min(
+            np.abs(
+                1.0
+                - (
+                    ((np.arange(n_l) - n_l // 2) * pixsize_l)[:, None] ** 2
+                    + ((np.arange(n_m) - n_m // 2) * pixsize_m)[None, :] ** 2
+                )
+            )
+        )
+    )
+
+
+def _nm1_inside_disc(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> np.ndarray:
+    """The ``l^2 + m^2 <= 1`` mask on the same grid."""
+    i = np.arange(n_l) - n_l // 2
+    j = np.arange(n_m) - n_m // 2
+    r2 = ((i * pixsize_l)[:, None]) ** 2 + ((j * pixsize_m)[None, :]) ** 2
+    return r2 <= 1.0
+
+
+def _nm1_max_ulp_error(got: np.ndarray, exact: np.ndarray) -> float:
+    """Max over pixels of ``|got - exact| / ulp(|exact|)``, i.e. distance from correctly rounded.
+
+    The elementwise companion to :func:`_nm1_errors_vs_exact`'s two whole-grid
+    numbers. A whole-grid *absolute* bound is blind to a defect proportional to
+    the pixel's own value, and a whole-grid *relative* bound is dominated by
+    whichever pixel is smallest; this is the per-pixel statement, in the only
+    unit in which "as good as float64 allows" means anything.
+
+    The phase-centre pixel is skipped: ``exact`` is zero there, ``ulp(0)`` is
+    the smallest subnormal, and every implementation returns exactly +-0.0, so
+    the ratio is either 0/tiny or undefined.
+    """
+    worst = decimal.Decimal(0)
+    n_l, n_m = exact.shape
+    with decimal.localcontext(decimal.Context(prec=_NM1_ORACLE_PREC)):
+        for a in range(n_l):
+            for b in range(n_m):
+                ref = exact[a, b]
+                if ref == 0:
+                    continue
+                ulp = decimal.Decimal(float(np.spacing(abs(float(ref)))))
+                worst = max(worst, abs(decimal.Decimal(float(got[a, b])) - ref) / ulp)
+    return float(worst)
+
+
+def _nm1_errors_vs_exact(got: np.ndarray, exact: np.ndarray) -> tuple[float, float]:
+    """``(max absolute error, max relative error)`` of ``got`` against the oracle.
+
+    The relative error skips the phase-centre pixel, where the exact value is
+    zero and every implementation returns exactly zero: a relative error is not
+    defined there, and including it as ``0/0`` or as an absolute error would
+    quietly dilute the maximum.
+
+    The subtraction, ``abs`` and division below are all context-sensitive, so
+    the whole loop runs inside ``decimal.localcontext`` at
+    ``_NM1_ORACLE_PREC``. Without it they ran at ``decimal``'s ambient default
+    of 28 digits (see :func:`_nm1_exact`) and this function would have inherited
+    whatever precision an unrelated ``decimal.setcontext`` anywhere in the
+    process had left behind -- a gate that rescales itself without failing.
+    """
+    absmax = decimal.Decimal(0)
+    relmax = decimal.Decimal(0)
+    n_l, n_m = exact.shape
+    with decimal.localcontext(decimal.Context(prec=_NM1_ORACLE_PREC)):
+        for a in range(n_l):
+            for b in range(n_m):
+                ref = exact[a, b]
+                err = abs(decimal.Decimal(float(got[a, b])) - ref)
+                absmax = max(absmax, err)
+                if ref != 0:
+                    relmax = max(relmax, err / abs(ref))
+    return float(absmax), float(relmax)
+
+
+# (id, n_l, n_m, pixsize_l, pixsize_m, naive_rel_err, naive_clears_1e_12)
+#
+# The pixel scale is the axis this issue lives on, and it is the axis every CI
+# fixture holds nearly constant: the seven review fixtures span 1.0e-4 to
+# 3.3e-2 rad, so a test written on any of them measures at most 1.5e-09. The
+# last two rows are VLBI-realistic (1e-6 rad is 0.21 arcsec, 1e-8 rad is 2.1
+# mas) and are where the defect is unmissable. Relative errors are the whole
+# grid against ``_nm1_exact``, measured 2026-09-08 at ``ef509c5``:
+#
+#     grid                     pixsize (rad)  innermost |n-1|   naive rel    stable rel
+#     EDA2 120 deg FoV / 64      3.2725e-02       5.3560e-04    3.8342e-14    1.5421e-15
+#     MWA 25 deg FoV / 128       3.4088e-03       5.8101e-06    2.7877e-12    3.8038e-16
+#     (round number)             5.0000e-03       1.2500e-05    4.4372e-12    3.7280e-16
+#     MeerKAT 1.5 deg / 256      1.0227e-04       5.2291e-09    1.4634e-09    4.0013e-16
+#     odd 63x65, pm = pl / 5     5e-3 / 1e-3      5.0000e-07    6.0167e-11    3.7280e-16
+#     (VLBI, 0.21 arcsec)        1.0000e-06       5.0000e-13    8.8901e-05    3.7305e-16
+#     (VLBI, 2.1 mas)            1.0000e-08       5.0000e-17    1.2204e+00    3.5479e-16
+#
+# The naive column is ``2 * ulp(1) / pixsize^2`` to within a factor of two, as
+# it must be: the absolute error is pinned at half an ulp of 1.0 (see
+# ``test_nm1_absolute_error_stays_at_ulp_scale``) while the innermost value it
+# is divided by shrinks as ``pixsize^2 / 2``.
+_NM1_PIXEL_SCALES: tuple[tuple[str, int, int, float, float, float, bool], ...] = (
+    (
+        "EDA2_120deg_pixsize",
+        64,
+        64,
+        math.radians(120.0) / 64,
+        math.radians(120.0) / 64,
+        3.8342e-14,
+        True,
+    ),
+    (
+        "MWA_25deg_pixsize",
+        64,
+        64,
+        math.radians(25.0) / 128,
+        math.radians(25.0) / 128,
+        2.7877e-12,
+        False,
+    ),
+    ("pixsize_5e-3", 64, 64, 5e-3, 5e-3, 4.4372e-12, False),
+    (
+        "MeerKAT_1.5deg_pixsize",
+        64,
+        64,
+        math.radians(1.5) / 256,
+        math.radians(1.5) / 256,
+        1.4634e-09,
+        False,
+    ),
+    ("odd_63x65_anisotropic", 63, 65, 5e-3, 1e-3, 6.0167e-11, False),
+    ("pixsize_1e-6_vlbi", 64, 64, 1e-6, 1e-6, 8.8901e-05, False),
+    ("pixsize_1e-8_vlbi", 64, 64, 1e-8, 1e-8, 1.2204e00, False),
+)
+
+# The gate itself, from issue #12's revised definition of done. The stable form
+# measures 3.5e-16 to 1.5e-15 on every row above -- i.e. its relative error is
+# at the float64 rounding floor and does *not* grow as the pixel shrinks -- so
+# 1e-12 clears it by at least 650x on the worst row and is nowhere near a
+# tuned threshold.
+_NM1_REL_GATE = 1e-12
+
+# How far every row of ``_NM1_PIXEL_SCALES`` must keep its closest pixel from
+# the horizon ``l^2 + m^2 = 1``, where ``n`` is infinitely ill-conditioned in
+# ``r2`` and no rewrite of ``n - 1`` can reach ``_NM1_REL_GATE``. Reachability
+# is proved, not assumed, by
+# ``test_the_horizon_precondition_rejects_the_grid_it_is_meant_to_reject``.
+_NM1_HORIZON_GAP_MIN = 1e-3
+
+
+def test_the_pre_issue_12_helper_is_still_frozen() -> None:
+    """``_nm1_naive_pre_issue_12`` must keep the *old* arithmetic, not the new.
+
+    Four cells read that helper and all four go **quiet, not red**, if someone
+    "keeps it in sync" with ``planning`` -- see its docstring for the list and
+    for what each one degenerates into. The most important of them,
+    ``test_plan_n_minus_1_does_not_move_at_imaging_pixel_scales``, becomes
+    ``|x - x|`` and passes as a tautology. So the freeze is stated here,
+    directly and next to the helper, rather than left to be inferred.
+
+    The two assertions are the two halves of "frozen": the value at one pixel
+    where the two formulas provably differ, and whole-grid inequality.
+    ``(32, 33)`` on the 1e-8 grid is the sharpest such pixel -- the true value
+    is -5.0000000000000005e-17 and the pre-#12 formula can only return a
+    multiple of ``ulp(1)/2``, so it returns exactly -1.1102230246251565e-16
+    (measured 2026-09-09).
+    """
+    frozen = _nm1_naive_pre_issue_12(64, 64, 1e-8, 1e-8)
+    assert frozen[32, 33] == -1.1102230246251565e-16, (
+        f"_nm1_naive_pre_issue_12 returned {frozen[32, 33]!r} at (32, 33) on the 1e-8 "
+        f"grid, not the frozen -1.1102230246251565e-16 (= -ulp(1)/2, the cancelled "
+        f"value). This helper is a historical record of pre-issue-#12 arithmetic and "
+        f"must not be updated when planning changes"
+    )
+    assert not np.array_equal(frozen, _n_minus_1_grid(64, 64, 1e-8, 1e-8)), (
+        "_nm1_naive_pre_issue_12 now agrees bit-for-bit with _n_minus_1_grid; four "
+        "cells in this section silently stop testing anything, including "
+        "test_plan_n_minus_1_does_not_move_at_imaging_pixel_scales, which becomes a "
+        "tautology"
+    )
+
+
+def test_nm1_is_exactly_minus_one_on_the_exact_horizon() -> None:
+    """A pixel landing exactly on ``l^2 + m^2 == 1`` must give ``n - 1 == -1``, bitwise.
+
+    The horizon is where the two branches meet, and they meet exactly: at
+    ``x == 1`` the inside branch is ``-1 / (sqrt(0) + 1) == -1`` and the outside
+    branch is ``-sqrt(0) - 1 == -1``, with no rounding on either side. Nothing
+    else in this section reaches that pixel -- every row of
+    ``_NM1_PIXEL_SCALES`` is required by its own horizon precondition to stay
+    ``1e-3`` clear of it -- so without this cell the boundary is untested.
+
+    A 5x5 grid at ``pixsize = 0.5`` puts four pixels on it in **binary-exact**
+    arithmetic: ``(+-1.0)^2 + 0.0^2`` is exactly 1.0, no rounding involved, so
+    this is not a near-miss dressed up as a boundary (measured 2026-09-09:
+    ``r2 == 1.0`` at exactly (0,2), (2,0), (2,4), (4,2)).
+
+    What it catches: narrowing the mask that builds ``x`` from ``<=`` to ``<``
+    -- an entirely plausible edit, since the *selector* is ``<=`` -- sets
+    ``x = 0`` at those pixels and returns ``-0.0`` instead of ``-1.0``. That
+    corrupts their w-phase and, worse, makes ``n = (n-1) + 1`` equal ``1.0``
+    instead of ``0.0``, so ``wgridder._disc_mask_and_safe_n`` starts treating
+    the horizon as *interior* and divides by it under ``divide_by_n=True``.
+    Verified 2026-09-09: with that mutation ``tests/test_planning.py`` reports
+    **1 failed, 105 passed** -- this cell and nothing else. Before it existed
+    the mutation was silent.
+    """
+    n_pix = 5
+    pixsize = 0.5
+    i = np.arange(n_pix) - n_pix // 2
+    r2 = ((i * pixsize)[:, None]) ** 2 + ((i * pixsize)[None, :]) ** 2
+    on_horizon = r2 == 1.0
+    assert int(on_horizon.sum()) == 4, (
+        f"expected the 5x5 / pixsize 0.5 grid to put 4 pixels exactly on l^2 + m^2 = 1, "
+        f"found {int(on_horizon.sum())}; this cell is vacuous without them"
+    )
+
+    got = _n_minus_1_grid(n_pix, n_pix, pixsize, pixsize)
+    assert np.array_equal(got[on_horizon], np.full(4, -1.0)), (
+        f"n - 1 on the exact horizon is {got[on_horizon]!r}, not exactly -1.0. Both "
+        f"branches evaluate to -1 there with no rounding, so this is a mask or a "
+        f"branch-selection defect, not a precision one; at -0.0 the pixel's w-phase is "
+        f"wrong and n = (n-1) + 1 becomes 1.0 instead of 0.0, which puts the horizon "
+        f"inside wgridder._disc_mask_and_safe_n's division mask"
+    )
+    n_grid = got[on_horizon] + 1.0
+    assert np.array_equal(n_grid, np.zeros(4)) and not np.any(np.signbit(n_grid)), (
+        f"n = (n - 1) + 1 on the exact horizon is {n_grid!r}, not +0.0; "
+        f"_disc_mask_and_safe_n masks on n > 0 and must exclude these pixels"
+    )
+
+
+@pytest.mark.parametrize(
+    ("n_l", "n_m", "pixsize_l", "pixsize_m", "naive_rel_err", "naive_clears_gate"),
+    [case[1:] for case in _NM1_PIXEL_SCALES],
+    ids=[case[0] for case in _NM1_PIXEL_SCALES],
+)
+def test_nm1_relative_accuracy_across_pixel_scales(
+    n_l: int,
+    n_m: int,
+    pixsize_l: float,
+    pixsize_m: float,
+    naive_rel_err: float,
+    naive_clears_gate: bool,
+) -> None:
+    """issue #12: ``n - 1`` must be accurate to 1e-12 *relative*, at any pixel scale.
+
+    Three assertions per row, in this order, because the third one is only
+    worth anything if the first two hold:
+
+    1. the frozen pre-#12 formula reproduces the relative error recorded in
+       ``_NM1_PIXEL_SCALES``, within an explicit **two-sided** factor of two
+       (``0.5 * v <= measured <= 2 * v``) -- the numbers are deterministic
+       IEEE-754, the factor is slack for a platform whose ``sqrt`` is not
+       correctly rounded, not for drift, and the lower half is the half that
+       catches a helper someone "kept in sync";
+    2. whether that row *can* discriminate is asserted, not assumed:
+       ``naive_clears_gate`` says whether the old formula already passes
+       ``_NM1_REL_GATE``, and it is ``True`` on exactly one row;
+    3. ``planning._n_minus_1_grid`` passes the gate.
+
+    Row 2 is the anti-vacuity row and the point of the table. **EDA2's own
+    pixel size cannot see this bug**: at 3.27e-2 rad the innermost ``|n - 1|``
+    is 5.3560e-04, 2.4e12 ulps of 1.0, and the pre-#12 formula already
+    measures 3.8342e-14. A test written on the repository's widest fixture --
+    the natural place to put it -- would have passed before the rewrite and
+    after it, pinning nothing. Within the regime this table covers (every
+    pixel comfortably inside the disc, or EDA2's wide field) the pre-#12
+    error tracks ``2 * ulp(1) / pixsize^2``, which crosses 1e-12 at ~2e-2 rad;
+    every one of the seven review fixtures except EDA2 is below that, and the
+    two VLBI rows are far below.
+
+    Fails on ``ef509c5`` on the six rows with ``naive_clears_gate=False``,
+    worst at ``pixsize_1e-8_vlbi``: the true innermost ``|n - 1|`` is 5.0e-17,
+    the naive form can only return 0.0 or 1.11e-16 there, and it returns the
+    latter -- a relative error of 1.22, i.e. 122%.
+
+    The horizon precondition below keeps this cell honest in the other
+    direction. ``n`` is infinitely ill-conditioned in ``r2 = l^2 + m^2`` at the
+    disc edge (``dn / d(r2) = -1 / 2n``), so a pixel that lands on ``r2 = 1``
+    carries a relative error of order ``sqrt(ulp(1))`` no matter how ``n - 1``
+    is written: at ``pixsize = 2.5e-2`` on 64^2, pixel (0, 8) sits at
+    ``l = -0.8, m = -0.6`` and **both** forms measure 4.3644e-09 there
+    (2026-09-08). That is a property of the square root, not a cancellation
+    this issue can remove, so such a row would fail the gate for ever. Every
+    row of ``_NM1_PIXEL_SCALES`` keeps ``min|1 - r2|`` at 1.9e-3 (EDA2) or
+    above -- 0.95 or more on the six narrow-field rows -- and the assertion
+    below is what stops a future row from being added inside that trap and
+    mistaken for a real failure.
+    """
+    horizon_gap = _nm1_horizon_gap(n_l, n_m, pixsize_l, pixsize_m)
+    assert horizon_gap > _NM1_HORIZON_GAP_MIN, (
+        f"this grid has a pixel at |1 - (l^2 + m^2)| = {horizon_gap:.4e}, on the disc "
+        f"edge where n is ill-conditioned in r2 and no algebraic rewrite of n - 1 can "
+        f"reach {_NM1_REL_GATE:.0e} relative; pick a pixel size whose grid stays clear "
+        f"of the horizon"
+    )
+
+    exact = _nm1_exact(n_l, n_m, pixsize_l, pixsize_m)
+
+    naive = _nm1_naive_pre_issue_12(n_l, n_m, pixsize_l, pixsize_m)
+    _, measured_naive_rel = _nm1_errors_vs_exact(naive, exact)
+    # An explicit two-sided band, NOT ``pytest.approx(naive_rel_err, rel=1.0)``.
+    # ``approx`` takes the *larger* of its relative and absolute tolerances and
+    # its default ``abs`` is 1e-12, so on the EDA2 row (3.83e-14) the effective
+    # window was [0, 1.04e-12] -- 27x the recorded value, with no lower bound at
+    # all. Every row accepted 0.0, i.e. the assertion could not detect the drift
+    # it exists to detect, in the direction that matters (a helper "kept in
+    # sync" makes this number *smaller*, not larger).
+    assert 0.5 * naive_rel_err <= measured_naive_rel <= 2.0 * naive_rel_err, (
+        f"the recorded pre-#12 relative error {naive_rel_err:.4e} is no longer what the "
+        f"frozen formula produces ({measured_naive_rel:.4e}); the table in "
+        f"_NM1_PIXEL_SCALES describes float64 arithmetic and should not move"
+    )
+    assert (measured_naive_rel <= _NM1_REL_GATE) is naive_clears_gate, (
+        f"this row's discriminating power changed: the pre-#12 formula measures "
+        f"{measured_naive_rel:.4e} against a gate of {_NM1_REL_GATE:.0e}, so "
+        f"naive_clears_gate should be {measured_naive_rel <= _NM1_REL_GATE}, not "
+        f"{naive_clears_gate}"
+    )
+
+    _, rel = _nm1_errors_vs_exact(_n_minus_1_grid(n_l, n_m, pixsize_l, pixsize_m), exact)
+    assert rel <= _NM1_REL_GATE, (
+        f"_n_minus_1_grid is {rel:.4e} relative against the exact grid at "
+        f"pixsize ({pixsize_l:.4e}, {pixsize_m:.4e}), over the gate of "
+        f"{_NM1_REL_GATE:.0e}. The pre-#12 formula measures {measured_naive_rel:.4e} "
+        f"here; use -x / (sqrt(1 - x) + 1) for the inside-disc branch"
+    )
+
+
+@pytest.mark.parametrize("pixsize", [1e-9, 1e-10], ids=["pixsize_1e-9", "pixsize_1e-10"])
+def test_nm1_is_never_exactly_zero_off_the_phase_centre(pixsize: float) -> None:
+    """Issue #12's premise -- "exactly 0 for the innermost pixels" -- was true, below 1e-9.
+
+    The issue body says ``n - 1`` is "exactly 0 for the innermost pixels in
+    float32". PR #70's first correction called that false; it is false about
+    *float32* -- ``_n_minus_1_grid`` computes in float64 whatever the plan
+    dtype, and narrowing preserves an exact zero rather than creating one --
+    but the underlying claim is right one order of magnitude below the finest
+    row of ``_NM1_PIXEL_SCALES``, for a reason the issue did not give: float64
+    cancellation, not float32 storage.
+
+    Count of **off-centre** pixels where ``n - 1`` is exactly ``0.0``, 64^2
+    grid, measured 2026-09-09 (identical after narrowing to float32):
+
+        pixsize   pre-#12   cancellation-free
+        1e-8            0                   0
+        1e-9          176                   0
+        1e-10        4095 (all)             0
+        1e-12        4095 (all)             0
+
+    At 0.2 mas the pre-#12 formula collapsed 176 pixels of the grid to a
+    constant; at 0.02 mas, the entire off-centre grid. The cancellation-free
+    form returns -5e-19 at (32, 33) at pixsize 1e-9 and is never exactly zero
+    at any scale. This is a stronger statement than the relative gate above --
+    a value of exactly zero has infinite relative error and destroys the pixel
+    ordering, not just its precision -- and it is the assertion that matches
+    what the issue actually asked for.
+    """
+    n_pix = 64
+    got = _n_minus_1_grid(n_pix, n_pix, pixsize, pixsize)
+    off_centre = np.ones((n_pix, n_pix), dtype=bool)
+    off_centre[n_pix // 2, n_pix // 2] = False
+
+    frozen = _nm1_naive_pre_issue_12(n_pix, n_pix, pixsize, pixsize)
+    n_zero_before = int((frozen[off_centre] == 0.0).sum())
+    assert n_zero_before > 0, (
+        f"the pre-#12 formula returns no exact zeros off the phase centre at pixsize "
+        f"{pixsize:.0e}, so this row no longer demonstrates the collapse it exists to "
+        f"demonstrate (measured 176 at 1e-9 and 4095 at 1e-10 on 2026-09-09)"
+    )
+    assert not np.any(got[off_centre] == 0.0), (
+        f"_n_minus_1_grid returns exactly 0.0 at "
+        f"{int((got[off_centre] == 0.0).sum())} off-centre pixels at pixsize "
+        f"{pixsize:.0e}; the pre-#12 formula returned {n_zero_before}. An exact zero "
+        f"is not a rounding error, it is the loss of the pixel's identity in the "
+        f"w-phase"
+    )
+    assert not np.any(got.astype(np.float32)[off_centre] == 0.0), (
+        f"narrowing to float32 introduces exact zeros off the phase centre at pixsize "
+        f"{pixsize:.0e}; the float64 grid has none, so this is the float32 storage "
+        f"claim in issue #12's body and it would be a separate defect"
+    )
+
+
+def test_the_horizon_precondition_rejects_the_grid_it_is_meant_to_reject() -> None:
+    """The ``min|1 - r2| > 1e-3`` precondition must be reachable, and it must be right.
+
+    Same shape as ``tests/test_window_bucketing.py::
+    test_the_vacuity_guard_rejects_the_fixtures_it_is_meant_to_reject``: a guard
+    that never fires on any current row is indistinguishable from a guard that
+    cannot fire, so one grid that *does* trip it is asserted here.
+
+    ``pixsize = 2.5e-2`` on 64^2 is that grid. Pixel (0, 8) sits at
+    ``l = -0.8, m = -0.6`` and ``l^2 + m^2`` lands within one ulp of 1.0:
+    measured 2026-09-09, ``min|1 - r2| = 2.2204e-16``, thirteen orders of
+    magnitude inside the ``1e-3`` threshold.
+
+    The second assertion is the reason the guard exists rather than a bug: at
+    the horizon ``dn/d(r2) = -1/(2n)`` diverges, so ``n - 1`` inherits
+    ``~sqrt(ulp(1))`` of relative error from the pixel coordinate no matter how
+    it is written, and **both** forms measure 4.3644e-09 there (2026-09-09) --
+    3600x over ``_NM1_REL_GATE``. A row placed there would fail for ever and
+    read as a defect in ``_n_minus_1_grid``, which is what the guard prevents.
+    """
+    n_pix = 64
+    pixsize = 2.5e-2
+    gap = _nm1_horizon_gap(n_pix, n_pix, pixsize, pixsize)
+    assert gap <= _NM1_HORIZON_GAP_MIN, (
+        f"the pixsize 2.5e-2 grid no longer trips the horizon precondition "
+        f"(min|1 - r2| = {gap:.4e} against a threshold of {_NM1_HORIZON_GAP_MIN:.0e}); "
+        f"without a grid that trips it, the precondition in "
+        f"test_nm1_relative_accuracy_across_pixel_scales is untested"
+    )
+
+    exact = _nm1_exact(n_pix, n_pix, pixsize, pixsize)
+    _, naive_rel = _nm1_errors_vs_exact(
+        _nm1_naive_pre_issue_12(n_pix, n_pix, pixsize, pixsize), exact
+    )
+    _, live_rel = _nm1_errors_vs_exact(_n_minus_1_grid(n_pix, n_pix, pixsize, pixsize), exact)
+    assert naive_rel > _NM1_REL_GATE and live_rel > _NM1_REL_GATE, (
+        f"on the horizon grid the pre-#12 form measures {naive_rel:.4e} and the "
+        f"cancellation-free form {live_rel:.4e}; the precondition exists because "
+        f"BOTH exceed {_NM1_REL_GATE:.0e} there (4.3644e-09 each, 2026-09-09), so if "
+        f"either now clears the gate the precondition is over-broad and should be "
+        f"narrowed rather than kept"
+    )
+
+
+# (id, plan dtype, epsilon, relative gate). The float64 row is issue #12's
+# definition of done. The float32 row is the *other* half of the same claim and
+# the one the PR text got backwards: ``_n_minus_1_grid`` is float64 whatever the
+# plan dtype, so the helper is unaffected by ``dtype`` -- but ``plan.n_minus_1``
+# is the narrowed leaf, and below ~1e-5 rad it inherited the float64
+# cancellation wholesale. Measured 2026-09-09, 64^2, whole grid against
+# ``_nm1_exact``, ``ef509c5`` -> ``ec469ff``:
+#
+#     pixsize   float64 before   float64 after   float32 before   float32 after
+#     3.27e-2       2.4563e-13      1.6894e-13       3.8798e-05      3.8798e-05
+#     5.00e-3       4.4372e-12      2.9350e-14       1.0678e-05      1.0678e-05
+#     1.00e-6       8.8901e-05      5.6830e-14       8.8901e-05      2.2122e-05
+#     1.00e-8       1.2204e+00      5.4815e-14       1.2204e+00      2.6784e-05
+#
+# i.e. at 1e-8 the float32 plan leaf improves by a factor of 45,000, which is
+# the largest measurable effect this change has anywhere. The float32 floor of
+# ~2.7e-05 is issue #23's ``n_minus_1_shifted - nshift`` round trip in single
+# precision, not this issue, which is why the two gates differ by eight orders
+# of magnitude.
+#
+# What this does NOT do is add coverage to the ``JAX_ENABLE_X64=0`` CI leg:
+# this whole module is in ``tests/conftest.py``'s ``collect_ignore`` there
+# (it builds default float64 plans and imports modules that switch x64 back
+# on). ``dtype=jnp.float32`` under an x64-enabled jax exercises the narrowing
+# and the single-precision ``n_minus_1_shifted - nshift`` round trip, which is
+# the whole of what this issue can affect at float32; a cell that also wanted
+# the x64=0 *config* would have to live in a module that leg collects.
+_NM1_PLAN_DTYPE_CASES: tuple[tuple[str, DTypeLike, float, float], ...] = (
+    ("float64", jnp.float64, 1e-6, _NM1_REL_GATE),
+    # epsilon 1e-4: make_plan warns below 1e-5 for a float32 plan, and the leaf
+    # measured here does not depend on epsilon (checked: identical at 1e-6).
+    ("float32", jnp.float32, 1e-4, 1e-4),
+)
+
+
+@requires_x64
+@pytest.mark.parametrize(
+    ("dtype", "epsilon", "gate"),
+    [case[1:] for case in _NM1_PLAN_DTYPE_CASES],
+    ids=[case[0] for case in _NM1_PLAN_DTYPE_CASES],
+)
+def test_plan_n_minus_1_relative_accuracy_at_vlbi_pixel_scale(
+    dtype: DTypeLike, epsilon: float, gate: float
+) -> None:
+    """issue #12's definition of done, on the plan leaf rather than the helper.
+
+    ``plan.n_minus_1`` is not ``_n_minus_1_grid``'s output: since issue #23 it
+    is the property ``n_minus_1_shifted - nshift``, so it carries an extra
+    ``ulp(nshift)`` of absolute error on top. That matters here because
+    ``nshift`` scales with the grid, not with the innermost pixel: at
+    ``pixsize = 1e-8`` on 64^2, ``nshift`` is 5.1237e-14 and ``ulp(nshift)`` is
+    6.3109e-30, which is a sixth of an ulp of 1.0 in absolute terms but sits
+    against an innermost ``|n - 1|`` of 5.0e-17. So the round trip alone spends
+    most of a 1e-12 relative budget, and the gate cannot simply be inherited
+    from the helper's 3.5479e-16 -- it is measured through the plan.
+
+    Measured 2026-09-09, 64^2, epsilon as parametrised, whole grid against
+    ``_nm1_exact``:
+
+        dtype      plan.n_minus_1 at ef509c5   with the stable inside branch
+        float64                      1.2204                        5.4815e-14
+        float32                      1.2204                        2.6784e-05
+
+    18x of headroom after the rewrite on the float64 row, 3.7x on the float32
+    one, against 1.2e12 / 1.2e4 times over their gates before it. See
+    ``_NM1_PLAN_DTYPE_CASES`` for the full pixel-scale x dtype table and for
+    why the two gates are eight orders of magnitude apart.
+
+    **Grid size is an axis this cell deliberately does not sweep, and it is
+    not free.** The ``nshift`` round trip grows with the extent while the
+    innermost ``|n - 1|`` does not, so the float64 measurement degrades as the
+    grid doubles -- measured 2026-09-09 at pixsize 1e-8: 64^2 5.4815e-14
+    (nshift 5.120e-14), 128^2 1.9762e-13, 256^2 3.0728e-13, and **512^2
+    3.7317e-12, which fails this 1e-12 gate**. That failure would belong to
+    issue #23's ``n_minus_1_shifted - nshift`` representation, not to #12: the
+    helper itself measures 3.5e-16 at every one of those sizes. 64^2 is the
+    sized-down review geometry and is what this cell uses; a maintainer who
+    raises ``n_pix`` here should expect a red cell at 512 and should not read
+    it as a regression in ``_n_minus_1_grid``.
+    """
+    n_pix = 64
+    pixsize = 1e-8
+    plan = make_plan(
+        uvw=_baseline_uvw(),
+        freq=np.array([200e6]),
+        image_shape=(n_pix, n_pix),
+        pixsize_l=pixsize,
+        pixsize_m=pixsize,
+        epsilon=epsilon,
+        dtype=dtype,
+    )
+    exact = _nm1_exact(n_pix, n_pix, pixsize, pixsize)
+    _, rel = _nm1_errors_vs_exact(np.asarray(plan.n_minus_1), exact)
+    assert rel <= gate, (
+        f"plan.n_minus_1 ({np.dtype(dtype).name}) is {rel:.4e} relative against the "
+        f"exact grid at pixsize {pixsize:.0e} rad, over the gate of {gate:.0e} "
+        f"(measured 1.2204 at both dtypes before issue #12's rewrite; 5.4815e-14 "
+        f"float64 / 2.6784e-05 float32 after it)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("n_l", "n_m", "pixsize_l", "pixsize_m"),
+    [case[1:5] for case in _NM1_PIXEL_SCALES],
+    ids=[case[0] for case in _NM1_PIXEL_SCALES],
+)
+def test_nm1_absolute_error_stays_at_ulp_scale(
+    n_l: int, n_m: int, pixsize_l: float, pixsize_m: float
+) -> None:
+    """The absolute error must stay at ulp scale, and the live form within 3 ulps.
+
+    ``n - 1`` reaches the operators only through ``exp(2*pi*i*w*(n-1))`` and
+    through ``n = (n-1) + 1``, and both depend on the **absolute** error, not
+    the relative one. So this cell holds the absolute error at ulp scale for
+    the frozen pre-#12 formula *and* for the live one -- a future rewrite that
+    bought relative accuracy at the cost of absolute accuracy would be a real
+    regression that no accuracy test in this suite would catch, and the first
+    two assertions are what stand in its way.
+
+    The third assertion is stronger and applies to the live form only: on a
+    grid wholly inside the disc it must be within **three ulps of its own
+    value** at every pixel, i.e. essentially correctly rounded. A flat absolute
+    bound cannot see a defect that scales with the value -- ``np.nextafter``
+    applied to every inside pixel is a real one-ulp degradation, and it changes
+    the whole-grid absolute error of the 1e-6 row from 1.06e-25 to 1.2e-28,
+    which no absolute bound in this file would notice. Measured elementwise
+    ulp distance from ``_nm1_exact`` (2026-09-09):
+
+        row                    live    with the one-ulp nextafter mutation
+        MWA 25 deg / 128       2.599                                 3.067
+        pixsize 5e-3           2.756                                 3.756
+        MeerKAT 1.5 deg / 256  2.588                                 3.037
+        odd 63x65 anisotropic  2.398                                 3.356
+        pixsize 1e-6           2.193                                 3.056
+        pixsize 1e-8           2.353                                 3.312
+        EDA2 (wide field)      7.284                                 7.284
+
+    Three is not tuned to those numbers, it is the forward bound of the
+    expression: ``x = fl(l^2 + m^2)`` is within one ulp, and ``1 - x``,
+    ``sqrt``, ``+ 1`` and the divide each add at most half a one, with the
+    condition number of ``n - 1`` in ``x`` equal to 1 for small ``x``. Every
+    operation is IEEE-754 correctly rounded, so the measurements above are
+    bit-reproducible on any platform, not just this one.
+
+    EDA2 is exempted from the ulp bound and given 10: its worst pixel is
+    dominated by the rounding of the pixel *coordinate* (``l`` reaches 1.05, so
+    ``ulp(l)`` is 2.2e-16 before any square root), which both forms share and
+    which the mutation does not touch -- 7.284 either way. It is a
+    characterisation row here, not the discriminating one.
+
+    Measured 2026-09-08 at ``ef509c5``, whole grid against ``_nm1_exact``:
+
+        grid                       naive abs      stable abs
+        EDA2 120 deg FoV / 64     1.6173e-15      1.6173e-15
+        every other row above     ~8.15e-17       <= 4.03e-18
+
+    Hence the two-tier bound. EDA2 is an order of magnitude worse than the
+    narrow-field grids and identically so in both forms, because its error
+    comes from somewhere else entirely: with ``l`` running to 1.05 the
+    float64-rounded pixel coordinate is already 2.2e-16 off, and the
+    outside-disc branch amplifies that, so the figure is a property of the
+    grid construction that this issue does not touch (and that
+    ``test_nm1_outside_disc_branch_is_bit_identical`` pins exactly). A flat
+    2e-16 bound is the tempting form of this test and it is wrong: it fails on
+    the repository's own wide-field fixture, before the rewrite as well as
+    after.
+    """
+    # ``max|n - 1|`` never exceeds 1 on a grid inside the disc and grows past
+    # it on a wide field, so this is one ulp of the grid's own dynamic range,
+    # times a factor of ~2.5 of headroom over the worst measurement.
+    inside_only = bool(_nm1_inside_disc(n_l, n_m, pixsize_l, pixsize_m).all())
+    bound = 2e-16 if inside_only else 4e-15
+    ulp_bound = 3.0 if inside_only else 10.0
+
+    exact = _nm1_exact(n_l, n_m, pixsize_l, pixsize_m)
+    naive_abs, _ = _nm1_errors_vs_exact(
+        _nm1_naive_pre_issue_12(n_l, n_m, pixsize_l, pixsize_m), exact
+    )
+    assert naive_abs <= bound, (
+        f"the pre-#12 formula's absolute error is {naive_abs:.4e}, over {bound:.0e}; "
+        f"this arm characterises frozen float64 arithmetic and should not move"
+    )
+
+    got = _n_minus_1_grid(n_l, n_m, pixsize_l, pixsize_m)
+    got_abs, _ = _nm1_errors_vs_exact(got, exact)
+    assert got_abs <= bound, (
+        f"_n_minus_1_grid's absolute error is {got_abs:.4e}, over {bound:.0e}, at "
+        f"pixsize ({pixsize_l:.4e}, {pixsize_m:.4e}). Relative accuracy near the phase "
+        f"centre may not be bought with absolute accuracy: the w-phase "
+        f"exp(2*pi*i*w*(n-1)) and the adjoint's n = (n-1) + 1 both read the absolute "
+        f"value (pre-#12 form: {naive_abs:.4e})"
+    )
+
+    worst_ulps = _nm1_max_ulp_error(got, exact)
+    assert worst_ulps <= ulp_bound, (
+        f"_n_minus_1_grid is {worst_ulps:.3f} ulps from correctly rounded at pixsize "
+        f"({pixsize_l:.4e}, {pixsize_m:.4e}), over the bound of {ulp_bound:g}. This is "
+        f"the elementwise arm: a defect that scales with the pixel value (an ulp of a "
+        f"1e-4-scale number, say) is invisible to the whole-grid absolute bound above "
+        f"but not to this one"
+    )
+
+
+def test_nm1_outside_disc_branch_is_bit_identical() -> None:
+    """Outside the unit disc, ``n - 1`` must not change by a single bit.
+
+    ``-sqrt(l^2 + m^2 - 1) - 1`` is a sum of two same-sign quantities: there is
+    no cancellation to remove, so issue #12's rewrite has no business touching
+    it. The branch is not a corner case here -- EDA2's 120-degree field puts
+    **1155 of 4096 pixels** outside the disc (measured 2026-09-08), reaching
+    ``n - 1 = -2.0924``, and those pixels set ``nshift`` and therefore the
+    plane count for the whole plan (``test_nshift_matches_geometry``).
+
+    Bit-identity rather than a tolerance, because these pixels are exactly
+    where the plan's dynamic range lives: on this grid ``max|n-1|`` outside the
+    disc is 2.0924 against 1.0 inside, ``nshift`` is 1.0462, and a change of
+    even one ulp there moves ``dw`` and can move ``n_w``. The absolute error of
+    this branch against the exact grid is 1.6173e-15 -- see
+    ``test_nm1_absolute_error_stays_at_ulp_scale`` for why that is the pixel
+    coordinate's rounding and not the branch's -- and it must be *the same*
+    1.6173e-15 after the rewrite, not a different value inside a tolerance.
+
+    Passes on ``ef509c5``; it is a guard on the rewrite, not a demonstration of
+    the defect.
+    """
+    n_pix = 64
+    pixsize = math.radians(120.0) / n_pix  # EDA2
+    outside = ~_nm1_inside_disc(n_pix, n_pix, pixsize, pixsize)
+    assert int(outside.sum()) == 1155, (
+        f"expected EDA2's 64^2 / 120-degree grid to put 1155 pixels outside the unit "
+        f"disc, found {int(outside.sum())}; this cell is vacuous without them"
+    )
+
+    got = _n_minus_1_grid(n_pix, n_pix, pixsize, pixsize)
+    frozen = _nm1_naive_pre_issue_12(n_pix, n_pix, pixsize, pixsize)
+    assert np.array_equal(got[outside], frozen[outside]), (
+        "the outside-disc analytic extension changed. "
+        f"max |delta| = {float(np.max(np.abs(got[outside] - frozen[outside]))):.4e}; "
+        "issue #12's rewrite applies to the inside-disc branch only"
+    )
+    assert float(np.min(got[outside])) == pytest.approx(-2.0924, abs=1e-4)
+
+
+# (id, n_l, n_m, pixsize_l, pixsize_m) -- the imaging-realistic geometries, i.e.
+# the pixel sizes of the review fixtures plus one odd/anisotropic grid. The two
+# VLBI rows are deliberately absent: nothing in this repository images at 2 mas,
+# and the claim being pinned is about the configurations that exist.
+_NM1_IMAGING_GEOMETRIES: tuple[tuple[str, int, int, float, float], ...] = tuple(
+    case[:5] for case in _NM1_PIXEL_SCALES if "vlbi" not in case[0]
+)
+
+
+@requires_x64
+@pytest.mark.parametrize(
+    ("n_l", "n_m", "pixsize_l", "pixsize_m"),
+    [case[1:] for case in _NM1_IMAGING_GEOMETRIES],
+    ids=[case[0] for case in _NM1_IMAGING_GEOMETRIES],
+)
+def test_plan_n_minus_1_does_not_move_at_imaging_pixel_scales(
+    n_l: int, n_m: int, pixsize_l: float, pixsize_m: float
+) -> None:
+    """issue #12 bounds how far ``plan.n_minus_1`` moves: half an ulp of 1.0, times 1.5.
+
+    This cell bounds the **size of the change**, and that is all it does. It is
+    explicitly *not* an argument that nothing downstream moves -- that
+    inference is false, and the two cells that state the truth instead are
+    ``test_nm1_downstream_phase_accuracy_at_large_w`` (the change is visible
+    downstream, it scales as ``2 pi w`` times this bound, and the new form is
+    the more accurate of the two) and the re-run accuracy sweep in
+    ``tests/test_accuracy_sweep.py``.
+
+    For the record, measured 2026-09-09 over 78 plans (the eight review
+    fixtures plus five synthetic geometries x both dtypes x epsilon 1e-4/1e-6 x
+    hermitian on/off) and their 312 operator outputs, ``ef509c5`` vs
+    ``ec469ff``: 60 of 78 plans and 224 of 312 outputs change **bitwise**;
+    ``plan.nshift`` moves on 38 of 78 (worst 3.17e-17 absolute, 3.70e-13
+    relative, on MeerKAT zenith). What does *not* move, on 0 of 78, is every
+    structural quantity -- ``n_w``, ``w_kernel_width``, ``beta``,
+    ``w_kernel_scale``, ``w0``, ``w_extent``, the whole window layout,
+    ``sort_perm``, ``flip_sign``, ``uvw_m``, ``inv_lambda``,
+    ``w_centers_rel``. "It moves no measured number" was the wrong claim; this
+    bound plus that structural invariance is the right one.
+
+    "Before" is the frozen ``_nm1_naive_pre_issue_12``, so the comparison keeps
+    working once ``planning`` no longer contains that formula.
+
+    Measured 2026-09-09, float64 plan, epsilon 1e-6, max over the whole grid of
+    ``|plan.n_minus_1 - pre_issue_12|``:
+
+        grid                       today     with the stable inside branch
+        EDA2 120 deg FoV / 64    1.1102e-16                    1.1102e-16
+        MWA 25 deg / 128                0                      8.0665e-17
+        pixsize 5e-3                    0                      8.0665e-17
+        MeerKAT 1.5 deg / 256           0                      8.1481e-17
+        odd 63x65 anisotropic           0                      8.1532e-17
+
+    The bound is ``1.5 * (0.5 * np.spacing(1.0))`` = 1.6653e-16, not the
+    ``np.spacing(1.0)`` = 2.2204e-16 this cell was first written with. Half an
+    ulp of 1.0 is what the cancellation can produce and no more -- inside the
+    disc ``sqrt(...) - 1`` is a Sterbenz-exact subtraction, so the whole of the
+    pre-#12 error comes from rounding ``1 - r2``, which is bounded by
+    ``ulp(1)/2`` -- and EDA2 attains it exactly at 1.1102e-16. The remaining
+    1.5x is for issue #23's ``nshift`` round trip, which is what makes EDA2's
+    figure non-zero *before* the rewrite as well as after (``nshift`` is 1.0462
+    there while ``|n - 1|`` reaches 2.0924, the condition
+    ``plan.n_minus_1``'s docstring names as breaking the error-free-subtraction
+    argument).
+
+    Note what this bound is still blind to, by construction: it compares
+    against a formula whose own error is ``ulp(1)/2``, so a defect smaller than
+    that -- ``np.nextafter`` on every inside pixel, say -- cannot show up here
+    at all. ``test_nm1_absolute_error_stays_at_ulp_scale``'s elementwise ulp
+    arm is where that is caught.
+    """
+    plan = make_plan(
+        uvw=_baseline_uvw(),
+        freq=np.array([200e6]),
+        image_shape=(n_l, n_m),
+        pixsize_l=pixsize_l,
+        pixsize_m=pixsize_m,
+        epsilon=1e-6,
+    )
+    moved = np.abs(
+        np.asarray(plan.n_minus_1) - _nm1_naive_pre_issue_12(n_l, n_m, pixsize_l, pixsize_m)
+    )
+    worst = float(moved.max())
+    bound = 1.5 * (0.5 * float(np.spacing(1.0)))
+    assert worst <= bound, (
+        f"plan.n_minus_1 moved by {worst:.4e} against the pre-issue-#12 grid at pixsize "
+        f"({pixsize_l:.4e}, {pixsize_m:.4e}), over {bound:.4e} (1.5 x half an ulp of "
+        f"1.0). Half an ulp is the most the pre-#12 cancellation could produce, so a "
+        f"move past this is a change in kind, not in rounding: re-measure the "
+        f"downstream phase (test_nm1_downstream_phase_accuracy_at_large_w) and re-run "
+        f"the accuracy sweep"
+    )
+
+
+# The downstream fixture: a fine-pixel image at a large common w offset. 16^2
+# pixels and 8 rows is enough for the effect (which is per-pixel, not
+# statistical) and keeps the row-at-a-time DFT reference below a millisecond.
+_NM1_W_PHASE_N_PIX = 16
+_NM1_W_PHASE_N_ROWS = 8
+_NM1_W_PHASE_PIXSIZE = 1e-6  # 0.21 arcsec, the VLBI row of _NM1_PIXEL_SCALES
+_NM1_W_PHASE_W0 = 1e6  # wavelengths
+
+
+def _nm1_w_phase_problem() -> tuple[np.ndarray, np.ndarray]:
+    """``(uvw in metres, freq)`` for the large-w downstream cell.
+
+    ``freq`` is the speed of light so that ``uvw`` in metres *is* ``uvw`` in
+    wavelengths, exactly as ``tests/test_nshift.py::_w0_offset_problem`` does,
+    which makes ``_NM1_W_PHASE_W0`` directly the w offset under test.
+    """
+    rng = np.random.default_rng(11)
+    uvw = np.zeros((_NM1_W_PHASE_N_ROWS, 3))
+    uvw[:, 0] = rng.uniform(-50.0, 50.0, _NM1_W_PHASE_N_ROWS)
+    uvw[:, 1] = rng.uniform(-50.0, 50.0, _NM1_W_PHASE_N_ROWS)
+    uvw[:, 2] = _NM1_W_PHASE_W0 + rng.uniform(-10.0, 10.0, _NM1_W_PHASE_N_ROWS)
+    return uvw, np.array([SPEED_OF_LIGHT])
+
+
+def _nm1_dft_forward(
+    image: np.ndarray, uvw: np.ndarray, pixsize: float, nm1: np.ndarray
+) -> np.ndarray:
+    """Forward DFT on the given ``n - 1`` grid, row at a time, float64.
+
+    ``V = sum_lm I exp(-2i pi (u l + v m - w (n-1)))`` -- AGENTS.md section 1's
+    sign convention, written from it rather than imported (the row loop is the
+    same shape as ``tests/test_against_dft.py::_reference_forward``).
+
+    **Range reduction is deliberately not done here, and that was checked
+    rather than assumed.** A large ``w`` normally makes a naive
+    ``exp(2i pi w x)`` reference worthless -- ``ulp(2 pi * 1e6)`` is 9.3e-10 --
+    which is why ``planning._phase_turns_reduced`` exists. It does not bite on
+    *this* fixture because the pixel scale is 1e-6 rad: ``|n - 1|`` never
+    exceeds 1.3e-10 on a 16^2 grid, so ``w (n - 1)`` is at most ~5e-7 turns and
+    the products are nowhere near a rounding cliff. Measured 2026-09-09 by
+    rebuilding the whole cell on an exactly ``Fraction``-reduced reference: the
+    pre-#12 number is 1.9853e-10 either way, and the cancellation-free one is
+    1.97e-20 (plain) against 7.90e-20 (exact) -- both twenty orders of
+    magnitude below what the assertions compare. A future edit that widens the
+    field or coarsens the pixel here would need the reduction back.
+    """
+    n_l, n_m = image.shape
+    ll = ((np.arange(n_l) - n_l // 2) * pixsize)[:, None]
+    mm = ((np.arange(n_m) - n_m // 2) * pixsize)[None, :]
+    out = np.zeros(uvw.shape[0], dtype=np.complex128)
+    for r in range(uvw.shape[0]):
+        u, v, w = (float(c) for c in uvw[r])
+        out[r] = np.sum(image * np.exp(-2j * np.pi * (u * ll + v * mm - w * nm1)))
+    return out
+
+
+@requires_x64
+def test_nm1_downstream_phase_accuracy_at_large_w() -> None:
+    """The rewrite *is* visible downstream, and it is visible as an improvement.
+
+    This is the cell that replaces the inference
+    ``test_plan_n_minus_1_does_not_move_at_imaging_pixel_scales`` used to make.
+    That cell shows ``n - 1`` moves by at most half an ulp of 1.0; it does
+    **not** follow that nothing downstream moves. ``n - 1`` enters as
+    ``exp(2i pi w (n - 1))``, so an absolute error ``delta`` becomes a phase
+    error of ``2 pi w delta`` -- unbounded in ``w``. Measured on this fixture
+    (16^2 at pixsize 1e-6, 2026-09-09), relative L2 of the DFT against a
+    reference built on ``_nm1_exact``:
+
+        w offset     pre-#12 n - 1     cancellation-free n - 1
+        0                  9.46e-16                        0.0
+        1e4                1.99e-12                        0.0
+        1e6                1.99e-10                   1.97e-20
+
+    i.e. exactly linear in ``w``, as ``2 pi w delta`` with ``delta`` the
+    ``8.3e-17`` absolute error the pre-#12 form carries at this pixel scale.
+    1e6 wavelengths is not a stress value: at 1.4 GHz it is a 214 km baseline.
+
+    Three assertions:
+
+    1. the pre-#12 form's downstream error clears ``1e-11`` -- the anti-vacuity
+       assertion, and the direct falsification of "it moves no measured number
+       anywhere in the suite";
+    2. the live form's is at least 1e6 times smaller;
+    3. ``dirty2vis`` itself, at ``epsilon = 1e-12``, stays inside the sweep's
+       ``2 x epsilon`` contract against the same reference (measured 0.40x eps).
+
+    Assertion 3 is what makes 1 and 2 about the operator rather than about a
+    numpy expression: the plan really does carry ``_n_minus_1_grid``'s output
+    into the phase, at a ``w`` where getting it wrong would show.
+    """
+    n_pix = _NM1_W_PHASE_N_PIX
+    pixsize = _NM1_W_PHASE_PIXSIZE
+    uvw, freq = _nm1_w_phase_problem()
+    image = np.random.default_rng(7).standard_normal((n_pix, n_pix))
+
+    exact_grid = np.array(
+        [[float(v) for v in row] for row in _nm1_exact(n_pix, n_pix, pixsize, pixsize)]
+    )
+    reference = _nm1_dft_forward(image, uvw, pixsize, exact_grid)
+    norm = float(np.linalg.norm(reference))
+
+    def rel(nm1: np.ndarray) -> float:
+        got = _nm1_dft_forward(image, uvw, pixsize, nm1)
+        return float(np.linalg.norm(got - reference)) / norm
+
+    naive_rel = rel(_nm1_naive_pre_issue_12(n_pix, n_pix, pixsize, pixsize))
+    live_rel = rel(_n_minus_1_grid(n_pix, n_pix, pixsize, pixsize))
+
+    assert naive_rel > 1e-11, (
+        f"the pre-#12 n - 1 costs only {naive_rel:.4e} relative at w = "
+        f"{_NM1_W_PHASE_W0:.0e} on this fixture, so this cell no longer shows that the "
+        f"issue-#12 rewrite is observable downstream and assertion 2 below is vacuous"
+    )
+    assert live_rel <= naive_rel / 1e6, (
+        f"the cancellation-free n - 1 costs {live_rel:.4e} relative at w = "
+        f"{_NM1_W_PHASE_W0:.0e}, against {naive_rel:.4e} for the pre-#12 form -- less "
+        f"than the 1e6x improvement issue #12 buys. The w-phase reads the ABSOLUTE "
+        f"error of n - 1, multiplied by 2*pi*w"
+    )
+
+    eps = 1e-12
+    plan = make_plan(
+        uvw=uvw,
+        freq=freq,
+        image_shape=(n_pix, n_pix),
+        pixsize_l=pixsize,
+        pixsize_m=pixsize,
+        epsilon=eps,
+    )
+    got = np.asarray(dirty2vis(plan, jnp.asarray(image[None, :, :])))[:, 0]
+    operator_rel = float(np.linalg.norm(got - reference)) / norm
+    assert operator_rel <= 2.0 * eps, (
+        f"dirty2vis is {operator_rel:.4e} ({operator_rel / eps:.2f}x eps) against an "
+        f"exact-n-1 DFT at w = {_NM1_W_PHASE_W0:.0e} and pixsize "
+        f"{pixsize:.0e}, outside the accuracy sweep's 2x epsilon contract (measured "
+        f"0.40x eps at ec469ff)"
+    )
 
 
 def test_plan_invalid_inputs() -> None:

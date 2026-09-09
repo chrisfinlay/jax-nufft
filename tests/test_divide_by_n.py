@@ -755,9 +755,13 @@ def _reference_adjoint_no_divide(
     lgrid, mgrid = np.meshgrid(ll, mm, indexing="ij")
     rho2 = lgrid**2 + mgrid**2
     inside = rho2 <= 1.0
+    x = np.where(inside, rho2, 0.0)
     nm1 = np.where(
         inside,
-        np.sqrt(np.where(inside, 1.0 - rho2, 0.0)) - 1.0,
+        # Cancellation-free ``sqrt(1 - x) - 1``; see
+        # ``tests/conftest.py::reference_lmn_grids`` for why an oracle may not
+        # carry the ``ulp(1)/2`` error that issue #12 removed from ``planning``.
+        -x / (np.sqrt(1.0 - x) + 1.0),
         -np.sqrt(np.where(inside, 0.0, rho2 - 1.0)) - 1.0,
     )
     out = np.zeros(shape, dtype=np.float64)

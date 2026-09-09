@@ -252,6 +252,11 @@ def _nm1_grid(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> np.ndar
     Written out here rather than imported from ``jax_nufft.planning`` so the
     ``n_w`` prediction in :func:`_independent_plan_geometry` is an independent
     reference rather than a restatement of the code under test.
+
+    The inside-disc branch is the cancellation-free ``-r2 / (sqrt(1 - r2) + 1)``
+    rather than ``sqrt(1 - r2) - 1``: see
+    ``tests/conftest.py::reference_lmn_grids`` for why an oracle may not carry
+    the ``ulp(1)/2`` absolute error that issue #12 removed from the operator.
     """
     i = np.arange(n_l) - n_l // 2
     j = np.arange(n_m) - n_m // 2
@@ -259,9 +264,10 @@ def _nm1_grid(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> np.ndar
     mm = (j * pixsize_m)[None, :]
     r2 = ll * ll + mm * mm
     inside = r2 <= 1.0
+    x = np.where(inside, r2, 0.0)
     return np.where(
         inside,
-        np.sqrt(np.where(inside, 1.0 - r2, 0.0)) - 1.0,
+        -x / (np.sqrt(1.0 - x) + 1.0),
         -np.sqrt(np.where(inside, 0.0, r2 - 1.0)) - 1.0,
     )
 
@@ -353,7 +359,8 @@ def _reference_adjoint(
     """Exact DFT adjoint with ``divide_by_n=True``.
 
     Mirrors ``tests/test_adjoint.py::_reference_adjoint``, including its use of
-    the *clipped* ``n - 1`` (no analytic extension) and its ``n > 0`` mask.
+    the *clipped* ``n - 1`` (no analytic extension), its ``n > 0`` mask and its
+    cancellation-free spelling of ``sqrt(1 - r2) - 1``.
     """
     n_l, n_m = image_shape
     n_rows, n_chan = vis.shape
@@ -361,7 +368,8 @@ def _reference_adjoint(
     j = np.arange(n_m) - n_m // 2
     ll = (i * pixsize_l)[:, None]
     mm = (j * pixsize_m)[None, :]
-    nm1 = np.sqrt(np.maximum(1.0 - ll**2 - mm**2, 0.0)) - 1.0
+    r2 = np.minimum(ll**2 + mm**2, 1.0)
+    nm1 = -r2 / (np.sqrt(1.0 - r2) + 1.0)
     n_grid = nm1 + 1.0
     out = np.zeros((n_chan, n_l, n_m), dtype=np.float64)
     for c in range(n_chan):
