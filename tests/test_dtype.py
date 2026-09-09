@@ -953,3 +953,53 @@ def test_a_float32_plan_needs_half_the_scratch_of_a_float64_one(
         f"float32 saves a factor of {ratio:.6f}, below the {_HALVING_MIN_RATIO} "
         "README.md quotes as 'halves it'."
     )
+
+
+# The plan is a different question from the scratch, and has a different
+# answer. Its floating leaves halve, but ``sort_perm`` is int32 and
+# ``flip_sign`` is int8, so a plan whose size is dominated by per-row tables
+# saves noticeably less than one dominated by the image grid. README.md quotes
+# both ends; a single fixture would only ever show one of them.
+_PLAN_RATIO_CASES = (
+    pytest.param(MWA_EXTENDED, 256, 600, 0.501, id="image_dominated"),
+    pytest.param(EDA2, 150, 4_896_000, 0.586, id="row_dominated"),
+)
+
+
+@requires_x64
+@pytest.mark.parametrize("tel,n_pix,n_rows,expected", _PLAN_RATIO_CASES)
+def test_what_float32_saves_on_the_plan_depends_on_its_shape(
+    tel: Telescope, n_pix: int, n_rows: int, expected: float
+) -> None:
+    """Both ends of the range README.md quotes for the plan.
+
+    The interesting failure is not the ratio drifting a little; it is someone
+    reading "float32 halves memory", applying it to a row-heavy plan, and
+    budgeting 41% less than the plan will take.
+    """
+    from dataclasses import replace
+
+    sized = replace(tel, n_pix=n_pix, n_rows=n_rows)
+    uvw = synthetic_uvw(sized, 30.0, seed=0)
+    freq = np.array([sized.freq_hz])
+
+    def plan_bytes(dtype: Any) -> int:
+        plan = make_plan(
+            uvw,
+            freq,
+            (n_pix, n_pix),
+            sized.pixsize,
+            sized.pixsize,
+            1e-4,
+            dtype=dtype,
+        )
+        return sum(leaf.nbytes for leaf in jax.tree.leaves(plan) if hasattr(leaf, "nbytes"))
+
+    ratio = plan_bytes(jnp.float32) / plan_bytes(jnp.float64)
+    assert round(ratio, 3) == expected, (
+        f"a float32 plan is {ratio:.3f} of the float64 one here; README.md's "
+        f"Precision section quotes {expected}. The two ends of that range are "
+        "the point of the sentence -- an image-dominated plan halves, a "
+        "row-dominated one does not -- so a change in either end changes the "
+        "advice."
+    )

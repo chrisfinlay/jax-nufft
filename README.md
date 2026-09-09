@@ -40,7 +40,9 @@ self-cal, or amortised inference networks. Concretely:
 - Output within `2 * epsilon` of the exact DFT, and within `3 * epsilon` of
   `ducc0.wgridder`, for both `dirty2vis` and `vis2dirty`, on the default
   float64 plan with `jax_enable_x64` enabled; single precision is
-  accuracy-limited (see "Accuracy expectation" below and issues #11, #13).
+  accuracy-limited. Both bounds are measured over a stated grid rather than
+  proved &mdash; see ["Accuracy expectation"](#accuracy-expectation) below for
+  exactly which epsilons, fixtures and strategies, and issues #11, #13.
 
 Polarisation handling is **out of scope for v1**.
 
@@ -1145,12 +1147,37 @@ pinned; neither choice of `w_strategy` substitutes for it.
 ### Accuracy expectation
 
 `dirty2vis` and `vis2dirty` land within **`2 * epsilon`** of the exact DFT
-&mdash; relative L2, in the sign convention above &mdash; for every
-`epsilon` from `1e-3` to `1e-12`, forward and adjoint, on the seven telescope
-fixtures of `tests/test_accuracy_sweep.py`. The measured worst cell across
-that 112-cell matrix is `1.48 * epsilon` (MWA_extended off30, `epsilon =
-1e-12`, adjoint). Against `ducc0.wgridder` (with matched `divide_by_n` flags)
-the bound is `3 * epsilon`, the sum of the two implementations' budgets.
+&mdash; relative L2, in the sign convention above &mdash; forward and adjoint,
+on the seven telescope fixtures of `tests/test_accuracy_sweep.py`. The measured
+worst cell across that 112-cell matrix is `1.48 * epsilon` (MWA_extended off30,
+`epsilon = 1e-12`, adjoint). Against `ducc0.wgridder` (with matched
+`divide_by_n` flags) the bound is `3 * epsilon`, the sum of the two
+implementations' budgets.
+
+**What the grid covers, and what it holds constant.** This is a measurement
+over a finite grid, not a proof, so the axes it does *not* vary are part of the
+claim:
+
+| axis | swept | held constant |
+|---|---|---|
+| `epsilon` (DFT bound) | eight points: `1e-3`, `1e-4`, `1e-5`, `1e-6`, `1e-7`, `1e-8`, `1e-10`, `1e-12` | `1e-9` and `1e-11` are skipped, only to keep the matrix at 112 cells |
+| `epsilon` (ducc0 bound) | &mdash; | **`1e-4` and `1e-6` only.** Nothing above or below is checked against ducc0 |
+| `w_strategy` | &mdash; | **`dense_scan` only**, which is *not* the shipped default |
+| `channel_strategy`, `n_chan` | &mdash; | one channel, `"scan"` |
+| `divide_by_n` | &mdash; | the shipped mixed pair (forward `False`, adjoint `True`) |
+| `weights`, `hermitian` | &mdash; | `None`; `True` |
+| precision | &mdash; | float64 with `jax_enable_x64` |
+
+The `w_strategy` row is the one that matters in practice. A caller who takes
+the default gets `"auto"`, which on CPU resolves to `windowed_scan` for the
+adjoint on several off-zenith fixtures &mdash; a strategy this sweep never
+measures. What connects them is `tests/test_strategies_equivalent.py`, which
+pins cross-strategy agreement to `1e-11` at `epsilon` in {`1e-4`, `1e-6`,
+`1e-8`}. That is looser than the contract itself at the tightest settings: at
+`epsilon = 1e-12` the contract is `2e-12` and the transfer bound is `1e-11`,
+5&times; wider. **So the `2 * epsilon` figure is established for `dense_scan`,
+and carries to the other strategies only down to about `epsilon = 1e-10`.** If
+you need the tight bound at `1e-12`, pin `w_strategy="dense_scan"`.
 
 That worst cell was `0.67 * epsilon` before the `nshift` centring, so the
 headroom against the `2 * epsilon` contract has genuinely narrowed, from about
@@ -1193,8 +1220,20 @@ jax.config.update("jax_enable_x64", True)   # before the first JAX array
 # or: JAX_ENABLE_X64=1 in the environment
 ```
 
-**Opting into float32.** Single precision halves the plan's memory footprint
-and is the natural choice on GPUs where fp32 throughput dominates:
+**Opting into float32.** Single precision roughly halves memory and is the
+natural choice on GPUs where fp32 throughput dominates. The two halves of
+"roughly" differ, and it is worth knowing which you are buying:
+
+* **Operator scratch halves, essentially exactly** &mdash; a ratio of 1.99987 to
+  1.99999 over three size classes, two strategies and both operators. The
+  shortfall is a fixed overhead under 512 bytes that does not scale.
+* **The plan halves only when it is image-dominated** &mdash; 0.501&times; at
+  256&sup2; with 600 rows, but 0.586&times; at 150&sup2; with 4.9M rows. The
+  per-pixel term goes 32 B to 16 B, but the per-row term only goes 29 B to
+  17 B, because `sort_perm` is `int32` and `flip_sign` is `int8` and neither
+  follows the floating dtype. Row-heavy plans keep the larger share.
+
+Both are pinned in `tests/test_dtype.py`.
 
 ```python
 plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-4,
@@ -1688,10 +1727,13 @@ row that fits your card. `w_chunk=16` takes this problem from *needs a 96 GB
 GH200* to *fits on a 16 GB card* for 35% more time.
 
 **float32 is the other, and it is free of any such trade.** A
-`make_plan(..., dtype=jnp.float32)` plan halves both the plan and the scratch:
-measured over three size classes, two strategies and both operators, the ratio
-runs 1.99987 to 1.99999, the shortfall being a fixed overhead under 512 bytes
-that does not scale with the problem. Single precision reaches
+`make_plan(..., dtype=jnp.float32)` plan halves the operator scratch measured
+above &mdash; a ratio of 1.99987 to 1.99999 over three size classes, two
+strategies and both operators, the shortfall being a fixed overhead under 512
+bytes that does not scale with the problem. The plan object itself halves only
+when it is image-dominated (0.501&times;) and saves less on row-heavy problems
+(0.586&times;), because its `int32` and `int8` index tables do not follow the
+floating dtype. Single precision reaches
 `epsilon = 1e-4` against ducc0 but not `1e-6` &mdash; `make_plan` warns when you
 ask for an epsilon the dtype cannot reach. See [Precision](#precision).
 
