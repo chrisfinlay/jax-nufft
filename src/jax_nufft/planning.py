@@ -1049,7 +1049,29 @@ def _n_minus_1_grid(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> n
     mm = (j * pixsize_m)[None, :]
     eps_lm = ll * ll + mm * mm
     inside_disc = eps_lm <= 1.0
-    inside_val = np.sqrt(np.where(inside_disc, 1.0 - eps_lm, 0.0)) - 1.0
+    # ``sqrt(1 - x) - 1`` cancels catastrophically as ``x -> 0``: the subtraction
+    # discards every digit the square root agreed with 1.0 on, so the relative
+    # error grows without bound as the pixel scale falls. Measured against a
+    # 60-digit ``decimal`` oracle on this grid (issue #12): 4.44e-12 at
+    # pixsize 5e-3 rad, 8.89e-05 at 1e-6, and **1.22 -- 122 per cent -- at
+    # 1e-8 rad** (about 2 mas, a VLBI-realistic pixel).
+    #
+    # The cancellation-free form ``sqrt(1-x) - 1 = -x / (sqrt(1-x) + 1)``
+    # ([Higham2002] Ch. 1) evaluates the same quantity with no subtraction of
+    # near-equal numbers: 3.73e-16 at 5e-3, 3.73e-16 at 1e-6, 3.55e-16 at 1e-8.
+    #
+    # This is a *relative* improvement on values that are already tiny. The
+    # ABSOLUTE error was and remains ~8e-17 on a narrow field, below a float64
+    # ulp of everything this feeds, so no measured number downstream moves --
+    # which is why it was safe to land late. ``n - 1`` enters as
+    # ``exp(2i pi w (n-1))``, and that phase depends on the absolute error.
+    #
+    # Not fixed here, because a different mechanism: a pixel landing on the disc
+    # edge (``l^2 + m^2 == 1``) carries ~``sqrt(ulp(1))`` relative error in both
+    # forms, since ``n`` is infinitely ill-conditioned in ``l^2 + m^2`` there
+    # (``dn/d(r^2) = -1/(2n)``). Measured 4.36e-09 for both at pixsize 2.5e-2.
+    x = np.where(inside_disc, eps_lm, 0.0)
+    inside_val = -x / (np.sqrt(1.0 - x) + 1.0)
     outside_val = -np.sqrt(np.where(inside_disc, 0.0, eps_lm - 1.0)) - 1.0
     return np.where(inside_disc, inside_val, outside_val)
 
