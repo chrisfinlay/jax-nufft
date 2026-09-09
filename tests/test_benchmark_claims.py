@@ -633,6 +633,15 @@ CITATIONS: dict[str, Citation] = {
                 "chunked8": 1.73,
                 "dense_scan": 2.35,
             },
+            # The dirty2vis / vis2dirty docstrings quote the adjoint half of
+            # the same curve, so it is pinned here too rather than left as the
+            # one column nothing recomputes.
+            "adjoint_time_ratio": {
+                "dense_vmap": 1.00,
+                "chunked32": 1.17,
+                "chunked8": 1.53,
+                "dense_scan": 1.94,
+            },
             "monotone": True,
         },
     ),
@@ -1818,6 +1827,19 @@ def test_the_w_chunk_dial_trades_memory_for_time_monotonically() -> None:
         assert got == ratio, (
             f"{strategy} now runs at {got}x the dense_vmap time; the README's "
             f"table says {ratio}x.{_cite('w_chunk_dial')}"
+        )
+
+    adjoint = {
+        r["w_strategy"]: r
+        for r in _load(_MEMORY)["w_chunk_sweep"]["rows"]
+        if r["fixture"] == cited["fixture"] and r["op"] == "vis2dirty"
+    }
+    adjoint_base = adjoint["dense_vmap"]
+    for strategy, ratio in cited["adjoint_time_ratio"].items():
+        got = round(adjoint[strategy]["median_ms"] / adjoint_base["median_ms"], 2)
+        assert got == ratio, (
+            f"{strategy} now runs at {got}x the dense_vmap time on the adjoint; "
+            f"the operator docstrings say {ratio}x.{_cite('w_chunk_dial')}"
         )
 
     ordered = sorted(sweep, key=lambda r: r["temp_mb"])

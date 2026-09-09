@@ -2025,8 +2025,11 @@ def dirty2vis(
         worst of the four choices: measured on one GH200 against ducc0 on
         72 Grace cores of the same node (eps 1e-6, float64, single
         channel), ``dense_scan`` runs 1.4-5.6x *slower* than ducc0 on five
-        of the six cells of issue #46's table, where what ``"auto"`` picks
-        there runs 1.4-6.3x faster on all six. The exception is the
+        of the six cells of issue #46's table, where ``dense_vmap`` runs
+        1.4-6.3x faster on all six. That range is the ``dense_vmap``
+        column, which is what ``"auto"`` picks in five of those six; on the
+        sixth it picks ``windowed_vmap``, whose re-run figure is 3.5x
+        faster than ducc0 and so sits inside the same range. The exception is the
         GH200_large off30 adjoint, where the old default was about 1.16x
         faster than ducc0 -- still 2.0x off the ``dense_vmap`` column of
         the same table.
@@ -2036,7 +2039,9 @@ def dirty2vis(
         restore the pre-#46 *numbers*, because the release carrying #46
         also carries #16, #23 and #43, and #16's ``nshift`` centring moved
         the numbers on its own (the worst cell against the exact DFT went
-        from 0.67x to 1.47x ``epsilon``). Scoped to the strategy change
+        from 0.67x to 1.47x ``epsilon``, and to 1.48x once #17's fold
+        landed -- 1.47x is the intermediate, not the current figure).
+        Scoped to the strategy change
         alone, the four strategies accumulate the w-planes in a different
         order and so agree to the strategy-equivalence bound (1e-11 in
         float64, ``tests/test_strategies_equivalent.py``) rather than
@@ -2121,8 +2126,11 @@ def dirty2vis(
         for ``dense_vmap`` against 6 256 MB at ``w_chunk = 32`` (4.8x less)
         for 1.27x the forward time and 1.17x the adjoint, 1 929 MB at
         ``w_chunk = 8`` (15.7x less) for 1.73x / 1.53x, and 414 MB on
-        ``dense_scan`` (73x less) for 2.35x / 1.94x. See README.md's
-        ``w_chunk`` section for the full curve; note that the 1.27x forward
+        ``dense_scan`` (73x less) for 2.35x / 1.94x. Both halves of this
+        curve are committed as the ``w_chunk_sweep`` block of
+        ``docs/benchmarks/v0.2.0-memory-gh200.json`` and recomputed by
+        ``tests/test_benchmark_claims.py`` (#33); see README.md's
+        ``w_chunk`` section for the full curve. Note that the 1.27x forward
         cell **breaches** issue #25's "within 1.2x of ``dense_vmap``" GPU
         gate as that gate is written.
 
@@ -2648,8 +2656,11 @@ def vis2dirty(
         for ``dense_vmap`` against 6 256 MB at ``w_chunk = 32`` (4.8x less)
         for 1.27x the forward time and 1.17x the adjoint, 1 929 MB at
         ``w_chunk = 8`` (15.7x less) for 1.73x / 1.53x, and 414 MB on
-        ``dense_scan`` (73x less) for 2.35x / 1.94x. See README.md's
-        ``w_chunk`` section for the full curve; note that the 1.27x forward
+        ``dense_scan`` (73x less) for 2.35x / 1.94x. Both halves of this
+        curve are committed as the ``w_chunk_sweep`` block of
+        ``docs/benchmarks/v0.2.0-memory-gh200.json`` and recomputed by
+        ``tests/test_benchmark_claims.py`` (#33); see README.md's
+        ``w_chunk`` section for the full curve. Note that the 1.27x forward
         cell **breaches** issue #25's "within 1.2x of ``dense_vmap``" GPU
         gate as that gate is written.
 
