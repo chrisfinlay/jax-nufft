@@ -26,6 +26,14 @@ followed by one thing this module asserts on data it cannot check the scale of:
   markdown table in ``README.md``; no JSON was committed for them. Recomputing
   them from that table (by hand, 2026-09) reproduces every one of the four
   figures, but a test would be asserting the README against itself.
+
+  The v0.2.0 comparison that replaces it in the README's performance section
+  does not have this problem: issue #33 committed the sweep behind it as
+  ``docs/benchmarks/v0.2.0-vs-ducc0-gh200.json``, and the cases from
+  :func:`test_the_realistic_forward_speedup_spans_the_cited_range` onwards
+  recompute every figure the new prose states. This bullet stays because the
+  *old* table's numbers are still quoted in the four sites above and still
+  cannot be checked against anything.
 * The post-#43 ``window_padding_overhead`` figures in ``wgridder.py``'s
   ``_GPU_PADDING_CUTOFF`` comment. ``docs/benchmarks/README.md`` records that
   every committed JSON carries the *pre*-#43 scale and that the conversion
@@ -35,6 +43,23 @@ followed by one thing this module asserts on data it cannot check the scale of:
   in ``AGENTS.md`` sec 5 / sec 9, including the #24 ``nthreads`` ranges. The
   committed CPU JSON is aarch64 Grace/GH200 from 2026-05-18; those tables are a
   different machine and a different date, with no JSON behind them.
+
+And one figure that is checked here but whose *comparability* rests on a
+judgement this module cannot make for itself:
+
+* The memory ratio in :func:`test_jax_needs_more_memory_than_ducc0_in_every_cell_and_by_how_much`
+  divides jax-nufft's peak device HBM by ducc0's peak process RSS less the
+  interpreter's footprint. Both sides cover input, scratch and output, which is
+  what makes the division meaningful, but they are different instruments on
+  different hardware and the ducc0 side is the weaker: RSS moves in steps of
+  about 36 MB, and the interpreter baseline being subtracted is itself a
+  high-water mark over the import sequence, which took values from 36 MB to
+  144 MB across 48 runs of an identical program. Each ducc0 figure is the
+  median of three runs, and the ``resolvable`` flag marks the ten cells whose
+  median clears 200 MB, where the repeats agree to 1.20x. On the other six the
+  ducc0 side is comparable with that noise. This module pins the arithmetic and
+  the resolvable/unresolvable split; it asserts nothing about the magnitude of
+  the six, and the README daggers them for the same reason.
 
 And one hole that is *not* a missing case but a mismatch of scales, recorded
 here because the passing assertion hides it:
@@ -68,10 +93,11 @@ runs no kernels.
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
-from itertools import product
+from itertools import pairwise, product
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -84,6 +110,8 @@ _BENCH_DIR = Path(__file__).resolve().parent.parent / "docs" / "benchmarks"
 _GPU_BASELINE = _BENCH_DIR / "v0.1.2-baseline-gpu.json"
 _CPU_BASELINE = _BENCH_DIR / "v0.1.2-baseline-gh200.json"
 _CPU_PART1 = _BENCH_DIR / "v0.1.2-part1.json"
+_REALISTIC = _BENCH_DIR / "v0.2.0-vs-ducc0-gh200.json"
+_MEMORY = _BENCH_DIR / "v0.2.0-memory-gh200.json"
 
 _W_STRATEGIES = ("dense_scan", "dense_vmap", "windowed_scan", "windowed_vmap")
 _CPU_FIXTURES = (
@@ -399,8 +427,257 @@ CITATIONS: dict[str, Citation] = {
             "cells": 4,
         },
     ),
+    # ----------------------------------------------------------------------
+    # v0.2.0: the realistic-size comparison against ducc0 (issue #33).
+    #
+    # The GH200-versus-ducc0 figures used to be a hand-written markdown table
+    # with no JSON behind it, recorded in this module's docstring as one of the
+    # three families that could not be recomputed. They now can be: the sweep is
+    # committed as docs/benchmarks/v0.2.0-vs-ducc0-gh200.json.
+    # ----------------------------------------------------------------------
+    "realistic_forward_speedup": Citation(
+        claim=(
+            "'the forward is 1.7x to 3.8x faster than ducc0' at realistic sizes -- "
+            "over the eight (telescope, pointing) cells, each against ducc0's own "
+            "best measured thread count for that cell and operator."
+        ),
+        sites=("README.md (Performance notes -> GPU vs ducc0)",),
+        source=_REALISTIC,
+        figures={
+            "min": 1.663,
+            "max": 3.814,
+            "median": 2.259,
+            "cells": 8,
+            "rounded": (1.7, 3.8),
+            # The README prints a cell-by-cell table, so every cell is pinned.
+            "per_cell": {
+                "EDA2_zenith": 2.3,
+                "EDA2_off30": 3.5,
+                "MWA_compact_zenith": 2.1,
+                "MWA_compact_off30": 2.0,
+                "MWA_extended_zenith": 3.8,
+                "MWA_extended_off30": 1.7,
+                "MeerKAT_zenith": 3.6,
+                "MeerKAT_off30": 2.2,
+            },
+        },
+    ),
+    "realistic_adjoint_speedup": Citation(
+        claim=(
+            "'the adjoint is 1.5x to 11.2x faster', and that the spread is not a "
+            "continuum: five of the eight cells sit between 1.5x and 2.9x, and "
+            "three -- MWA_extended zenith, MeerKAT at both pointings -- sit "
+            "between 8.9x and 11.2x. Quoting only the range would suggest a "
+            "typical figure of about 6x, which no cell shows."
+        ),
+        sites=("README.md (Performance notes -> GPU vs ducc0)",),
+        source=_REALISTIC,
+        figures={
+            "min": 1.541,
+            "max": 11.217,
+            "median": 2.562,
+            "cells": 8,
+            "rounded": (1.5, 11.2),
+            # The empty band, as thresholds rather than as cluster endpoints:
+            # a rounded endpoint cannot double as a comparison bound, because
+            # the cell whose value rounds to it falls the wrong side.
+            "gap": (3.0, 8.0),
+            "cluster_low": (1.541, 2.938, 5),
+            "cluster_high": (8.850, 11.217, 3),
+            # 8.850 rounds to 8.8, not 8.9: round-half-even, and the binary
+            # value sits just under the tie. The README's prose and its table
+            # cell must agree on which, so the rounded form is pinned too.
+            "cluster_high_rounded": (8.8, 11.2),
+            "per_cell": {
+                "EDA2_zenith": 1.9,
+                "EDA2_off30": 1.5,
+                "MWA_compact_zenith": 2.9,
+                "MWA_compact_off30": 2.2,
+                "MWA_extended_zenith": 11.2,
+                "MWA_extended_off30": 2.1,
+                "MeerKAT_zenith": 10.7,
+                "MeerKAT_off30": 8.8,
+            },
+            "high_cells": ("MWA_extended_zenith", "MeerKAT_off30", "MeerKAT_zenith"),
+        },
+    ),
+    "jax_faster_in_every_realistic_cell": Citation(
+        claim=(
+            "'faster in every one' of the sixteen (cell, operator) comparisons -- "
+            "the universality, as opposed to the size of the gap."
+        ),
+        sites=("README.md (Performance notes -> GPU vs ducc0)",),
+        source=_REALISTIC,
+        figures={"comparisons": 16, "faster_in_all": True},
+    ),
+    "ducc0_thread_optimum": Citation(
+        claim=(
+            "'ducc0 is never fastest with all 288 hardware threads; at 288 it runs "
+            "1.9x to 6.0x slower than its own best measured setting'. Stated this "
+            "way on purpose: the thread grid is not the same for every fixture "
+            "(EDA2 was measured at 8/16/32/64/128/288, MWA_extended at "
+            "16/32/64/96/128/288), so the best *measured* count is a lower bound on "
+            "tuning, not a located optimum. What the data does establish is that "
+            "288 never wins and by how much it loses."
+        ),
+        sites=(
+            "README.md (Performance notes -> GPU vs ducc0)",
+            "README.md (nthreads)",
+        ),
+        source=_REALISTIC,
+        figures={
+            "n_hardware_threads": 288,
+            "best_never_288": True,
+            "penalty_min": 1.863,
+            "penalty_max": 5.996,
+            "penalty_rounded": (1.9, 6.0),
+            "best_counts": {32: 2, 64: 13, 96: 1},
+        },
+    ),
+    "realistic_sizing_rule": Citation(
+        claim=(
+            "the 'realistic' suite's problem sizes are not hand-picked: n_pix and "
+            "n_rows both follow from stated instrument parameters through "
+            "pixsize = lambda / (3 * B_max), n_pix = next even 5-smooth integer >= "
+            "fov / pixsize, and n_rows = 150 * n_ant * (n_ant - 1) / 2. All eight "
+            "numbers reproduce from the rule."
+        ),
+        sites=(
+            "README.md (Performance notes -> how the benchmark problems are sized)",
+            "docs/benchmarks/v0.2.0-vs-ducc0-gh200.json (sizing block)",
+        ),
+        source=_REALISTIC,
+        figures={
+            "n_pix": {"EDA2": 150, "MWA_compact": 144, "MWA_extended": 3600, "MeerKAT": 2700},
+            "n_rows": {
+                "EDA2": 4_896_000,
+                "MWA_compact": 1_219_200,
+                "MWA_extended": 1_219_200,
+                "MeerKAT": 302_400,
+            },
+        },
+    ),
+    "memory_vs_ducc0": Citation(
+        claim=(
+            "'jax-nufft needs 2.8x to 54x the memory ducc0 does, and more in every "
+            "one of the sixteen cells; the median is 8.8x'. The ratio is peak device "
+            "HBM against the median over three repeats of ducc0's peak RSS less the "
+            "interpreter's own footprint. Ten of the sixteen cells are 'resolvable' "
+            "-- ducc0 median at least 200 MB, repeats agreeing to 1.20x -- and on "
+            "the other six the ducc0 side is comparable with the instrument's noise, "
+            "so the direction is claimed there but not the magnitude."
+        ),
+        sites=("README.md (Performance notes -> memory)",),
+        source=_MEMORY,
+        figures={
+            "min": 2.8,
+            "max": 54.4,
+            "median": 8.8,
+            "cells": 16,
+            "heavier_in_all": True,
+            "min_cell": ("MWA_compact_off30", "vis2dirty"),
+            "max_cell": ("MWA_extended_off30", "dirty2vis"),
+            # The ten cells whose ducc0 side is large enough to resolve. On the
+            # other six the ducc0 working set is comparable with the
+            # measurement's own noise -- the interpreter baseline that
+            # working_set subtracts varied 36-144 MB over 48 runs -- so the
+            # direction holds there but the magnitude should not be quoted.
+            "resolvable_cells": 10,
+            "resolvable_min": 2.9,
+            "resolvable_max": 54.4,
+            "resolvable_median": 8.8,
+            "resolvable_threshold_mb": 200.0,
+            # The README prints the whole table, so the whole table is pinned.
+            "per_cell": {
+                ("MWA_compact_zenith", "dirty2vis"): 5.9,
+                ("MWA_compact_zenith", "vis2dirty"): 3.0,
+                ("MWA_compact_off30", "dirty2vis"): 9.1,
+                ("MWA_compact_off30", "vis2dirty"): 2.8,
+                ("EDA2_zenith", "dirty2vis"): 8.9,
+                ("EDA2_zenith", "vis2dirty"): 3.0,
+                ("EDA2_off30", "dirty2vis"): 13.6,
+                ("EDA2_off30", "vis2dirty"): 2.9,
+                ("MeerKAT_zenith", "dirty2vis"): 13.0,
+                ("MeerKAT_zenith", "vis2dirty"): 6.2,
+                ("MeerKAT_off30", "dirty2vis"): 19.3,
+                ("MeerKAT_off30", "vis2dirty"): 8.7,
+                ("MWA_extended_zenith", "dirty2vis"): 17.6,
+                ("MWA_extended_zenith", "vis2dirty"): 7.9,
+                ("MWA_extended_off30", "dirty2vis"): 54.4,
+                ("MWA_extended_off30", "vis2dirty"): 37.1,
+            },
+        },
+    ),
+    "w_chunk_dial": Citation(
+        claim=(
+            "the memory/compute curve quoted for MWA_extended off30's forward "
+            "(3600 pixels square, n_w = 140): dense_vmap 29.6 GB at 1.00x time, "
+            "w_chunk=32 6.1 GB at 1.27x, w_chunk=8 1.9 GB at 1.73x, dense_scan "
+            "0.40 GB at 2.35x. Monotone in both columns -- less scratch costs more "
+            "time, with no inversion -- which is what makes it usable as a dial."
+        ),
+        sites=(
+            "README.md (w_chunk: the memory/compute knob)",
+            "README.md (Performance notes -> memory)",
+        ),
+        source=_MEMORY,
+        figures={
+            "fixture": "MWA_extended_off30",
+            "op": "dirty2vis",
+            # Every row of the README's table, not only the four the surrounding
+            # sentence quotes: an unchecked row is how a stale figure survives.
+            "gb": {
+                "dense_vmap": 29.6,
+                "chunked64": 10.1,
+                "chunked32": 6.1,
+                "chunked16": 3.6,
+                "chunked8": 1.9,
+                "dense_scan": 0.40,
+            },
+            "saving": {
+                "chunked64": 2.9,
+                "chunked32": 4.8,
+                "chunked16": 8.3,
+                "chunked8": 15.7,
+                "dense_scan": 73.1,
+            },
+            "time_ratio": {
+                "dense_vmap": 1.00,
+                "chunked64": 1.10,
+                "chunked32": 1.27,
+                "chunked16": 1.35,
+                "chunked8": 1.73,
+                "dense_scan": 2.35,
+            },
+            # The dirty2vis / vis2dirty docstrings quote the adjoint half of
+            # the same curve, so it is pinned here too rather than left as the
+            # one column nothing recomputes.
+            "adjoint_time_ratio": {
+                "dense_vmap": 1.00,
+                "chunked32": 1.17,
+                "chunked8": 1.53,
+                "dense_scan": 1.94,
+            },
+            # Monotonicity over the WHOLE sweep, not just the cell the README
+            # tabulates. Two things make this subtler than it looks:
+            #
+            #  * When w_chunk >= n_w the chunked strategy clamps to dense_vmap
+            #    and compiles to the same program, so several rows share a
+            #    temp_mb exactly. Ordering tied rows by time and calling the
+            #    result an inversion measures run-to-run noise (about 1.4% on
+            #    these cells), not the dial. Tied levels are collapsed first.
+            #  * With that done, seven of the eight (fixture, op) pairs are
+            #    monotone and one is not, recorded here so it cannot grow
+            #    silently: MWA_extended_zenith's adjoint at n_w = 13, where
+            #    chunked8 uses 4.1x the scratch of dense_scan and is 2.9%
+            #    slower. At n_w = 13 a chunk of 8 is two chunks of 7, so the
+            #    dial barely engages; the README's claim is about the regime
+            #    where n_w substantially exceeds w_chunk.
+            "monotone_pairs": 7,
+            "known_inversion": ("MWA_extended_zenith", "vis2dirty"),
+        },
+    ),
 }
-
 
 # --------------------------------------------------------------------------
 # Loading
@@ -1230,4 +1507,456 @@ def test_every_committed_benchmark_json_is_covered_by_a_case() -> None:
     assert covered <= committed, (
         f"CITATIONS names {sorted(covered - committed)}, which is not committed "
         "under docs/benchmarks/."
+    )
+
+
+# --------------------------------------------------------------------------
+# v0.2.0: the realistic-size sweep against ducc0
+# (docs/benchmarks/v0.2.0-vs-ducc0-gh200.json)
+#
+# Every ducc0 row in a cell is one thread count. "ducc0's best" throughout
+# means the fastest thread count *measured for that cell and operator*, which
+# is the only fair comparison available: quoting ducc0 at a fixed setting would
+# either flatter it or handicap it depending on the setting chosen.
+# --------------------------------------------------------------------------
+
+_REALISTIC_OPS = ("dirty2vis", "vis2dirty")
+
+
+def _realistic_cells(suite: str = "realistic") -> dict[str, list[dict]]:
+    """Group one suite of the v0.2.0 sweep by fixture."""
+    cells: dict[str, list[dict]] = defaultdict(list)
+    for row in _load(_REALISTIC)["rows"]:
+        if row["suite"] == suite:
+            cells[row["fixture"]].append(row)
+    return dict(cells)
+
+
+def _speedups(op: str, suite: str = "realistic") -> dict[str, float]:
+    """jax-nufft's speedup over the best measured ducc0 thread count, per cell."""
+    stat = f"{op}_median_ms"
+    out = {}
+    for fixture, rows in _realistic_cells(suite).items():
+        jax_rows = [r for r in rows if r["impl"] == "jax-nufft"]
+        ducc_rows = [r for r in rows if r["impl"] == "ducc0"]
+        assert len(jax_rows) == 1, f"{fixture} has {len(jax_rows)} jax-nufft rows, expected 1"
+        assert ducc_rows, f"{fixture} has no ducc0 rows to compare against"
+        out[fixture] = min(r[stat] for r in ducc_rows) / jax_rows[0][stat]
+    return out
+
+
+def test_the_realistic_forward_speedup_spans_the_cited_range() -> None:
+    """The forward's spread is tight; the README quotes it as its own range."""
+    cited = CITATIONS["realistic_forward_speedup"].figures
+    ratios = _speedups("dirty2vis")
+    assert len(ratios) == cited["cells"], (
+        f"{len(ratios)} realistic cells, prose counts {cited['cells']}."
+        f"{_cite('realistic_forward_speedup')}"
+    )
+    got = (
+        round(min(ratios.values()), 3),
+        round(max(ratios.values()), 3),
+        round(statistics.median(ratios.values()), 3),
+    )
+    assert got == (cited["min"], cited["max"], cited["median"]), (
+        f"the forward now spans {got[0]}x to {got[1]}x (median {got[2]}x); the "
+        f"prose says {cited['min']}x to {cited['max']}x (median "
+        f"{cited['median']}x).{_cite('realistic_forward_speedup')}"
+    )
+    per_cell = {f: round(v, 1) for f, v in ratios.items()}
+    assert per_cell == cited["per_cell"], (
+        "the forward's per-cell table has moved: "
+        + str(
+            {
+                k: (per_cell.get(k), cited["per_cell"].get(k))
+                for k in set(per_cell) | set(cited["per_cell"])
+                if per_cell.get(k) != cited["per_cell"].get(k)
+            }
+        )
+        + _cite("realistic_forward_speedup")
+    )
+    rounded = (round(min(ratios.values()), 1), round(max(ratios.values()), 1))
+    assert rounded == cited["rounded"], (
+        f"README.md quotes '{cited['rounded'][0]}x to {cited['rounded'][1]}x'; "
+        f"the data rounds to {rounded[0]}x to {rounded[1]}x."
+        f"{_cite('realistic_forward_speedup')}"
+    )
+
+
+def test_the_realistic_adjoint_speedup_is_two_clusters_not_a_continuum() -> None:
+    """The shape of the adjoint's spread, not just its ends.
+
+    A bare "1.5x to 11.2x" invites the reader to average it to about 6x, and no
+    cell is anywhere near 6x. The claim the README makes is the two clusters and
+    the empty gap between them, so that is what is checked -- including that the
+    gap really is empty, which is the part a new fixture could quietly break.
+    """
+    cited = CITATIONS["realistic_adjoint_speedup"].figures
+    ratios = _speedups("vis2dirty")
+    got = (
+        round(min(ratios.values()), 3),
+        round(max(ratios.values()), 3),
+        round(statistics.median(ratios.values()), 3),
+    )
+    assert got == (cited["min"], cited["max"], cited["median"]), (
+        f"the adjoint now spans {got[0]}x to {got[1]}x (median {got[2]}x); the "
+        f"prose says {cited['min']}x to {cited['max']}x (median "
+        f"{cited['median']}x).{_cite('realistic_adjoint_speedup')}"
+    )
+
+    low_min, low_max, low_n = cited["cluster_low"]
+    high_min, high_max, high_n = cited["cluster_high"]
+    gap_lo, gap_hi = cited["gap"]
+    low = {f: r for f, r in ratios.items() if r < gap_lo}
+    high = {f: r for f, r in ratios.items() if r > gap_hi}
+    assert len(low) == low_n and len(high) == high_n, (
+        f"the clusters now hold {len(low)} and {len(high)} cells; the prose says "
+        f"{low_n} and {high_n}.{_cite('realistic_adjoint_speedup')}"
+    )
+    assert len(low) + len(high) == len(ratios), (
+        f"a cell has landed in the empty band {gap_lo}x-{gap_hi}x between the two "
+        f"clusters: {sorted(set(ratios) - set(low) - set(high))}. The prose "
+        f"describes the spread as two clusters with nothing between them."
+        f"{_cite('realistic_adjoint_speedup')}"
+    )
+    assert (round(min(low.values()), 3), round(max(low.values()), 3)) == (low_min, low_max)
+    assert (round(min(high.values()), 3), round(max(high.values()), 3)) == (high_min, high_max)
+    per_cell = {f: round(v, 1) for f, v in ratios.items()}
+    assert per_cell == cited["per_cell"], (
+        "the adjoint's per-cell table has moved: "
+        + str(
+            {
+                k: (per_cell.get(k), cited["per_cell"].get(k))
+                for k in set(per_cell) | set(cited["per_cell"])
+                if per_cell.get(k) != cited["per_cell"].get(k)
+            }
+        )
+        + _cite("realistic_adjoint_speedup")
+    )
+    assert (round(min(high.values()), 1), round(max(high.values()), 1)) == cited[
+        "cluster_high_rounded"
+    ], (
+        "the README states the upper cluster in one-decimal form in its prose "
+        "and again in its table; those two roundings must match."
+        + _cite("realistic_adjoint_speedup")
+    )
+    assert tuple(sorted(high)) == tuple(sorted(cited["high_cells"])), (
+        f"the cells above {high_min}x are now {tuple(sorted(high))}; the prose "
+        f"names {tuple(sorted(cited['high_cells']))}."
+        f"{_cite('realistic_adjoint_speedup')}"
+    )
+
+
+def test_jax_is_faster_than_ducc0_in_every_realistic_comparison() -> None:
+    """The universality the README's headline rests on, separately from the gap."""
+    cited = CITATIONS["jax_faster_in_every_realistic_cell"].figures
+    losses = [
+        (op, fixture, ratio)
+        for op in _REALISTIC_OPS
+        for fixture, ratio in _speedups(op).items()
+        if ratio <= 1.0
+    ]
+    n = sum(len(_speedups(op)) for op in _REALISTIC_OPS)
+    assert n == cited["comparisons"], (
+        f"{n} comparisons, prose counts {cited['comparisons']}."
+        f"{_cite('jax_faster_in_every_realistic_cell')}"
+    )
+    assert not losses, (
+        f"ducc0 is at least as fast in {losses}; the README says jax-nufft is "
+        f"faster in every one.{_cite('jax_faster_in_every_realistic_cell')}"
+    )
+
+
+def test_ducc0_is_never_fastest_with_all_288_hardware_threads() -> None:
+    """Why the README tells users to tune ``nthreads`` rather than max it.
+
+    Deliberately two assertions with different strengths. That 288 never wins is
+    exact and holds however coarse the grid is. The size of the penalty is only
+    against the best count *measured*, and the grid differs per fixture, so it
+    bounds the loss from below rather than locating the optimum.
+    """
+    cited = CITATIONS["ducc0_thread_optimum"].figures
+    best_counts: dict[int, int] = defaultdict(int)
+    penalties = []
+    at_288_wins = []
+    for op in _REALISTIC_OPS:
+        stat = f"{op}_median_ms"
+        for fixture, rows in _realistic_cells().items():
+            ducc_rows = [r for r in rows if r["impl"] == "ducc0"]
+            best = min(ducc_rows, key=lambda r: r[stat])
+            at_288 = [r for r in ducc_rows if r["nthreads"] == cited["n_hardware_threads"]]
+            assert at_288, f"{fixture}/{op} has no {cited['n_hardware_threads']}-thread row"
+            best_counts[best["nthreads"]] += 1
+            if best["nthreads"] == cited["n_hardware_threads"]:
+                at_288_wins.append((fixture, op))
+            penalties.append(at_288[0][stat] / best[stat])
+
+    assert not at_288_wins, (
+        f"{cited['n_hardware_threads']} threads is now the best measured setting "
+        f"for {at_288_wins}; the README says it never is."
+        f"{_cite('ducc0_thread_optimum')}"
+    )
+    got = (round(min(penalties), 3), round(max(penalties), 3))
+    assert got == (cited["penalty_min"], cited["penalty_max"]), (
+        f"running ducc0 at {cited['n_hardware_threads']} threads now costs "
+        f"{got[0]}x to {got[1]}x its best measured setting; the prose says "
+        f"{cited['penalty_min']}x to {cited['penalty_max']}x."
+        f"{_cite('ducc0_thread_optimum')}"
+    )
+    assert (round(min(penalties), 1), round(max(penalties), 1)) == cited["penalty_rounded"]
+    assert dict(best_counts) == {int(k): v for k, v in cited["best_counts"].items()}, (
+        f"the winning thread counts are now {dict(sorted(best_counts.items()))}; "
+        f"the citation records {cited['best_counts']}."
+        f"{_cite('ducc0_thread_optimum')}"
+    )
+
+
+def test_the_realistic_problem_sizes_reproduce_from_the_stated_sizing_rule() -> None:
+    """The sizes are derived, not chosen -- so recompute them from the rule.
+
+    This is the guard against the benchmark quietly drifting to whatever size
+    happened to be convenient: both dimensions follow from published instrument
+    parameters, and if a future re-measurement changes a size without changing
+    the rule, this fails.
+    """
+    cited = CITATIONS["realistic_sizing_rule"].figures
+    payload = _load(_REALISTIC)
+    sizing = payload["sizing"]
+    c_m_s = 299_792_458.0
+
+    def next_even_5_smooth(x: float) -> int:
+        n = math.ceil(x)
+        if n % 2:
+            n += 1
+        while True:
+            m = n
+            for p in (2, 3, 5):
+                while m % p == 0:
+                    m //= p
+            if m == 1:
+                return n
+            n += 2
+
+    rows = {r["fixture"]: r for r in payload["rows"] if r["suite"] == "realistic"}
+    for name, params in sizing["telescopes"].items():
+        lam = c_m_s / params["freq_hz"]
+        pixsize = lam / (3.0 * params["max_baseline_m"])
+        n_pix = next_even_5_smooth(math.radians(params["fov_deg"]) / pixsize)
+        n_ant = params["n_ant"]
+        n_rows = 150 * n_ant * (n_ant - 1) // 2
+
+        assert n_pix == cited["n_pix"][name], (
+            f"the sizing rule gives n_pix = {n_pix} for {name}; the citation "
+            f"records {cited['n_pix'][name]}.{_cite('realistic_sizing_rule')}"
+        )
+        assert n_rows == cited["n_rows"][name], (
+            f"the sizing rule gives n_rows = {n_rows} for {name}; the citation "
+            f"records {cited['n_rows'][name]}.{_cite('realistic_sizing_rule')}"
+        )
+        # ... and that the rows actually measured were the size the rule asks for.
+        for pointing in ("zenith", "off30"):
+            row = rows.get(f"{name}_{pointing}")
+            assert row is not None, f"no realistic row for {name}_{pointing}"
+            assert (row["n_pix"], row["n_rows"]) == (n_pix, n_rows), (
+                f"{name}_{pointing} was measured at n_pix={row['n_pix']}, "
+                f"n_rows={row['n_rows']}, but the rule asks for {n_pix} and "
+                f"{n_rows}.{_cite('realistic_sizing_rule')}"
+            )
+
+
+# --------------------------------------------------------------------------
+# v0.2.0: memory (docs/benchmarks/v0.2.0-memory-gh200.json)
+# --------------------------------------------------------------------------
+
+
+def _memory_ratios() -> dict[tuple[str, str], float]:
+    """jax-nufft peak device HBM over ducc0's interpreter-corrected peak RSS."""
+    rows = _load(_MEMORY)["rows"]
+    keyed = {(r["fixture"], r["op"], r["impl"]): r for r in rows}
+    out = {}
+    for (fixture, op, impl), row in keyed.items():
+        if impl != "jax-nufft":
+            continue
+        ducc = keyed[(fixture, op, "ducc0")]
+        out[(fixture, op)] = row["peak_mb"] / ducc["working_set_mb"]
+    return out
+
+
+def test_jax_needs_more_memory_than_ducc0_in_every_cell_and_by_how_much() -> None:
+    """The cost side of the trade the README states next to the speedups."""
+    cited = CITATIONS["memory_vs_ducc0"].figures
+    ratios = _memory_ratios()
+    assert len(ratios) == cited["cells"], (
+        f"{len(ratios)} memory cells, prose counts {cited['cells']}.{_cite('memory_vs_ducc0')}"
+    )
+    lighter = {k: v for k, v in ratios.items() if v <= 1.0}
+    assert not lighter, (
+        f"jax-nufft is no heavier than ducc0 in {sorted(lighter)}; the README "
+        f"says it is heavier in every cell.{_cite('memory_vs_ducc0')}"
+    )
+    got = (
+        round(min(ratios.values()), 1),
+        round(max(ratios.values()), 1),
+        round(statistics.median(ratios.values()), 1),
+    )
+    assert got == (cited["min"], cited["max"], cited["median"]), (
+        f"the memory ratio now spans {got[0]}x to {got[1]}x (median {got[2]}x); "
+        f"the prose says {cited['min']}x to {cited['max']}x (median "
+        f"{cited['median']}x).{_cite('memory_vs_ducc0')}"
+    )
+    per_cell = {k: round(v, 1) for k, v in ratios.items()}
+    assert per_cell == cited["per_cell"], (
+        "the per-cell memory table has moved. Differences: "
+        + str(
+            {
+                k: (per_cell.get(k), cited["per_cell"].get(k))
+                for k in set(per_cell) | set(cited["per_cell"])
+                if per_cell.get(k) != cited["per_cell"].get(k)
+            }
+        )
+        + _cite("memory_vs_ducc0")
+    )
+    rows = {(r["fixture"], r["op"]): r for r in _load(_MEMORY)["rows"] if r["impl"] == "ducc0"}
+    resolvable = {k: v for k, v in ratios.items() if rows[k]["resolvable"]}
+    assert len(resolvable) == cited["resolvable_cells"], (
+        f"{len(resolvable)} cells are marked resolvable; the prose says "
+        f"{cited['resolvable_cells']}.{_cite('memory_vs_ducc0')}"
+    )
+    for key, row in rows.items():
+        expected = row["working_set_mb"] >= cited["resolvable_threshold_mb"]
+        assert row["resolvable"] == expected, (
+            f"{key} is flagged resolvable={row['resolvable']} but its ducc0 median "
+            f"is {row['working_set_mb']} MB against a "
+            f"{cited['resolvable_threshold_mb']} MB threshold."
+            f"{_cite('memory_vs_ducc0')}"
+        )
+    got_res = (
+        round(min(resolvable.values()), 1),
+        round(max(resolvable.values()), 1),
+        round(statistics.median(resolvable.values()), 1),
+    )
+    assert got_res == (
+        cited["resolvable_min"],
+        cited["resolvable_max"],
+        cited["resolvable_median"],
+    ), (
+        f"the resolvable cells now span {got_res[0]}x to {got_res[1]}x (median "
+        f"{got_res[2]}x); the prose says {cited['resolvable_min']}x to "
+        f"{cited['resolvable_max']}x (median {cited['resolvable_median']}x)."
+        f"{_cite('memory_vs_ducc0')}"
+    )
+    assert min(ratios, key=lambda k: ratios[k]) == tuple(cited["min_cell"])
+    assert max(ratios, key=lambda k: ratios[k]) == tuple(cited["max_cell"]), (
+        "the heaviest cell has moved; the README names "
+        f"{tuple(cited['max_cell'])}.{_cite('memory_vs_ducc0')}"
+    )
+
+
+def _non_monotone_pairs() -> set[tuple[str, str]]:
+    """(fixture, op) pairs where more scratch buys strictly more time.
+
+    Rows sharing a ``temp_mb`` are the same compiled program -- ``w_chunk >=
+    n_w`` clamps to ``dense_vmap`` -- so they are collapsed to one level
+    spanning their observed times. A level counts as an inversion only when its
+    fastest time is slower than the whole of the previous level, which run-to-
+    run noise between tied rows cannot manufacture.
+    """
+    pairs: dict[tuple[str, str], dict[float, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for row in _load(_MEMORY)["w_chunk_sweep"]["rows"]:
+        pairs[(row["fixture"], row["op"])][round(row["temp_mb"], 1)].append(row["median_ms"])
+
+    bad = set()
+    for key, levels in pairs.items():
+        ordered = sorted(levels.items())
+        for (_, lo), (_, hi) in pairwise(ordered):
+            if min(hi) > max(lo):
+                bad.add(key)
+                break
+    return bad
+
+
+def test_the_w_chunk_dial_trades_memory_for_time_monotonically() -> None:
+    """``w_chunk`` is documented as a dial, which requires it to behave like one.
+
+    Two separate properties. The quoted waypoints are what the README's table
+    prints. Monotonicity is the stronger claim and the one that makes the table
+    advice rather than trivia: sorting the strategies by scratch must sort them
+    by time the other way, with no inversion, or "pick your point on the curve"
+    is not sound guidance.
+    """
+    cited = CITATIONS["w_chunk_dial"].figures
+    sweep = [
+        r
+        for r in _load(_MEMORY)["w_chunk_sweep"]["rows"]
+        if r["fixture"] == cited["fixture"] and r["op"] == cited["op"]
+    ]
+    assert sweep, f"no w_chunk sweep rows for {cited['fixture']}/{cited['op']}"
+    by_strategy = {r["w_strategy"]: r for r in sweep}
+    baseline = by_strategy["dense_vmap"]
+
+    for strategy, gb in cited["gb"].items():
+        got = round(by_strategy[strategy]["temp_mb"] / 1024.0, 1)
+        assert got == gb, (
+            f"{strategy} now needs {got} GB of scratch; the README's table says "
+            f"{gb} GB.{_cite('w_chunk_dial')}"
+        )
+    for strategy, saving in cited["saving"].items():
+        got = round(baseline["temp_mb"] / by_strategy[strategy]["temp_mb"], 1)
+        assert got == saving, (
+            f"{strategy} now saves {got}x against dense_vmap; the README's "
+            f"table says {saving}x.{_cite('w_chunk_dial')}"
+        )
+    for strategy, ratio in cited["time_ratio"].items():
+        got = round(by_strategy[strategy]["median_ms"] / baseline["median_ms"], 2)
+        assert got == ratio, (
+            f"{strategy} now runs at {got}x the dense_vmap time; the README's "
+            f"table says {ratio}x.{_cite('w_chunk_dial')}"
+        )
+
+    adjoint = {
+        r["w_strategy"]: r
+        for r in _load(_MEMORY)["w_chunk_sweep"]["rows"]
+        if r["fixture"] == cited["fixture"] and r["op"] == "vis2dirty"
+    }
+    adjoint_base = adjoint["dense_vmap"]
+    for strategy, ratio in cited["adjoint_time_ratio"].items():
+        got = round(adjoint[strategy]["median_ms"] / adjoint_base["median_ms"], 2)
+        assert got == ratio, (
+            f"{strategy} now runs at {got}x the dense_vmap time on the adjoint; "
+            f"the operator docstrings say {ratio}x.{_cite('w_chunk_dial')}"
+        )
+
+    non_monotone = _non_monotone_pairs()
+    assert non_monotone == {tuple(cited["known_inversion"])}, (
+        f"the set of (fixture, op) pairs whose memory/time curve inverts is now "
+        f"{sorted(non_monotone)}; the citation records exactly "
+        f"{{{tuple(cited['known_inversion'])}}}. 'Less scratch costs more time' "
+        f"is the claim the README's table rests on, and it is checked over the "
+        f"whole sweep, not only the cell the table prints."
+        f"{_cite('w_chunk_dial')}"
+    )
+    n_pairs = len({(r["fixture"], r["op"]) for r in _load(_MEMORY)["w_chunk_sweep"]["rows"]})
+    assert n_pairs - len(non_monotone) == cited["monotone_pairs"], (
+        f"{n_pairs - len(non_monotone)} of {n_pairs} pairs are monotone; the "
+        f"citation says {cited['monotone_pairs']}.{_cite('w_chunk_dial')}"
+    )
+
+
+def test_every_citation_is_recomputed_by_a_case_in_this_module() -> None:
+    """Naming a file in CITATIONS is not the same as checking anything in it.
+
+    ``test_every_committed_benchmark_json_is_covered_by_a_case`` is satisfied by
+    a ``Citation`` that merely points at a file, so on its own it would let a new
+    sweep be "covered" by an entry no assertion ever reads. Every key must reach
+    a ``_cite(...)`` call, which only appears in failure messages of cases that
+    assert something.
+    """
+    source = Path(__file__).read_text()
+    unreferenced = sorted(
+        k for k in CITATIONS if f"_cite('{k}')" not in source and f'_cite("{k}")' not in source
+    )
+    assert not unreferenced, (
+        f"{unreferenced} are entries of CITATIONS that no case in this module "
+        "cites in a failure message, so nothing recomputes them. Add a case, or "
+        "drop the entry."
     )

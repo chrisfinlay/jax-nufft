@@ -2,20 +2,22 @@
 
 JAX-native wgridder for radio interferometric imaging.
 
-> **Status:** v0.1.2. API stable; v0.1.2 is a performance release
-> (sorted-order windowed forward, constant-w fast path, precomputed
-> FINUFFT coords, GPU benchmark suite) plus a third `w_strategy`
-> value, `"auto"`, which resolves to one of the four canonical
-> strategies via a platform-aware heuristic. Two defaults *have* changed.
-> `nthreads` is now `None` by default (issue #24, R11/D4) and resolves,
-> before the JIT boundary, to a strategy-aware thread count instead of the
-> old flat `0` -- see [`nthreads`](#nthreads-issue-24-r11d4) below. Pass an
-> explicit `nthreads=0` to opt back into the pre-#24 behaviour. And
-> `w_strategy` now defaults to `"auto"` (issue #46), where it was
-> `"dense_scan"` through v0.1.2 -- see [`w_strategy="auto"`](#w_strategyauto-the-shipped-default)
-> below for what that changes and how to opt back out. Both of these
-> default changes are unreleased: the version this package reports is
-> still the v0.1.2 line.
+> **Status:** 0.2.0 in development; the package reports `0.2.0.dev0`.
+> API stable. A v0.1.2 series was developed and merged but never tagged,
+> so its work (sorted-order windowed forward, constant-w fast path,
+> precomputed FINUFFT coords, GPU benchmark suite) ships for the first
+> time in 0.2.0 alongside this release's own. See
+> [`CHANGELOG.md`](CHANGELOG.md) for the full list.
+>
+> Two defaults have changed since v0.1.1. `nthreads` is now `None` by
+> default (issue #24, R11/D4) and resolves, before the JIT boundary, to a
+> strategy-aware thread count instead of the old flat `0` -- see
+> [`nthreads`](#nthreads-issue-24-r11d4) below; pass an explicit
+> `nthreads=0` to opt back into the pre-#24 behaviour. And `w_strategy`
+> now defaults to `"auto"` (issue #46), where it was `"dense_scan"`
+> through the v0.1.2 line -- see
+> [`w_strategy="auto"`](#w_strategyauto-the-shipped-default) below for
+> what that changes and how to opt back out.
 
 ## Overview
 
@@ -38,7 +40,9 @@ self-cal, or amortised inference networks. Concretely:
 - Output within `2 * epsilon` of the exact DFT, and within `3 * epsilon` of
   `ducc0.wgridder`, for both `dirty2vis` and `vis2dirty`, on the default
   float64 plan with `jax_enable_x64` enabled; single precision is
-  accuracy-limited (see "Accuracy expectation" below and issues #11, #13).
+  accuracy-limited. Both bounds are measured over a stated grid rather than
+  proved &mdash; see ["Accuracy expectation"](#accuracy-expectation) below for
+  exactly which epsilons, fixtures and strategies, and issues #11, #13.
 
 Polarisation handling is **out of scope for v1**.
 
@@ -269,8 +273,8 @@ visibility on every w-plane and rely on the kernel zeroing out non-
 contributing rows; the windowed variants take a contiguous slice of
 visibilities (after sorting by `w`) per plane, cutting the spread cost
 to roughly `p * n_rows * W^3` where `p` is the window padding overhead —
-1.14-4.94 on the review fixtures for the forward, and 1.00-1.38 for the
-adjoint, which v0.1.3 (#26) bucketed. See *Strategy options* below for the
+1.08-5.08 over the forty-cell calibration grid for the forward, and 1.00-1.41 for the
+adjoint, which 0.2.0 (#26) bucketed. See *Strategy options* below for the
 trade-offs. Channel traversal independently supports `scan` (default) or
 `vmap`.
 
@@ -586,15 +590,25 @@ operator* above for the measured residuals.
 *before* the JIT boundary to a strategy-aware choice, not a flat number:
 `1` for `dense_scan` / `windowed_scan` (each w-plane makes its own FINUFFT
 call, so `nthreads > 1` just re-spins the whole OpenMP pool on every plane
-— 4.80x-8.49x slower than `nthreads=1` for the old flat default of `0`,
-measured on a 10-core Apple M-series: MWA_extended off30 3343.6ms vs
+— 4.80x-8.51x slower than `nthreads=1` for the old flat default of `0`,
+measured on `dense_scan` on a 10-core Apple M-series: MWA_extended off30 3343.6ms vs
 696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith 36.6ms vs 4.3ms), and
 `0` (let FINUFFT decide) for `dense_vmap` / `windowed_vmap` (one batched
 FINUFFT call across all w-planes, which benefits from threads at large
-enough `n_w`). Below 100k rows every strategy gets `1` regardless, since the
-whole plane loop is short enough that spinning up a pool isn't worth it.
-Pass an explicit `int` (including `0`) to opt out of the strategy-aware
-default.
+enough `n_w`). The `chunked` family splits on `w_chunk`: `w_chunk == 1` is a
+plane-at-a-time loop and gets `1`, any wider chunk is a batched call and gets
+`0`. Below 100k rows every strategy gets `1` regardless, since the whole
+plane loop is short enough that spinning up a pool isn't worth it. Pass an
+explicit `int` (including `0`) to opt out of the strategy-aware default.
+
+Those three timings are from one session on one laptop and no JSON for them
+is committed, so treat them as an illustration of the effect's size rather
+than a figure to tune against. What *is* pinned, by
+`tests/test_nthreads_resolution.py`, is the resolution table itself — which
+integer comes out of `_resolve_nthreads` for each (strategy, `n_rows`,
+`w_chunk`) — not any wall-clock number. The 100k cutoff is exact and the
+comparison is strict: `n_rows = 100_000` takes the strategy rule, not the
+small-problem rule.
 
 **Limitation:** every fixture in this repository is below the 100k-row
 cutoff -- 400-600 rows for the CPU telescope fixtures, 50k for the
@@ -626,8 +640,8 @@ four, and the two v0.1 names are kept as deprecated aliases:
 | `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1 `"vmap"` is a deprecated alias.           |
 | `"windowed_scan"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(image_size + n_rows)`    | 1.46-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `"windowed_vmap"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1.1; rare wins, mostly for completeness.    |
-| `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward  | v0.1.3 (#25); takes `w_chunk` (default 32).    |
-| `"windowed_chunked"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward  | v0.1.3 (#25); the windowed half of the same knob. |
+| `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward  | 0.2.0 (#25); takes `w_chunk` (default 32).    |
+| `"windowed_chunked"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward  | 0.2.0 (#25); the windowed half of the same knob. |
 | `"auto"`          | resolves to one of the first four | matches the resolved choice | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
@@ -660,7 +674,7 @@ live at once, not an exact count: the loop runs `ceil(n_w / w_chunk)` chunks
 of `ceil(n_w / n_chunks) <= w_chunk` planes, so at most `n_chunks - 1` planes
 of padding are run and thrown away rather than up to `w_chunk - 1`.
 
-Since v0.1.3 (#26) the windowed **adjoint** slices `bucket_length`, not
+Since 0.2.0 (#26) the windowed **adjoint** slices `bucket_length`, not
 `max_window_size`: each channel's planes are sorted into at most four size
 classes and each class is a sub-loop with its own static slice length, so a
 plane whose window holds 8 rows does not read 155. Measured adjoint
@@ -696,7 +710,8 @@ telescope in `tests/conftest.py` at both pointings (seed 0, eps 1e-6,
 float64, hermitian, one channel), `n_w` is EDA2 11 / **56**, GH200_large
 9 / 26, MWA_compact 8 / 12, MWA_extended 11 / **134**, MeerKAT 8 / 13
 (zenith / off30) — so `w_chunk = 32` clamps to `dense_vmap` on eight of the
-ten and runs a genuine 2- or 5-chunk loop, with one padded plane, on the
+ten and runs a genuine 2-chunk loop (2 x 28, no padding) on EDA2 off30 or a
+5-chunk loop (5 x 27, one padded plane) on MWA_extended off30, on the
 other two. At the realistic sizes below it never clamps.
 
 Measured on MWA_extended off30 (256&sup2;, 600 rows, `n_w = 134`, float64,
@@ -812,7 +827,7 @@ re-entry dominate.
 `w_strategy="auto"` never resolves to a chunked strategy: choosing a chunk
 size needs a memory budget the heuristic is not given.
 
-The `grad` column is new in v0.1.3 (issue #21) and is a *ratio against the
+The `grad` column is new in 0.2.0 (issue #21) and is a *ratio against the
 same strategy's forward*, not an absolute size: both operators are now bound
 as linear primitives whose transposes are each other, so reverse mode is one
 call to the other operator at the forward's own settings rather than a
@@ -876,7 +891,7 @@ For the windowed strategies, the plan exposes
 # the forward's: every plane slices the plan's widest window
 plan.window_padding_overhead = n_chan * n_w * max_window_size / plan.live_row_count
 
-# the adjoint's: every plane slices its own size class (v0.1.3, #26)
+# the adjoint's: every plane slices its own size class (0.2.0, #26)
 plan.window_padding_overhead_adjoint = (
     sum(slice_length * n_planes for c in channels for slice_length, n_planes in
         plan.window_buckets[c])
@@ -893,16 +908,20 @@ Both are bounded below by 1.0, attaining it on the constant-`w` fast path
 where the single plane holds every row and none of the slice is padding, and
 the adjoint's is never above the forward's.
 
-There are two of them because v0.1.3 (#26) bucketed the plane slices of the
+There are two of them because 0.2.0 (#26) bucketed the plane slices of the
 windowed **adjoint** only. On the review fixtures that took the adjoint's
-ratio to 1.00-1.38 against the forward's unchanged 1.14-4.94 (measured at eps
-1e-6, float64, seed 0, `hermitian=True`, single channel), so the regime where
+ratio to 1.00-1.41 against the forward's unchanged 1.08-5.08 over the
+forty-cell calibration grid — five fixtures, two pointings, four epsilons
+(1e-3, 1e-6, 1e-9, 1e-12), float64, seed 0, `hermitian=True`, single channel.
+(The eps = 1e-6 slice alone reads 1.00-1.38 and 1.14-4.94; earlier drafts
+quoted that slice while saying "the review fixtures", which is the whole
+grid.) So the regime where
 a high padding figure sends the `auto` selector to a dense strategy is no
 longer reached by any of them on the adjoint. The forward keeps `ab7fbbd`'s
 code and `ab7fbbd`'s figure: bucketing it as well was measured at 20.3x to
 58.4x *slower* on a GH200 and reverted.
 
-The denominator changed in v0.1.3. Through v0.1.2 it was the mean of the
+The denominator changed in 0.2.0. Through v0.1.2 it was the mean of the
 per-`(channel, plane)` window lengths, which are measured *after* the builder
 widens each window by `window_boundary_margin` and by one further row at each
 end. Those rows are real work but lie outside nominal support, so counting
@@ -925,13 +944,17 @@ explicit equivalent on the same plan. The heuristic is **platform-aware**
 - **CPU.** Conservative: never picks a windowed forward (no measured
   win on the v0.1.1 algorithm), and only picks `windowed_scan` on the
   adjoint when `n_w / w_kernel_width > 2` and the windowed padding
-  overhead is below 6x. Otherwise `dense_scan`. (That cutoff was 5x
-  through v0.1.2, against the pre-v0.1.3 denominator; it was restated so
+  overhead is below 6x. In practice only the first conjunct can bind: since
+  #26 bucketed the adjoint's slices, no repository fixture reaches an adjoint
+  overhead above 1.41 at any epsilon on the shipped folded geometry (1.62
+  unfolded), so the 6x test passes for all of them
+  and never changes a pick. Otherwise `dense_scan`. (That cutoff was 5x
+  through v0.1.2, against the pre-0.2.0 denominator; it was restated so
   that redefining the diagnostic changes no decision on the calibration
   grid, where the worst fixture reads 5.78 on the new scale against 4.93
   on the old. Since #26 the *adjoint* leg of this comparison reads
   `window_padding_overhead_adjoint` instead, on which that same worst
-  fixture is 1.62 and no repository fixture reaches either cutoff at any
+  fixture is 1.41 folded (1.62 unfolded) and no repository fixture reaches either cutoff at any
   epsilon — so on the adjoint this branch no longer fires on one, which is
   the intended effect, the padding it guards against being what bucketing
   removes. The forward leg is unchanged.)
@@ -967,8 +990,8 @@ behind fails the suite (issue #49).
 Through v0.1.2 both operators defaulted to `"dense_scan"` and `"auto"` was
 opt-in, which meant the heuristic was never reached unless a caller asked
 for it by name. On GPU that made the shipped default the *worst* of the
-four choices. (It became the default in the release now in development —
-the version this package reports is still v0.1.2.) Measured on one
+four choices. (It becomes the default in 0.2.0, the release now in
+development.) Measured on one
 NVIDIA GH200 (Daint) against `ducc0` on the
 72 Grace cores of the same node, at `epsilon = 1e-6`, float64, single
 channel, forward / adjoint milliseconds (median of 9, warm-up outside the
@@ -994,8 +1017,11 @@ defaulting caller gets there. The re-run below has that cell measured on
 the pick the default actually makes.
 
 So on five of those six cells the old default ran 1.4-5.6x *slower* than
-ducc0 on that hardware, where what the heuristic picks runs 1.4-6.3x
-faster in all six. The exception is the GH200_large off30 adjoint, where
+ducc0 on that hardware, where `dense_vmap` runs 1.4-6.3x faster in all
+six. That range is the `dense_vmap` column, which is the heuristic's pick
+in five of the six but not the sixth: on the GH200_large off30 adjoint it
+picks `windowed_vmap`, whose re-run figure of 53.1 ms is 3.5x faster than
+ducc0 and so falls inside the same range without changing it. The exception is the GH200_large off30 adjoint, where
 `dense_scan` at 159.2 ms was about 1.16x *faster* than ducc0's 184.8 ms —
 the one cell in the table where the old default was not losing to ducc0
 outright, though it was still 2.0x off `dense_vmap` and 3.0x off the
@@ -1143,12 +1169,37 @@ pinned; neither choice of `w_strategy` substitutes for it.
 ### Accuracy expectation
 
 `dirty2vis` and `vis2dirty` land within **`2 * epsilon`** of the exact DFT
-&mdash; relative L2, in the sign convention above &mdash; for every
-`epsilon` from `1e-3` to `1e-12`, forward and adjoint, on the seven telescope
-fixtures of `tests/test_accuracy_sweep.py`. The measured worst cell across
-that 112-cell matrix is `1.48 * epsilon` (MWA_extended off30, `epsilon =
-1e-12`, adjoint). Against `ducc0.wgridder` (with matched `divide_by_n` flags)
-the bound is `3 * epsilon`, the sum of the two implementations' budgets.
+&mdash; relative L2, in the sign convention above &mdash; forward and adjoint,
+on the seven telescope fixtures of `tests/test_accuracy_sweep.py`. The measured
+worst cell across that 112-cell matrix is `1.48 * epsilon` (MWA_extended off30,
+`epsilon = 1e-12`, adjoint). Against `ducc0.wgridder` (with matched
+`divide_by_n` flags) the bound is `3 * epsilon`, the sum of the two
+implementations' budgets.
+
+**What the grid covers, and what it holds constant.** This is a measurement
+over a finite grid, not a proof, so the axes it does *not* vary are part of the
+claim:
+
+| axis | swept | held constant |
+|---|---|---|
+| `epsilon` (DFT bound) | eight points: `1e-3`, `1e-4`, `1e-5`, `1e-6`, `1e-7`, `1e-8`, `1e-10`, `1e-12` | `1e-9` and `1e-11` are skipped, only to keep the matrix at 112 cells |
+| `epsilon` (ducc0 bound) | &mdash; | **`1e-4` and `1e-6` only.** Nothing above or below is checked against ducc0 |
+| `w_strategy` | &mdash; | **`dense_scan` only**, which is *not* the shipped default |
+| `channel_strategy`, `n_chan` | &mdash; | one channel, `"scan"` |
+| `divide_by_n` | &mdash; | the shipped mixed pair (forward `False`, adjoint `True`) |
+| `weights`, `hermitian` | &mdash; | `None`; `True` |
+| precision | &mdash; | float64 with `jax_enable_x64` |
+
+The `w_strategy` row is the one that matters in practice. A caller who takes
+the default gets `"auto"`, which on CPU resolves to `windowed_scan` for the
+adjoint on several off-zenith fixtures &mdash; a strategy this sweep never
+measures. What connects them is `tests/test_strategies_equivalent.py`, which
+pins cross-strategy agreement to `1e-11` at `epsilon` in {`1e-4`, `1e-6`,
+`1e-8`}. That is looser than the contract itself at the tightest settings: at
+`epsilon = 1e-12` the contract is `2e-12` and the transfer bound is `1e-11`,
+5&times; wider. **So the `2 * epsilon` figure is established for `dense_scan`,
+and carries to the other strategies only down to about `epsilon = 1e-10`.** If
+you need the tight bound at `1e-12`, pin `w_strategy="dense_scan"`.
 
 That worst cell was `0.67 * epsilon` before the `nshift` centring, so the
 headroom against the `2 * epsilon` contract has genuinely narrowed, from about
@@ -1191,8 +1242,20 @@ jax.config.update("jax_enable_x64", True)   # before the first JAX array
 # or: JAX_ENABLE_X64=1 in the environment
 ```
 
-**Opting into float32.** Single precision halves the plan's memory footprint
-and is the natural choice on GPUs where fp32 throughput dominates:
+**Opting into float32.** Single precision roughly halves memory and is the
+natural choice on GPUs where fp32 throughput dominates. The two halves of
+"roughly" differ, and it is worth knowing which you are buying:
+
+* **Operator scratch halves, essentially exactly** &mdash; a ratio of 1.99987 to
+  1.99999 over three size classes, two strategies and both operators. The
+  shortfall is a fixed overhead under 512 bytes that does not scale.
+* **The plan halves only when it is image-dominated** &mdash; 0.501&times; at
+  256&sup2; with 600 rows, but 0.586&times; at 150&sup2; with 4.9M rows. The
+  per-pixel term goes 32 B to 16 B, but the per-row term only goes 29 B to
+  17 B, because `sort_perm` is `int32` and `flip_sign` is `int8` and neither
+  follows the floating dtype. Row-heavy plans keep the larger share.
+
+Both are pinned in `tests/test_dtype.py`.
 
 ```python
 plan = make_plan(uvw, freq, (n_l, n_m), pixsize, pixsize, epsilon=1e-4,
@@ -1242,6 +1305,77 @@ between the two by installing the matching `jax-finufft` extra:
 - `pixi run -e default ...` &mdash; CPU FINUFFT.
 - `pixi run -e gpu ...` &mdash; CUDA-enabled `jax-finufft` (Linux only).
 
+### GPU vs ducc0, at sizes worth measuring
+
+On one GH200 node &mdash; jax-nufft on the H100, ducc0 on the same node's 72
+Grace cores &mdash; **jax-nufft is faster in all sixteen (problem, operator)
+comparisons**, against ducc0 running at the best thread count measured for that
+comparison rather than at a fixed setting.
+
+The two operators behave differently enough that a single range would mislead:
+
+| | span | median |
+|---|---|---|
+| `dirty2vis` (forward) | 1.7&times; &ndash; 3.8&times; | 2.3&times; |
+| `vis2dirty` (adjoint) | 1.5&times; &ndash; 11.2&times; | 2.6&times; |
+
+The adjoint's wide span is two clusters, not a continuum: five of the eight
+problems sit between 1.5&times; and 2.9&times;, and three &mdash; MWA_extended at
+zenith, MeerKAT at both pointings &mdash; between 8.8&times; and 11.2&times;.
+Nothing lands in between, so "about 6&times;" describes no case that was measured.
+
+| Telescope / pointing | n_pix | n_rows | `n_w` | `dirty2vis` | `vis2dirty` |
+|----------------------|-------|-----------|------|-------------|-------------|
+| EDA2 zenith          | 150   | 4,896,000 | 13   | 2.3&times;  | 1.9&times;  |
+| EDA2 off30           | 150   | 4,896,000 | 60   | 3.5&times;  | 1.5&times;  |
+| MWA_compact zenith   | 144   | 1,219,200 | 8    | 2.1&times;  | 2.9&times;  |
+| MWA_compact off30    | 144   | 1,219,200 | 13   | 2.0&times;  | 2.2&times;  |
+| MWA_extended zenith  | 3600  | 1,219,200 | 13   | 3.8&times;  | 11.2&times; |
+| MWA_extended off30   | 3600  | 1,219,200 | 140  | 1.7&times;  | 2.1&times;  |
+| MeerKAT zenith       | 2700  | 302,400   | 8    | 3.6&times;  | 10.7&times; |
+| MeerKAT off30        | 2700  | 302,400   | 14   | 2.2&times;  | 8.8&times;  |
+
+Read this next to [Memory](#memory), which is the other half of the same trade:
+the speedups above are bought with roughly 3&times; to 54&times; the memory.
+
+#### Give ducc0 its best thread count, not all of them
+
+`nthreads=288` &mdash; every hardware thread on the node &mdash; was **never**
+the fastest setting for ducc0 in any of the sixteen comparisons. It ran
+1.86&times; to 6.00&times; slower than that comparison's best measured count,
+which was 64 in thirteen of the sixteen.
+
+That is why the comparison above tunes ducc0 per cell. Benchmarking it at
+`nthreads = os.cpu_count()` would have flattered jax-nufft by up to a further
+6&times;, and a comparison that has to misconfigure the baseline to win is not
+worth publishing. Note the claim is deliberately one-sided: the thread grid was
+not identical for every telescope (EDA2 was measured at 8/16/32/64/128/288,
+MWA_extended at 16/32/64/96/128/288), so "best measured" bounds the tuning
+available rather than locating ducc0's true optimum. What the data does settle
+is that 288 never wins.
+
+#### How these problems are sized
+
+The built-in test fixtures are CI-sized &mdash; 400 to 600 rows, 64 to 256
+pixels &mdash; which under-resolves the field of view and holds orders of
+magnitude fewer visibilities than any real observation. Benchmarking on them
+measures overhead, not the algorithm. Both dimensions here are derived from
+instrument parameters instead:
+
+* `pixsize = lambda / (3 * B_max)` &mdash; three pixels across the synthesised beam.
+* `n_pix` = the next even 5-smooth integer at or above `fov / pixsize`, so the
+  image spans the field of view and the FFT size stays friendly.
+* `n_rows = 150 * n_ant * (n_ant - 1) / 2` &mdash; 150 time samples on every
+  baseline of the array.
+
+`tests/test_benchmark_claims.py` recomputes all eight sizes from that rule, so
+the benchmark cannot quietly drift to whatever size happens to be convenient.
+
+Raw data: [`docs/benchmarks/v0.2.0-vs-ducc0-gh200.json`](docs/benchmarks/v0.2.0-vs-ducc0-gh200.json).
+It also carries a `ci_sized` suite &mdash; the unmodified fixtures &mdash; so
+the effect of the sizing can be inspected rather than taken on trust. ducc0 is
+used only as a black-box oracle through its public Python API.
+
 ### Scaling with `n_w` and image size
 
 Per-channel forward / adjoint cost is roughly `n_w * (image_size + n_rows)`
@@ -1254,15 +1388,23 @@ baselines produce more w-planes &mdash; expected wgridder behaviour.
 When every visibility shares the same `w` in wavelengths &mdash; e.g. a perfectly
 coplanar array, snapshot data at fixed pointing, or any case where
 `plan.w_extent == 0` after planning &mdash; `make_plan` collapses the
-w-plane loop to a single plane at the constant w-value. Expected speedup
-is roughly `w_kernel_width + 1` (one NUFFT instead of `W+1`), which is
-about 8&times; for the default `epsilon = 1e-6` (`W = 7`).
+w-plane loop to a single plane at the constant w-value. The expected
+speedup is roughly `w_kernel_width + 1` (one NUFFT instead of `W+1`),
+about 8&times; for the default `epsilon = 1e-6` (`W = 7`). That is a
+count of NUFFTs, not a measurement: no timing for this path is committed
+to the repository.
 
 The user-visible signal that the specialisation engaged is
-`plan.n_w == 1` (and `plan.is_constant_w == True`). All four
+`plan.n_w == 1` (and `plan.is_constant_w == True`). All six
 `w_strategy` choices reduce to the same single-plane work in this
-regime, so picking one vs another has no effect on output. Both
-operators stay bit-identical across strategies in this case and match
+regime, so the arithmetic each performs is the same. That makes the
+outputs bit-identical **only if `nthreads` is pinned**: with the default
+`nthreads=None` the strategies resolve to different thread counts, and
+FINUFFT's reduction order changes with them — on a constant-`w` plan
+above the large-row cutoff, `chunked(32)` and `dense_vmap` differ by a
+relative `1.8e-13` for exactly this reason (see
+[`nthreads`](#nthreads-issue-24-r11d4)). Pass an explicit `nthreads` for
+the identity to hold unconditionally. Either way both operators match
 ducc within `3 * epsilon` (issue #9 tightened this from `20 * epsilon`,
 the same DFT-width-rule fix behind the headline accuracy contract
 above).
@@ -1547,7 +1689,11 @@ Reading the table:
 * **Part 1 wins broadly** &mdash; 1.05x to 1.6x across most cases, with
   the largest gains at off-zenith where `n_w` was previously inflated
   most by the v0.1 `x0 = 1/W` choice. This matches the `W/4` theoretical
-  FFT-count reduction: at eps=1e-6 (W=6), expected speedup is 1.5x.
+  FFT-count reduction: at eps=1e-6 the kernel width was `W = 6` under the
+  pre-#9 rule in force when this comparison was run, giving an expected
+  speedup of 1.5x. (The current rule, `W = ceil(-log10(epsilon / 10))`,
+  gives `W = 7` at that epsilon; this whole section is a v0.1.0 to v0.1.1
+  comparison and is kept at the widths of the time.)
 * **Part 2 helps the adjoint** at off-zenith on most telescopes
   (1.05–1.53x). Forward is essentially flat: NUFFT type-2 per-point
   cost doesn't fall with slice size.
@@ -1563,28 +1709,93 @@ total speedup, with both parts each contributing ~1.2x.
 
 #### Memory
 
-`vmap` variants are still consistently 1.4-3.5x faster than `scan` because
-they reduce the per-iteration FINUFFT planning / setpts cost and let XLA
-fuse work across w-planes. The cost is **memory**: `vmap` materialises
-the full `(n_w, n_l, n_m)` stack of corrected images at once. For
-MWA-extended off-zenith at `n_pix = 256`:
+Speed is not the whole trade. On the same GH200 node and the same realistic
+problems, **jax-nufft needs more device memory than ducc0 needs host memory in
+every one of the sixteen cells measured**, by roughly 3&times; to 54&times;. If a
+problem is memory-bound rather than time-bound, that is what decides whether
+this library is usable for it.
 
-| Implementation             | peak RSS delta |
-|----------------------------|----------------|
-| jax/dense_scan dirty2vis   | 1.6 MB         |
-| jax/dense_scan vis2dirty   | 0 MB           |
-| **jax/dense_vmap dirty2vis** | **776 MB**   |
-| **jax/dense_vmap vis2dirty** | **1.5 GB**   |
-| ducc dirty2vis             | 0 MB           |
-| ducc vis2dirty             | 0 MB           |
+The dagger marks the six cells where ducc0's own figure is small enough to sit
+inside the measurement's noise; read those as "several times more", not as the
+number printed.
 
-(Windowed variants sit between the two: `windowed_scan` is comparable to
-`dense_scan` plus the sort-permutation tables; `windowed_vmap` is
-comparable to `dense_vmap`.)
+| Telescope / pointing | n_pix | `dirty2vis` | `vis2dirty` |
+|----------------------|-------|-------------|-------------|
+| MWA_compact zenith   | 144   | 5.9&times;&dagger; | 3.0&times;&dagger; |
+| MWA_compact off30    | 144   | 9.1&times;&dagger; | 2.8&times;&dagger; |
+| EDA2 zenith          | 150   | 8.9&times;  | 3.0&times;  |
+| EDA2 off30           | 150   | 13.6&times; | 2.9&times;  |
+| MeerKAT zenith       | 2700  | 13.0&times;&dagger; | 6.2&times;  |
+| MeerKAT off30        | 2700  | 19.3&times;&dagger; | 8.7&times;  |
+| MWA_extended zenith  | 3600  | 17.6&times; | 7.9&times;  |
+| MWA_extended off30   | 3600  | **54.4&times;** | 37.1&times; |
 
-ducc remains the fastest CPU implementation in every regime; the
-jax-nufft value proposition is differentiability and the GPU port
-(where the wasted spread / FFT work parallelises cheaply).
+Over the ten cells that are cleanly resolvable the range is **2.9&times; to
+54.4&times;, median 8.8&times;**, and the three repeats of each agree to within
+1.20&times;.
+
+**How it is measured, and how far to trust it.** The ratio is jax-nufft's peak
+device HBM over ducc0's peak process RSS with the interpreter's own footprint
+removed, so both sides cover input, scratch and output. They are different
+instruments on different hardware, and the ducc0 side is the weaker of the two:
+RSS moves in steps of about 36 MB, and the interpreter baseline that gets
+subtracted is itself a high-water mark over the import sequence, which took
+values from 36 MB to 144 MB across 48 runs of an identical program. Each ducc0
+cell is therefore the median of three separate runs. A 108 MB swing is smaller
+than the working set of the large fixtures and comparable with that of the small
+ones, which is exactly what the dagger marks. What is *not* in doubt is the
+direction: jax-nufft is heavier in all sixteen cells under every repeat.
+
+Raw data: [`docs/benchmarks/v0.2.0-memory-gh200.json`](docs/benchmarks/v0.2.0-memory-gh200.json),
+recomputed by `tests/test_benchmark_claims.py`, with each repeat kept rather
+than only the median. Every figure was measured in a process that made exactly
+one operator call, because `peak_bytes_in_use` and `ru_maxrss` are both
+monotonic high-water marks: two operators measured in one process cannot be told
+apart, and the second one's rise reads zero whenever its transient stayed under
+the first one's peak.
+
+##### The two levers
+
+**`w_chunk` is the dial.** The worst cell above is the forward at
+`n_pix = 3600` with `n_w = 140`, where `auto` picks `dense_vmap` and every plane
+is live at once. Chunking trades that back for time, monotonically:
+
+| `w_strategy`             | scratch  | vs `dense_vmap` | time     |
+|--------------------------|----------|-----------------|----------|
+| `dense_vmap`             | 29.6 GB  | &mdash;         | 1.00&times; |
+| `chunked`, `w_chunk=64`  | 10.1 GB  | 2.9&times; less | 1.10&times; |
+| `chunked`, `w_chunk=32`  | 6.1 GB   | 4.8&times; less | 1.27&times; |
+| `chunked`, `w_chunk=16`  | 3.6 GB   | 8.3&times; less | 1.35&times; |
+| `chunked`, `w_chunk=8`   | 1.9 GB   | 15.7&times; less | 1.73&times; |
+| `dense_scan`             | 0.40 GB  | 73&times; less  | 2.35&times; |
+
+Sorting the strategies by scratch sorts them by time the other way with no
+inversion, which is what makes the table advice rather than trivia: pick the
+row that fits your card. `w_chunk=16` takes this problem from *needs a 96 GB
+GH200* to *fits on a 16 GB card* for 35% more time.
+
+**float32 is the other, and it is free of any such trade.** A
+`make_plan(..., dtype=jnp.float32)` plan halves the operator scratch measured
+above &mdash; a ratio of 1.99987 to 1.99999 over three size classes, two
+strategies and both operators, the shortfall being a fixed overhead under 512
+bytes that does not scale with the problem. The plan object itself halves only
+when it is image-dominated (0.501&times;) and saves less on row-heavy problems
+(0.586&times;), because its `int32` and `int8` index tables do not follow the
+floating dtype. Single precision reaches
+`epsilon = 1e-4` against ducc0 but not `1e-6` &mdash; `make_plan` warns when you
+ask for an epsilon the dtype cannot reach. See [Precision](#precision).
+
+The two compose: `dtype=jnp.float32` with `w_chunk=16` puts the 30 GB cell
+under 2 GB.
+
+##### Strategy memory, in order
+
+`vmap` variants are faster than `scan` because they cut the per-iteration
+FINUFFT planning / setpts cost and let XLA fuse across w-planes; the cost is
+that `dense_vmap` materialises the whole `(n_w, n_l, n_m)` stack of corrected
+images at once, where `dense_scan` holds one plane. `windowed_scan` is
+comparable to `dense_scan` plus the sort-permutation tables; `windowed_vmap` is
+comparable to `dense_vmap`; `chunked` sits between them at `w_chunk` planes.
 
 ### Picking a strategy
 

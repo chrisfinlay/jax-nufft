@@ -19,6 +19,10 @@ venv/
 
 # Pixi
 .pixi/
+# ...and as a bare symlink: a worktree may link .pixi at another checkout's
+# environments, which `.pixi/` does not match (it matches a directory only),
+# so `git add -A` would otherwise commit a path valid on exactly one machine.
+.pixi
 
 # Testing / tooling
 .pytest_cache/

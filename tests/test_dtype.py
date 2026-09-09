@@ -845,3 +845,173 @@ def test_mixed_dtypes_never_leak_a_bare_assertion(case: str) -> None:
         assert str(exc).strip(), f"{case}: the dtype error must carry a message"
     else:
         assert np.all(np.isfinite(np.asarray(result))), f"{case}: produced non-finite output"
+
+
+# --------------------------------------------------------------------------
+# What float32 buys: exactly half the memory (issue #33).
+#
+# The README offers single precision as the cheapest way to halve a problem's
+# footprint, so the factor is a documented number and needs a test rather than
+# an appeal to "floats are half the width" -- which would not settle it, since
+# the plan also carries int32 index tables whose size does not change with the
+# floating dtype, and a scratch buffer dominated by those would not halve.
+# --------------------------------------------------------------------------
+
+
+# The largest non-scaling remainder observed over the cases below, rounded up to
+# a round number, and the weakest ratio it implies. Both are quoted in README.md.
+_HALVING_FIXED_OVERHEAD_BYTES = 512
+_HALVING_MIN_RATIO = 1.999
+#: The range README.md actually quotes. Bounding the ratio only from below
+#: would leave the upper figure unchecked, and "1.99999" is the half of the
+#: sentence that makes the halving sound exact.
+_HALVING_RATIO_RANGE = (1.9998, 2.0)
+
+_HALVING_SIZES = (
+    # (telescope, n_pix, n_rows) -- one image-dominated, one row-dominated, and
+    # one CI-sized, so the ratio is not established on a single size class. See
+    # the sizing rule in docs/benchmarks/v0.2.0-vs-ducc0-gh200.json.
+    pytest.param(MEERKAT, 540, 60_480, id="MeerKAT_image_heavy"),
+    pytest.param(EDA2, 150, 244_800, id="EDA2_row_heavy"),
+    pytest.param(MWA_EXTENDED, 256, 600, id="MWA_extended_ci_sized"),
+)
+
+
+def _scratch_bytes(plan: WGridderPlan, op: str, w_strategy: str, w_chunk: int, n_rows: int) -> int:
+    """Compiler-reported scratch for one compiled operator.
+
+    ``temp_size_in_bytes`` is a property of the executable, so it needs no
+    device and no run, and it is unaffected by whatever else the process has
+    done -- unlike a high-water mark such as ``peak_bytes_in_use``.
+    """
+    rng = np.random.default_rng(7)
+    n_pix = plan.image_shape[0]
+    if op == "dirty2vis":
+        data = jnp.asarray(rng.standard_normal((n_pix, n_pix)), plan.real_dtype)
+
+        def fn(d):
+            return dirty2vis(plan, d, w_strategy=w_strategy, w_chunk=w_chunk)
+    else:
+        raw = rng.standard_normal((n_rows, 1)) + 1j * rng.standard_normal((n_rows, 1))
+        data = jnp.asarray(raw, plan.complex_dtype)
+
+        def fn(d):
+            return vis2dirty(plan, d, w_strategy=w_strategy, w_chunk=w_chunk)
+
+    return jax.jit(fn).lower(data).compile().memory_analysis().temp_size_in_bytes
+
+
+@requires_x64
+@pytest.mark.parametrize("tel,n_pix,n_rows", _HALVING_SIZES)
+@pytest.mark.parametrize("w_strategy", ["dense_scan", "chunked"])
+@pytest.mark.parametrize("op", ["dirty2vis", "vis2dirty"])
+def test_a_float32_plan_needs_half_the_scratch_of_a_float64_one(
+    tel: Telescope, n_pix: int, n_rows: int, w_strategy: str, op: str
+) -> None:
+    """The README's "float32 halves it", to the precision the README states.
+
+    Quantified over three size classes, two strategies and both operators,
+    because the interesting way for this to be false is for it to hold on the
+    shape the claim was written against and not on another.
+    """
+    from dataclasses import replace
+
+    sized = replace(tel, n_pix=n_pix, n_rows=n_rows)
+    uvw = synthetic_uvw(sized, 30.0, seed=0)
+    freq = np.array([sized.freq_hz])
+    kwargs = dict(
+        uvw=uvw,
+        freq=freq,
+        image_shape=(n_pix, n_pix),
+        pixsize_l=sized.pixsize,
+        pixsize_m=sized.pixsize,
+        # 1e-4 is reachable in single precision; 1e-6 is not, and asking for it
+        # would warn and compare two different kernel widths.
+        epsilon=1e-4,
+    )
+    wide = _scratch_bytes(
+        make_plan(**kwargs, dtype=jnp.float64), op, w_strategy, w_chunk=8, n_rows=n_rows
+    )
+    narrow = _scratch_bytes(
+        make_plan(**kwargs, dtype=jnp.float32), op, w_strategy, w_chunk=8, n_rows=n_rows
+    )
+    assert narrow > 0 and wide > 0, "a compiled operator with no scratch is not a real case"
+
+    # Not exactly 2x: a small fixed remainder does not scale with the floating
+    # dtype, so the halving is asymptotic rather than exact. Measured at 96-264
+    # bytes over these twelve cells, against scratch of 2 MB to 39 MB. Both
+    # halves of the bound matter -- the size of the remainder is what makes
+    # "halves it" honest, and the ratio is what the README quotes.
+    remainder = 2 * narrow - wide
+    assert 0 <= remainder <= _HALVING_FIXED_OVERHEAD_BYTES, (
+        f"float64 scratch is {wide} B and float32 {narrow} B, leaving "
+        f"{remainder} B that does not scale with the floating dtype. README.md "
+        f"describes the halving as exact up to a fixed overhead of at most "
+        f"{_HALVING_FIXED_OVERHEAD_BYTES} B; a remainder growing with the "
+        "problem would mean some part of the working set (the plan's int32 "
+        "index tables, say) is being counted in the documented factor when it "
+        "does not shrink."
+    )
+    ratio = wide / narrow
+    assert ratio >= _HALVING_MIN_RATIO, (
+        f"float32 saves a factor of {ratio:.6f}, below the {_HALVING_MIN_RATIO} "
+        "README.md quotes as 'halves it'."
+    )
+    lo, hi = _HALVING_RATIO_RANGE
+    assert lo <= ratio <= hi, (
+        f"float32 saves a factor of {ratio:.6f}, outside the "
+        f"{lo}-{hi} band README.md's Precision section quotes as "
+        f"'1.99987 to 1.99999'. Both ends are checked: a ratio above the band "
+        "would mean something is being counted that is not scratch, and one "
+        "below it that the halving is less complete than advertised."
+    )
+
+
+# The plan is a different question from the scratch, and has a different
+# answer. Its floating leaves halve, but ``sort_perm`` is int32 and
+# ``flip_sign`` is int8, so a plan whose size is dominated by per-row tables
+# saves noticeably less than one dominated by the image grid. README.md quotes
+# both ends; a single fixture would only ever show one of them.
+_PLAN_RATIO_CASES = (
+    pytest.param(MWA_EXTENDED, 256, 600, 0.501, id="image_dominated"),
+    pytest.param(EDA2, 150, 4_896_000, 0.586, id="row_dominated"),
+)
+
+
+@requires_x64
+@pytest.mark.parametrize("tel,n_pix,n_rows,expected", _PLAN_RATIO_CASES)
+def test_what_float32_saves_on_the_plan_depends_on_its_shape(
+    tel: Telescope, n_pix: int, n_rows: int, expected: float
+) -> None:
+    """Both ends of the range README.md quotes for the plan.
+
+    The interesting failure is not the ratio drifting a little; it is someone
+    reading "float32 halves memory", applying it to a row-heavy plan, and
+    budgeting 41% less than the plan will take.
+    """
+    from dataclasses import replace
+
+    sized = replace(tel, n_pix=n_pix, n_rows=n_rows)
+    uvw = synthetic_uvw(sized, 30.0, seed=0)
+    freq = np.array([sized.freq_hz])
+
+    def plan_bytes(dtype: Any) -> int:
+        plan = make_plan(
+            uvw,
+            freq,
+            (n_pix, n_pix),
+            sized.pixsize,
+            sized.pixsize,
+            1e-4,
+            dtype=dtype,
+        )
+        return sum(leaf.nbytes for leaf in jax.tree.leaves(plan) if hasattr(leaf, "nbytes"))
+
+    ratio = plan_bytes(jnp.float32) / plan_bytes(jnp.float64)
+    assert round(ratio, 3) == expected, (
+        f"a float32 plan is {ratio:.3f} of the float64 one here; README.md's "
+        f"Precision section quotes {expected}. The two ends of that range are "
+        "the point of the sentence -- an image-dominated plan halves, a "
+        "row-dominated one does not -- so a change in either end changes the "
+        "advice."
+    )

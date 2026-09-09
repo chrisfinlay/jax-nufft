@@ -26,8 +26,9 @@ tagged or released, so its changes appear here for the first time; they are mark
   `"auto"` resolves per call from the plan and the device platform, so the strategy a given call
   runs may differ from v0.1.1. Pass `w_strategy="dense_scan"` explicitly to keep the old behaviour.
   On one GH200, against ducc0 on the 72 Grace cores of the same node, the old default ran 1.4–5.6×
-  *slower* than ducc0 on five of six measured cells, where the heuristic's pick runs 1.4–6.3×
-  faster.
+  *slower* than ducc0 on five of six measured cells, where `dense_vmap` runs 1.4–6.3× faster in
+  all six. (That range is the `dense_vmap` column; the heuristic picks `windowed_vmap` on the
+  sixth cell, at 3.5× faster, which is inside the same range.)
   ([#46](https://github.com/chrisfinlay/jax-nufft/issues/46),
   [PR #48](https://github.com/chrisfinlay/jax-nufft/pull/48))
 
@@ -334,9 +335,45 @@ tagged or released, so its changes appear here for the first time; they are mark
 - Native aarch64 CPU environments, split `gpu`/`gpu-dev` features, and pixi-based CI.
   *(v0.1.2 series)*
 
-## [0.1.1]
+### Documentation
 
-See the git history; this file starts at 0.2.0.
+- **The GPU-versus-ducc0 and memory comparisons are now measured data in the tree**
+  ([#33](https://github.com/chrisfinlay/jax-nufft/issues/33)). Both were previously hand-written
+  markdown tables; `tests/test_benchmark_claims.py` recorded them as figures it could not
+  recompute. `docs/benchmarks/v0.2.0-vs-ducc0-gh200.json` and `v0.2.0-memory-gh200.json` now hold
+  the sweeps, and every figure the README prints from them is recomputed by a test. The ducc0
+  memory side is the median of three runs per cell: the interpreter baseline it subtracts is
+  itself a high-water mark and varied 36–144 MB across 48 runs of an identical program, which is
+  comparable with the whole working set of the smaller fixtures. Ten of the sixteen cells clear a
+  200 MB resolvability bar; the README marks the other six rather than quoting them.
+  - Problem sizes are derived from instrument parameters (`pixsize = lambda / (3 B_max)`,
+    `n_pix` the next even 5-smooth integer covering the field of view, `n_rows = 150 N_bl`)
+    rather than taken from the CI fixtures, which are 400–600 rows at 64–256 pixels and measure
+    overhead rather than the algorithm. The test recomputes all eight sizes from the rule.
+  - ducc0 is compared at its own best measured thread count per cell. All 288 hardware threads
+    is never its best setting, and costs it 1.9–6.0× against that best.
+- **The accuracy sweep now runs in CI** ([#33](https://github.com/chrisfinlay/jax-nufft/issues/33)).
+  Nothing in `.github/workflows` passed `--runsweep`, so the only evidence for the headline
+  `2 * epsilon` contract ran solely when someone typed the flag locally. It costs 22 s.
+- **The accuracy contract is scoped to the grid that measures it.** The sweep holds `w_strategy`
+  at `dense_scan`, which is not the shipped default; cross-strategy agreement is pinned at
+  `1e-11`, wider than the contract itself below `epsilon = 5e-12`. The `3 * epsilon` bound
+  against ducc0 holds `epsilon` at {`1e-4`, `1e-6`}.
+- **Corrected claims that the repository's own code or data falsified**
+  ([#33](https://github.com/chrisfinlay/jax-nufft/issues/33)): the README reported the package
+  version as v0.1.2 (it is `0.2.0.dev0`) and attributed shipped work to a "v0.1.3" that will
+  never be tagged; the memory table reported 0 MB for three rows, an artefact of measuring two
+  operators against one monotonic high-water mark; the padding-overhead ranges quoted an
+  `epsilon = 1e-6` slice while naming a four-epsilon grid; "all four `w_strategy` choices"
+  survived #25 adding two more; `_plane_chunk_grid(56, 32)` pads nothing where two docstrings
+  said it pads a plane; and float32 was said to halve plan memory, which holds for
+  image-dominated plans (0.501×) but not row-dominated ones (0.586×).
+- `[tool.mypy]` and `[tool.ruff]` now target Python 3.11, matching `requires-python`.
+
+## [0.1.1] and earlier
+
+Not itemised here: this file starts at 0.2.0. See the git history, and the
+historical plan documents under `docs/`.
 
 [Unreleased]: https://github.com/chrisfinlay/jax-nufft/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/chrisfinlay/jax-nufft/compare/v0.1.1...v0.2.0

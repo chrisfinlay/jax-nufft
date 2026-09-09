@@ -74,10 +74,9 @@ import ast
 import importlib
 import re
 import sys
+import tomllib
 import traceback
 from pathlib import Path
-
-import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

@@ -40,6 +40,14 @@ jobs:
       - name: Run pytest (slow ducc parity)
         run: pixi run -e ${{ matrix.environment }} test -ra --runslow
 
+      # The accuracy sweep is the only evidence for README.md's headline
+      # "within 2 * epsilon of the exact DFT" contract, and until #33 nothing
+      # in CI ran it -- it fired only when someone typed the flag locally. It
+      # costs about 22 s, so there was no cost argument for leaving the
+      # project's central numerical claim unguarded.
+      - name: Run the accuracy sweep (the 2 * epsilon contract)
+        run: pixi run -e ${{ matrix.environment }} test -ra --runsweep -k accuracy_sweep
+
   test-float32:
     # Separate job rather than another matrix dimension: a single-precision
     # failure then shows up as its own line in the checks list instead of

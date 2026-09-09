@@ -13,10 +13,9 @@ Nothing caught it because nothing read both. These tests do.
 from __future__ import annotations
 
 import re
+import tomllib
 from importlib import metadata
 from pathlib import Path
-
-import tomllib
 
 import jax_nufft
 

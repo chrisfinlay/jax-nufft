@@ -6,8 +6,11 @@ code is laid out, the conventions and invariants you need to respect,
 how to run tests / benchmarks, the history of design decisions taken
 in `v0.1` and `v0.1.1`, and the performance plan for `v0.1.2`.
 
-For end-user-facing documentation, see `README.md`. For the most recent
-formal release plan, see `docs/v0.1.2-plan.md`.
+For end-user-facing documentation, see `README.md`. For what shipped in each
+release, see `CHANGELOG.md`. `docs/v0.1.1-plan.md` and `docs/v0.1.2-plan.md`
+are historical plan documents, useful for the reasoning behind decisions still
+in the code but not a record of outcomes -- 0.2.0 was driven by the issue
+tracker and has no plan document.
 
 ---
 
@@ -57,7 +60,7 @@ and likewise `m_j = (j - n_m // 2) · pixsize_m`. The offset is
 **floor division**, `n_l // 2`. It is built once in
 `planning._n_minus_1_grid` and restated independently by every grid
 construction under `tests/` — `grep -rn 'arange(n_l)' tests/` finds
-nine, all using `// 2`; the ones a change would be checked against
+thirteen, all using `// 2`; the ones a change would be checked against
 first are `test_against_dft.py::reference_lmn_grids`,
 `test_adjoint.py::_reference_adjoint` and
 `test_divide_by_n.py::_independent_one_over_n`.
@@ -65,12 +68,18 @@ first are `test_against_dft.py::reference_lmn_grids`,
 `// 2` and `/ 2` agree for even `n_l` and differ by half a pixel for
 odd `n_l`, so **do not "simplify" `//` to `/`**: the phase centre
 `l = 0` has to land on the exact pixel `n_l // 2` at both parities,
-and with `/ 2` an odd-sized image has no pixel there at all. Issue
-#14 measured this on the suite as it now stands (1495 tests):
-substituting `/` for `//` in `_n_minus_1_grid` fails exactly **six**
+and with `/ 2` an odd-sized image has no pixel there at all.
+
+Issue #14 first measured this against a 1495-test suite, where
+substituting `/` for `//` in `_n_minus_1_grid` failed exactly six
 cells — the two odd geometries of
 `tests/test_against_dft.py::test_geometry_matches_dft_forward_and_adjoint`
-times its three `w_strategy` legs — and passes the other 1489.
+times its three `w_strategy` legs. Re-measured for #33 against the
+current suite (`--runslow`, 2136 cases), the same substitution now fails
+**ten**: those same six, plus four that #12 added in
+`tests/test_planning.py`
+(`test_nm1_is_exactly_minus_one_on_the_exact_horizon` and the
+`odd_63x65_anisotropic` cells of the three `nm1` accuracy tests).
 Before that test existed the repository had **no** odd extent
 anywhere and nothing in it could tell the two forms apart.
 
@@ -184,11 +193,13 @@ w-plane `k`, multiplies the image by the w-correction
 `exp(2πi w_k (n-1)) / phi_hat_n`, runs a 2D NUFFT to land at the
 visibilities, and weights each visibility by `phi((w-w_k) / scale)`.
 
-The four `w_strategy` variants (`dense_scan` default, `dense_vmap`,
-`windowed_scan`, `windowed_vmap`) differ only in how the w-plane loop
-is structured (scan vs vmap) and whether each plane processes every
+The six `w_strategy` variants (`dense_scan`, `dense_vmap`,
+`windowed_scan`, `windowed_vmap`, and since #25 `chunked` /
+`windowed_chunked`; the default is `"auto"`, which resolves to one of the
+first four) differ only in how the w-plane loop is structured (scan, vmap,
+or a chunk loop of `w_chunk` planes) and whether each plane processes every
 visibility (`dense_*`) or just a contiguous w-sorted slice (`windowed_*`).
-All four are mathematically equivalent — they differ only in
+All six are mathematically equivalent — they differ only in
 floating-point reduction order.
 
 For the underlying math (sign convention, phi_hat correction, kernel
@@ -488,7 +499,7 @@ If you touch any of these, run `tests/test_planning.py` and
 Since issue #26 the windowed **adjoint**'s rows are `bucket_length`, not
 `max_window_size`: each plane slices its own size class's length (at most
 four per channel), which is what took the padded row-work on the review
-fixtures from 1.14-4.94x the irreducible work to 1.00-1.38x. The
+fixtures from 1.08-5.08x the irreducible work to 1.00-1.41x. The
 per-bucket loop still branches on nothing but `w_chunk`, and a plan with
 one bucket per channel runs the pre-#26 program.
 
@@ -793,8 +804,10 @@ release's output needs that release pinned, not the strategy.
 
 The v0.1 names `"scan"` / `"vmap"` are accepted as deprecated aliases
 that emit `DeprecationWarning` and resolve to their `dense_*`
-counterparts (`_canonicalise_w_strategy` in `wgridder.py`). Plan to
-remove these in v0.2.
+counterparts (`_canonicalise_w_strategy` in `wgridder.py`). They were
+slated for removal in v0.2 and **still ship in 0.2.0**: dropping them is
+a breaking API change and was out of scope for #33's documentation pass.
+Tracked as [#71](https://github.com/chrisfinlay/jax-nufft/issues/71).
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
 The default `"scan"` is the safer choice across `n_chan` and memory
@@ -808,7 +821,7 @@ default without a GPU benchmark.
 ## 6. Testing conventions
 
 ```sh
-pixi run -e test pytest                # fast unit tests, ~5 s
+pixi run -e test pytest                # unit tests, ~6 min (2082 cases)
 pixi run -e test pytest --runslow      # adds MWA_extended/MeerKAT parity
 pixi run -e test pytest --runsweep -s tests/test_accuracy_sweep.py  # exact-DFT accuracy sweep
 pixi run -e test pytest --runbench     # opt-in benchmarks (~2 min for one pointing)
@@ -1080,8 +1093,9 @@ mask: the kernel weight `phi(z)` is zero outside the support.
 * Combined: 1.6–1.86x at the off-zenith adjoint workloads.
 
 **Renames.** `scan` &rarr; `dense_scan`, `vmap` &rarr; `dense_vmap`
-(old names accepted as deprecated aliases for one release; remove in
-v0.2).
+(old names accepted as deprecated aliases for one release; the removal
+was planned for v0.2 but has not happened -- they still ship in 0.2.0,
+tracked as #71).
 
 ### v0.1.2 (branch `feature/v0.1.2-perf-gpu`)
 
@@ -1146,6 +1160,51 @@ v0.1.1 windowed-adjoint gains forward; constant-w gives ~`W+1` on
 coplanar data. GPU (GH200): `dense_vmap` / `windowed_vmap` dominate;
 the auto heuristic picks the measured winner in 20/20 (op, fixture)
 cells.
+
+### v0.2.0 (review-driven; branch `main`)
+
+Sixteen issues from the 2026-09 review, plus the v0.1.2 series above, which
+was merged but never tagged and so ships here for the first time. The full
+list is `CHANGELOG.md`; what a future agent needs to know:
+
+* **Plane count and accuracy.** #9 replaced the width rule with
+  `W = ceil(-log10(epsilon / 10))` ([Barnett+2019] eq. 10 at sigma = 2), #16
+  centred `n - 1` via `nshift` and #17 folded the Hermitian symmetry
+  ([Arras+2021] eq. 19), together taking MWA_extended off30 from 495 to 134
+  planes at eps 1e-6. The accuracy contract tightened from `20 * epsilon` to
+  `2 * epsilon` against the exact DFT, but the *margin* narrowed: the worst
+  cell went 0.67x to 1.48x eps, because centring puts both ends of the
+  `n - 1` range at the eta extreme where the w-kernel's aliasing error peaks.
+  A change that spends more error budget should expect to widen the kernel
+  rather than assume slack.
+* **Differentiability.** #21 made both operators linear primitives with
+  `ad.primitive_transposes`, *not* `jax.custom_vjp` -- the latter breaks
+  `jvp`, `check_grads(fwd)` and `hessian`. Gradient memory went from
+  12.5-135x a forward call to 1.48-1.50x.
+* **Memory.** #25 added `chunked` / `windowed_chunked` and the `w_chunk`
+  knob; `dense_scan` is `chunked(1)` and `dense_vmap` is `chunked(n_w)` by
+  genuine aliasing, not by resemblance. #26 bucketed the windowed adjoint's
+  plane slices by an exact DP over each channel's sorted padded window sizes,
+  capped at four classes. #26 is **adjoint-only**: bucketing the forward
+  regressed GPU by 20-58x on the `auto` path, cause not established, filed as
+  #65.
+* **Numerics.** #12 evaluates `n - 1` as `-x / (sqrt(1 - x) + 1)` rather than
+  `sqrt(1 - x) - 1` ([Higham2002] Ch. 1). Nothing structural moves -- `n_w`,
+  `beta`, `W`, the window layout and `sort_perm` are identical on every
+  fixture -- but the outputs do: 2.45e-10 at w = 1e6, growing linearly in w.
+  An early write-up claimed it moved no measured number; that was false, and
+  was caught by re-measuring rather than by review.
+* **Provenance.** #49 added `tests/test_benchmark_claims.py` after three
+  cited aggregates were found wrong against JSON sitting in the tree. #33
+  committed the GPU-versus-ducc0 and memory sweeps that the module had
+  previously recorded as un-recomputable, and put the accuracy sweep into CI,
+  where it had never run despite being the only evidence for the headline
+  accuracy contract.
+
+Performance against ducc0 at realistic sizes, one GH200: forward 1.7-3.8x
+faster, adjoint 1.5-11.2x, faster in all sixteen comparisons -- against ducc0
+at its own best measured thread count, which is never all 288. Memory is the
+other side: 2.7-54x more than ducc0, worse in every cell.
 
 ---
 
@@ -1251,3 +1310,17 @@ These are seeds for later releases, not v0.1.2 candidates:
   CPU+GPU benchmark validation. The default is the value most users
   inherit by not specifying — changing it changes the behaviour of
   every existing caller.
+* Don't loosen a tolerance to make a test pass. Measure what the number
+  actually is, and either fix the cause or record the new value with the
+  measurement behind it. A tolerance widened to accommodate an unexplained
+  change destroys the only evidence that the change was harmless.
+* Don't consult the ducc0 source. ducc0 is GPL-2.0-or-later and is used in
+  this project **only** as a black-box test oracle through its public Python
+  API; nothing under `src/` may import it. Implement from the cited papers
+  (§9 and README "Citations"). FINUFFT and jax-finufft are Apache-2.0 and may
+  be read freely.
+* Don't quantify a claim over an axis your evidence holds constant. This is
+  the single most common defect found in the 2026-09 review -- "for all four
+  strategies" from a fixture that only ran one, "for 1e-3 to 1e-12" from a
+  sweep at 1e-6. Before writing a range, check which axes the measurement
+  behind it actually varied, and state the ones it did not.
