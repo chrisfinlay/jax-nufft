@@ -1,10 +1,17 @@
-# Benchmark JSON schema (v0.1.2+)
+# Benchmark JSON schema
 
 This directory stores time-series benchmark results plus the GH200
-baseline used to track v0.1.2 performance regressions. The two kinds of
-JSON files here are produced by different harnesses with different
-shapes; this README documents both so a downstream diff/merge script can
-consume either without guessing.
+baseline used to track v0.1.2 performance regressions. There are **four**
+schemas here, produced by different harnesses with different shapes; this
+README documents each so a downstream diff/merge script can consume any of
+them without guessing.
+
+| file | schema | section |
+|---|---|---|
+| `v0.1.2-baseline-gh200.json`, `v0.1.2-part1.json` | pytest-benchmark | below |
+| `v0.1.2-baseline-gpu.json` | `{fingerprint, rows}` | below |
+| `v0.2.0-vs-ducc0-gh200.json` | `{schema, provenance, sizing, suites, rows}` | below |
+| `v0.2.0-memory-gh200.json` | `{schema, provenance, rows, w_chunk_sweep}` | below |
 
 ## v0.1.x CPU benchmark JSON: `v0.1.2-baseline-gh200.json`, `v0.1.2-part1.json`, ...
 
@@ -27,9 +34,12 @@ changed in 0.2.0** (issue #43): the denominator moved from the mean of the
 padded per-plane window lengths to `plan.live_row_count`, the incidences
 inside the unpadded *nominal* kernel support (a host-side count — see the
 `live_row_count` field comment in `planning.py` for how far it can sit from
-what the compiled operators weight, and why that does not matter here). Every JSON file in this directory was
-recorded through v0.1.2 and so carries the old scale, which reads 0 – 17%
-lower on the same plan. The two are not convertible after the fact — the
+what the compiled operators weight, and why that does not matter here). Every
+JSON file in this directory that carries a `padding_overhead` column at all
+— that is, the two pytest-benchmark files and `v0.1.2-baseline-gpu.json` —
+was recorded through v0.1.2 and so holds the old scale, which reads 0 – 17%
+lower on the same plan. (The two `v0.2.0-*` files record no padding column,
+so the question does not arise for them.) The two are not convertible after the fact — the
 conversion needs the per-`(channel, plane)` window lengths, which are
 plan-time locals and have never been stored — so a `padding_overhead` value
 is only comparable against another recorded by the same version. Compare
@@ -114,3 +124,73 @@ pixi run -e gpu python -m tests.bench_harness fingerprint > /tmp/fp.json
 
 The `__main__` block is intentionally minimal so the harness stays
 import-safe and unit-testable.
+
+## v0.2.0 comparison JSON: `v0.2.0-vs-ducc0-gh200.json`
+
+Written by `scratchpad/build_json.py` from the raw sweep, and recomputed by
+`tests/test_benchmark_claims.py`. Top-level shape:
+
+```jsonc
+{
+  "schema": "v0.2.0-vs-ducc0",
+  "provenance": { /* machine, date, epsilon, dtype, protocol, ducc0_role */ },
+  "sizing":     { /* the rule the problem sizes follow, and its inputs */ },
+  "suites":     { /* what each value of rows[*].suite means */ },
+  "rows":       [ /* one entry per (suite, fixture, implementation) */ ]
+}
+```
+
+Each row carries `suite` (`"realistic"` or `"ci_sized"`), `fixture`, `impl`
+(`"jax-nufft"` or `"ducc0"`), `device`, `nthreads` (ducc0 only; `null` for
+jax-nufft), `n_pix`, `n_rows`, `n_w`, `w_kernel_width`, and the four timing
+columns `dirty2vis_median_ms`, `vis2dirty_median_ms`, `dirty2vis_min_ms`,
+`vis2dirty_min_ms`.
+
+**How to compare.** A jax-nufft row is one measurement; the ducc0 rows for
+the same fixture are a thread-count sweep. "jax-nufft is N times faster"
+means against `min()` over that sweep — ducc0 at its own best measured
+setting for that cell and operator. Comparing against a fixed thread count
+instead flatters jax-nufft by up to 6x, since ducc0's best is never all 288
+hardware threads.
+
+`sizing` is not decoration: the `realistic` suite's `n_pix` and `n_rows` are
+derived from the instrument parameters recorded there, and
+`test_the_realistic_problem_sizes_reproduce_from_the_stated_sizing_rule`
+recomputes all eight from the rule. The `ci_sized` suite is the unmodified
+`tests/conftest.py` fixtures, kept so the effect of the sizing can be
+inspected rather than taken on trust.
+
+## v0.2.0 memory JSON: `v0.2.0-memory-gh200.json`
+
+Top-level `{schema, provenance, rows, w_chunk_sweep}`.
+
+`rows` holds one entry per (fixture, operator, implementation), each with
+`n_pix`, `n_rows`, `n_w`, `w_strategy`, `w_chunk`, `nthreads` and:
+
+| key | impl | meaning |
+|---|---|---|
+| `temp_mb` | jax-nufft | `memory_analysis().temp_size_in_bytes` for the compiled executable — a compiler-reported figure, independent of run order |
+| `peak_mb` | both | jax-nufft: peak device HBM. ducc0: peak process RSS |
+| `peak_pre_mb` | jax-nufft | device peak before the measured call |
+| `rss_import_mb` | ducc0 | RSS after imports, before any problem data exists |
+| `working_set_mb` | ducc0 | `peak_mb - rss_import_mb`: input + scratch + output without the interpreter, the quantity comparable with jax-nufft's `peak_mb` |
+
+**One operator per process.** Both `peak_bytes_in_use` and `ru_maxrss` are
+monotonic high-water marks for the life of a process, so two operators
+measured in one process cannot be attributed separately — the second one's
+rise reads zero whenever its transient stayed below the first one's peak. An
+earlier sweep did exactly that and reported a zero adjoint delta for all
+eight fixtures, plus an identical 72.0 MB forward figure for four fixtures
+spanning 144² to 3600². Those numbers were discarded rather than published.
+Any re-measurement must keep the one-operator-per-process discipline or it
+will reproduce the same artefact.
+
+**RSS is coarse.** Observed ducc0 values are multiples of about 36 MB, so
+ratios against a ducc0 side below a few hundred MB carry a large relative
+uncertainty. The `provenance.comparability` field says this too; read the
+small ratios as approximate.
+
+`w_chunk_sweep.rows` is a separate grid: `temp_mb` and `median_ms` for the
+same problem under each w-strategy including `chunked` at several chunk
+widths. This is the memory/compute dial the README documents, and the test
+asserts it is monotone in both columns.

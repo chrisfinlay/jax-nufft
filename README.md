@@ -590,15 +590,25 @@ operator* above for the measured residuals.
 *before* the JIT boundary to a strategy-aware choice, not a flat number:
 `1` for `dense_scan` / `windowed_scan` (each w-plane makes its own FINUFFT
 call, so `nthreads > 1` just re-spins the whole OpenMP pool on every plane
-— 4.80x-8.49x slower than `nthreads=1` for the old flat default of `0`,
-measured on a 10-core Apple M-series: MWA_extended off30 3343.6ms vs
+— 4.80x-8.51x slower than `nthreads=1` for the old flat default of `0`,
+measured on `dense_scan` on a 10-core Apple M-series: MWA_extended off30 3343.6ms vs
 696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith 36.6ms vs 4.3ms), and
 `0` (let FINUFFT decide) for `dense_vmap` / `windowed_vmap` (one batched
 FINUFFT call across all w-planes, which benefits from threads at large
-enough `n_w`). Below 100k rows every strategy gets `1` regardless, since the
-whole plane loop is short enough that spinning up a pool isn't worth it.
-Pass an explicit `int` (including `0`) to opt out of the strategy-aware
-default.
+enough `n_w`). The `chunked` family splits on `w_chunk`: `w_chunk == 1` is a
+plane-at-a-time loop and gets `1`, any wider chunk is a batched call and gets
+`0`. Below 100k rows every strategy gets `1` regardless, since the whole
+plane loop is short enough that spinning up a pool isn't worth it. Pass an
+explicit `int` (including `0`) to opt out of the strategy-aware default.
+
+Those three timings are from one session on one laptop and no JSON for them
+is committed, so treat them as an illustration of the effect's size rather
+than a figure to tune against. What *is* pinned, by
+`tests/test_nthreads_resolution.py`, is the resolution table itself — which
+integer comes out of `_resolve_nthreads` for each (strategy, `n_rows`,
+`w_chunk`) — not any wall-clock number. The 100k cutoff is exact and the
+comparison is strict: `n_rows = 100_000` takes the strategy rule, not the
+small-problem rule.
 
 **Limitation:** every fixture in this repository is below the 100k-row
 cutoff -- 400-600 rows for the CPU telescope fixtures, 50k for the
@@ -1006,8 +1016,11 @@ defaulting caller gets there. The re-run below has that cell measured on
 the pick the default actually makes.
 
 So on five of those six cells the old default ran 1.4-5.6x *slower* than
-ducc0 on that hardware, where what the heuristic picks runs 1.4-6.3x
-faster in all six. The exception is the GH200_large off30 adjoint, where
+ducc0 on that hardware, where `dense_vmap` runs 1.4-6.3x faster in all
+six. That range is the `dense_vmap` column, which is the heuristic's pick
+in five of the six but not the sixth: on the GH200_large off30 adjoint it
+picks `windowed_vmap`, whose re-run figure of 53.1 ms is 3.5x faster than
+ducc0 and so falls inside the same range without changing it. The exception is the GH200_large off30 adjoint, where
 `dense_scan` at 159.2 ms was about 1.16x *faster* than ducc0's 184.8 ms —
 the one cell in the table where the old default was not losing to ducc0
 outright, though it was still 2.0x off `dense_vmap` and 3.0x off the

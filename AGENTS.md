@@ -6,8 +6,11 @@ code is laid out, the conventions and invariants you need to respect,
 how to run tests / benchmarks, the history of design decisions taken
 in `v0.1` and `v0.1.1`, and the performance plan for `v0.1.2`.
 
-For end-user-facing documentation, see `README.md`. For the most recent
-formal release plan, see `docs/v0.1.2-plan.md`.
+For end-user-facing documentation, see `README.md`. For what shipped in each
+release, see `CHANGELOG.md`. `docs/v0.1.1-plan.md` and `docs/v0.1.2-plan.md`
+are historical plan documents, useful for the reasoning behind decisions still
+in the code but not a record of outcomes -- 0.2.0 was driven by the issue
+tracker and has no plan document.
 
 ---
 

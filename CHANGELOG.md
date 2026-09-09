@@ -26,8 +26,9 @@ tagged or released, so its changes appear here for the first time; they are mark
   `"auto"` resolves per call from the plan and the device platform, so the strategy a given call
   runs may differ from v0.1.1. Pass `w_strategy="dense_scan"` explicitly to keep the old behaviour.
   On one GH200, against ducc0 on the 72 Grace cores of the same node, the old default ran 1.4–5.6×
-  *slower* than ducc0 on five of six measured cells, where the heuristic's pick runs 1.4–6.3×
-  faster.
+  *slower* than ducc0 on five of six measured cells, where `dense_vmap` runs 1.4–6.3× faster in
+  all six. (That range is the `dense_vmap` column; the heuristic picks `windowed_vmap` on the
+  sixth cell, at 3.5× faster, which is inside the same range.)
   ([#46](https://github.com/chrisfinlay/jax-nufft/issues/46),
   [PR #48](https://github.com/chrisfinlay/jax-nufft/pull/48))
 
@@ -365,9 +366,10 @@ tagged or released, so its changes appear here for the first time; they are mark
   image-dominated plans (0.501×) but not row-dominated ones (0.586×).
 - `[tool.mypy]` and `[tool.ruff]` now target Python 3.11, matching `requires-python`.
 
-## [0.1.1]
+## [0.1.1] and earlier
 
-See the git history; this file starts at 0.2.0.
+Not itemised here: this file starts at 0.2.0. See the git history, and the
+historical plan documents under `docs/`.
 
 [Unreleased]: https://github.com/chrisfinlay/jax-nufft/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/chrisfinlay/jax-nufft/compare/v0.1.1...v0.2.0

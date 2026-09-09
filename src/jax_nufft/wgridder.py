@@ -390,7 +390,7 @@ def _resolve_nthreads(
     Measured on the review machine (Apple M-series, 10 cores), default
     ``nthreads=0`` vs. explicit ``nthreads=1`` on ``dense_scan``: MWA_extended
     off30 3343.6ms vs 696.0ms (4.80x), MeerKAT off30 207.5ms vs 41.5ms
-    (5.01x), EDA2 zenith 36.6ms vs 4.3ms (8.49x). The batched ``dense_vmap``
+    (5.00x), EDA2 zenith 36.6ms vs 4.3ms (8.51x). The batched ``dense_vmap``
     is the opposite story -- it benefits from threads -- so a flat default of
     ``1`` would regress it; hence the strategy-family split rather than a
     single number.
@@ -2052,7 +2052,7 @@ def dirty2vis(
         strategy-aware choice: ``1`` for the ``*_scan`` strategies, which
         re-enter FINUFFT once per w-plane, so ``nthreads > 1`` just re-spins
         the whole OpenMP thread pool on every plane -- measured on the
-        review machine (Apple M-series, 10 cores) at 4.80x-8.49x slower than
+        review machine (Apple M-series, 10 cores) at 4.80x-8.51x slower than
         ``nthreads=1`` for the pre-#24 default of ``0`` (MWA_extended off30
         3343.6ms vs 696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith
         36.6ms vs 4.3ms); ``0`` (let FINUFFT decide) for the ``*_vmap``
@@ -2579,7 +2579,7 @@ def vis2dirty(
         strategy-aware choice: ``1`` for the ``*_scan`` strategies, which
         re-enter FINUFFT once per w-plane, so ``nthreads > 1`` just re-spins
         the whole OpenMP thread pool on every plane -- measured on the
-        review machine (Apple M-series, 10 cores) at 4.80x-8.49x slower than
+        review machine (Apple M-series, 10 cores) at 4.80x-8.51x slower than
         ``nthreads=1`` for the pre-#24 default of ``0`` (MWA_extended off30
         3343.6ms vs 696.0ms, MeerKAT off30 207.5ms vs 41.5ms, EDA2 zenith
         36.6ms vs 4.3ms); ``0`` (let FINUFFT decide) for the ``*_vmap``
