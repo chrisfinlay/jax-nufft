@@ -157,23 +157,30 @@ coordinates $(u, v, w)$ in wavelengths:
 
 $$
 V(u, v, w) \;=\; \int \frac{B(l, m)}{n} \;
-  e^{-2\pi i\,\left(u\,l \;+\; v\,m \;+\; w\,(n - 1)\right)} \; \mathrm{d}l \; \mathrm{d}m ,
+  \underbrace{e^{-2\pi i\,(u\,l \;+\; v\,m)}}_{\text{the 2D NUFFT}} \;
+  \underbrace{e^{+2\pi i\,w\,(n - 1)}}_{\text{the w-screen}}
+  \; \mathrm{d}l \; \mathrm{d}m ,
 \qquad n = \sqrt{1 - l^2 - m^2} .
 $$
 
 The $w(n-1)$ term is what makes wide-field imaging hard: it couples the sky
 coordinates into the exponent in a way that is not a 2D Fourier transform.
 
-**Sign convention.** `jax-nufft` matches ducc0's `explicit_degridder`:
+**Sign convention.** Note the **plus** on the w-term while the $(u, v)$ part
+carries a minus. Collapsed into one exponential this library computes
 
 $$
-V(u, v, w) \;=\; \sum_{l, m} B(l, m) \;
-  \underbrace{e^{-2\pi i\,(u\,l + v\,m)}}_{\text{the 2D NUFFT}} \;
-  \underbrace{e^{+2\pi i\,w\,(n - 1)}}_{\text{the w-screen}}
+e^{-2\pi i\,\left(u\,l \;+\; v\,m \;-\; w\,(n - 1)\right)} ,
 $$
 
-Note the **plus** sign on the w-term. ducc0 writes $-w(n-1)$ inside the
-parenthesis, which is the same thing.
+which is `ducc0`'s `explicit_degridder` convention and is what
+`tests/test_against_dft.py` checks against. Texts that write
+$+w(n-1)$ *inside* the parenthesis are using the opposite overall sign, and
+that form is **not** what this library implements: evaluated against the
+operator it disagrees at relative $L_2$ of order 1, where the form above
+agrees to $1.5 \times 10^{-12}$. If you are porting an expression in from
+elsewhere, check this sign first — it is the easiest thing in the whole
+library to get backwards.
 
 **The image grid** is regular on the tangent plane, centred on the phase
 centre:
@@ -491,6 +498,12 @@ cell above, 3600² with `n_w = 140`:
 | `chunked`, `w_chunk=32` | 6.1 GB | 4.8× less | 1.27× |
 | `chunked`, `w_chunk=8` | 1.9 GB | 15.7× less | 1.73× |
 | `dense_scan` | 0.40 GB | 73× less | 2.35× |
+
+Less scratch costs more time with no inversion here, which is what makes the
+table advice rather than trivia: pick the row that fits your card. That
+monotonicity holds on seven of the eight (fixture, operator) pairs measured —
+the exception is a 2.9% inversion at `n_w = 13`, where a chunk of 8 barely
+engages the dial at all.
 
 `w_chunk=16` takes that problem from *needs a 96 GB GH200* to *fits on a 16 GB
 card* for 35% more time. And `dtype=jnp.float32` halves whatever remains. The

@@ -20,7 +20,12 @@ on:
         options: [testpypi]
 
 concurrency:
-  group: publish-${{ github.ref }}
+  # Deliberately NOT "publish-${{ github.ref }}". test.yml groups on
+  # "${{ github.workflow }}-${{ github.ref }}", and a called workflow
+  # evaluates github.workflow as the *caller's* name -- so that group is
+  # also "publish-<ref>". With test.yml's cancel-in-progress, the called
+  # suite would cancel the release that called it.
+  group: publish-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -77,6 +82,20 @@ jobs:
           python -m pip install --upgrade packaging
           python .github/scripts/check_release_version.py "$TAG"
 
+      - name: Check the released commit is on main
+        # A tag can point anywhere. Without this the suite above proves only
+        # that *some* commit passes, not that the released one is the reviewed
+        # history -- and the upload is not reversible.
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=0 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::released commit $GITHUB_SHA is not contained in origin/main" >&2
+            exit 1
+          fi
+          echo "released commit $GITHUB_SHA is on main"
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -107,7 +126,12 @@ jobs:
 
   pypi:
     name: upload to PyPI
-    if: github.event_name == 'release'
+    # `types: [published]` fires for a release marked "pre-release" on GitHub
+    # as well. check_release_version.py rejects a pre-release *version string*
+    # (0.2.0rc1), which is a different thing: a GitHub pre-release tagged
+    # v0.2.0 carries a perfectly ordinary version and would sail through to
+    # production PyPI. Mark a release pre-release and it goes nowhere.
+    if: github.event_name == 'release' && github.event.release.prerelease == false
     needs: [build, test]
     runs-on: ubuntu-latest
     environment:

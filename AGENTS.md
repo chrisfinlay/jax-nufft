@@ -128,7 +128,8 @@ unrestricted, its output being the real part.
 
 ```
 jax-nufft/
-├── README.md                 # user-facing docs, install, API, benchmarks
+├── README.md                 # overview: install, quick start, API, headline results
+├── docs/                     # reference: algorithm, strategies, accuracy, benchmarking
 ├── AGENTS.md                 # this file
 ├── LICENSE                   # Apache-2.0
 ├── pyproject.toml            # hatchling build, pytest config, ruff config
@@ -207,7 +208,7 @@ All six are mathematically equivalent — they differ only in
 floating-point reduction order.
 
 For the underlying math (sign convention, phi_hat correction, kernel
-parameters), see `README.md` &rarr; "Mathematical background" and the
+parameters), see `docs/algorithm.md` and the
 docstrings in `src/jax_nufft/wgridder.py`.
 
 ---
@@ -695,7 +696,7 @@ test *name* and classifies it with `rsplit("_", 1)[1]`, which raises on
 `"chunked"` and yields a third family on `"windowed_chunked"`, against pair
 counts and spreads pinned to three decimals from committed v0.1.2 JSONs. The
 reason is restated in both suites' module docstrings. Until item 4 lands the
-chunked curve is measured out-of-band and lives in `README.md`
+chunked curve is measured out-of-band and lives in `docs/strategies.md`
 §`w_chunk` — including the fact that the CPU 1.2x gate is only non-vacuous
 on one of its five fixtures, and that the GPU 1.2x gate is **breached** at
 1.27x on MWA_extended off30's forward at 3600².
@@ -1148,7 +1149,7 @@ population lying inside 5-30x, 10.376x to 29.393x over eight cells. Its
 endpoints are still not 5 and 30, so it does not reproduce the quoted range
 either.)
 
-Every aggregate quoted in this paragraph, in `README.md`'s strategy section,
+Every aggregate quoted in this paragraph, in `docs/strategies.md`,
 in `wgridder.py`'s heuristic comments and in `docs/v0.1.2-plan.md` is
 recomputed from the committed JSON by `tests/test_benchmark_claims.py`
 (issue #49), whose `CITATIONS` table is the one place the figures are
