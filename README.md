@@ -1242,6 +1242,77 @@ between the two by installing the matching `jax-finufft` extra:
 - `pixi run -e default ...` &mdash; CPU FINUFFT.
 - `pixi run -e gpu ...` &mdash; CUDA-enabled `jax-finufft` (Linux only).
 
+### GPU vs ducc0, at sizes worth measuring
+
+On one GH200 node &mdash; jax-nufft on the H100, ducc0 on the same node's 72
+Grace cores &mdash; **jax-nufft is faster in all sixteen (problem, operator)
+comparisons**, against ducc0 running at the best thread count measured for that
+comparison rather than at a fixed setting.
+
+The two operators behave differently enough that a single range would mislead:
+
+| | span | median |
+|---|---|---|
+| `dirty2vis` (forward) | 1.7&times; &ndash; 3.8&times; | 2.3&times; |
+| `vis2dirty` (adjoint) | 1.5&times; &ndash; 11.2&times; | 2.6&times; |
+
+The adjoint's wide span is two clusters, not a continuum: five of the eight
+problems sit between 1.5&times; and 2.9&times;, and three &mdash; MWA_extended at
+zenith, MeerKAT at both pointings &mdash; between 8.8&times; and 11.2&times;.
+Nothing lands in between, so "about 6&times;" describes no case that was measured.
+
+| Telescope / pointing | n_pix | n_rows | `n_w` | `dirty2vis` | `vis2dirty` |
+|----------------------|-------|-----------|------|-------------|-------------|
+| EDA2 zenith          | 150   | 4,896,000 | 13   | 2.3&times;  | 1.9&times;  |
+| EDA2 off30           | 150   | 4,896,000 | 60   | 3.5&times;  | 1.5&times;  |
+| MWA_compact zenith   | 144   | 1,219,200 | 8    | 2.1&times;  | 2.9&times;  |
+| MWA_compact off30    | 144   | 1,219,200 | 13   | 2.0&times;  | 2.2&times;  |
+| MWA_extended zenith  | 3600  | 1,219,200 | 13   | 3.8&times;  | 11.2&times; |
+| MWA_extended off30   | 3600  | 1,219,200 | 140  | 1.7&times;  | 2.1&times;  |
+| MeerKAT zenith       | 2700  | 302,400   | 8    | 3.6&times;  | 10.7&times; |
+| MeerKAT off30        | 2700  | 302,400   | 14   | 2.2&times;  | 8.8&times;  |
+
+Read this next to [Memory](#memory), which is the other half of the same trade:
+the speedups above are bought with 2.7&times; to 54&times; the memory.
+
+#### Give ducc0 its best thread count, not all of them
+
+`nthreads=288` &mdash; every hardware thread on the node &mdash; was **never**
+the fastest setting for ducc0 in any of the sixteen comparisons. It ran
+1.9&times; to 6.0&times; slower than that comparison's best measured count,
+which was 64 in thirteen of the sixteen.
+
+That is why the comparison above tunes ducc0 per cell. Benchmarking it at
+`nthreads = os.cpu_count()` would have flattered jax-nufft by up to a further
+6&times;, and a comparison that has to misconfigure the baseline to win is not
+worth publishing. Note the claim is deliberately one-sided: the thread grid was
+not identical for every telescope (EDA2 was measured at 8/16/32/64/128/288,
+MWA_extended at 16/32/64/96/128/288), so "best measured" bounds the tuning
+available rather than locating ducc0's true optimum. What the data does settle
+is that 288 never wins.
+
+#### How these problems are sized
+
+The built-in test fixtures are CI-sized &mdash; 400 to 600 rows, 64 to 256
+pixels &mdash; which under-resolves the field of view and holds orders of
+magnitude fewer visibilities than any real observation. Benchmarking on them
+measures overhead, not the algorithm. Both dimensions here are derived from
+instrument parameters instead:
+
+* `pixsize = lambda / (3 * B_max)` &mdash; three pixels across the synthesised beam.
+* `n_pix` = the next even 5-smooth integer at or above `fov / pixsize`, so the
+  image spans the field of view and the FFT size stays friendly.
+* `n_rows = 150 * n_ant * (n_ant - 1) / 2` &mdash; 150 time samples on every
+  baseline of the array.
+
+`tests/test_benchmark_claims.py` recomputes all eight sizes from that rule, so
+the benchmark cannot quietly drift to whatever size happens to be convenient.
+
+Raw data: [`docs/benchmarks/v0.2.0-vs-ducc0-gh200.json`](docs/benchmarks/v0.2.0-vs-ducc0-gh200.json).
+It also carries a `ci_sized` suite &mdash; the unmodified fixtures &mdash; so
+the effect of the sizing can be inspected rather than taken on trust. ducc0 is
+used only as a black-box oracle through its public Python API.
+
 ### Scaling with `n_w` and image size
 
 Per-channel forward / adjoint cost is roughly `n_w * (image_size + n_rows)`

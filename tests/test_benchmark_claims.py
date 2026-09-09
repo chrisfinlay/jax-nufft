@@ -439,7 +439,24 @@ CITATIONS: dict[str, Citation] = {
         ),
         sites=("README.md (Performance notes -> GPU vs ducc0)",),
         source=_REALISTIC,
-        figures={"min": 1.663, "max": 3.814, "median": 2.259, "cells": 8, "rounded": (1.7, 3.8)},
+        figures={
+            "min": 1.663,
+            "max": 3.814,
+            "median": 2.259,
+            "cells": 8,
+            "rounded": (1.7, 3.8),
+            # The README prints a cell-by-cell table, so every cell is pinned.
+            "per_cell": {
+                "EDA2_zenith": 2.3,
+                "EDA2_off30": 3.5,
+                "MWA_compact_zenith": 2.1,
+                "MWA_compact_off30": 2.0,
+                "MWA_extended_zenith": 3.8,
+                "MWA_extended_off30": 1.7,
+                "MeerKAT_zenith": 3.6,
+                "MeerKAT_off30": 2.2,
+            },
+        },
     ),
     "realistic_adjoint_speedup": Citation(
         claim=(
@@ -463,6 +480,20 @@ CITATIONS: dict[str, Citation] = {
             "gap": (3.0, 8.0),
             "cluster_low": (1.541, 2.938, 5),
             "cluster_high": (8.850, 11.217, 3),
+            # 8.850 rounds to 8.8, not 8.9: round-half-even, and the binary
+            # value sits just under the tie. The README's prose and its table
+            # cell must agree on which, so the rounded form is pinned too.
+            "cluster_high_rounded": (8.8, 11.2),
+            "per_cell": {
+                "EDA2_zenith": 1.9,
+                "EDA2_off30": 1.5,
+                "MWA_compact_zenith": 2.9,
+                "MWA_compact_off30": 2.2,
+                "MWA_extended_zenith": 11.2,
+                "MWA_extended_off30": 2.1,
+                "MeerKAT_zenith": 10.7,
+                "MeerKAT_off30": 8.8,
+            },
             "high_cells": ("MWA_extended_zenith", "MeerKAT_off30", "MeerKAT_zenith"),
         },
     ),
@@ -1491,6 +1522,18 @@ def test_the_realistic_forward_speedup_spans_the_cited_range() -> None:
         f"prose says {cited['min']}x to {cited['max']}x (median "
         f"{cited['median']}x).{_cite('realistic_forward_speedup')}"
     )
+    per_cell = {f: round(v, 1) for f, v in ratios.items()}
+    assert per_cell == cited["per_cell"], (
+        "the forward's per-cell table has moved: "
+        + str(
+            {
+                k: (per_cell.get(k), cited["per_cell"].get(k))
+                for k in set(per_cell) | set(cited["per_cell"])
+                if per_cell.get(k) != cited["per_cell"].get(k)
+            }
+        )
+        + _cite("realistic_forward_speedup")
+    )
     rounded = (round(min(ratios.values()), 1), round(max(ratios.values()), 1))
     assert rounded == cited["rounded"], (
         f"README.md quotes '{cited['rounded'][0]}x to {cited['rounded'][1]}x'; "
@@ -1537,6 +1580,25 @@ def test_the_realistic_adjoint_speedup_is_two_clusters_not_a_continuum() -> None
     )
     assert (round(min(low.values()), 3), round(max(low.values()), 3)) == (low_min, low_max)
     assert (round(min(high.values()), 3), round(max(high.values()), 3)) == (high_min, high_max)
+    per_cell = {f: round(v, 1) for f, v in ratios.items()}
+    assert per_cell == cited["per_cell"], (
+        "the adjoint's per-cell table has moved: "
+        + str(
+            {
+                k: (per_cell.get(k), cited["per_cell"].get(k))
+                for k in set(per_cell) | set(cited["per_cell"])
+                if per_cell.get(k) != cited["per_cell"].get(k)
+            }
+        )
+        + _cite("realistic_adjoint_speedup")
+    )
+    assert (round(min(high.values()), 1), round(max(high.values()), 1)) == cited[
+        "cluster_high_rounded"
+    ], (
+        "the README states the upper cluster in one-decimal form in its prose "
+        "and again in its table; those two roundings must match."
+        + _cite("realistic_adjoint_speedup")
+    )
     assert tuple(sorted(high)) == tuple(sorted(cited["high_cells"])), (
         f"the cells above {high_min}x are now {tuple(sorted(high))}; the prose "
         f"names {tuple(sorted(cited['high_cells']))}."
