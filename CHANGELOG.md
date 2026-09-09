@@ -375,8 +375,10 @@ tagged or released, so its changes appear here for the first time; they are mark
   dropped — into [`docs/algorithm.md`](docs/algorithm.md),
   [`docs/strategies.md`](docs/strategies.md), [`docs/accuracy.md`](docs/accuracy.md) and
   [`docs/benchmarking.md`](docs/benchmarking.md); every figure in those files was verified during
-  the #33 pass, so moving beat rewriting. The install instructions no longer lead with a
-  `pip install jax-nufft` that does not work yet.
+  the #33 pass, so moving beat rewriting. Installation now leads with `pip install jax-nufft`,
+  which 0.2.0 is the first release to make true, and records that there is no `jax-nufft[gpu]`
+  extra — the CPU/CUDA choice belongs to `jax-finufft`, and the extra the previous README
+  documented never existed.
 
 ### Packaging
 

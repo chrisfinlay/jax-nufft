@@ -6,6 +6,7 @@ GPU-capable, and built on [`jax-finufft`][jaxfinufft].
 [![tests](https://github.com/chrisfinlay/jax-nufft/actions/workflows/test.yml/badge.svg)](https://github.com/chrisfinlay/jax-nufft/actions/workflows/test.yml)
 [![python](https://img.shields.io/badge/python-3.11%20|%203.12%20|%203.13%20|%203.14-blue)](pyproject.toml)
 [![jax](https://img.shields.io/badge/jax-%E2%89%A5%200.6.0-important)](https://github.com/jax-ml/jax)
+[![pypi](https://img.shields.io/pypi/v/jax-nufft)](https://pypi.org/project/jax-nufft/)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
@@ -88,14 +89,21 @@ cannot do is participate in a JAX program.
 
 ## Installation
 
-Not yet on PyPI. Install from source:
+```sh
+pip install jax-nufft
+```
+
+Available from **0.2.0** onwards. For the unreleased tip, or before that
+release lands:
 
 ```sh
 pip install git+https://github.com/chrisfinlay/jax-nufft.git
 ```
 
-For CUDA, install a matching [`jax-finufft`][jaxfinufft] GPU build first;
-`jax-nufft` itself is platform-agnostic and dispatches through it.
+**GPU.** `jax-nufft` itself is platform-agnostic — the CUDA support comes from
+[`jax-finufft`][jaxfinufft], so install a matching GPU build of *that* and
+`jax-nufft` dispatches through it. There is no `jax-nufft[gpu]` extra; the
+choice of CPU or CUDA backend is entirely `jax-finufft`'s.
 
 For development, the repository uses [pixi](https://pixi.sh/):
 
