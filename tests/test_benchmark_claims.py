@@ -452,7 +452,10 @@ CITATIONS: dict[str, Citation] = {
         sites=("README.md (Performance notes -> GPU vs ducc0)",),
         source=_REALISTIC,
         figures={
-            "min": 1.541, "max": 11.217, "median": 2.562, "cells": 8,
+            "min": 1.541,
+            "max": 11.217,
+            "median": 2.562,
+            "cells": 8,
             "rounded": (1.5, 11.2),
             # The empty band, as thresholds rather than as cluster endpoints:
             # a rounded endpoint cannot double as a comparison bound, because
@@ -512,8 +515,10 @@ CITATIONS: dict[str, Citation] = {
         figures={
             "n_pix": {"EDA2": 150, "MWA_compact": 144, "MWA_extended": 3600, "MeerKAT": 2700},
             "n_rows": {
-                "EDA2": 4_896_000, "MWA_compact": 1_219_200,
-                "MWA_extended": 1_219_200, "MeerKAT": 302_400,
+                "EDA2": 4_896_000,
+                "MWA_compact": 1_219_200,
+                "MWA_extended": 1_219_200,
+                "MeerKAT": 302_400,
             },
         },
     ),
@@ -528,7 +533,11 @@ CITATIONS: dict[str, Citation] = {
         sites=("README.md (Performance notes -> memory)",),
         source=_MEMORY,
         figures={
-            "min": 2.7, "max": 54.0, "median": 8.5, "cells": 16, "heavier_in_all": True,
+            "min": 2.7,
+            "max": 54.0,
+            "median": 8.5,
+            "cells": 16,
+            "heavier_in_all": True,
             "min_cell": ("MWA_compact_off30", "vis2dirty"),
             "max_cell": ("MWA_extended_off30", "dirty2vis"),
         },
@@ -550,7 +559,12 @@ CITATIONS: dict[str, Citation] = {
             "fixture": "MWA_extended_off30",
             "op": "dirty2vis",
             "gb": {"dense_vmap": 29.6, "chunked32": 6.1, "chunked8": 1.9, "dense_scan": 0.40},
-            "time_ratio": {"dense_vmap": 1.00, "chunked32": 1.27, "chunked8": 1.73, "dense_scan": 2.35},
+            "time_ratio": {
+                "dense_vmap": 1.00,
+                "chunked32": 1.27,
+                "chunked8": 1.73,
+                "dense_scan": 2.35,
+            },
             "monotone": True,
         },
     ),
@@ -1571,7 +1585,7 @@ def test_the_realistic_problem_sizes_reproduce_from_the_stated_sizing_rule() -> 
     c_m_s = 299_792_458.0
 
     def next_even_5_smooth(x: float) -> int:
-        n = int(math.ceil(x))
+        n = math.ceil(x)
         if n % 2:
             n += 1
         while True:
@@ -1633,8 +1647,7 @@ def test_jax_needs_more_memory_than_ducc0_in_every_cell_and_by_how_much() -> Non
     cited = CITATIONS["memory_vs_ducc0"].figures
     ratios = _memory_ratios()
     assert len(ratios) == cited["cells"], (
-        f"{len(ratios)} memory cells, prose counts {cited['cells']}."
-        f"{_cite('memory_vs_ducc0')}"
+        f"{len(ratios)} memory cells, prose counts {cited['cells']}.{_cite('memory_vs_ducc0')}"
     )
     lighter = {k: v for k, v in ratios.items() if v <= 1.0}
     assert not lighter, (
@@ -1715,9 +1728,7 @@ def test_every_citation_is_recomputed_by_a_case_in_this_module() -> None:
     """
     source = Path(__file__).read_text()
     unreferenced = sorted(
-        k
-        for k in CITATIONS
-        if f"_cite('{k}')" not in source and f'_cite("{k}")' not in source
+        k for k in CITATIONS if f"_cite('{k}')" not in source and f'_cite("{k}")' not in source
     )
     assert not unreferenced, (
         f"{unreferenced} are entries of CITATIONS that no case in this module "
