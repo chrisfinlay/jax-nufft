@@ -273,7 +273,7 @@ visibility on every w-plane and rely on the kernel zeroing out non-
 contributing rows; the windowed variants take a contiguous slice of
 visibilities (after sorting by `w`) per plane, cutting the spread cost
 to roughly `p * n_rows * W^3` where `p` is the window padding overhead —
-1.14-4.94 on the review fixtures for the forward, and 1.00-1.38 for the
+1.08-5.08 over the forty-cell calibration grid for the forward, and 1.00-1.41 for the
 adjoint, which 0.2.0 (#26) bucketed. See *Strategy options* below for the
 trade-offs. Channel traversal independently supports `scan` (default) or
 `vmap`.
@@ -700,7 +700,8 @@ telescope in `tests/conftest.py` at both pointings (seed 0, eps 1e-6,
 float64, hermitian, one channel), `n_w` is EDA2 11 / **56**, GH200_large
 9 / 26, MWA_compact 8 / 12, MWA_extended 11 / **134**, MeerKAT 8 / 13
 (zenith / off30) — so `w_chunk = 32` clamps to `dense_vmap` on eight of the
-ten and runs a genuine 2- or 5-chunk loop, with one padded plane, on the
+ten and runs a genuine 2-chunk loop (2 x 28, no padding) on EDA2 off30 or a
+5-chunk loop (5 x 27, one padded plane) on MWA_extended off30, on the
 other two. At the realistic sizes below it never clamps.
 
 Measured on MWA_extended off30 (256&sup2;, 600 rows, `n_w = 134`, float64,
@@ -899,8 +900,12 @@ the adjoint's is never above the forward's.
 
 There are two of them because 0.2.0 (#26) bucketed the plane slices of the
 windowed **adjoint** only. On the review fixtures that took the adjoint's
-ratio to 1.00-1.38 against the forward's unchanged 1.14-4.94 (measured at eps
-1e-6, float64, seed 0, `hermitian=True`, single channel), so the regime where
+ratio to 1.00-1.41 against the forward's unchanged 1.08-5.08 over the
+forty-cell calibration grid — five fixtures, two pointings, four epsilons
+(1e-3, 1e-6, 1e-9, 1e-12), float64, seed 0, `hermitian=True`, single channel.
+(The eps = 1e-6 slice alone reads 1.00-1.38 and 1.14-4.94; earlier drafts
+quoted that slice while saying "the review fixtures", which is the whole
+grid.) So the regime where
 a high padding figure sends the `auto` selector to a dense strategy is no
 longer reached by any of them on the adjoint. The forward keeps `ab7fbbd`'s
 code and `ab7fbbd`'s figure: bucketing it as well was measured at 20.3x to
@@ -929,7 +934,10 @@ explicit equivalent on the same plan. The heuristic is **platform-aware**
 - **CPU.** Conservative: never picks a windowed forward (no measured
   win on the v0.1.1 algorithm), and only picks `windowed_scan` on the
   adjoint when `n_w / w_kernel_width > 2` and the windowed padding
-  overhead is below 6x. Otherwise `dense_scan`. (That cutoff was 5x
+  overhead is below 6x. In practice only the first conjunct can bind: since
+  #26 bucketed the adjoint's slices, no repository fixture reaches an adjoint
+  overhead above 1.62 at any epsilon, so the 6x test passes for all of them
+  and never changes a pick. Otherwise `dense_scan`. (That cutoff was 5x
   through v0.1.2, against the pre-0.2.0 denominator; it was restated so
   that redefining the diagnostic changes no decision on the calibration
   grid, where the worst fixture reads 5.78 on the new scale against 4.93
@@ -1366,15 +1374,23 @@ baselines produce more w-planes &mdash; expected wgridder behaviour.
 When every visibility shares the same `w` in wavelengths &mdash; e.g. a perfectly
 coplanar array, snapshot data at fixed pointing, or any case where
 `plan.w_extent == 0` after planning &mdash; `make_plan` collapses the
-w-plane loop to a single plane at the constant w-value. Expected speedup
-is roughly `w_kernel_width + 1` (one NUFFT instead of `W+1`), which is
-about 8&times; for the default `epsilon = 1e-6` (`W = 7`).
+w-plane loop to a single plane at the constant w-value. The expected
+speedup is roughly `w_kernel_width + 1` (one NUFFT instead of `W+1`),
+about 8&times; for the default `epsilon = 1e-6` (`W = 7`). That is a
+count of NUFFTs, not a measurement: no timing for this path is committed
+to the repository.
 
 The user-visible signal that the specialisation engaged is
-`plan.n_w == 1` (and `plan.is_constant_w == True`). All four
+`plan.n_w == 1` (and `plan.is_constant_w == True`). All six
 `w_strategy` choices reduce to the same single-plane work in this
-regime, so picking one vs another has no effect on output. Both
-operators stay bit-identical across strategies in this case and match
+regime, so the arithmetic each performs is the same. That makes the
+outputs bit-identical **only if `nthreads` is pinned**: with the default
+`nthreads=None` the strategies resolve to different thread counts, and
+FINUFFT's reduction order changes with them — on a constant-`w` plan
+above the large-row cutoff, `chunked(32)` and `dense_vmap` differ by a
+relative `1.8e-13` for exactly this reason (see
+[`nthreads`](#nthreads-issue-24-r11d4)). Pass an explicit `nthreads` for
+the identity to hold unconditionally. Either way both operators match
 ducc within `3 * epsilon` (issue #9 tightened this from `20 * epsilon`,
 the same DFT-width-rule fix behind the headline accuracy contract
 above).
@@ -1659,7 +1675,11 @@ Reading the table:
 * **Part 1 wins broadly** &mdash; 1.05x to 1.6x across most cases, with
   the largest gains at off-zenith where `n_w` was previously inflated
   most by the v0.1 `x0 = 1/W` choice. This matches the `W/4` theoretical
-  FFT-count reduction: at eps=1e-6 (W=6), expected speedup is 1.5x.
+  FFT-count reduction: at eps=1e-6 the kernel width was `W = 6` under the
+  pre-#9 rule in force when this comparison was run, giving an expected
+  speedup of 1.5x. (The current rule, `W = ceil(-log10(epsilon / 10))`,
+  gives `W = 7` at that epsilon; this whole section is a v0.1.0 to v0.1.1
+  comparison and is kept at the widths of the time.)
 * **Part 2 helps the adjoint** at off-zenith on most telescopes
   (1.05–1.53x). Forward is essentially flat: NUFFT type-2 per-point
   cost doesn't fall with slice size.

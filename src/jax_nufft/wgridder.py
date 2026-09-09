@@ -650,10 +650,17 @@ _GPU_LARGE_N_ROWS = 10_000
 # off30 3.172 -> 2.437), the grid maximum outside that fixture becomes 2.765,
 # and no cell crosses in the other direction. So this branch is *less* reachable
 # on the shipped geometry, not differently calibrated. It also cannot change a
-# pick either way on the review fixtures: everything that crosses it has 600
-# rows, and the GPU heuristic's row-count gates send those to ``dense_vmap``
-# before this comparison is reached. The gate that #17 does move is the
-# small-``n_w`` one -- see :func:`_auto_w_strategy_gpu`.
+# pick either way on the review fixtures -- though not for the reason this
+# comment gave until #33. The padding comparison is *reached* on those cells:
+# it sits ahead of the row-count gates in :func:`_auto_w_strategy_gpu`, and the
+# only gate before it needs ``n_w <= W + 2``, which MWA_extended off30 at
+# ``n_w`` 131-140 does not satisfy. What actually happens is that the branch
+# fires and returns the same answer the fall-through would have: everything
+# that crosses the cutoff has 600 rows, which the row-count gates would also
+# have sent to ``dense_vmap``. Traced over the calibration grid, the branch
+# fires twelve times, all on the forward leg, and changes no pick. The gate
+# that #17 does move is the small-``n_w`` one -- see
+# :func:`_auto_w_strategy_gpu`.
 #
 # issue #26 leaves the number and every figure above alone. All of them are on
 # ``plan.window_padding_overhead``, which #26 does not touch and which is what
@@ -2089,7 +2096,8 @@ def dirty2vis(
         off30 **56**, GH200_large zenith 9 / off30 26, MWA_compact zenith 8 /
         off30 12, MWA_extended zenith 11 / off30 **134**, MeerKAT zenith 8 /
         off30 13. So ``w_chunk = 32`` clamps to ``n_w`` on eight of the ten
-        and runs a real chunk loop -- with padding -- on the other two.
+        and runs a real chunk loop on the other two: 2 x 28 with no padding
+        on EDA2 off30, and 5 x 27 with one padded plane on MWA_extended off30.
 
         It is an **upper bound** on the planes held live, not an exact
         count: the loop runs ``ceil(n_w / w_chunk)`` chunks of
@@ -2538,10 +2546,16 @@ def vis2dirty(
 
         The adjoint is where the new default can also change what a *CPU*
         caller gets, though issue #17 narrowed that to one fixture. On the
-        shipped folded geometry the heuristic picks ``"windowed_scan"``
-        here only on MWA_extended off30 (n_w=134, ratio 19.1); MWA_compact
-        off30 and MeerKAT off30 pick ``"dense_scan"`` again, their halved
-        ``n_w`` having dropped them under the ``n_w / W > 2`` gate. Measured
+        shipped folded geometry, and at the default ``epsilon = 1e-6``, the
+        heuristic picks ``"windowed_scan"`` here on MWA_extended off30
+        (n_w=134, ratio 19.1) among the five fixtures of the CPU timing table
+        below; MWA_compact off30 and MeerKAT off30 pick ``"dense_scan"``
+        again, their halved ``n_w`` having dropped them under the
+        ``n_w / W > 2`` gate. Widen either axis and it is no longer the only
+        one: EDA2 off30 and GH200_large off30 also take ``"windowed_scan"``
+        at every epsilon on the calibration grid, and MWA_compact off30 and
+        MeerKAT off30 do so at ``epsilon = 1e-3``, where their ``n_w`` clears
+        the gate again. Measured
         on a 10-core Apple M-series (eps 1e-6, float64, single channel, plan
         and warm-up outside the timer, median of 9 calls, two passes) the
         shipped default against an explicit ``dense_scan`` is 1.03x on that
@@ -2609,7 +2623,8 @@ def vis2dirty(
         off30 **56**, GH200_large zenith 9 / off30 26, MWA_compact zenith 8 /
         off30 12, MWA_extended zenith 11 / off30 **134**, MeerKAT zenith 8 /
         off30 13. So ``w_chunk = 32`` clamps to ``n_w`` on eight of the ten
-        and runs a real chunk loop -- with padding -- on the other two.
+        and runs a real chunk loop on the other two: 2 x 28 with no padding
+        on EDA2 off30, and 5 x 27 with one padded plane on MWA_extended off30.
 
         It is an **upper bound** on the planes held live, not an exact
         count: the loop runs ``ceil(n_w / w_chunk)`` chunks of
