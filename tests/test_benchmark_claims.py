@@ -540,14 +540,33 @@ CITATIONS: dict[str, Citation] = {
             "heavier_in_all": True,
             "min_cell": ("MWA_compact_off30", "vis2dirty"),
             "max_cell": ("MWA_extended_off30", "dirty2vis"),
+            # The README prints the whole table, so the whole table is pinned.
+            "per_cell": {
+                ("MWA_compact_zenith", "dirty2vis"): 3.9,
+                ("MWA_compact_zenith", "vis2dirty"): 3.0,
+                ("MWA_compact_off30", "dirty2vis"): 6.1,
+                ("MWA_compact_off30", "vis2dirty"): 2.7,
+                ("EDA2_zenith", "dirty2vis"): 8.3,
+                ("EDA2_zenith", "vis2dirty"): 2.9,
+                ("EDA2_off30", "dirty2vis"): 12.7,
+                ("EDA2_off30", "vis2dirty"): 2.7,
+                ("MeerKAT_zenith", "dirty2vis"): 19.5,
+                ("MeerKAT_zenith", "vis2dirty"): 7.5,
+                ("MeerKAT_off30", "dirty2vis"): 19.3,
+                ("MeerKAT_off30", "vis2dirty"): 10.4,
+                ("MWA_extended_zenith", "dirty2vis"): 17.6,
+                ("MWA_extended_zenith", "vis2dirty"): 8.6,
+                ("MWA_extended_off30", "dirty2vis"): 54.0,
+                ("MWA_extended_off30", "vis2dirty"): 34.7,
+            },
         },
     ),
     "w_chunk_dial": Citation(
         claim=(
             "the memory/compute curve quoted for MWA_extended off30's forward "
-            "(3600 pixels square, n_w = 140): dense_vmap 30.3 GB at 1.00x time, "
-            "w_chunk=32 6.3 GB at 1.27x, w_chunk=8 1.9 GB at 1.73x, dense_scan "
-            "0.41 GB at 2.35x. Monotone in both columns -- less scratch costs more "
+            "(3600 pixels square, n_w = 140): dense_vmap 29.6 GB at 1.00x time, "
+            "w_chunk=32 6.1 GB at 1.27x, w_chunk=8 1.9 GB at 1.73x, dense_scan "
+            "0.40 GB at 2.35x. Monotone in both columns -- less scratch costs more "
             "time, with no inversion -- which is what makes it usable as a dial."
         ),
         sites=(
@@ -558,10 +577,28 @@ CITATIONS: dict[str, Citation] = {
         figures={
             "fixture": "MWA_extended_off30",
             "op": "dirty2vis",
-            "gb": {"dense_vmap": 29.6, "chunked32": 6.1, "chunked8": 1.9, "dense_scan": 0.40},
+            # Every row of the README's table, not only the four the surrounding
+            # sentence quotes: an unchecked row is how a stale figure survives.
+            "gb": {
+                "dense_vmap": 29.6,
+                "chunked64": 10.1,
+                "chunked32": 6.1,
+                "chunked16": 3.6,
+                "chunked8": 1.9,
+                "dense_scan": 0.40,
+            },
+            "saving": {
+                "chunked64": 2.9,
+                "chunked32": 4.8,
+                "chunked16": 8.3,
+                "chunked8": 15.7,
+                "dense_scan": 73.1,
+            },
             "time_ratio": {
                 "dense_vmap": 1.00,
+                "chunked64": 1.10,
                 "chunked32": 1.27,
+                "chunked16": 1.35,
                 "chunked8": 1.73,
                 "dense_scan": 2.35,
             },
@@ -1664,6 +1701,18 @@ def test_jax_needs_more_memory_than_ducc0_in_every_cell_and_by_how_much() -> Non
         f"the prose says {cited['min']}x to {cited['max']}x (median "
         f"{cited['median']}x).{_cite('memory_vs_ducc0')}"
     )
+    per_cell = {k: round(v, 1) for k, v in ratios.items()}
+    assert per_cell == cited["per_cell"], (
+        "the per-cell memory table has moved. Differences: "
+        + str(
+            {
+                k: (per_cell.get(k), cited["per_cell"].get(k))
+                for k in set(per_cell) | set(cited["per_cell"])
+                if per_cell.get(k) != cited["per_cell"].get(k)
+            }
+        )
+        + _cite("memory_vs_ducc0")
+    )
     assert min(ratios, key=lambda k: ratios[k]) == tuple(cited["min_cell"])
     assert max(ratios, key=lambda k: ratios[k]) == tuple(cited["max_cell"]), (
         "the heaviest cell has moved; the README names "
@@ -1695,6 +1744,12 @@ def test_the_w_chunk_dial_trades_memory_for_time_monotonically() -> None:
         assert got == gb, (
             f"{strategy} now needs {got} GB of scratch; the README's table says "
             f"{gb} GB.{_cite('w_chunk_dial')}"
+        )
+    for strategy, saving in cited["saving"].items():
+        got = round(baseline["temp_mb"] / by_strategy[strategy]["temp_mb"], 1)
+        assert got == saving, (
+            f"{strategy} now saves {got}x against dense_vmap; the README's "
+            f"table says {saving}x.{_cite('w_chunk_dial')}"
         )
     for strategy, ratio in cited["time_ratio"].items():
         got = round(by_strategy[strategy]["median_ms"] / baseline["median_ms"], 2)

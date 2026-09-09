@@ -1563,28 +1563,76 @@ total speedup, with both parts each contributing ~1.2x.
 
 #### Memory
 
-`vmap` variants are still consistently 1.4-3.5x faster than `scan` because
-they reduce the per-iteration FINUFFT planning / setpts cost and let XLA
-fuse work across w-planes. The cost is **memory**: `vmap` materialises
-the full `(n_w, n_l, n_m)` stack of corrected images at once. For
-MWA-extended off-zenith at `n_pix = 256`:
+Speed is not the whole trade. On the same GH200 node and the same realistic
+problems, **jax-nufft needs more device memory than ducc0 needs host memory in
+every one of the sixteen cells measured &mdash; between 2.7&times; and 54&times;,
+median 8.5&times;.** If a problem is memory-bound rather than time-bound, that is
+the number that decides whether this library is usable for it.
 
-| Implementation             | peak RSS delta |
-|----------------------------|----------------|
-| jax/dense_scan dirty2vis   | 1.6 MB         |
-| jax/dense_scan vis2dirty   | 0 MB           |
-| **jax/dense_vmap dirty2vis** | **776 MB**   |
-| **jax/dense_vmap vis2dirty** | **1.5 GB**   |
-| ducc dirty2vis             | 0 MB           |
-| ducc vis2dirty             | 0 MB           |
+| Telescope / pointing | n_pix | `dirty2vis` | `vis2dirty` |
+|----------------------|-------|-------------|-------------|
+| MWA_compact zenith   | 144   | 3.9&times;  | 3.0&times;  |
+| MWA_compact off30    | 144   | 6.1&times;  | 2.7&times;  |
+| EDA2 zenith          | 150   | 8.3&times;  | 2.9&times;  |
+| EDA2 off30           | 150   | 12.7&times; | 2.7&times;  |
+| MeerKAT zenith       | 2700  | 19.5&times; | 7.5&times;  |
+| MeerKAT off30        | 2700  | 19.3&times; | 10.4&times; |
+| MWA_extended zenith  | 3600  | 17.6&times; | 8.6&times;  |
+| MWA_extended off30   | 3600  | **54.0&times;** | 34.7&times; |
 
-(Windowed variants sit between the two: `windowed_scan` is comparable to
-`dense_scan` plus the sort-permutation tables; `windowed_vmap` is
-comparable to `dense_vmap`.)
+The ratio is jax-nufft's peak device HBM over ducc0's peak process RSS with the
+interpreter's own footprint removed, so both sides cover input, scratch and
+output. Two caveats belong with it: they are different instruments on different
+hardware, and RSS is quantised in steps of about 36 MB, so the four cells whose
+ducc0 side reads 108 MB or less carry a large relative uncertainty. Read the
+small ratios as approximate and the large ones as real.
 
-ducc remains the fastest CPU implementation in every regime; the
-jax-nufft value proposition is differentiability and the GPU port
-(where the wasted spread / FFT work parallelises cheaply).
+Raw data: [`docs/benchmarks/v0.2.0-memory-gh200.json`](docs/benchmarks/v0.2.0-memory-gh200.json),
+recomputed by `tests/test_benchmark_claims.py`. Each figure was measured in a
+process that made exactly one operator call, because `peak_bytes_in_use` and
+`ru_maxrss` are both monotonic high-water marks: two operators measured in one
+process cannot be told apart, and the second one's rise reads zero whenever its
+transient stayed under the first one's peak.
+
+##### The two levers
+
+**`w_chunk` is the dial.** The worst cell above is the forward at
+`n_pix = 3600` with `n_w = 140`, where `auto` picks `dense_vmap` and every plane
+is live at once. Chunking trades that back for time, monotonically:
+
+| `w_strategy`             | scratch  | vs `dense_vmap` | time     |
+|--------------------------|----------|-----------------|----------|
+| `dense_vmap`             | 29.6 GB  | &mdash;         | 1.00&times; |
+| `chunked`, `w_chunk=64`  | 10.1 GB  | 2.9&times; less | 1.10&times; |
+| `chunked`, `w_chunk=32`  | 6.1 GB   | 4.8&times; less | 1.27&times; |
+| `chunked`, `w_chunk=16`  | 3.6 GB   | 8.3&times; less | 1.35&times; |
+| `chunked`, `w_chunk=8`   | 1.9 GB   | 15.7&times; less | 1.73&times; |
+| `dense_scan`             | 0.40 GB  | 73&times; less  | 2.35&times; |
+
+Sorting the strategies by scratch sorts them by time the other way with no
+inversion, which is what makes the table advice rather than trivia: pick the
+row that fits your card. `w_chunk=16` takes this problem from *needs a 96 GB
+GH200* to *fits on a 16 GB card* for 35% more time.
+
+**float32 is the other, and it is free of any such trade.** A
+`make_plan(..., dtype=jnp.float32)` plan halves both the plan and the scratch:
+measured over three size classes, two strategies and both operators, the ratio
+runs 1.99987 to 1.99999, the shortfall being a fixed overhead under 512 bytes
+that does not scale with the problem. Single precision reaches
+`epsilon = 1e-4` against ducc0 but not `1e-6` &mdash; `make_plan` warns when you
+ask for an epsilon the dtype cannot reach. See [Precision](#precision).
+
+The two compose: `dtype=jnp.float32` with `w_chunk=16` puts the 30 GB cell
+under 2 GB.
+
+##### Strategy memory, in order
+
+`vmap` variants are faster than `scan` because they cut the per-iteration
+FINUFFT planning / setpts cost and let XLA fuse across w-planes; the cost is
+that `dense_vmap` materialises the whole `(n_w, n_l, n_m)` stack of corrected
+images at once, where `dense_scan` holds one plane. `windowed_scan` is
+comparable to `dense_scan` plus the sort-permutation tables; `windowed_vmap` is
+comparable to `dense_vmap`; `chunked` sits between them at `w_chunk` planes.
 
 ### Picking a strategy
 
