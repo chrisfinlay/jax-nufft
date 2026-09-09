@@ -31,12 +31,12 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 from types import FrameType
 
 import jax
 import pytest
-import tomllib
 
 from tests import jax_floor_probe
 from tests.jax_floor_probe import (

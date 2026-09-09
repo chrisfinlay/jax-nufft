@@ -2,20 +2,22 @@
 
 JAX-native wgridder for radio interferometric imaging.
 
-> **Status:** v0.1.2. API stable; v0.1.2 is a performance release
-> (sorted-order windowed forward, constant-w fast path, precomputed
-> FINUFFT coords, GPU benchmark suite) plus a third `w_strategy`
-> value, `"auto"`, which resolves to one of the four canonical
-> strategies via a platform-aware heuristic. Two defaults *have* changed.
-> `nthreads` is now `None` by default (issue #24, R11/D4) and resolves,
-> before the JIT boundary, to a strategy-aware thread count instead of the
-> old flat `0` -- see [`nthreads`](#nthreads-issue-24-r11d4) below. Pass an
-> explicit `nthreads=0` to opt back into the pre-#24 behaviour. And
-> `w_strategy` now defaults to `"auto"` (issue #46), where it was
-> `"dense_scan"` through v0.1.2 -- see [`w_strategy="auto"`](#w_strategyauto-the-shipped-default)
-> below for what that changes and how to opt back out. Both of these
-> default changes are unreleased: the version this package reports is
-> still the v0.1.2 line.
+> **Status:** 0.2.0 in development; the package reports `0.2.0.dev0`.
+> API stable. A v0.1.2 series was developed and merged but never tagged,
+> so its work (sorted-order windowed forward, constant-w fast path,
+> precomputed FINUFFT coords, GPU benchmark suite) ships for the first
+> time in 0.2.0 alongside this release's own. See
+> [`CHANGELOG.md`](CHANGELOG.md) for the full list.
+>
+> Two defaults have changed since v0.1.1. `nthreads` is now `None` by
+> default (issue #24, R11/D4) and resolves, before the JIT boundary, to a
+> strategy-aware thread count instead of the old flat `0` -- see
+> [`nthreads`](#nthreads-issue-24-r11d4) below; pass an explicit
+> `nthreads=0` to opt back into the pre-#24 behaviour. And `w_strategy`
+> now defaults to `"auto"` (issue #46), where it was `"dense_scan"`
+> through the v0.1.2 line -- see
+> [`w_strategy="auto"`](#w_strategyauto-the-shipped-default) below for
+> what that changes and how to opt back out.
 
 ## Overview
 
@@ -270,7 +272,7 @@ contributing rows; the windowed variants take a contiguous slice of
 visibilities (after sorting by `w`) per plane, cutting the spread cost
 to roughly `p * n_rows * W^3` where `p` is the window padding overhead —
 1.14-4.94 on the review fixtures for the forward, and 1.00-1.38 for the
-adjoint, which v0.1.3 (#26) bucketed. See *Strategy options* below for the
+adjoint, which 0.2.0 (#26) bucketed. See *Strategy options* below for the
 trade-offs. Channel traversal independently supports `scan` (default) or
 `vmap`.
 
@@ -626,8 +628,8 @@ four, and the two v0.1 names are kept as deprecated aliases:
 | `"dense_vmap"`    | `n_rows * W^2`               | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1 `"vmap"` is a deprecated alias.           |
 | `"windowed_scan"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(image_size + n_rows)`    | 1.46-1.50x its own forward  | v0.1.1; helps on adjoint when `n_w >> W`.      |
 | `"windowed_vmap"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(n_w * image_size)`       | 0.98-1.98x its own forward  | v0.1.1; rare wins, mostly for completeness.    |
-| `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward  | v0.1.3 (#25); takes `w_chunk` (default 32).    |
-| `"windowed_chunked"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward  | v0.1.3 (#25); the windowed half of the same knob. |
+| `"chunked"`       | `n_rows * W^2`               | `O(w_chunk * image_size)`   | 1.03-1.96x its own forward  | 0.2.0 (#25); takes `w_chunk` (default 32).    |
+| `"windowed_chunked"` | fwd `max_window_size * W^2`, adj `bucket_length * W^2` | `O(w_chunk * image_size)`   | 1.03-1.33x its own forward  | 0.2.0 (#25); the windowed half of the same knob. |
 | `"auto"`          | resolves to one of the first four | matches the resolved choice | matches the resolved choice | v0.1.2; the default since #46. Platform-aware heuristic. |
 
 `channel_strategy` is independently `"scan"` (default) or `"vmap"`.
@@ -660,7 +662,7 @@ live at once, not an exact count: the loop runs `ceil(n_w / w_chunk)` chunks
 of `ceil(n_w / n_chunks) <= w_chunk` planes, so at most `n_chunks - 1` planes
 of padding are run and thrown away rather than up to `w_chunk - 1`.
 
-Since v0.1.3 (#26) the windowed **adjoint** slices `bucket_length`, not
+Since 0.2.0 (#26) the windowed **adjoint** slices `bucket_length`, not
 `max_window_size`: each channel's planes are sorted into at most four size
 classes and each class is a sub-loop with its own static slice length, so a
 plane whose window holds 8 rows does not read 155. Measured adjoint
@@ -812,7 +814,7 @@ re-entry dominate.
 `w_strategy="auto"` never resolves to a chunked strategy: choosing a chunk
 size needs a memory budget the heuristic is not given.
 
-The `grad` column is new in v0.1.3 (issue #21) and is a *ratio against the
+The `grad` column is new in 0.2.0 (issue #21) and is a *ratio against the
 same strategy's forward*, not an absolute size: both operators are now bound
 as linear primitives whose transposes are each other, so reverse mode is one
 call to the other operator at the forward's own settings rather than a
@@ -876,7 +878,7 @@ For the windowed strategies, the plan exposes
 # the forward's: every plane slices the plan's widest window
 plan.window_padding_overhead = n_chan * n_w * max_window_size / plan.live_row_count
 
-# the adjoint's: every plane slices its own size class (v0.1.3, #26)
+# the adjoint's: every plane slices its own size class (0.2.0, #26)
 plan.window_padding_overhead_adjoint = (
     sum(slice_length * n_planes for c in channels for slice_length, n_planes in
         plan.window_buckets[c])
@@ -893,7 +895,7 @@ Both are bounded below by 1.0, attaining it on the constant-`w` fast path
 where the single plane holds every row and none of the slice is padding, and
 the adjoint's is never above the forward's.
 
-There are two of them because v0.1.3 (#26) bucketed the plane slices of the
+There are two of them because 0.2.0 (#26) bucketed the plane slices of the
 windowed **adjoint** only. On the review fixtures that took the adjoint's
 ratio to 1.00-1.38 against the forward's unchanged 1.14-4.94 (measured at eps
 1e-6, float64, seed 0, `hermitian=True`, single channel), so the regime where
@@ -902,7 +904,7 @@ longer reached by any of them on the adjoint. The forward keeps `ab7fbbd`'s
 code and `ab7fbbd`'s figure: bucketing it as well was measured at 20.3x to
 58.4x *slower* on a GH200 and reverted.
 
-The denominator changed in v0.1.3. Through v0.1.2 it was the mean of the
+The denominator changed in 0.2.0. Through v0.1.2 it was the mean of the
 per-`(channel, plane)` window lengths, which are measured *after* the builder
 widens each window by `window_boundary_margin` and by one further row at each
 end. Those rows are real work but lie outside nominal support, so counting
@@ -926,7 +928,7 @@ explicit equivalent on the same plan. The heuristic is **platform-aware**
   win on the v0.1.1 algorithm), and only picks `windowed_scan` on the
   adjoint when `n_w / w_kernel_width > 2` and the windowed padding
   overhead is below 6x. Otherwise `dense_scan`. (That cutoff was 5x
-  through v0.1.2, against the pre-v0.1.3 denominator; it was restated so
+  through v0.1.2, against the pre-0.2.0 denominator; it was restated so
   that redefining the diagnostic changes no decision on the calibration
   grid, where the worst fixture reads 5.78 on the new scale against 4.93
   on the old. Since #26 the *adjoint* leg of this comparison reads
@@ -967,8 +969,8 @@ behind fails the suite (issue #49).
 Through v0.1.2 both operators defaulted to `"dense_scan"` and `"auto"` was
 opt-in, which meant the heuristic was never reached unless a caller asked
 for it by name. On GPU that made the shipped default the *worst* of the
-four choices. (It became the default in the release now in development —
-the version this package reports is still v0.1.2.) Measured on one
+four choices. (It becomes the default in 0.2.0, the release now in
+development.) Measured on one
 NVIDIA GH200 (Daint) against `ducc0` on the
 72 Grace cores of the same node, at `epsilon = 1e-6`, float64, single
 channel, forward / adjoint milliseconds (median of 9, warm-up outside the
