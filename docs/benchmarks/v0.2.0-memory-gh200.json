@@ -1,14 +1,15 @@
 {
   "schema": "v0.2.0-memory",
   "provenance": {
-    "measured": "2026-09-09 (jax-nufft and ducc0), 2026-09-08 (w_chunk sweep)",
+    "measured": "2026-09-09; the ducc0 side re-measured the same day with three repeats per cell",
     "machine": "CSCS Alps/Daint, one GH200 node (72-core NVIDIA Grace CPU, 288 hardware threads; H100 GPU, 96 GB HBM)",
     "epsilon": 1e-06,
     "dtype": "float64",
     "protocol": "ONE operator per process. Both peak_bytes_in_use (jax) and ru_maxrss (ducc0) are monotonic high-water marks for the life of a process, so two operators measured in one process cannot be attributed separately -- the second one's rise reads zero whenever its own transient stayed below the first one's peak. An earlier sweep did exactly that and reported a zero adjoint delta for every fixture; those numbers were discarded rather than published.",
-    "comparability": "jax-nufft's peak_mb is device HBM holding plan + input + scratch + output. ducc0's working_set_mb is peak process RSS minus the interpreter's own footprint, so it likewise covers input + scratch + output and excludes the runtime. The two are comparable in what they cover, but RSS is quantised coarsely -- observed values are multiples of about 36 MB -- so ducc0 figures below a few hundred MB carry a substantial relative uncertainty and ratios against them should be read as approximate.",
+    "comparability": "jax-nufft's peak_mb is device HBM holding plan + input + scratch + output. ducc0's working_set_mb is peak process RSS minus the interpreter's own footprint, so it likewise covers input + scratch + output and excludes the runtime. The two are comparable in what they cover, but the ducc0 side is measured with a coarse and noisy instrument: RSS moves in steps of about 36 MB and the baseline varies by up to 108 MB between runs. The `resolvable` flag marks the ten cells whose ducc0 median is at least 200 MB, where the three repeats agree to within 1.20x and the ratio is meaningful. On the other six the ducc0 side is comparable with the noise: the direction still holds -- jax-nufft is heavier in all sixteen -- but the size of the ratio there should not be quoted to a significant figure.",
     "ducc0_role": "Black-box oracle through its public Python API only. ducc0 is GPL-2.0-or-later; no ducc0 source was consulted for this project.",
-    "sizing": "The 'realistic' sizing of v0.2.0-vs-ducc0-gh200.json; see its 'sizing' block."
+    "sizing": "The 'realistic' sizing of v0.2.0-vs-ducc0-gh200.json; see its 'sizing' block.",
+    "repeats": "Every ducc0 cell was run three times, each in its own process, and the reported figure is the median of the three; the individual draws are kept in working_set_reps_mb. This is not decoration. ru_maxrss is sampled after imports to give the interpreter baseline that working_set subtracts, and that sample is itself a high-water mark over the import sequence: across 48 runs of an identical program it took values from 36 to 144 MB. A 108 MB swing in the subtrahend is larger than the entire working set of the smaller fixtures, so a single draw cannot be trusted for them."
   },
   "rows": [
     {
@@ -40,10 +41,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 424.25,
+      "peak_mb": 380.4375,
       "peak_pre_mb": null,
-      "rss_import_mb": 108.0,
-      "working_set_mb": 316.25
+      "rss_import_mb": 72.0,
+      "working_set_mb": 296.625,
+      "working_set_reps_mb": [
+        308.4375,
+        286.9375,
+        296.625
+      ],
+      "rss_import_reps_mb": [
+        72.0,
+        144.0,
+        72.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "EDA2_zenith",
@@ -74,10 +86,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 508.6875,
+      "peak_mb": 432.9375,
       "peak_pre_mb": null,
-      "rss_import_mb": 108.0,
-      "working_set_mb": 400.6875
+      "rss_import_mb": 72.0,
+      "working_set_mb": 387.75,
+      "working_set_reps_mb": [
+        387.75,
+        392.625,
+        360.9375
+      ],
+      "rss_import_reps_mb": [
+        36.0,
+        72.0,
+        72.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "EDA2_off30",
@@ -108,10 +131,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 483.0,
+      "peak_mb": 422.4375,
       "peak_pre_mb": null,
-      "rss_import_mb": 108.0,
-      "working_set_mb": 375.0
+      "rss_import_mb": 72.0,
+      "working_set_mb": 350.4375,
+      "working_set_reps_mb": [
+        363.875,
+        345.4375,
+        350.4375
+      ],
+      "rss_import_reps_mb": [
+        36.0,
+        144.0,
+        72.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "EDA2_off30",
@@ -142,10 +176,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 498.75,
+      "peak_mb": 489.4375,
       "peak_pre_mb": null,
-      "rss_import_mb": 72.0,
-      "working_set_mb": 426.75
+      "rss_import_mb": 108.0,
+      "working_set_mb": 402.375,
+      "working_set_reps_mb": [
+        408.125,
+        402.375,
+        345.4375
+      ],
+      "rss_import_reps_mb": [
+        36.0,
+        108.0,
+        144.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "MWA_compact_zenith",
@@ -176,10 +221,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 216.0,
+      "peak_mb": 180.0,
       "peak_pre_mb": null,
       "rss_import_mb": 108.0,
-      "working_set_mb": 108.0
+      "working_set_mb": 72.0,
+      "working_set_reps_mb": [
+        72.0,
+        108.0,
+        72.0
+      ],
+      "rss_import_reps_mb": [
+        36.0,
+        108.0,
+        108.0
+      ],
+      "resolvable": false
     },
     {
       "fixture": "MWA_compact_zenith",
@@ -213,7 +269,18 @@
       "peak_mb": 216.0,
       "peak_pre_mb": null,
       "rss_import_mb": 108.0,
-      "working_set_mb": 108.0
+      "working_set_mb": 108.0,
+      "working_set_reps_mb": [
+        108.0,
+        108.0,
+        72.0
+      ],
+      "rss_import_reps_mb": [
+        108.0,
+        144.0,
+        108.0
+      ],
+      "resolvable": false
     },
     {
       "fixture": "MWA_compact_off30",
@@ -246,8 +313,19 @@
       "temp_mb": null,
       "peak_mb": 216.0,
       "peak_pre_mb": null,
-      "rss_import_mb": 108.0,
-      "working_set_mb": 108.0
+      "rss_import_mb": 144.0,
+      "working_set_mb": 72.0,
+      "working_set_reps_mb": [
+        72.0,
+        72.0,
+        72.0
+      ],
+      "rss_import_reps_mb": [
+        144.0,
+        144.0,
+        144.0
+      ],
+      "resolvable": false
     },
     {
       "fixture": "MWA_compact_off30",
@@ -278,10 +356,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 144.0,
+      "peak_mb": 246.0625,
       "peak_pre_mb": null,
-      "rss_import_mb": 36.0,
-      "working_set_mb": 108.0
+      "rss_import_mb": 144.0,
+      "working_set_mb": 103.9375,
+      "working_set_reps_mb": [
+        103.9375,
+        135.4375,
+        102.0625
+      ],
+      "rss_import_reps_mb": [
+        144.0,
+        108.0,
+        144.0
+      ],
+      "resolvable": false
     },
     {
       "fixture": "MeerKAT_zenith",
@@ -312,10 +401,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 144.0,
+      "peak_mb": 216.0,
       "peak_pre_mb": null,
-      "rss_import_mb": 72.0,
-      "working_set_mb": 72.0
+      "rss_import_mb": 108.0,
+      "working_set_mb": 108.0,
+      "working_set_reps_mb": [
+        72.0,
+        108.0,
+        108.0
+      ],
+      "rss_import_reps_mb": [
+        144.0,
+        36.0,
+        108.0
+      ],
+      "resolvable": false
     },
     {
       "fixture": "MeerKAT_zenith",
@@ -346,10 +446,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 288.0,
+      "peak_mb": 324.0,
       "peak_pre_mb": null,
       "rss_import_mb": 108.0,
-      "working_set_mb": 180.0
+      "working_set_mb": 216.0,
+      "working_set_reps_mb": [
+        216.0,
+        216.0,
+        180.0
+      ],
+      "rss_import_reps_mb": [
+        72.0,
+        108.0,
+        144.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "MeerKAT_off30",
@@ -380,10 +491,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 216.0,
+      "peak_mb": 180.0,
       "peak_pre_mb": null,
-      "rss_import_mb": 108.0,
-      "working_set_mb": 108.0
+      "rss_import_mb": 72.0,
+      "working_set_mb": 108.0,
+      "working_set_reps_mb": [
+        108.0,
+        108.0,
+        108.0
+      ],
+      "rss_import_reps_mb": [
+        72.0,
+        108.0,
+        72.0
+      ],
+      "resolvable": false
     },
     {
       "fixture": "MeerKAT_off30",
@@ -414,10 +536,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 324.0,
+      "peak_mb": 252.0,
       "peak_pre_mb": null,
-      "rss_import_mb": 144.0,
-      "working_set_mb": 180.0
+      "rss_import_mb": 36.0,
+      "working_set_mb": 216.0,
+      "working_set_reps_mb": [
+        216.0,
+        216.0,
+        216.0
+      ],
+      "rss_import_reps_mb": [
+        36.0,
+        108.0,
+        36.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "MWA_extended_zenith",
@@ -448,10 +581,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 360.0,
+      "peak_mb": 324.0,
       "peak_pre_mb": null,
-      "rss_import_mb": 144.0,
-      "working_set_mb": 216.0
+      "rss_import_mb": 108.0,
+      "working_set_mb": 216.0,
+      "working_set_reps_mb": [
+        216.0,
+        216.0,
+        216.0
+      ],
+      "rss_import_reps_mb": [
+        144.0,
+        108.0,
+        108.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "MWA_extended_zenith",
@@ -484,8 +628,19 @@
       "temp_mb": null,
       "peak_mb": 540.0,
       "peak_pre_mb": null,
-      "rss_import_mb": 144.0,
-      "working_set_mb": 396.0
+      "rss_import_mb": 108.0,
+      "working_set_mb": 432.0,
+      "working_set_reps_mb": [
+        432.0,
+        396.0,
+        432.0
+      ],
+      "rss_import_reps_mb": [
+        108.0,
+        144.0,
+        108.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "MWA_extended_off30",
@@ -516,10 +671,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 683.0,
+      "peak_mb": 682.9375,
       "peak_pre_mb": null,
       "rss_import_mb": 108.0,
-      "working_set_mb": 575.0
+      "working_set_mb": 571.125,
+      "working_set_reps_mb": [
+        574.9375,
+        570.8125,
+        571.125
+      ],
+      "rss_import_reps_mb": [
+        108.0,
+        144.0,
+        108.0
+      ],
+      "resolvable": true
     },
     {
       "fixture": "MWA_extended_off30",
@@ -550,10 +716,21 @@
       "w_chunk": null,
       "nthreads": 64,
       "temp_mb": null,
-      "peak_mb": 603.375,
+      "peak_mb": 606.0,
       "peak_pre_mb": null,
-      "rss_import_mb": 108.0,
-      "working_set_mb": 495.375
+      "rss_import_mb": 144.0,
+      "working_set_mb": 463.9375,
+      "working_set_reps_mb": [
+        462.0,
+        468.0,
+        463.9375
+      ],
+      "rss_import_reps_mb": [
+        144.0,
+        36.0,
+        144.0
+      ],
+      "resolvable": true
     }
   ],
   "w_chunk_sweep": {

@@ -946,14 +946,15 @@ explicit equivalent on the same plan. The heuristic is **platform-aware**
   adjoint when `n_w / w_kernel_width > 2` and the windowed padding
   overhead is below 6x. In practice only the first conjunct can bind: since
   #26 bucketed the adjoint's slices, no repository fixture reaches an adjoint
-  overhead above 1.62 at any epsilon, so the 6x test passes for all of them
+  overhead above 1.41 at any epsilon on the shipped folded geometry (1.62
+  unfolded), so the 6x test passes for all of them
   and never changes a pick. Otherwise `dense_scan`. (That cutoff was 5x
   through v0.1.2, against the pre-0.2.0 denominator; it was restated so
   that redefining the diagnostic changes no decision on the calibration
   grid, where the worst fixture reads 5.78 on the new scale against 4.93
   on the old. Since #26 the *adjoint* leg of this comparison reads
   `window_padding_overhead_adjoint` instead, on which that same worst
-  fixture is 1.62 and no repository fixture reaches either cutoff at any
+  fixture is 1.41 folded (1.62 unfolded) and no repository fixture reaches either cutoff at any
   epsilon — so on the adjoint this branch no longer fires on one, which is
   the intended effect, the padding it guards against being what bucketing
   removes. The forward leg is unchanged.)
@@ -1335,13 +1336,13 @@ Nothing lands in between, so "about 6&times;" describes no case that was measure
 | MeerKAT off30        | 2700  | 302,400   | 14   | 2.2&times;  | 8.8&times;  |
 
 Read this next to [Memory](#memory), which is the other half of the same trade:
-the speedups above are bought with 2.7&times; to 54&times; the memory.
+the speedups above are bought with roughly 3&times; to 54&times; the memory.
 
 #### Give ducc0 its best thread count, not all of them
 
 `nthreads=288` &mdash; every hardware thread on the node &mdash; was **never**
 the fastest setting for ducc0 in any of the sixteen comparisons. It ran
-1.9&times; to 6.0&times; slower than that comparison's best measured count,
+1.86&times; to 6.00&times; slower than that comparison's best measured count,
 which was 64 in thirteen of the sixteen.
 
 That is why the comparison above tunes ducc0 per cell. Benchmarking it at
@@ -1710,34 +1711,48 @@ total speedup, with both parts each contributing ~1.2x.
 
 Speed is not the whole trade. On the same GH200 node and the same realistic
 problems, **jax-nufft needs more device memory than ducc0 needs host memory in
-every one of the sixteen cells measured &mdash; between 2.7&times; and 54&times;,
-median 8.5&times;.** If a problem is memory-bound rather than time-bound, that is
-the number that decides whether this library is usable for it.
+every one of the sixteen cells measured**, by roughly 3&times; to 54&times;. If a
+problem is memory-bound rather than time-bound, that is what decides whether
+this library is usable for it.
+
+The dagger marks the six cells where ducc0's own figure is small enough to sit
+inside the measurement's noise; read those as "several times more", not as the
+number printed.
 
 | Telescope / pointing | n_pix | `dirty2vis` | `vis2dirty` |
 |----------------------|-------|-------------|-------------|
-| MWA_compact zenith   | 144   | 3.9&times;  | 3.0&times;  |
-| MWA_compact off30    | 144   | 6.1&times;  | 2.7&times;  |
-| EDA2 zenith          | 150   | 8.3&times;  | 2.9&times;  |
-| EDA2 off30           | 150   | 12.7&times; | 2.7&times;  |
-| MeerKAT zenith       | 2700  | 19.5&times; | 7.5&times;  |
-| MeerKAT off30        | 2700  | 19.3&times; | 10.4&times; |
-| MWA_extended zenith  | 3600  | 17.6&times; | 8.6&times;  |
-| MWA_extended off30   | 3600  | **54.0&times;** | 34.7&times; |
+| MWA_compact zenith   | 144   | 5.9&times;&dagger; | 3.0&times;&dagger; |
+| MWA_compact off30    | 144   | 9.1&times;&dagger; | 2.8&times;&dagger; |
+| EDA2 zenith          | 150   | 8.9&times;  | 3.0&times;  |
+| EDA2 off30           | 150   | 13.6&times; | 2.9&times;  |
+| MeerKAT zenith       | 2700  | 13.0&times;&dagger; | 6.2&times;  |
+| MeerKAT off30        | 2700  | 19.3&times;&dagger; | 8.7&times;  |
+| MWA_extended zenith  | 3600  | 17.6&times; | 7.9&times;  |
+| MWA_extended off30   | 3600  | **54.4&times;** | 37.1&times; |
 
-The ratio is jax-nufft's peak device HBM over ducc0's peak process RSS with the
-interpreter's own footprint removed, so both sides cover input, scratch and
-output. Two caveats belong with it: they are different instruments on different
-hardware, and RSS is quantised in steps of about 36 MB, so the four cells whose
-ducc0 side reads 108 MB or less carry a large relative uncertainty. Read the
-small ratios as approximate and the large ones as real.
+Over the ten cells that are cleanly resolvable the range is **2.9&times; to
+54.4&times;, median 8.8&times;**, and the three repeats of each agree to within
+1.20&times;.
+
+**How it is measured, and how far to trust it.** The ratio is jax-nufft's peak
+device HBM over ducc0's peak process RSS with the interpreter's own footprint
+removed, so both sides cover input, scratch and output. They are different
+instruments on different hardware, and the ducc0 side is the weaker of the two:
+RSS moves in steps of about 36 MB, and the interpreter baseline that gets
+subtracted is itself a high-water mark over the import sequence, which took
+values from 36 MB to 144 MB across 48 runs of an identical program. Each ducc0
+cell is therefore the median of three separate runs. A 108 MB swing is smaller
+than the working set of the large fixtures and comparable with that of the small
+ones, which is exactly what the dagger marks. What is *not* in doubt is the
+direction: jax-nufft is heavier in all sixteen cells under every repeat.
 
 Raw data: [`docs/benchmarks/v0.2.0-memory-gh200.json`](docs/benchmarks/v0.2.0-memory-gh200.json),
-recomputed by `tests/test_benchmark_claims.py`. Each figure was measured in a
-process that made exactly one operator call, because `peak_bytes_in_use` and
-`ru_maxrss` are both monotonic high-water marks: two operators measured in one
-process cannot be told apart, and the second one's rise reads zero whenever its
-transient stayed under the first one's peak.
+recomputed by `tests/test_benchmark_claims.py`, with each repeat kept rather
+than only the median. Every figure was measured in a process that made exactly
+one operator call, because `peak_bytes_in_use` and `ru_maxrss` are both
+monotonic high-water marks: two operators measured in one process cannot be told
+apart, and the second one's rise reads zero whenever its transient stayed under
+the first one's peak.
 
 ##### The two levers
 

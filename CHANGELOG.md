@@ -341,7 +341,11 @@ tagged or released, so its changes appear here for the first time; they are mark
   ([#33](https://github.com/chrisfinlay/jax-nufft/issues/33)). Both were previously hand-written
   markdown tables; `tests/test_benchmark_claims.py` recorded them as figures it could not
   recompute. `docs/benchmarks/v0.2.0-vs-ducc0-gh200.json` and `v0.2.0-memory-gh200.json` now hold
-  the sweeps, and every figure the README prints from them is recomputed by a test.
+  the sweeps, and every figure the README prints from them is recomputed by a test. The ducc0
+  memory side is the median of three runs per cell: the interpreter baseline it subtracts is
+  itself a high-water mark and varied 36–144 MB across 48 runs of an identical program, which is
+  comparable with the whole working set of the smaller fixtures. Ten of the sixteen cells clear a
+  200 MB resolvability bar; the README marks the other six rather than quoting them.
   - Problem sizes are derived from instrument parameters (`pixsize = lambda / (3 B_max)`,
     `n_pix` the next even 5-smooth integer covering the field of view, `n_rows = 150 N_bl`)
     rather than taken from the CI fixtures, which are 400–600 rows at 64–256 pixels and measure
@@ -353,7 +357,7 @@ tagged or released, so its changes appear here for the first time; they are mark
   `2 * epsilon` contract ran solely when someone typed the flag locally. It costs 22 s.
 - **The accuracy contract is scoped to the grid that measures it.** The sweep holds `w_strategy`
   at `dense_scan`, which is not the shipped default; cross-strategy agreement is pinned at
-  `1e-11`, wider than the contract itself below `epsilon = 1e-10`. The `3 * epsilon` bound
+  `1e-11`, wider than the contract itself below `epsilon = 5e-12`. The `3 * epsilon` bound
   against ducc0 holds `epsilon` at {`1e-4`, `1e-6`}.
 - **Corrected claims that the repository's own code or data falsified**
   ([#33](https://github.com/chrisfinlay/jax-nufft/issues/33)): the README reported the package

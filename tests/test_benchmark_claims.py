@@ -51,11 +51,15 @@ judgement this module cannot make for itself:
   divides jax-nufft's peak device HBM by ducc0's peak process RSS less the
   interpreter's footprint. Both sides cover input, scratch and output, which is
   what makes the division meaningful, but they are different instruments on
-  different hardware, and RSS is quantised in steps of about 36 MB. For the
-  four cells whose ducc0 side reads 108 MB or less that quantisation is a large
-  fraction of the value, so those ratios carry an uncertainty this module
-  asserts nothing about. The arithmetic is pinned; the interpretation is stated
-  in the JSON's ``comparability`` field and in the README beside the number.
+  different hardware and the ducc0 side is the weaker: RSS moves in steps of
+  about 36 MB, and the interpreter baseline being subtracted is itself a
+  high-water mark over the import sequence, which took values from 36 MB to
+  144 MB across 48 runs of an identical program. Each ducc0 figure is the
+  median of three runs, and the ``resolvable`` flag marks the ten cells whose
+  median clears 200 MB, where the repeats agree to 1.20x. On the other six the
+  ducc0 side is comparable with that noise. This module pins the arithmetic and
+  the resolvable/unresolvable split; it asserts nothing about the magnitude of
+  the six, and the README daggers them for the same reason.
 
 And one hole that is *not* a missing case but a mismatch of scales, recorded
 here because the passing assertion hides it:
@@ -93,7 +97,7 @@ import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
-from itertools import product
+from itertools import pairwise, product
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -555,40 +559,52 @@ CITATIONS: dict[str, Citation] = {
     ),
     "memory_vs_ducc0": Citation(
         claim=(
-            "'jax-nufft needs 2.7x to 54x the memory ducc0 does, and more in every "
-            "one of the sixteen cells; the median is 8.5x'. The ratio is peak device "
-            "HBM against ducc0's peak RSS less the interpreter's own footprint -- "
-            "see the JSON's 'comparability' note, including that RSS quantisation "
-            "makes the small-fixture ratios approximate."
+            "'jax-nufft needs 2.8x to 54x the memory ducc0 does, and more in every "
+            "one of the sixteen cells; the median is 8.8x'. The ratio is peak device "
+            "HBM against the median over three repeats of ducc0's peak RSS less the "
+            "interpreter's own footprint. Ten of the sixteen cells are 'resolvable' "
+            "-- ducc0 median at least 200 MB, repeats agreeing to 1.20x -- and on "
+            "the other six the ducc0 side is comparable with the instrument's noise, "
+            "so the direction is claimed there but not the magnitude."
         ),
         sites=("README.md (Performance notes -> memory)",),
         source=_MEMORY,
         figures={
-            "min": 2.7,
-            "max": 54.0,
-            "median": 8.5,
+            "min": 2.8,
+            "max": 54.4,
+            "median": 8.8,
             "cells": 16,
             "heavier_in_all": True,
             "min_cell": ("MWA_compact_off30", "vis2dirty"),
             "max_cell": ("MWA_extended_off30", "dirty2vis"),
+            # The ten cells whose ducc0 side is large enough to resolve. On the
+            # other six the ducc0 working set is comparable with the
+            # measurement's own noise -- the interpreter baseline that
+            # working_set subtracts varied 36-144 MB over 48 runs -- so the
+            # direction holds there but the magnitude should not be quoted.
+            "resolvable_cells": 10,
+            "resolvable_min": 2.9,
+            "resolvable_max": 54.4,
+            "resolvable_median": 8.8,
+            "resolvable_threshold_mb": 200.0,
             # The README prints the whole table, so the whole table is pinned.
             "per_cell": {
-                ("MWA_compact_zenith", "dirty2vis"): 3.9,
+                ("MWA_compact_zenith", "dirty2vis"): 5.9,
                 ("MWA_compact_zenith", "vis2dirty"): 3.0,
-                ("MWA_compact_off30", "dirty2vis"): 6.1,
-                ("MWA_compact_off30", "vis2dirty"): 2.7,
-                ("EDA2_zenith", "dirty2vis"): 8.3,
-                ("EDA2_zenith", "vis2dirty"): 2.9,
-                ("EDA2_off30", "dirty2vis"): 12.7,
-                ("EDA2_off30", "vis2dirty"): 2.7,
-                ("MeerKAT_zenith", "dirty2vis"): 19.5,
-                ("MeerKAT_zenith", "vis2dirty"): 7.5,
+                ("MWA_compact_off30", "dirty2vis"): 9.1,
+                ("MWA_compact_off30", "vis2dirty"): 2.8,
+                ("EDA2_zenith", "dirty2vis"): 8.9,
+                ("EDA2_zenith", "vis2dirty"): 3.0,
+                ("EDA2_off30", "dirty2vis"): 13.6,
+                ("EDA2_off30", "vis2dirty"): 2.9,
+                ("MeerKAT_zenith", "dirty2vis"): 13.0,
+                ("MeerKAT_zenith", "vis2dirty"): 6.2,
                 ("MeerKAT_off30", "dirty2vis"): 19.3,
-                ("MeerKAT_off30", "vis2dirty"): 10.4,
+                ("MeerKAT_off30", "vis2dirty"): 8.7,
                 ("MWA_extended_zenith", "dirty2vis"): 17.6,
-                ("MWA_extended_zenith", "vis2dirty"): 8.6,
-                ("MWA_extended_off30", "dirty2vis"): 54.0,
-                ("MWA_extended_off30", "vis2dirty"): 34.7,
+                ("MWA_extended_zenith", "vis2dirty"): 7.9,
+                ("MWA_extended_off30", "dirty2vis"): 54.4,
+                ("MWA_extended_off30", "vis2dirty"): 37.1,
             },
         },
     ),
@@ -642,7 +658,23 @@ CITATIONS: dict[str, Citation] = {
                 "chunked8": 1.53,
                 "dense_scan": 1.94,
             },
-            "monotone": True,
+            # Monotonicity over the WHOLE sweep, not just the cell the README
+            # tabulates. Two things make this subtler than it looks:
+            #
+            #  * When w_chunk >= n_w the chunked strategy clamps to dense_vmap
+            #    and compiles to the same program, so several rows share a
+            #    temp_mb exactly. Ordering tied rows by time and calling the
+            #    result an inversion measures run-to-run noise (about 1.4% on
+            #    these cells), not the dial. Tied levels are collapsed first.
+            #  * With that done, seven of the eight (fixture, op) pairs are
+            #    monotone and one is not, recorded here so it cannot grow
+            #    silently: MWA_extended_zenith's adjoint at n_w = 13, where
+            #    chunked8 uses 4.1x the scratch of dense_scan and is 2.9%
+            #    slower. At n_w = 13 a chunk of 8 is two chunks of 7, so the
+            #    dial barely engages; the README's claim is about the regime
+            #    where n_w substantially exceeds w_chunk.
+            "monotone_pairs": 7,
+            "known_inversion": ("MWA_extended_zenith", "vis2dirty"),
         },
     ),
 }
@@ -1784,11 +1816,63 @@ def test_jax_needs_more_memory_than_ducc0_in_every_cell_and_by_how_much() -> Non
         )
         + _cite("memory_vs_ducc0")
     )
+    rows = {(r["fixture"], r["op"]): r for r in _load(_MEMORY)["rows"] if r["impl"] == "ducc0"}
+    resolvable = {k: v for k, v in ratios.items() if rows[k]["resolvable"]}
+    assert len(resolvable) == cited["resolvable_cells"], (
+        f"{len(resolvable)} cells are marked resolvable; the prose says "
+        f"{cited['resolvable_cells']}.{_cite('memory_vs_ducc0')}"
+    )
+    for key, row in rows.items():
+        expected = row["working_set_mb"] >= cited["resolvable_threshold_mb"]
+        assert row["resolvable"] == expected, (
+            f"{key} is flagged resolvable={row['resolvable']} but its ducc0 median "
+            f"is {row['working_set_mb']} MB against a "
+            f"{cited['resolvable_threshold_mb']} MB threshold."
+            f"{_cite('memory_vs_ducc0')}"
+        )
+    got_res = (
+        round(min(resolvable.values()), 1),
+        round(max(resolvable.values()), 1),
+        round(statistics.median(resolvable.values()), 1),
+    )
+    assert got_res == (
+        cited["resolvable_min"],
+        cited["resolvable_max"],
+        cited["resolvable_median"],
+    ), (
+        f"the resolvable cells now span {got_res[0]}x to {got_res[1]}x (median "
+        f"{got_res[2]}x); the prose says {cited['resolvable_min']}x to "
+        f"{cited['resolvable_max']}x (median {cited['resolvable_median']}x)."
+        f"{_cite('memory_vs_ducc0')}"
+    )
     assert min(ratios, key=lambda k: ratios[k]) == tuple(cited["min_cell"])
     assert max(ratios, key=lambda k: ratios[k]) == tuple(cited["max_cell"]), (
         "the heaviest cell has moved; the README names "
         f"{tuple(cited['max_cell'])}.{_cite('memory_vs_ducc0')}"
     )
+
+
+def _non_monotone_pairs() -> set[tuple[str, str]]:
+    """(fixture, op) pairs where more scratch buys strictly more time.
+
+    Rows sharing a ``temp_mb`` are the same compiled program -- ``w_chunk >=
+    n_w`` clamps to ``dense_vmap`` -- so they are collapsed to one level
+    spanning their observed times. A level counts as an inversion only when its
+    fastest time is slower than the whole of the previous level, which run-to-
+    run noise between tied rows cannot manufacture.
+    """
+    pairs: dict[tuple[str, str], dict[float, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for row in _load(_MEMORY)["w_chunk_sweep"]["rows"]:
+        pairs[(row["fixture"], row["op"])][round(row["temp_mb"], 1)].append(row["median_ms"])
+
+    bad = set()
+    for key, levels in pairs.items():
+        ordered = sorted(levels.items())
+        for (_, lo), (_, hi) in pairwise(ordered):
+            if min(hi) > max(lo):
+                bad.add(key)
+                break
+    return bad
 
 
 def test_the_w_chunk_dial_trades_memory_for_time_monotonically() -> None:
@@ -1842,17 +1926,19 @@ def test_the_w_chunk_dial_trades_memory_for_time_monotonically() -> None:
             f"the operator docstrings say {ratio}x.{_cite('w_chunk_dial')}"
         )
 
-    ordered = sorted(sweep, key=lambda r: r["temp_mb"])
-    times = [r["median_ms"] for r in ordered]
-    inversions = [
-        (ordered[i]["w_strategy"], ordered[i + 1]["w_strategy"])
-        for i in range(len(times) - 1)
-        if times[i] < times[i + 1]
-    ]
-    assert not inversions and cited["monotone"], (
-        f"the memory/time curve is not monotone: {inversions} each use more "
-        f"scratch than their predecessor and are also faster, so 'less memory "
-        f"costs more time' does not hold as stated.{_cite('w_chunk_dial')}"
+    non_monotone = _non_monotone_pairs()
+    assert non_monotone == {tuple(cited["known_inversion"])}, (
+        f"the set of (fixture, op) pairs whose memory/time curve inverts is now "
+        f"{sorted(non_monotone)}; the citation records exactly "
+        f"{{{tuple(cited['known_inversion'])}}}. 'Less scratch costs more time' "
+        f"is the claim the README's table rests on, and it is checked over the "
+        f"whole sweep, not only the cell the table prints."
+        f"{_cite('w_chunk_dial')}"
+    )
+    n_pairs = len({(r["fixture"], r["op"]) for r in _load(_MEMORY)["w_chunk_sweep"]["rows"]})
+    assert n_pairs - len(non_monotone) == cited["monotone_pairs"], (
+        f"{n_pairs - len(non_monotone)} of {n_pairs} pairs are monotone; the "
+        f"citation says {cited['monotone_pairs']}.{_cite('w_chunk_dial')}"
     )
 
 

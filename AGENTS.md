@@ -193,11 +193,13 @@ w-plane `k`, multiplies the image by the w-correction
 `exp(2πi w_k (n-1)) / phi_hat_n`, runs a 2D NUFFT to land at the
 visibilities, and weights each visibility by `phi((w-w_k) / scale)`.
 
-The four `w_strategy` variants (`dense_scan` default, `dense_vmap`,
-`windowed_scan`, `windowed_vmap`) differ only in how the w-plane loop
-is structured (scan vs vmap) and whether each plane processes every
+The six `w_strategy` variants (`dense_scan`, `dense_vmap`,
+`windowed_scan`, `windowed_vmap`, and since #25 `chunked` /
+`windowed_chunked`; the default is `"auto"`, which resolves to one of the
+first four) differ only in how the w-plane loop is structured (scan, vmap,
+or a chunk loop of `w_chunk` planes) and whether each plane processes every
 visibility (`dense_*`) or just a contiguous w-sorted slice (`windowed_*`).
-All four are mathematically equivalent — they differ only in
+All six are mathematically equivalent — they differ only in
 floating-point reduction order.
 
 For the underlying math (sign convention, phi_hat correction, kernel

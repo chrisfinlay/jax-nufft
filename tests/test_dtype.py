@@ -862,6 +862,10 @@ def test_mixed_dtypes_never_leak_a_bare_assertion(case: str) -> None:
 # a round number, and the weakest ratio it implies. Both are quoted in README.md.
 _HALVING_FIXED_OVERHEAD_BYTES = 512
 _HALVING_MIN_RATIO = 1.999
+#: The range README.md actually quotes. Bounding the ratio only from below
+#: would leave the upper figure unchecked, and "1.99999" is the half of the
+#: sentence that makes the halving sound exact.
+_HALVING_RATIO_RANGE = (1.9998, 2.0)
 
 _HALVING_SIZES = (
     # (telescope, n_pix, n_rows) -- one image-dominated, one row-dominated, and
@@ -952,6 +956,14 @@ def test_a_float32_plan_needs_half_the_scratch_of_a_float64_one(
     assert ratio >= _HALVING_MIN_RATIO, (
         f"float32 saves a factor of {ratio:.6f}, below the {_HALVING_MIN_RATIO} "
         "README.md quotes as 'halves it'."
+    )
+    lo, hi = _HALVING_RATIO_RANGE
+    assert lo <= ratio <= hi, (
+        f"float32 saves a factor of {ratio:.6f}, outside the "
+        f"{lo}-{hi} band README.md's Precision section quotes as "
+        f"'1.99987 to 1.99999'. Both ends are checked: a ratio above the band "
+        "would mean something is being counted that is not scratch, and one "
+        "below it that the halving is less complete than advertised."
     )
 
 

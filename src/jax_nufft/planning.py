@@ -1042,7 +1042,9 @@ def _n_minus_1_grid(n_l: int, n_m: int, pixsize_l: float, pixsize_m: float) -> n
     # reference) and ducc0 cannot check them (`nx_dirty must be even`), so the
     # only thing standing behind this line is the odd cells of
     # ``tests/test_against_dft.py::test_geometry_matches_dft_forward_and_adjoint``:
-    # substituting ``/`` here fails those six and nothing else in 1495 tests.
+    # substituting ``/`` here fails ten cells and nothing else in the 2136-case
+    # suite: the six of #14's original measurement plus four this module's own
+    # ``nm1`` tests added in #12. See AGENTS.md section 2.
     i = np.arange(n_l) - n_l // 2
     j = np.arange(n_m) - n_m // 2
     ll = (i * pixsize_l)[:, None]

@@ -127,8 +127,8 @@ import-safe and unit-testable.
 
 ## v0.2.0 comparison JSON: `v0.2.0-vs-ducc0-gh200.json`
 
-Written by `scratchpad/build_json.py` from the raw sweep, and recomputed by
-`tests/test_benchmark_claims.py`. Top-level shape:
+Assembled from the raw sweep recorded on the GH200 (see `provenance`), and
+recomputed by `tests/test_benchmark_claims.py`. Top-level shape:
 
 ```jsonc
 {
@@ -190,7 +190,20 @@ ratios against a ducc0 side below a few hundred MB carry a large relative
 uncertainty. The `provenance.comparability` field says this too; read the
 small ratios as approximate.
 
-`w_chunk_sweep.rows` is a separate grid: `temp_mb` and `median_ms` for the
-same problem under each w-strategy including `chunked` at several chunk
-widths. This is the memory/compute dial the README documents, and the test
-asserts it is monotone in both columns.
+`w_chunk_sweep.rows` is a separate grid: `temp_mb` and `median_ms` for each
+(fixture, operator) under every w-strategy, including `chunked` at several
+chunk widths. This is the memory/compute dial the README documents.
+
+Reading it needs one correction first: **when `w_chunk >= n_w` the chunked
+strategy clamps to `dense_vmap`** and compiles to the same program, so several
+rows share a `temp_mb` exactly. Ordering those tied rows by time and calling
+the result an inversion measures run-to-run noise (about 1.4% here), not the
+dial. Collapse equal `temp_mb` to one level first.
+
+With that done, `tests/test_benchmark_claims.py` checks monotonicity across
+all eight (fixture, operator) pairs, not only the one the README tabulates.
+Seven are monotone. One is not, and is pinned rather than hidden:
+`MWA_extended_zenith`'s adjoint at `n_w = 13`, where `chunked8` takes 4.1x the
+scratch of `dense_scan` and is 2.9% slower. At `n_w = 13` a chunk of 8 is two
+chunks of 7, so the dial barely engages; the trade is a usable one in the
+regime where `n_w` substantially exceeds `w_chunk`, which is where it matters.
