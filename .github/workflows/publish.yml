@@ -1,0 +1,159 @@
+name: publish
+
+# Publishing is deliberate, never incidental: the only path to PyPI is
+# publishing a GitHub Release. A tag push alone does not trigger it, so an
+# accidental or mistaken tag cannot ship a version.
+#
+# `workflow_dispatch` targets TestPyPI only, for rehearsing the whole path
+# without spending a real version number -- PyPI refuses to re-upload a
+# filename it has already seen, so a mistake there is permanent.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to upload the built artifacts"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi]
+
+concurrency:
+  # Deliberately NOT "publish-${{ github.ref }}". test.yml groups on
+  # "${{ github.workflow }}-${{ github.ref }}", and a called workflow
+  # evaluates github.workflow as the *caller's* name -- so that group is
+  # also "publish-<ref>". With test.yml's cancel-in-progress, the called
+  # suite would cancel the release that called it.
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The full suite, against the commit being released. Without this the only
+  # thing standing between a release and PyPI is that the package builds:
+  # test.yml runs on pushes to main and on pull requests, neither of which is
+  # a release, so a release cut from an untested commit -- or while main was
+  # red -- would publish happily. PyPI will not let a filename be replaced, so
+  # there is no taking it back.
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools-scm-style versioning is not in use -- the version comes
+          # from src/jax_nufft/_version.py -- but a full history keeps `git
+          # describe` meaningful for anyone debugging a release build.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Check metadata renders on PyPI
+        # PyPI rejects a long_description it cannot render, and the only place
+        # that shows up is the upload, after the version is spent.
+        run: python -m twine check --strict dist/*
+
+      - name: Check the tag matches the packaged version
+        # Issue #59 was a version that had drifted between two files and named
+        # a release that never existed. src/jax_nufft/_version.py is now the
+        # single source, and this is the gate that keeps the git tag honest
+        # against it: a release tagged v0.2.0 must contain 0.2.0, and must not
+        # be a .dev or pre-release build. Checking the built metadata rather
+        # than re-parsing the file also proves the wheel that is about to be
+        # uploaded carries the version, not just the source tree.
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade packaging
+          python .github/scripts/check_release_version.py "$TAG"
+
+      - name: Check the released commit is on main
+        # A tag can point anywhere. Without this the suite above proves only
+        # that *some* commit passes, not that the released one is the reviewed
+        # history -- and the upload is not reversible.
+        #
+        # This runs on BOTH triggers on purpose. Enforcing only on a release
+        # would leave the step's own correctness untested until the one run
+        # where failing is most expensive -- which is exactly how the first
+        # version of it shipped `git fetch --depth=0`, a fatal argument error
+        # ("depth 0 is not a positive number") that no rehearsal could reach.
+        # A dispatch run exercises the same code and only warns, so a
+        # rehearsal from a feature branch stays useful.
+        run: |
+          set -euo pipefail
+          # actions/checkout already fetched full history (fetch-depth: 0);
+          # this just makes sure the main ref itself is present locally.
+          git fetch --no-tags origin main
+          if git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "commit $GITHUB_SHA is contained in main"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "::error::released commit $GITHUB_SHA is not contained in main" >&2
+            exit 1
+          else
+            echo "::warning::commit $GITHUB_SHA is not on main; a real release would be refused"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  testpypi:
+    name: upload to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/jax-nufft
+    permissions:
+      id-token: write   # Trusted Publishing: mints a short-lived OIDC token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # A rehearsal that fails because the version is already there is not
+          # a useful failure.
+          skip-existing: true
+
+  pypi:
+    name: upload to PyPI
+    # `types: [published]` fires for a release marked "pre-release" on GitHub
+    # as well. check_release_version.py rejects a pre-release *version string*
+    # (0.2.0rc1), which is a different thing: a GitHub pre-release tagged
+    # v0.2.0 carries a perfectly ordinary version and would sail through to
+    # production PyPI. Mark a release pre-release and it goes nowhere.
+    if: github.event_name == 'release' && github.event.release.prerelease == false
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/jax-nufft
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -369,6 +369,36 @@ tagged or released, so its changes appear here for the first time; they are mark
   said it pads a plane; and float32 was said to halve plan memory, which holds for
   image-dominated plans (0.501×) but not row-dominated ones (0.586×).
 - `[tool.mypy]` and `[tool.ruff]` now target Python 3.11, matching `requires-python`.
+- **README rewritten as an overview** (1850 lines to ~600), with badges, a table of contents,
+  LaTeX-rendered mathematics in place of ASCII code fences, and parameter tables in place of
+  wall-of-prose API descriptions. The reference material it carried is moved unchanged — not
+  dropped — into [`docs/algorithm.md`](docs/algorithm.md),
+  [`docs/strategies.md`](docs/strategies.md), [`docs/accuracy.md`](docs/accuracy.md) and
+  [`docs/benchmarking.md`](docs/benchmarking.md); every figure in those files was verified during
+  the #33 pass, so moving beat rewriting. Installation now leads with `pip install jax-nufft`,
+  which 0.2.0 is the first release to make true, and records that there is no `jax-nufft[gpu]`
+  extra — the CPU/CUDA choice belongs to `jax-finufft`, and the extra the previous README
+  documented never existed.
+- **GPU installation is documented as its own step, before `pip install`.** `jax-finufft`'s PyPI
+  wheels carry no CUDA, so installing `jax-nufft` from PyPI on a GPU machine yields a CPU backend
+  that runs quietly and slowly. The CUDA builds are on conda-forge (linux-64 and linux-aarch64
+  only) and must be installed first; the README now says so, gives the command, and shows how to
+  check which backend is actually loaded, since `jax.devices()` reporting a CUDA device does not
+  imply `jax-finufft` is the CUDA build.
+
+### Packaging
+
+- **A publish workflow** ([`.github/workflows/publish.yml`](.github/workflows/publish.yml)) builds
+  the sdist and wheel and uploads them to PyPI via Trusted Publishing when a GitHub Release is
+  published. A tag alone does not trigger it, and `workflow_dispatch` targets TestPyPI only, so a
+  version number cannot be spent by accident.
+- The upload is gated on **the full test suite running against the released commit**, not on
+  main having been green at some earlier point: `test.yml` gained a `workflow_call` trigger and
+  `publish.yml` calls it, so a release cut from an untested commit cannot reach PyPI. It is also
+  gated on the tag agreeing with the built artifacts
+  ([`.github/scripts/check_release_version.py`](.github/scripts/check_release_version.py)) and on
+  `twine check --strict`. Publishing a `.dev` or pre-release version is refused. This is the
+  automated form of the check that #59 was filed for.
 
 ## [0.1.1] and earlier
 

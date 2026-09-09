@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Callable from publish.yml, so a release runs the same suite against the
+  # exact commit being published rather than trusting that main was green
+  # at some earlier point.
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
