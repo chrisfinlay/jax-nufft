@@ -1,0 +1,114 @@
+name: publish
+
+# Publishing is deliberate, never incidental: the only path to PyPI is
+# publishing a GitHub Release. A tag push alone does not trigger it, so an
+# accidental or mistaken tag cannot ship a version.
+#
+# `workflow_dispatch` targets TestPyPI only, for rehearsing the whole path
+# without spending a real version number -- PyPI refuses to re-upload a
+# filename it has already seen, so a mistake there is permanent.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to upload the built artifacts"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi]
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools-scm-style versioning is not in use -- the version comes
+          # from src/jax_nufft/_version.py -- but a full history keeps `git
+          # describe` meaningful for anyone debugging a release build.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Check metadata renders on PyPI
+        # PyPI rejects a long_description it cannot render, and the only place
+        # that shows up is the upload, after the version is spent.
+        run: python -m twine check --strict dist/*
+
+      - name: Check the tag matches the packaged version
+        # Issue #59 was a version that had drifted between two files and named
+        # a release that never existed. src/jax_nufft/_version.py is now the
+        # single source, and this is the gate that keeps the git tag honest
+        # against it: a release tagged v0.2.0 must contain 0.2.0, and must not
+        # be a .dev or pre-release build. Checking the built metadata rather
+        # than re-parsing the file also proves the wheel that is about to be
+        # uploaded carries the version, not just the source tree.
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade packaging
+          python .github/scripts/check_release_version.py "$TAG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  testpypi:
+    name: upload to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/jax-nufft
+    permissions:
+      id-token: write   # Trusted Publishing: mints a short-lived OIDC token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # A rehearsal that fails because the version is already there is not
+          # a useful failure.
+          skip-existing: true
+
+  pypi:
+    name: upload to PyPI
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/jax-nufft
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
