@@ -330,8 +330,8 @@ def _resolve_w_chunk(w_strategy: WStrategy, w_chunk: Any, plan: WGridderPlan) ->
 # every fixture currently in this repository has n_rows well below this
 # cutoff, so the vmap-family steady-state branch of ``_resolve_nthreads``
 # (the `else: return 0` below) is never exercised by anything in
-# ``tests/test_benchmark_against_ducc.py`` or the README's benchmark
-# tables -- only by the direct unit tests in
+# ``tests/test_benchmark_against_ducc.py`` or the benchmark tables in
+# ``docs/benchmarking.md`` -- only by the direct unit tests in
 # ``tests/test_nthreads_resolution.py`` and the JIT-boundary spy tests in
 # ``tests/test_jax_integration.py``, both of which pass a plan built with
 # `n_rows > _NTHREADS_SMALL_N_ROWS` explicitly to reach it.
@@ -2129,8 +2129,8 @@ def dirty2vis(
         ``dense_scan`` (73x less) for 2.35x / 1.94x. Both halves of this
         curve are committed as the ``w_chunk_sweep`` block of
         ``docs/benchmarks/v0.2.0-memory-gh200.json`` and recomputed by
-        ``tests/test_benchmark_claims.py`` (#33); see README.md's
-        ``w_chunk`` section for the full curve. Note that the 1.27x forward
+        ``tests/test_benchmark_claims.py`` (#33); see
+        ``docs/strategies.md``'s ``w_chunk`` section for the full curve. Note that the 1.27x forward
         cell **breaches** issue #25's "within 1.2x of ``dense_vmap``" GPU
         gate as that gate is written.
 
@@ -2659,8 +2659,8 @@ def vis2dirty(
         ``dense_scan`` (73x less) for 2.35x / 1.94x. Both halves of this
         curve are committed as the ``w_chunk_sweep`` block of
         ``docs/benchmarks/v0.2.0-memory-gh200.json`` and recomputed by
-        ``tests/test_benchmark_claims.py`` (#33); see README.md's
-        ``w_chunk`` section for the full curve. Note that the 1.27x forward
+        ``tests/test_benchmark_claims.py`` (#33); see
+        ``docs/strategies.md``'s ``w_chunk`` section for the full curve. Note that the 1.27x forward
         cell **breaches** issue #25's "within 1.2x of ``dense_vmap``" GPU
         gate as that gate is written.
 

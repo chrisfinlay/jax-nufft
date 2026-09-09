@@ -1,8 +1,9 @@
 """Issue #49: recompute every prose citation of ``docs/benchmarks/*.json``.
 
 The repository quotes aggregate figures from its own committed benchmark JSON
-in ``src/`` comments, ``README.md``, ``AGENTS.md``, ``docs/v0.1.2-plan.md`` and
-test docstrings, and those citations are written by hand. Three of them were
+in ``src/`` comments, ``README.md``, ``docs/strategies.md``,
+``docs/benchmarking.md``, ``AGENTS.md``, ``docs/v0.1.2-plan.md`` and test
+docstrings, and those citations are written by hand. Three of them were
 wrong when #46 was reviewed, each falsifiable by reading JSON that had been in
 the tree the whole time. This module closes that loop: every cited aggregate is
 recomputed here from the JSON, and each case states the claim *in the form the
@@ -20,12 +21,12 @@ followed by one thing this module asserts on data it cannot check the scale of:
 
 * Issue #46's GH200-versus-ducc0 table ("1.4-5.6x slower than ducc0 on five of
   the table's six cells", "1.4-6.3x faster in all six", the "about 1.16x
-  faster" exception) -- quoted in ``README.md``'s strategy section,
-  ``AGENTS.md`` sec 5, the ``dirty2vis`` / ``vis2dirty`` docstrings and
-  ``tests/test_default_w_strategy.py``. Those timings exist only as the
-  markdown table in ``README.md``; no JSON was committed for them. Recomputing
-  them from that table (by hand, 2026-09) reproduces every one of the four
-  figures, but a test would be asserting the README against itself.
+  faster" exception) -- quoted in ``docs/strategies.md``, ``AGENTS.md`` sec 5,
+  the ``dirty2vis`` / ``vis2dirty`` docstrings and
+  ``tests/test_default_w_strategy.py``. Those timings exist only as a markdown
+  table; no JSON was committed for them. Recomputing them from that table (by
+  hand, 2026-09) reproduces every one of the four figures, but a test would be
+  asserting the documentation against itself.
 
   The v0.2.0 comparison that replaces it in the README's performance section
   does not have this problem: issue #33 committed the sweep behind it as
@@ -39,8 +40,9 @@ followed by one thing this module asserts on data it cannot check the scale of:
   every committed JSON carries the *pre*-#43 scale and that the conversion
   needs plan-time locals that were never stored, so the new-scale numbers
   cannot come from the tree at all.
-* ``README.md``'s "Indicative numbers" tables and every Apple M-series timing
-  in ``AGENTS.md`` sec 5 / sec 9, including the #24 ``nthreads`` ranges. The
+* ``docs/benchmarking.md``'s "Indicative numbers" tables and every Apple
+  M-series timing in ``AGENTS.md`` sec 5 / sec 9, including the #24
+  ``nthreads`` ranges. The
   committed CPU JSON is aarch64 Grace/GH200 from 2026-05-18; those tables are a
   different machine and a different date, with no JSON behind them.
 
@@ -156,7 +158,7 @@ CITATIONS: dict[str, Citation] = {
         ),
         sites=(
             "src/jax_nufft/wgridder.py (_GPU_LARGE_N_ROWS comment; _auto_w_strategy_gpu docstring)",
-            "README.md (Strategies -> GPU bullet)",
+            "docs/strategies.md (Strategy options -> GPU bullet)",
             "AGENTS.md sec 9 (Part 6 correction)",
             "tests/test_auto_strategy_acceptance.py (test_gpu_auto_never_picks_a_scan_variant)",
             "tests/test_default_w_strategy.py (test_gpu_default_resolves_to_the_expected_strategy)",
@@ -172,7 +174,7 @@ CITATIONS: dict[str, Citation] = {
         ),
         sites=(
             "src/jax_nufft/wgridder.py (_GPU_LARGE_N_ROWS comment; _auto_w_strategy_gpu docstring)",
-            "README.md (Strategies -> GPU bullet)",
+            "docs/strategies.md (Strategy options -> GPU bullet)",
             "AGENTS.md sec 9 (Part 6 correction)",
             "tests/test_auto_strategy_acceptance.py",
             "tests/test_default_w_strategy.py",
@@ -188,7 +190,7 @@ CITATIONS: dict[str, Citation] = {
         ),
         sites=(
             "src/jax_nufft/wgridder.py (_GPU_LARGE_N_ROWS comment; _auto_w_strategy_gpu docstring)",
-            "README.md (Strategies -> GPU bullet)",
+            "docs/strategies.md (Strategy options -> GPU bullet)",
             "AGENTS.md sec 9 (Part 6 correction)",
             "tests/test_auto_strategy_acceptance.py",
             "tests/test_default_w_strategy.py",
@@ -324,7 +326,7 @@ CITATIONS: dict[str, Citation] = {
             "meets trivially here by picking the best one every time'."
         ),
         sites=(
-            "README.md (Strategies -> the GPU gates are validated ...)",
+            "docs/strategies.md (Strategy options -> the GPU gates are validated ...)",
             "AGENTS.md sec 9 (Part 6)",
             "src/jax_nufft/wgridder.py (_auto_w_strategy_gpu docstring)",
             "tests/test_auto_strategy_acceptance.py",
@@ -441,7 +443,7 @@ CITATIONS: dict[str, Citation] = {
             "over the eight (telescope, pointing) cells, each against ducc0's own "
             "best measured thread count for that cell and operator."
         ),
-        sites=("README.md (Performance notes -> GPU vs ducc0)",),
+        sites=("README.md (Performance)",),
         source=_REALISTIC,
         figures={
             "min": 1.663,
@@ -470,7 +472,7 @@ CITATIONS: dict[str, Citation] = {
             "between 8.9x and 11.2x. Quoting only the range would suggest a "
             "typical figure of about 6x, which no cell shows."
         ),
-        sites=("README.md (Performance notes -> GPU vs ducc0)",),
+        sites=("README.md (Performance)",),
         source=_REALISTIC,
         figures={
             "min": 1.541,
@@ -506,7 +508,7 @@ CITATIONS: dict[str, Citation] = {
             "'faster in every one' of the sixteen (cell, operator) comparisons -- "
             "the universality, as opposed to the size of the gap."
         ),
-        sites=("README.md (Performance notes -> GPU vs ducc0)",),
+        sites=("README.md (Performance)",),
         source=_REALISTIC,
         figures={"comparisons": 16, "faster_in_all": True},
     ),
@@ -521,8 +523,8 @@ CITATIONS: dict[str, Citation] = {
             "288 never wins and by how much it loses."
         ),
         sites=(
-            "README.md (Performance notes -> GPU vs ducc0)",
-            "README.md (nthreads)",
+            "README.md (Performance)",
+            "docs/strategies.md (nthreads)",
         ),
         source=_REALISTIC,
         figures={
@@ -543,7 +545,7 @@ CITATIONS: dict[str, Citation] = {
             "numbers reproduce from the rule."
         ),
         sites=(
-            "README.md (Performance notes -> how the benchmark problems are sized)",
+            "README.md (Performance -> how the problems are sized)",
             "docs/benchmarks/v0.2.0-vs-ducc0-gh200.json (sizing block)",
         ),
         source=_REALISTIC,
@@ -567,7 +569,7 @@ CITATIONS: dict[str, Citation] = {
             "the other six the ducc0 side is comparable with the instrument's noise, "
             "so the direction is claimed there but not the magnitude."
         ),
-        sites=("README.md (Performance notes -> memory)",),
+        sites=("README.md (Performance -> Memory)",),
         source=_MEMORY,
         figures={
             "min": 2.8,
@@ -617,8 +619,8 @@ CITATIONS: dict[str, Citation] = {
             "time, with no inversion -- which is what makes it usable as a dial."
         ),
         sites=(
-            "README.md (w_chunk: the memory/compute knob)",
-            "README.md (Performance notes -> memory)",
+            "docs/strategies.md (w_chunk: the memory/compute knob)",
+            "README.md (Performance -> Memory)",
         ),
         source=_MEMORY,
         figures={
