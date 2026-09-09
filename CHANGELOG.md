@@ -379,6 +379,12 @@ tagged or released, so its changes appear here for the first time; they are mark
   which 0.2.0 is the first release to make true, and records that there is no `jax-nufft[gpu]`
   extra — the CPU/CUDA choice belongs to `jax-finufft`, and the extra the previous README
   documented never existed.
+- **GPU installation is documented as its own step, before `pip install`.** `jax-finufft`'s PyPI
+  wheels carry no CUDA, so installing `jax-nufft` from PyPI on a GPU machine yields a CPU backend
+  that runs quietly and slowly. The CUDA builds are on conda-forge (linux-64 and linux-aarch64
+  only) and must be installed first; the README now says so, gives the command, and shows how to
+  check which backend is actually loaded, since `jax.devices()` reporting a CUDA device does not
+  imply `jax-finufft` is the CUDA build.
 
 ### Packaging
 

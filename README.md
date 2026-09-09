@@ -28,6 +28,7 @@ pipeline.
 |---|---|
 | [Why this exists](#why-this-exists) | what it is for, and what it is not |
 | [Installation](#installation) · [Quick start](#quick-start) | getting running |
+| [GPU setup](#gpu-install-jax-finufft-from-conda-forge-first) | **read before installing** — PyPI gives you a CPU-only backend |
 | [How it works](#how-it-works) | the measurement equation and w-stacking |
 | [API reference](#api-reference) | `make_plan`, `dirty2vis`, `vis2dirty` |
 | [Accuracy](#accuracy) · [Precision](#precision) | what `epsilon` buys, and float32 |
@@ -65,7 +66,9 @@ cannot do is participate in a JAX program.
   0.98–1.98× a forward call depending on strategy, down from 12.5–135× before
   v0.2.0.
 - **GPU-capable**, via cuFINUFFT, with no code change — and on a GH200 it is
-  [1.5–11.2× faster than ducc0](#performance) at realistic problem sizes.
+  [1.5–11.2× faster than ducc0](#performance) at realistic problem sizes. This
+  needs a CUDA `jax-finufft` from conda-forge; PyPI's is CPU-only, so
+  [read the GPU setup](#gpu-install-jax-finufft-from-conda-forge-first) first.
 - **Accurate to a contract**: within `2 * epsilon` of the exact DFT over a
   stated grid, and within `3 * epsilon` of `ducc0.wgridder`. See
   [Accuracy](#accuracy) for exactly what is measured.
@@ -100,10 +103,59 @@ release lands:
 pip install git+https://github.com/chrisfinlay/jax-nufft.git
 ```
 
-**GPU.** `jax-nufft` itself is platform-agnostic — the CUDA support comes from
-[`jax-finufft`][jaxfinufft], so install a matching GPU build of *that* and
-`jax-nufft` dispatches through it. There is no `jax-nufft[gpu]` extra; the
-choice of CPU or CUDA backend is entirely `jax-finufft`'s.
+### GPU: install `jax-finufft` from conda-forge *first*
+
+> [!IMPORTANT]
+> **`pip install jax-nufft` gives you a CPU-only backend, on a GPU machine
+> too.** `jax-nufft` is platform-agnostic and does no CUDA work itself — all
+> of it happens inside [`jax-finufft`][jaxfinufft] — and the `jax-finufft`
+> wheels on PyPI are built without CUDA. Installing `jax-nufft` from PyPI
+> therefore pulls a CPU `jax-finufft` and everything runs on the CPU, quietly
+> and correctly and slowly.
+>
+> The CUDA builds live on **conda-forge**. Install one **before** `jax-nufft`.
+
+```sh
+# 1. A CUDA build of jax-finufft (conda-forge; Linux x86-64 and aarch64 only)
+conda install -c conda-forge "jax-finufft=*=cuda*" "cuda-version>=12.0,<13"
+
+# 2. then jax-nufft, leaving that backend in place
+pip install --no-deps jax-nufft
+```
+
+`--no-deps` is the careful form: the requirement is already satisfied by the
+conda package, and it stops pip from reaching for `jax` on its own and
+replacing the CUDA-matched build. If you drop it, check `jax` afterwards.
+
+There is **no `jax-nufft[gpu]` extra** — the CPU/CUDA choice belongs entirely
+to `jax-finufft`, and an extra here could not express it.
+
+Using pixi instead, the stanza is the one this repository's own `pixi.toml`
+uses for its `gpu` feature:
+
+```toml
+[feature.gpu]
+platforms = ["linux-64", "linux-aarch64"]
+system-requirements = { cuda = "12.0" }
+
+[feature.gpu.dependencies]
+jax-finufft = { version = ">=1.3.0", build = "cuda*" }
+cuda-version = ">=12.0,<13"
+```
+
+**Check which backend you got**, because nothing will tell you otherwise:
+
+```python
+import jax
+print(jax.devices())            # CudaDevice(...) means the GPU is visible to JAX
+import jax_finufft, importlib.metadata as m
+print(m.version("jax-finufft"))  # and `conda list jax-finufft` shows cuda* vs cpu_*
+```
+
+`jax.devices()` reporting a CUDA device is necessary but not sufficient — JAX
+can see the GPU while `jax-finufft` is still the CPU build, which is exactly
+the failure this section exists to prevent. The build string is the thing to
+check.
 
 For development, the repository uses [pixi](https://pixi.sh/):
 
