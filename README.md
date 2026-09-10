@@ -37,9 +37,9 @@ pipeline.
 | [Further reading](#further-reading) | the deep-dive documents |
 
 > [!NOTE]
-> **0.2.0 is in development**; the package reports `0.2.0.dev0`. The API is
-> stable. A v0.1.2 series was developed and merged but never tagged, so its
-> work ships for the first time in 0.2.0 — see [`CHANGELOG.md`](CHANGELOG.md).
+> **Current release: 0.2.0.** The API is stable. A v0.1.2 series was developed
+> and merged but never tagged, so its work ships for the first time in 0.2.0 —
+> see [`CHANGELOG.md`](CHANGELOG.md).
 >
 > Two defaults changed since v0.1.1: `w_strategy` now defaults to `"auto"`
 > (was `"dense_scan"`), and `nthreads` defaults to `None`, resolving to a
@@ -96,8 +96,7 @@ cannot do is participate in a JAX program.
 pip install jax-nufft
 ```
 
-Available from **0.2.0** onwards. For the unreleased tip, or before that
-release lands:
+Requires Python 3.11+. For the unreleased tip:
 
 ```sh
 pip install git+https://github.com/chrisfinlay/jax-nufft.git

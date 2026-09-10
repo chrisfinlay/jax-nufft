@@ -11,7 +11,7 @@ them.
 
 ## [Unreleased]
 
-## [0.2.0] — unreleased
+## [0.2.0] — 2026-09-10
 
 This release covers everything since **v0.1.1**. A v0.1.2 series was developed and merged but never
 tagged or released, so its changes appear here for the first time; they are marked *(v0.1.2 series)*.
@@ -361,7 +361,8 @@ tagged or released, so its changes appear here for the first time; they are mark
   against ducc0 holds `epsilon` at {`1e-4`, `1e-6`}.
 - **Corrected claims that the repository's own code or data falsified**
   ([#33](https://github.com/chrisfinlay/jax-nufft/issues/33)): the README reported the package
-  version as v0.1.2 (it is `0.2.0.dev0`) and attributed shipped work to a "v0.1.3" that will
+  version as v0.1.2, which it had not been since #59, and attributed shipped work to a "v0.1.3"
+  that will
   never be tagged; the memory table reported 0 MB for three rows, an artefact of measuring two
   operators against one monotonic high-water mark; the padding-overhead ranges quoted an
   `epsilon = 1e-6` slice while naming a four-epsilon grid; "all four `w_strategy` choices"
