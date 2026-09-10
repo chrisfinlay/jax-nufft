@@ -9,8 +9,10 @@ in `v0.1` and `v0.1.1`, and the performance plan for `v0.1.2`.
 For end-user-facing documentation, see `README.md`, which is the overview; the
 reference material lives beside it in `docs/algorithm.md` (the factorisation and
 each operator step by step), `docs/strategies.md` (`w_strategy`, `w_chunk`,
-`nthreads`), `docs/accuracy.md` (the accuracy grid, precision, adjointness) and
-`docs/benchmarking.md` (running the suite). For what shipped in each release,
+`nthreads`), `docs/accuracy.md` (the accuracy grid, precision, adjointness),
+`docs/weighting.md` (Briggs, tapering, flags; the recipes there live in
+`tests/weighting_recipes.py` and a test checks the document still quotes them)
+and `docs/benchmarking.md` (running the suite). For what shipped in each release,
 see `CHANGELOG.md`. `docs/v0.1.1-plan.md` and `docs/v0.1.2-plan.md`
 are historical plan documents, useful for the reasoning behind decisions still
 in the code but not a record of outcomes -- 0.2.0 was driven by the issue

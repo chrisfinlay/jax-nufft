@@ -32,6 +32,7 @@ pipeline.
 | [How it works](#how-it-works) | the measurement equation and w-stacking |
 | [API reference](#api-reference) | `make_plan`, `dirty2vis`, `vis2dirty` |
 | [Accuracy](#accuracy) · [Precision](#precision) | what `epsilon` buys, and float32 |
+| [Weighting](docs/weighting.md) | Briggs, tapering, flags, and the PSF |
 | [Performance](#performance) | measured against ducc0 on a GH200 |
 | [Choosing a strategy](#choosing-a-strategy) | speed / memory trade-offs |
 | [Further reading](#further-reading) | the deep-dive documents |
@@ -402,8 +403,9 @@ vis2dirty(
 ```
 
 Takes `vis` of shape `(n_rows, n_chan)` complex and returns `(n_chan, n_l,
-n_m)` real. `weights`, if given, is `(n_rows, n_chan)` and is applied before
-gridding.
+n_m)` real. `weights`, if given, is `(n_rows, n_chan)` real and is applied
+before gridding — see [weighting](docs/weighting.md) for Briggs, tapering,
+flags and the PSF.
 
 ### Shared keyword arguments
 
@@ -619,6 +621,7 @@ a JAX program, or when there is a GPU to use.
 | document | contents |
 |---|---|
 | [docs/algorithm.md](docs/algorithm.md) | the factorisation, `nshift` and `w` centring, the kernel, and each operator step by step |
+| [docs/weighting.md](docs/weighting.md) | natural, Briggs, tapering and flags — and why imaging weights are not likelihood weights |
 | [docs/strategies.md](docs/strategies.md) | every `w_strategy`, the `auto` heuristic, `w_chunk`, `nthreads` |
 | [docs/accuracy.md](docs/accuracy.md) | the accuracy grid, precision, adjointness and `divide_by_n` |
 | [docs/benchmarking.md](docs/benchmarking.md) | running the benchmark suite, historical CPU comparisons |
