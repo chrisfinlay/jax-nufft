@@ -11,6 +11,21 @@ them.
 
 ## [Unreleased]
 
+### Documentation
+
+- **A weighting guide** ([`docs/weighting.md`](docs/weighting.md)): what goes in `vis2dirty`'s
+  `weights` argument, with worked Briggs and Gaussian-taper recipes, flags, the PSF, and the
+  normalisation that makes it peak at 1. The recipes live in `tests/weighting_recipes.py` and are
+  verified by `tests/test_weighting.py` — the taper's Fourier pair by transforming it and measuring
+  the beam (3, 5 and 8 pixels requested, the same measured), Briggs by its two limits (`+2` flat
+  within 1%, `-2` a 7.4e5x spread) and by the requirement that a denser uv cell never gets a larger
+  weight. A further test asserts the document still quotes the module, so a snippet cannot rot
+  silently.
+- Records that **imaging weights are not likelihood weights**: Briggs and tapering are beam-shape
+  choices, while a visibility-space chi-squared wants inverse noise variance, and using the former
+  in the latter biases the inference. Nothing in the API distinguishes the two, since `weights=`
+  carries both.
+
 ## [0.2.0] — 2026-09-10
 
 This release covers everything since **v0.1.1**. A v0.1.2 series was developed and merged but never
